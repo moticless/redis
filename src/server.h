@@ -973,7 +973,7 @@ typedef struct replBufBlock {
  * by integers from 0 (the default database) up to the max configured
  * database. The database number is the 'id' field in the structure. */
 typedef struct redisDb {
-    kvstore *keys;              /* The keyspace for this DB */
+    kvstore *keys;              /* The keyspace for this DB. As metadata, holds keysizes histogram */
     kvstore *expires;           /* Timeout of keys with a timeout set */
     ebuckets hexpires;          /* Hash expiration DS. Single TTL per hash (of next min field to expire) */
     dict *blocking_keys;        /* Keys with clients waiting for data (BLPOP)*/
@@ -3635,7 +3635,6 @@ void bgsaveCommand(client *c);
 void bgrewriteaofCommand(client *c);
 void shutdownCommand(client *c);
 void slowlogCommand(client *c);
-void largekeysCommand(client *c);
 void moveCommand(client *c);
 void copyCommand(client *c);
 void renameCommand(client *c);

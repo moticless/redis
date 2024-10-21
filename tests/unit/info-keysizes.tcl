@@ -423,6 +423,7 @@ proc test_all_keysizes { {replMode 0} } {
 }
 
 start_server {} {
+    # Test KEYSIZES on a single server
     r select 0
     test_all_keysizes 0
 
@@ -438,7 +439,8 @@ start_server {} {
         # Server should have role replica
         $replica replicaof $primary_host $primary_port
         wait_for_condition 50 100 { [s 0 role] eq {slave} } else { fail "Replication not started." }
-
+        
+        # Test KEYSIZES on leader and replica
         $primary select 0
         test_all_keysizes 1
     }

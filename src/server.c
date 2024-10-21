@@ -2690,7 +2690,7 @@ void initServer(void) {
         flags |= KVSTORE_FREE_EMPTY_DICTS;
     }
     for (j = 0; j < server.dbnum; j++) {
-        server.db[j].keys = kvstoreCreate(&dbDictType, slot_count_bits, flags);
+        server.db[j].keys = kvstoreCreate(&dbDictType, slot_count_bits, flags | KVSTORE_ALLOC_META_KEYS_HIST);
         server.db[j].expires = kvstoreCreate(&dbExpiresDictType, slot_count_bits, flags);
         server.db[j].hexpires = ebCreate();
         server.db[j].expires_cursor = 0;

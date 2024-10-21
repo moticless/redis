@@ -64,7 +64,7 @@ void updateLFU(robj *val) {
  *               [1,2)->0 [2,4)->1 [4,8)->2 [8,16)->3
  */
 void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, uint64_t newLen) {
-    uint64_t dummyHist[MAX_KEYSIZES_BINS];
+    uint64_t dummy_hist[MAX_KEYSIZES_BINS];
 
     if  (unlikely(type >= OBJ_TYPE_BASIC_MAX)) 
         return;
@@ -73,22 +73,22 @@ void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, u
 
     /* If following key deletion, If it is last one in slot's dict, then 
      * slot's dict might get released as well. Verify if metadata is available. */
-    uint64_t *dictHist = (metadata != NULL) ? metadata->keysizes_hist[type] : dummyHist;
+    uint64_t *dict_hist = (metadata != NULL) ? metadata->keysizes_hist[type] : dummy_hist;
 
-    uint64_t *kvstoreHist = kvstoreGetMetadata(db->keys)->keysizes_hist[type];
+    uint64_t *kvstore_hist = kvstoreGetMetadata(db->keys)->keysizes_hist[type];
 
     if (oldLen != 0) {
-        int oLdBin = log2ceil(oldLen);
-        debugServerAssertWithInfo(server.current_client, NULL, oLdBin < MAX_KEYSIZES_BINS);
-        --dictHist[oLdBin];
-        --kvstoreHist[oLdBin];
+        int old_bin = log2ceil(oldLen);
+        debugServerAssertWithInfo(server.current_client, NULL, old_bin < MAX_KEYSIZES_BINS);
+        dict_hist[old_bin]--;
+        kvstore_hist[old_bin]--;
     }
     
     if (newLen != 0) {
-        int newBin = log2ceil(newLen);
-        debugServerAssertWithInfo(server.current_client, NULL, newBin < MAX_KEYSIZES_BINS);
-        ++dictHist[newBin];
-        ++kvstoreHist[newBin];
+        int new_bin = log2ceil(newLen);
+        debugServerAssertWithInfo(server.current_client, NULL, new_bin < MAX_KEYSIZES_BINS);
+        dict_hist[new_bin]++;
+        kvstore_hist[new_bin]++;
     }
 }
 
@@ -686,7 +686,8 @@ redisDb *initTempDb(void) {
     redisDb *tempDb = zcalloc(sizeof(redisDb)*server.dbnum);
     for (int i=0; i<server.dbnum; i++) {
         tempDb[i].id = i;
-        tempDb[i].keys = kvstoreCreate(&dbDictType, slot_count_bits, flags);
+        tempDb[i].keys = kvstoreCreate(&dbDictType, slot_count_bits, 
+                                       flags | KVSTORE_ALLOC_META_KEYS_HIST);
         tempDb[i].expires = kvstoreCreate(&dbExpiresDictType, slot_count_bits, flags);
         tempDb[i].hexpires = ebCreate();
     }
