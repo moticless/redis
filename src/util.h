@@ -85,7 +85,7 @@ static inline int log2ceil(size_t x) {
     return  63 - __builtin_clzll(x);
 #else
     return 31 - __builtin_clz(x);
-#endif    
+#endif
 }
 
 #ifndef static_assert

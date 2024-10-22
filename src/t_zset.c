@@ -2035,7 +2035,7 @@ void zremrangeGenericCommand(client *c, zrange_type rangetype) {
             /* No need updateKeysizesHist(). dbDelete() done it already. */
         } else {
             unsigned long len =  zsetLength(zobj);
-            updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, len + deleted, len);            
+            updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, len + deleted, len);
         }
     }
     server.dirty += deleted;
@@ -4042,7 +4042,7 @@ void genericZpopCommand(client *c, robj **keyv, int keyc, int where, int emitkey
         if (deleted) *deleted = 1;
 
         dbDelete(c->db,key);
-        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);        
+        notifyKeyspaceEvent(NOTIFY_GENERIC,"del",key,c->db->id);
         /* No need updateKeysizesHist(). dbDelete() done it already. */
     } else {
         updateKeysizesHist(c->db, getKeySlot(key->ptr), OBJ_ZSET, llen, llen - result_count);

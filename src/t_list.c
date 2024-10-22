@@ -552,7 +552,7 @@ void linsertCommand(client *c) {
     }
     listTypeReleaseIterator(iter);
 
-    if (inserted) {        
+    if (inserted) {
         signalModifiedKey(c,c->db,c->argv[1]);
         notifyKeyspaceEvent(NOTIFY_LIST,"linsert",
                             c->argv[1],c->db->id);

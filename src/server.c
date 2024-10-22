@@ -6180,7 +6180,6 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
                 uint64_t *kvstoreHist = kvstoreGetMetadata(server.db[dbnum].keys)->keysizes_hist[type];
                 char buf[10000];
                 int cnt = 0, buflen = 0;
-                UNUSED(cnt);
 
                 /* Print histogram to temp buf[]. First bin is garbage */
                 buflen += snprintf(buf + buflen, sizeof(buf) - buflen, "db%d_%s:", dbnum, typestr[type]);

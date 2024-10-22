@@ -66,8 +66,7 @@ void updateLFU(robj *val) {
 void updateKeysizesHist(redisDb *db, int didx, uint32_t type, uint64_t oldLen, uint64_t newLen) {
     uint64_t dummy_hist[MAX_KEYSIZES_BINS];
 
-    if  (unlikely(type >= OBJ_TYPE_BASIC_MAX)) 
-        return;
+    serverAssert(unlikely(type < OBJ_TYPE_BASIC_MAX));
 
     kvstoreDictMetadata *metadata = kvstoreGetDictMetadata(db->keys, didx);
 

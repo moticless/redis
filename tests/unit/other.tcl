@@ -510,7 +510,7 @@ start_server {tags {"other external:skip"}} {
         r flushall
         
         # Add one key to the db just to create the dict and get its initial size
-        r set x 1        
+        r set x 1
         set initial_size [dict get [r memory stats] db.9 overhead.hashtable.main] 
         
         # Now add 128 keys and then delete them
@@ -522,7 +522,7 @@ start_server {tags {"other external:skip"}} {
             r del $j{b}
         }
         
-        # dict must have expanded. Verify it eventually shrinks back to its initial size.        
+        # dict must have expanded. Verify it eventually shrinks back to its initial size.
         wait_for_condition 100 50 {
             [dict get [r memory stats] db.9 overhead.hashtable.main] == $initial_size
         } else {

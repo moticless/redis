@@ -67,7 +67,7 @@ typedef struct {
 
 /* Conditionally metadata allocated per dict (specifically for keysizes histogram) */
 typedef struct {
-    kvstoreDictMetaBase base; /* must be first in struct ! */    
+    kvstoreDictMetaBase base; /* must be first in struct ! */
     /* External metadata */
     kvstoreDictMetadata meta;
 } kvstoreDictMetaEx;
@@ -285,7 +285,6 @@ kvstore *kvstoreCreate(dictType *type, int num_dicts_bits, int flags) {
     kvs->bucket_count = 0;
     kvs->overhead_hashtable_lut = 0;
     kvs->overhead_hashtable_rehashing = 0;
-    
     return kvs;
 }
 
