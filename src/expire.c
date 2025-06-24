@@ -437,7 +437,7 @@ ebuckets *estoreGetBucket(estore *es, int slot) {
 size_t estoreMemUsage(estore *es) {
     if (es == NULL) return 0;
 
-    size_t mem = sizeof(*es);
+    size_t mem = sizeof(estore); /* Size of the estore structure */
     mem += sizeof(ebuckets) * es->num_buckets; /* Buckets array */
     if (!server.cluster_enabled) {
         mem +=  ebMemUsage(es->buckets + 0, es->bucket_type);
@@ -1482,7 +1482,7 @@ int expireTest(int argc, char **argv, int flags) {
     TEST("estoreGetStats returns correct stats in non-clustered mode") {
         server.cluster_enabled = 0;
 
-        estore *es = estoreCreate(&testEbType, 1); /* only one bucket */
+        estore *es = estoreCreate(&testEbType, 0); /* only one bucket */
 
         TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
         estoreAdd(es, (kvobj*)kv1, 0, 1);
@@ -1512,7 +1512,7 @@ int expireTest(int argc, char **argv, int flags) {
     TEST("estoreGetStats returns combined stats in clustered mode") {
         server.cluster_enabled = 1;
 
-        estore *es = estoreCreate(&testEbType, 2); /* two buckets */
+        estore *es = estoreCreate(&testEbType, 1); /* two buckets */
 
         /* Add objects to different buckets */
         TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
@@ -1546,6 +1546,59 @@ int expireTest(int argc, char **argv, int flags) {
         estoreRelease(es);
     }
     
+    TEST("estoreMemUsage computes memory correctly in non-cluster mode") {
+        server.cluster_enabled = 0;
+
+        estore *es = estoreCreate(&testEbType, 1); /* 2 buckets */
+
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 1);
+        estoreAdd(es, (kvobj*)kv2, 0, 2);
+
+        size_t expected = sizeof(estore) + sizeof(ebuckets) * 2; /* Size of the estore structure + buckets array */
+        expected += ebMemUsage(es->buckets + 0, es->bucket_type); /* Only one bucket considered */
+
+        size_t actual = estoreMemUsage(es);
+        assert(actual == expected);
+
+        zfree(kv1);
+        zfree(kv2);
+        estoreRelease(es);
+    }
+
+    TEST("estoreMemUsage computes memory correctly in cluster mode") {
+        server.cluster_enabled = 1;
+
+        estore *es = estoreCreate(&testEbType, 2); /* 4 buckets */
+
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv4 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 3);
+        estoreAdd(es, (kvobj*)kv2, 1, 4);
+        estoreAdd(es, (kvobj*)kv3, 2, 5);
+        estoreAdd(es, (kvobj*)kv4, 3, 6);
+
+        size_t expected = sizeof(estore) + sizeof(ebuckets) * 4;
+        for (int i = 0; i < 4; i++) {
+            expected += ebMemUsage(es->buckets + i, es->bucket_type);
+        }
+
+        size_t actual = estoreMemUsage(es);
+        assert(actual == expected);
+
+        zfree(kv1);
+        zfree(kv2);
+        zfree(kv3);
+        zfree(kv4);
+        estoreRelease(es);
+    }
+
+
     return 0;
 }
 #endif
