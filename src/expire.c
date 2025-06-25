@@ -18,7 +18,8 @@
 #define CASCADE_CONTROLLER_KP  0.0005
 #define CASCADE_CONTROLLER_KI  0.00001
 #define CASCADE_CONTROLLER_KD  0.0001
-#define START_MAX_CASCADE 1
+#define CASCADE_INIT_COUNT 10
+#define CASCADE_MIN_COUNT 1
 typedef struct {
     double integral;
     double previous_error;
@@ -150,7 +151,7 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
  * @param elapsedMicros - Actual time taken by the last cascade execution in microseconds.
  * @return              - Updated value of `maxCascade` after PID adjustment.
  */
-uint64_t estoreCascadeController(ControlerState *state, uint64_t maxCascade, long long timeLimit, double elapsedMicros) {
+int64_t estoreCascadeController(ControlerState *state, uint64_t cascadeQuota, long long timeLimit, double elapsedMicros) {
     double error = (double)timeLimit - elapsedMicros;
 
     state->integral += error;
@@ -158,14 +159,13 @@ uint64_t estoreCascadeController(ControlerState *state, uint64_t maxCascade, lon
     double adjustment = CASCADE_CONTROLLER_KP * error + CASCADE_CONTROLLER_KI * state->integral + CASCADE_CONTROLLER_KD * derivative;
     state->previous_error = error;
 
-    int64_t newMaxCascade = (int64_t)maxCascade + (int64_t)adjustment;
-
-    if (newMaxCascade < START_MAX_CASCADE)
-        return START_MAX_CASCADE;
-    else if ((uint64_t)newMaxCascade > UINT64_MAX)
-        return UINT64_MAX;
+    int64_t newCascadeQuota = (int64_t)cascadeQuota + (int64_t)adjustment;
+    if (newCascadeQuota < CASCADE_MIN_COUNT)
+        return CASCADE_MIN_COUNT;
+    else if (newCascadeQuota > INT64_MAX)
+        return INT64_MAX;
     else
-        return (uint64_t)newMaxCascade;
+        return newCascadeQuota;
 }
 
 /**
@@ -203,14 +203,14 @@ void estoreResetCascadeController(ControlerState *state) {
  * @param now        - Timestamp for use in cascade logic.
  * @param timeLimit  - Maximum desired time per call in microseconds.
  */
-void estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
+uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
     static int last_bucket_index = 0;
-    static uint64_t maxCascade = START_MAX_CASCADE; /* Start with 20 max cascade */
+    static int64_t cascadeQuota = CASCADE_INIT_COUNT;
 
     uint64_t start = ustime();
-    uint64_t remainingCascade = maxCascade;
+    int64_t remainingCascade = cascadeQuota;
     if (!server.cluster_enabled) {
-        remainingCascade = ebCascade(es->buckets + 0, es->bucket_type, now, remainingCascade);
+        remainingCascade -= ebCascade(es->buckets + 0, es->bucket_type, now, remainingCascade);
     } else {
         int i = 0;
         for (; i < es->num_buckets && remainingCascade > 0; i++) {
@@ -222,14 +222,18 @@ void estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
         last_bucket_index = (i + last_bucket_index) % es->num_buckets;
     }
 
-    if(maxCascade == remainingCascade) {
+    uint64_t cascaded = cascadeQuota - remainingCascade < 0 ? cascadeQuota : cascadeQuota - remainingCascade;
+    if(cascadeQuota == remainingCascade) {
         estoreResetCascadeController(&cascadeControllerState);
-        maxCascade = START_MAX_CASCADE; /* Reset to default if no change */
+        cascadeQuota = CASCADE_INIT_COUNT; /* Reset to default if no change */
     } else {
         uint64_t end = ustime();
         double elapsed = (double)(end - start);
-        maxCascade = estoreCascadeController(&cascadeControllerState, maxCascade, timeLimit, elapsed);
+        printf("Elapsed: %f mc\n", elapsed);
+        cascadeQuota = estoreCascadeController(&cascadeControllerState, cascadeQuota, timeLimit, elapsed);
     }
+
+    return cascaded;
 }
 
 void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
@@ -1748,7 +1752,7 @@ int expireTest(int argc, char **argv, int flags) {
         estoreRelease(es);
     }
 
-    TEST("estoreIncrementalCascade cacade 1M objects from L2 to L1") {
+    TEST("estoreIncrementalCascade cacade 100K objects from L2 to L1") {
         server.cluster_enabled = 0;
         server.cmd_time_snapshot = 1;
         EbucketsType stackType = testEbType;
@@ -1756,24 +1760,28 @@ int expireTest(int argc, char **argv, int flags) {
 
         estore *es = estoreCreate(&stackType, 1); /* 1 bucket for simplicity */
 
+        int max_objects = 20000;
         int object = 0;
-        TestKVObj *objects = zmalloc(sizeof(TestKVObj) * 10000);
+        TestKVObj *objects = zmalloc(sizeof(TestKVObj) * max_objects);
 
         const int L2_BUCKET_INTERVAL = 1 << ebpStackL2.precision;
         server.cmd_time_snapshot = L2_BUCKET_INTERVAL + 1;
         uint64_t l1MaxExpireTime = (server.cmd_time_snapshot + (1 << ebpStackL2.precision)) | ((1 << ebpStackL2.precision) - 1);
         uint64_t l2MinExpireTime = l1MaxExpireTime + 1;
         for(int i=0; i<2000; i++) {
-            for(int j=0; j<5; j++) {
+            for(int j=0; j<max_objects/2000; j++) {
                 TestKVObj *kv =  &objects[object++];
                 mstime_t ttl = l2MinExpireTime + i;
                 estoreAdd(es, (kvobj*)kv, 0, ttl);
             }
         }
 
-        long long timeLimit = 5000;  
-        for(int i=0; i<10000; i++) {
-            estoreIncrementalCascade(es, server.cmd_time_snapshot + L2_BUCKET_INTERVAL, timeLimit);
+        int total_cascaded = 0;
+        long long timeLimit = 8000;
+        while(total_cascaded < max_objects) {
+            int cascaded = estoreIncrementalCascade(es, server.cmd_time_snapshot + L2_BUCKET_INTERVAL, timeLimit);
+            total_cascaded += cascaded;
+            printf("Cascaded %d, Total cascaded: %d\n", cascaded, total_cascaded);
         }
 
         zfree(objects);
