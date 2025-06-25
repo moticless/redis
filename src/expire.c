@@ -240,6 +240,9 @@ void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
     into->totalItems += from->totalItems;
     into->totalBuckets += from->totalBuckets;
     into->totalSegments += from->totalSegments;
+    into->totalL1Items += from->totalL1Items;
+    into->totalL2Items += from->totalL2Items;
+    into->totalL3Items += from->totalL3Items;
 
     if (into->totalBuckets == 0) return;
 
@@ -1521,14 +1524,20 @@ int expireTest(int argc, char **argv, int flags) {
 
     TEST("estoreGetStats returns correct stats in non-clustered mode") {
         server.cluster_enabled = 0;
+        EbucketsType stackType = testEbType;
+        stackType.isEbStack = 1;
 
-        estore *es = estoreCreate(&testEbType, 0); /* only one bucket */
+        estore *es = estoreCreate(&stackType, 0); /* only one bucket */
 
         TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
-        estoreAdd(es, (kvobj*)kv1, 0, 1);
-
         TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv4 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 1);
         estoreAdd(es, (kvobj*)kv2, 0, 1);
+        estoreAdd(es, (kvobj*)kv3, 0, EB_EXPIRE_TIME_MAX -1); /* Level 2 */
+        estoreAdd(es, (kvobj*)kv4, 0, EB_EXPIRE_TIME_MAX + 1); /* Level 3 */
 
         char buf[1024];
         memset(buf, 0, sizeof(buf));
@@ -1536,9 +1545,13 @@ int expireTest(int argc, char **argv, int flags) {
         estoreGetStats(es, buf, sizeof(buf), 1);
 
         /* Validate that output includes expected stats */
-        assert(strstr(buf, " total items: 2") != NULL);
-        assert(strstr(buf, " total buckets: 1") != NULL);
-        assert(strstr(buf, " total segments: 1") != NULL);
+        assert(strstr(buf, " total items: 4") != NULL);
+        assert(strstr(buf, " total buckets: 2") != NULL);
+        assert(strstr(buf, " total segments: 2") != NULL);
+
+        assert(strstr(buf, " total items in L1: 2") != NULL);
+        assert(strstr(buf, " total items in L2: 1") != NULL);
+        assert(strstr(buf, " total items in L3: 1") != NULL);
 
         assert(strstr(buf, " avg items per bucket: 2") != NULL);
         assert(strstr(buf, " avg items per segment: 2") != NULL);
@@ -1546,6 +1559,8 @@ int expireTest(int argc, char **argv, int flags) {
 
         zfree(kv1);
         zfree(kv2);
+        zfree(kv3);
+        zfree(kv4);
         estoreRelease(es);
     }
 
