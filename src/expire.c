@@ -141,7 +141,7 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
  * - Use the PID formula: `adjustment = KP * error + KI * integral + KD * derivative`
  * - Apply the adjustment to the current `maxCascade`.
  * - Clamp the result to ensure it stays within valid bounds.
- *   - Minimum: `20000 / server.hz` (baseline throughput).
+ *   - Minimum: START_MAX_CASCADE (baseline throughput).
  *   - Maximum: `UINT64_MAX` (system limit).
  *
  * @param state         - Pointer to a persistent `ControlerState` holding integral and previous error.
@@ -160,8 +160,8 @@ uint64_t estoreCascadeController(ControlerState *state, uint64_t maxCascade, lon
 
     int64_t newMaxCascade = (int64_t)maxCascade + (int64_t)adjustment;
 
-    if (newMaxCascade < 20000 / server.hz)
-        return 20000 / server.hz;
+    if (newMaxCascade < START_MAX_CASCADE)
+        return START_MAX_CASCADE;
     else if ((uint64_t)newMaxCascade > UINT64_MAX)
         return UINT64_MAX;
     else
