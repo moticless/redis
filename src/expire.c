@@ -14,6 +14,18 @@
 #include "expire.h"
 #include "redisassert.h"
 
+
+#define CASCADE_CONTROLLER_KP 10.0
+#define CASCADE_CONTROLLER_KI 0.1
+#define CASCADE_CONTROLLER_KD 5.0
+#define START_MAX_CASCADE 20
+typedef struct {
+    double integral;
+    double previous_error;
+} ControlerState;
+
+static ControlerState cascadeControllerState = {0};
+
 /* Define the EbucketsType for keys */
 EbucketsType estoreBucketsType = {
     .onDeleteItem = NULL,
@@ -115,19 +127,109 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
     }
 }
 
-void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade) {
+/**
+ * Adjust the `maxCascade` value using a PID controller based on execution timing.
+ *
+ * This function implements a PID (Proportional–Integral–Derivative) controller to regulate
+ * the `maxCascade` limit. It compares the actual elapsed execution time to a specified
+ * time limit (`timeLimit`) and adjusts the next cycle's `maxCascade` accordingly.
+ *
+ * Logic Overview:
+ * - Compute the error: `timeLimit - elapsedMicros`
+ * - Accumulate the integral of the error over time.
+ * - Compute the derivative (change in error).
+ * - Use the PID formula: `adjustment = KP * error + KI * integral + KD * derivative`
+ * - Apply the adjustment to the current `maxCascade`.
+ * - Clamp the result to ensure it stays within valid bounds.
+ *   - Minimum: `20000 / server.hz` (baseline throughput).
+ *   - Maximum: `UINT64_MAX` (system limit).
+ *
+ * @param state         - Pointer to a persistent `ControlerState` holding integral and previous error.
+ * @param maxCascade    - Current `maxCascade` value before adjustment.
+ * @param timeLimit     - Target execution time in microseconds.
+ * @param elapsedMicros - Actual time taken by the last cascade execution in microseconds.
+ * @return              - Updated value of `maxCascade` after PID adjustment.
+ */
+uint64_t estoreCascadeController(ControlerState *state, uint64_t maxCascade, long long timeLimit, double elapsedMicros) {
+    double error = (double)timeLimit - elapsedMicros;
+
+    state->integral += error;
+    double derivative = error - state->previous_error;
+    double adjustment = CASCADE_CONTROLLER_KP * error + CASCADE_CONTROLLER_KI * state->integral + CASCADE_CONTROLLER_KD * derivative;
+    state->previous_error = error;
+
+    int64_t newMaxCascade = (int64_t)maxCascade + (int64_t)adjustment;
+
+    if (newMaxCascade < 20000 / server.hz)
+        return 20000 / server.hz;
+    else if ((uint64_t)newMaxCascade > UINT64_MAX)
+        return UINT64_MAX;
+    else
+        return (uint64_t)newMaxCascade;
+}
+
+/**
+ * Reset the internal state of the PID controller.
+ *
+ * This function zeroes out the integral and derivative memory of the PID controller.
+ * It is used to restart the controller from a clean state, typically when the system
+ * is reinitialized or no progress has been made (e.g., no cascade was performed).
+ *
+ * @param state - Pointer to the `ControlerState` to reset.
+ */
+void estoreResetCascadeController(ControlerState *state) {
+    state->integral = 0;
+    state->previous_error = 0;
+}
+
+/**
+ * Perform an incremental cascade of the estore buckets, controlled by a PID-regulated limit.
+ *
+ * This function performs eviction (or another maintenance operation) in small increments
+ * across estore buckets. The number of items processed is regulated by `maxCascade`,
+ * which is dynamically adjusted by a PID controller based on how long the last call took.
+ *
+ * Logic Overview:
+ * - Start a timer to measure execution time.
+ * - If cluster is disabled:
+ *   - Apply cascade only to the first bucket.
+ * - If cluster is enabled:
+ *   - Cascade across buckets in a round-robin fashion, resuming from where it left off.
+ *   - Stop once the `maxCascade` budget is exhausted.
+ * - If no work was done (`remainingCascade == maxCascade`), reset controller and revert to default.
+ * - Otherwise, use the controller to update `maxCascade` based on actual time taken.
+ *
+ * @param es         - Pointer to the `estore` object.
+ * @param now        - Timestamp for use in cascade logic.
+ * @param timeLimit  - Maximum desired time per call in microseconds.
+ */
+void estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
+    static int last_bucket_index = 0;
+    static uint64_t maxCascade = START_MAX_CASCADE; /* Start with 20 max cascade */
+
+    uint64_t start = ustime();
+    uint64_t remainingCascade = maxCascade;
     if (!server.cluster_enabled) {
-        ebCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
-        return;
+        remainingCascade = ebCascade(es->buckets + 0, es->bucket_type, now, remainingCascade);
+    } else {
+        int i = 0;
+        for (; i < es->num_buckets && remainingCascade > 0; i++) {
+            int index = (i + last_bucket_index) % es->num_buckets;
+            remainingCascade -= ebCascade(es->buckets + index, es->bucket_type, now, remainingCascade);
+            if (remainingCascade <= 0)
+                break;
+        }
+        last_bucket_index = (i + last_bucket_index) % es->num_buckets;
     }
 
-    int i = 0;
-    static int last_bucket_index = 0;
-    for(; i < es->num_buckets && maxCascade > 0; i++) {
-        int index = (i + last_bucket_index) % es->num_buckets;
-        maxCascade -= ebCascade(es->buckets + index, es->bucket_type, now, maxCascade);
+    if(maxCascade == remainingCascade) {
+        estoreResetCascadeController(&cascadeControllerState);
+        maxCascade = START_MAX_CASCADE; /* Reset to default if no change */
+    } else {
+        uint64_t end = ustime();
+        double elapsed = (double)(end - start);
+        maxCascade = estoreCascadeController(&cascadeControllerState, maxCascade, timeLimit, elapsed);
     }
-    last_bucket_index = (i + last_bucket_index) % es->num_buckets;
 }
 
 void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
@@ -401,10 +503,10 @@ unsigned int estoreActiveExpire(redisDb *db, unsigned int max_keys) {
 
     static mstime_t last_run_time = 0;
     if (last_run_time == 0)
-        last_run_time = now;
+        last_run_time = server.mstime;
 
-    mstime_t elapsed = now - last_run_time;
-    last_run_time = now;
+    mstime_t elapsed = server.mstime - last_run_time;
+    last_run_time = server.mstime;
 
     /* In cluster mode, we need to process only slots that belong to this node */
     int start_slot = 0;
@@ -596,116 +698,8 @@ void activeExpireCycle(int type) {
          * active expiration */
         activeExpireHashFieldCycle(type);
 
-//        /* Check if we have keys to expire in the old dict-based structure */
-//        if (kvstoreSize(db->expires)) {
-//            dbs_performed++;
-//
-//            /* Continue to expire if at the end of the cycle there are still
-//             * a big percentage of keys to expire, compared to the number of keys
-//             * we scanned. The percentage, stored in config_cycle_acceptable_stale
-//             * is not fixed, but depends on the Redis configured "expire effort". */
-//            do {
-//                unsigned long num;
-//                iteration++;
-//
-//                /* If there is nothing to expire try next DB ASAP. */
-//                if ((num = kvstoreSize(db->expires)) == 0) {
-//                    db->avg_ttl = 0;
-//                    break;
-//                }
-//                data.now = mstime();
-//
-//                /* The main collection cycle. Scan through keys among keys
-//                 * with an expire set, checking for expired ones. */
-//                data.sampled = 0;
-//                data.expired = 0;
-//
-//                if (num > config_keys_per_loop)
-//                    num = config_keys_per_loop;
-//
-//                /* Here we access the low level representation of the hash table
-//                 * for speed concerns: this makes this code coupled with dict.c,
-//                 * but it hardly changed in ten years.
-//                 *
-//                 * Note that certain places of the hash table may be empty,
-//                 * so we want also a stop condition about the number of
-//                 * buckets that we scanned. However scanning for free buckets
-//                 * is very fast: we are in the cache line scanning a sequential
-//                 * array of NULL pointers, so we can scan a lot more buckets
-//                 * than keys in the same time. */
-//                long max_buckets = num*20;
-//                long checked_buckets = 0;
-//
-//                int origin_ttl_samples = data.ttl_samples;
-//
-//                while (data.sampled < num && checked_buckets < max_buckets) {
-//                    db->expires_cursor = kvstoreScan(db->expires, db->expires_cursor, -1, expireScanCallback, isExpiryDictValidForSamplingCb, &data);
-//                    if (db->expires_cursor == 0) {
-//                        db_done = 1;
-//                        break;
-//                    }
-//                    checked_buckets++;
-//                }
-//                total_expired += data.expired;
-//                total_sampled += data.sampled;
-//
-//                /* If find keys with ttl not yet expired, we need to update the average TTL stats once. */
-//                if (data.ttl_samples - origin_ttl_samples > 0) update_avg_ttl_times++;
-//
-//                /* We don't repeat the cycle for the current database if the db is done
-//                 * for scanning or an acceptable number of stale keys (logically expired
-//                 * but yet not reclaimed). */
-//                repeat = db_done ? 0 : (data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale);
-//
-//                /* We can't block forever here even if there are many keys to
-//                 * expire. So after a given amount of microseconds return to the
-//                 * caller waiting for the other active expire cycle. */
-//                if ((iteration & 0xf) == 0 || !repeat) { /* Update the average TTL stats every 16 iterations or about to exit. */
-//                    /* Update the average TTL stats for this database,
-//                     * because this may reach the time limit. */
-//                    if (data.ttl_samples) {
-//                        long long avg_ttl = data.ttl_sum / data.ttl_samples;
-//
-//                        /* Do a simple running average with a few samples.
-//                         * We just use the current estimate with a weight of 2%
-//                         * and the previous estimate with a weight of 98%. */
-//                        if (db->avg_ttl == 0) {
-//                            db->avg_ttl = avg_ttl;
-//                        } else {
-//                            /* The origin code is as follow.
-//                             * for (int i = 0; i < update_avg_ttl_times; i++) {
-//                             *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
-//                             * }
-//                             * We can convert the loop into a sum of a geometric progression.
-//                             * db->avg_ttl = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-//                             *                  avg_ttl / 50 * (pow(0.98, update_avg_ttl_times - 1) + ... + 1)
-//                             *             = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-//                             *                  avg_ttl * (1 - pow(0.98, update_avg_ttl_times))
-//                             *             = avg_ttl +  (db->avg_ttl - avg_ttl) * pow(0.98, update_avg_ttl_times)
-//                             * Notice that update_avg_ttl_times is between 1 and 16, we use a constant table
-//                             * to accelerate the calculation of pow(0.98, update_avg_ttl_times).*/
-//                            db->avg_ttl = avg_ttl + (db->avg_ttl - avg_ttl) * avg_ttl_factor[update_avg_ttl_times - 1] ;
-//                        }
-//                        update_avg_ttl_times = 0;
-//                        data.ttl_sum = 0;
-//                        data.ttl_samples = 0;
-//                    }
-//                    if ((iteration & 0xf) == 0) { /* check time limit every 16 iterations. */
-//                        elapsed = ustime()-start;
-//                        if (elapsed > timelimit) {
-//                            timelimit_exit = 1;
-//                            server.stat_expired_time_cap_reached_count++;
-//                            break;
-//                        }
-//                    }
-//                }
-//            } while (repeat);
-//        }
-
         /* Cascade items from L2 to L1 if needed */
-        // TODO_MOTI: Fine tune estoreIncrementalCascade()
-        uint64_t maxCascade = 20000 / server.hz; 
-        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), maxCascade);
+        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), 1000000 / server.hz);
 
         /* Now check if we have keys to expire in the new ebuckets-based structure */
         if (estoreSize(db->expiresNew)) {

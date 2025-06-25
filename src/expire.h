@@ -40,7 +40,7 @@ void estoreRemove(estore *es, int slot, kvobj *kv);
 /* Add kv to estore with the given expiration time */
 void estoreAdd(estore *es, kvobj *kv, int slot, long long when);
 
-void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade);
+void estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit);
 
 void estoreGetStats(estore *es, char *buf, size_t bufsize, int full);
 
