@@ -15,10 +15,10 @@
 #include "redisassert.h"
 
 
-#define CASCADE_CONTROLLER_KP 10.0
-#define CASCADE_CONTROLLER_KI 0.1
-#define CASCADE_CONTROLLER_KD 5.0
-#define START_MAX_CASCADE 20
+#define CASCADE_CONTROLLER_KP  0.0005
+#define CASCADE_CONTROLLER_KI  0.00001
+#define CASCADE_CONTROLLER_KD  0.0001
+#define START_MAX_CASCADE 1
 typedef struct {
     double integral;
     double previous_error;
@@ -699,7 +699,7 @@ void activeExpireCycle(int type) {
         activeExpireHashFieldCycle(type);
 
         /* Cascade items from L2 to L1 if needed */
-        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), 1000000 / server.hz);
+        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), timelimit / 3);
 
         /* Now check if we have keys to expire in the new ebuckets-based structure */
         if (estoreSize(db->expiresNew)) {
@@ -1745,6 +1745,38 @@ int expireTest(int argc, char **argv, int flags) {
         zfree(kv3);
         zfree(kv4);
         zfree(kv5);
+        estoreRelease(es);
+    }
+
+    TEST("estoreIncrementalCascade cacade 1M objects from L2 to L1") {
+        server.cluster_enabled = 0;
+        server.cmd_time_snapshot = 1;
+        EbucketsType stackType = testEbType;
+        stackType.isEbStack = 1;
+
+        estore *es = estoreCreate(&stackType, 1); /* 1 bucket for simplicity */
+
+        int object = 0;
+        TestKVObj *objects = zmalloc(sizeof(TestKVObj) * 10000);
+
+        const int L2_BUCKET_INTERVAL = 1 << ebpStackL2.precision;
+        server.cmd_time_snapshot = L2_BUCKET_INTERVAL + 1;
+        uint64_t l1MaxExpireTime = (server.cmd_time_snapshot + (1 << ebpStackL2.precision)) | ((1 << ebpStackL2.precision) - 1);
+        uint64_t l2MinExpireTime = l1MaxExpireTime + 1;
+        for(int i=0; i<2000; i++) {
+            for(int j=0; j<5; j++) {
+                TestKVObj *kv =  &objects[object++];
+                mstime_t ttl = l2MinExpireTime + i;
+                estoreAdd(es, (kvobj*)kv, 0, ttl);
+            }
+        }
+
+        long long timeLimit = 5000;  
+        for(int i=0; i<10000; i++) {
+            estoreIncrementalCascade(es, server.cmd_time_snapshot + L2_BUCKET_INTERVAL, timeLimit);
+        }
+
+        zfree(objects);
         estoreRelease(es);
     }
 

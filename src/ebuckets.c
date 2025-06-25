@@ -164,12 +164,22 @@ typedef struct ExpireMetaL3 {
 #define static_assert(expr, lit) extern char __static_assert_failure[(expr) ? 1:-1]
 #endif
 
-#ifndef REDIS_TEST
 typedef long long mstime_t; /* millisecond time type. */
 mstime_t commandTimeSnapshot(void);
+
+#ifndef REDIS_TEST
+mstime_t ebCommandTimeSnapshot(void) {
+    return commandTimeSnapshot();
+}
 #else /* Let tests control time */
 uint64_t __NOW__ = 0;
-#define commandTimeSnapshot() __NOW__
+mstime_t ebCommandTimeSnapshot(void) {
+    if(__NOW__ == 0) {
+        /* If __NOW__ is not set, we use the current time as a snapshot */
+        __NOW__ = commandTimeSnapshot();
+    }
+    return __NOW__;
+}
 #endif
 
 /* Verify that "head" field is aligned in FirstSegHdr, NextSegHdr and CommonSegHdr */
@@ -1335,7 +1345,7 @@ int ebAddToStack(ebuckets *eb, EbucketsType *type, eItem item, uint64_t expireTi
     }
 
     /* Determine which level to add the item to based on bucket key precision */
-    uint64_t now = commandTimeSnapshot();
+    uint64_t now = ebCommandTimeSnapshot();
     uint64_t nowL2BucketKey = now >> ebpStackL2.precision;
     uint64_t itemL2BucketKey = expireTime >> ebpStackL2.precision;
 
