@@ -13,19 +13,13 @@
 #include "server.h"
 #include "expire.h"
 #include "redisassert.h"
+#include "pid_controller.h"
 
-
-#define CASCADE_CONTROLLER_KP  0.0005
-#define CASCADE_CONTROLLER_KI  0.00001
-#define CASCADE_CONTROLLER_KD  0.0001
-#define CASCADE_INIT_COUNT 10
+#define CASCADE_CONTROLLER_KP  0.001
+#define CASCADE_CONTROLLER_KI  0.00002
+#define CASCADE_CONTROLLER_KD  0.0002
+#define CASCADE_INIT_COUNT 100
 #define CASCADE_MIN_COUNT 1
-typedef struct {
-    double integral;
-    double previous_error;
-} ControlerState;
-
-static ControlerState cascadeControllerState = {0};
 
 /* Define the EbucketsType for keys */
 EbucketsType estoreBucketsType = {
@@ -129,111 +123,79 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
 }
 
 /**
- * Adjust the `maxCascade` value using a PID controller based on execution timing.
+ * Incrementally performs a cascade operation over estore buckets, adjusting work effort 
+ * using a PID controller based on time spent during the previous call.
  *
- * This function implements a PID (Proportional–Integral–Derivative) controller to regulate
- * the `maxCascade` limit. It compares the actual elapsed execution time to a specified
- * time limit (`timeLimit`) and adjusts the next cycle's `maxCascade` accordingly.
+ * This function is designed to spread eviction or maintenance work across multiple calls,
+ * avoiding latency spikes by regulating the amount of work done via a time-based PID controller.
  *
- * Logic Overview:
- * - Compute the error: `timeLimit - elapsedMicros`
- * - Accumulate the integral of the error over time.
- * - Compute the derivative (change in error).
- * - Use the PID formula: `adjustment = KP * error + KI * integral + KD * derivative`
- * - Apply the adjustment to the current `maxCascade`.
- * - Clamp the result to ensure it stays within valid bounds.
- *   - Minimum: START_MAX_CASCADE (baseline throughput).
- *   - Maximum: `UINT64_MAX` (system limit).
+ * Key behavior:
+ * - A PID controller determines how many items to cascade (`maxCascade`) based on prior execution time.
+ * - If the cluster is disabled, only the first bucket is cascaded.
+ * - If the cluster is enabled, the function would iterate across buckets in a round-robin fashion 
+ * - After cascading, the actual amount processed is measured.
+ * - If no work was done, the PID controller is reset.
+ * - If work occurred, the PID controller is updated using the measured execution time, tuning future `maxCascade` limits.
  *
- * @param state         - Pointer to a persistent `ControlerState` holding integral and previous error.
- * @param maxCascade    - Current `maxCascade` value before adjustment.
- * @param timeLimit     - Target execution time in microseconds.
- * @param elapsedMicros - Actual time taken by the last cascade execution in microseconds.
- * @return              - Updated value of `maxCascade` after PID adjustment.
- */
-int64_t estoreCascadeController(ControlerState *state, uint64_t cascadeQuota, long long timeLimit, double elapsedMicros) {
-    double error = (double)timeLimit - elapsedMicros;
-
-    state->integral += error;
-    double derivative = error - state->previous_error;
-    double adjustment = CASCADE_CONTROLLER_KP * error + CASCADE_CONTROLLER_KI * state->integral + CASCADE_CONTROLLER_KD * derivative;
-    state->previous_error = error;
-
-    int64_t newCascadeQuota = (int64_t)cascadeQuota + (int64_t)adjustment;
-    if (newCascadeQuota < CASCADE_MIN_COUNT)
-        return CASCADE_MIN_COUNT;
-    else if (newCascadeQuota > INT64_MAX)
-        return INT64_MAX;
-    else
-        return newCascadeQuota;
-}
-
-/**
- * Reset the internal state of the PID controller.
+ * @param es         Pointer to the estore structure.
+ * @param now        Current timestamp to guide cascade logic.
+ * @param timeLimit  Target duration in microseconds for this operation's execution time.
  *
- * This function zeroes out the integral and derivative memory of the PID controller.
- * It is used to restart the controller from a clean state, typically when the system
- * is reinitialized or no progress has been made (e.g., no cascade was performed).
- *
- * @param state - Pointer to the `ControlerState` to reset.
- */
-void estoreResetCascadeController(ControlerState *state) {
-    state->integral = 0;
-    state->previous_error = 0;
-}
-
-/**
- * Perform an incremental cascade of the estore buckets, controlled by a PID-regulated limit.
- *
- * This function performs eviction (or another maintenance operation) in small increments
- * across estore buckets. The number of items processed is regulated by `maxCascade`,
- * which is dynamically adjusted by a PID controller based on how long the last call took.
- *
- * Logic Overview:
- * - Start a timer to measure execution time.
- * - If cluster is disabled:
- *   - Apply cascade only to the first bucket.
- * - If cluster is enabled:
- *   - Cascade across buckets in a round-robin fashion, resuming from where it left off.
- *   - Stop once the `maxCascade` budget is exhausted.
- * - If no work was done (`remainingCascade == maxCascade`), reset controller and revert to default.
- * - Otherwise, use the controller to update `maxCascade` based on actual time taken.
- *
- * @param es         - Pointer to the `estore` object.
- * @param now        - Timestamp for use in cascade logic.
- * @param timeLimit  - Maximum desired time per call in microseconds.
+ * @return Number of items cascaded in this call.
  */
 uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
-    static int last_bucket_index = 0;
-    static int64_t cascadeQuota = CASCADE_INIT_COUNT;
+    if (estoreSize(es) == 0) {
+        return 0; /* Nothing to cascade */
+    }
+
+    /* Initialize PID controller if not already present */
+    if (es->cascadeController == NULL) {
+        es->cascadeController = pid_create(CASCADE_CONTROLLER_KP, CASCADE_CONTROLLER_KI, CASCADE_CONTROLLER_KD,
+                                           CASCADE_INIT_COUNT, CASCADE_MIN_COUNT, INT64_MAX);
+    }
+
+    PidController *pid = (PidController *)es->cascadeController;
 
     uint64_t start = ustime();
-    int64_t remainingCascade = cascadeQuota;
+    int64_t remainingCascade = (int64_t)pid->output;
+
+    /* Cascading logic */
     if (!server.cluster_enabled) {
         remainingCascade -= ebCascade(es->buckets + 0, es->bucket_type, now, remainingCascade);
     } else {
+        #ifdef FALSE
         int i = 0;
         for (; i < es->num_buckets && remainingCascade > 0; i++) {
-            int index = (i + last_bucket_index) % es->num_buckets;
+            int index = (i + (int)pid->output /* reused as bucket pointer */) % es->num_buckets;
             remainingCascade -= ebCascade(es->buckets + index, es->bucket_type, now, remainingCascade);
             if (remainingCascade <= 0)
                 break;
         }
-        last_bucket_index = (i + last_bucket_index) % es->num_buckets;
+        pid->output = (i + (int)pid->output) % es->num_buckets;
+        #endif
     }
 
-    uint64_t cascaded = cascadeQuota - remainingCascade < 0 ? cascadeQuota : cascadeQuota - remainingCascade;
-    if(cascadeQuota == remainingCascade) {
-        estoreResetCascadeController(&cascadeControllerState);
-        cascadeQuota = CASCADE_INIT_COUNT; /* Reset to default if no change */
+    /* Compute actual cascaded amount */
+    int64_t cascaded = (int64_t)pid->output - remainingCascade;
+    if (cascaded < 0) 
+        cascaded = 0;
+
+    /* If no cascade occurred, reset the PID controller state */
+    if ((int64_t)pid->output == remainingCascade) {
+        pid_reset(pid);
     } else {
         uint64_t end = ustime();
         double elapsed = (double)(end - start);
-        printf("Elapsed: %f mc\n", elapsed);
-        cascadeQuota = estoreCascadeController(&cascadeControllerState, cascadeQuota, timeLimit, elapsed);
+
+        printf("Time limit: %lld uc\n", timeLimit);
+        printf("Elapsed: %f uc\n", elapsed);
+        printf("Cascaded: %ld\n", cascaded);
+
+        double newOutput = pid_update(pid, (double)timeLimit, elapsed);
+        printf("New cascade quota: %f\n", newOutput);
     }
 
-    return cascaded;
+    return (uint64_t)cascaded;
 }
 
 void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
@@ -661,6 +623,7 @@ void activeExpireCycle(int type) {
      * time per iteration. Since this function gets called with a frequency of
      * server.hz times per second, the following is the max amount of
      * microseconds we can spend in this function. */
+
     timelimit = config_cycle_slow_time_perc*1000000/server.hz/100;
     timelimit_exit = 0;
     if (timelimit <= 0) timelimit = 1;
@@ -683,17 +646,7 @@ void activeExpireCycle(int type) {
      * 2) The time limit has been exceeded.
      * 3) All databases have been traversed. */
     for (j = 0; dbs_performed < dbs_per_call && timelimit_exit == 0 && j < server.dbnum; j++) {
-        /* Scan callback data including expired and checked count per iteration. */
-        expireScanData data;
-        data.ttl_sum = 0;
-        data.ttl_samples = 0;
-        UNUSED(data);
-
         redisDb *db = server.db+(current_db % server.dbnum);
-        data.db = db;
-
-        //int db_done = 0; /* The scan of the current DB is done? */
-        //int update_avg_ttl_times = 0, repeat = 0;
 
         /* Increment the DB now so we are sure if we run out of time
          * in the current DB we'll restart from the next. This allows to
@@ -724,7 +677,7 @@ void activeExpireCycle(int type) {
                         server.stat_expired_time_cap_reached_count++;
                         break;
                     }
-                }            
+                }
             } while (expired == config_keys_per_loop);
             
             

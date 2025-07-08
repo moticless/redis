@@ -17,7 +17,8 @@ typedef struct _estore {
     int num_buckets_bits;                 /* Log2 of the number of buckets */
     int num_buckets;                      /* Number of buckets (1 << num_buckets_bits) */
     unsigned long long count;             /* Total number of kv's in this estore */
-    long long sum_ttl;           /* Sum of TTLs of all kv's in this estore */
+    long long sum_ttl;                    /* Sum of TTLs of all kv's in this estore */
+    void *cascadeController;               /* Pointer to the state of the cascade controller */
 } estore;
 
 extern EbucketsType estoreBucketsType;
