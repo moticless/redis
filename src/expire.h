@@ -18,7 +18,8 @@ typedef struct _estore {
     int num_buckets;                      /* Number of buckets (1 << num_buckets_bits) */
     unsigned long long count;             /* Total number of kv's in this estore */
     long long sum_ttl;                    /* Sum of TTLs of all kv's in this estore */
-    void *cascadeController;               /* Pointer to the state of the cascade controller */
+    void *cascade_controller;              /* Pointer to the cascade controller */
+    void *expire_controller;               /* Pointer to the expire controller */
 } estore;
 
 extern EbucketsType estoreBucketsType;
@@ -41,7 +42,7 @@ void estoreRemove(estore *es, int slot, kvobj *kv);
 /* Add kv to estore with the given expiration time */
 void estoreAdd(estore *es, kvobj *kv, int slot, long long when);
 
-uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit);
+uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long time_limit);
 
 void estoreGetStats(estore *es, char *buf, size_t bufsize, int full);
 
@@ -55,7 +56,7 @@ unsigned long long estoreSlotSize(estore *es, int slot);
 int estoreSlotIsEmpty(estore *es, int slot);
 
 /* Perform active expiration on keys using ebuckets */
-unsigned int estoreActiveExpire(redisDb *db, unsigned int max_keys);
+unsigned int estoreActiveExpire(redisDb *db, uint64_t now, long long time_limit);
 
 /* Get the appropriate bucket for a given slot */
 ebuckets *estoreGetBucket(estore *es, int slot);

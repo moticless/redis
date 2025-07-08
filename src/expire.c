@@ -21,6 +21,12 @@
 #define CASCADE_INIT_COUNT 100
 #define CASCADE_MIN_COUNT 1
 
+#define EXPIRE_CONTROLLER_KP  0.01
+#define EXPIRE_CONTROLLER_KI  0.0002
+#define EXPIRE_CONTROLLER_KD  0.002
+#define EXPIRE_INIT_COUNT 100
+#define EXPIRE_MIN_COUNT 1
+
 /* Define the EbucketsType for keys */
 EbucketsType estoreBucketsType = {
     .onDeleteItem = NULL,
@@ -143,32 +149,32 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
  *
  * @return Number of items cascaded in this call.
  */
-uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit) {
+uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long time_limit) {
     if (estoreSize(es) == 0) {
         return 0; /* Nothing to cascade */
     }
 
     /* Initialize PID controller if not already present */
-    if (es->cascadeController == NULL) {
-        es->cascadeController = pid_create(CASCADE_CONTROLLER_KP, CASCADE_CONTROLLER_KI, CASCADE_CONTROLLER_KD,
+    if (es->cascade_controller == NULL) {
+        es->cascade_controller = pid_create(CASCADE_CONTROLLER_KP, CASCADE_CONTROLLER_KI, CASCADE_CONTROLLER_KD,
                                            CASCADE_INIT_COUNT, CASCADE_MIN_COUNT, INT64_MAX);
     }
 
-    PidController *pid = (PidController *)es->cascadeController;
+    PidController *pid = (PidController *)es->cascade_controller;
 
     uint64_t start = ustime();
-    int64_t remainingCascade = (int64_t)pid->output;
+    int64_t remaining_cascade = (int64_t)pid->output;
 
     /* Cascading logic */
     if (!server.cluster_enabled) {
-        remainingCascade -= ebCascade(es->buckets + 0, es->bucket_type, now, remainingCascade);
+        remaining_cascade -= ebCascade(es->buckets + 0, es->bucket_type, now, remaining_cascade);
     } else {
         #ifdef FALSE
         int i = 0;
-        for (; i < es->num_buckets && remainingCascade > 0; i++) {
+        for (; i < es->num_buckets && remaining_cascade > 0; i++) {
             int index = (i + (int)pid->output /* reused as bucket pointer */) % es->num_buckets;
-            remainingCascade -= ebCascade(es->buckets + index, es->bucket_type, now, remainingCascade);
-            if (remainingCascade <= 0)
+            remaining_cascade -= ebCascade(es->buckets + index, es->bucket_type, now, remaining_cascade);
+            if (remaining_cascade <= 0)
                 break;
         }
         pid->output = (i + (int)pid->output) % es->num_buckets;
@@ -176,23 +182,23 @@ uint64_t estoreIncrementalCascade(estore *es, uint64_t now, long long timeLimit)
     }
 
     /* Compute actual cascaded amount */
-    int64_t cascaded = (int64_t)pid->output - remainingCascade;
+    int64_t cascaded = (int64_t)pid->output - remaining_cascade;
     if (cascaded < 0) 
         cascaded = 0;
 
     /* If no cascade occurred, reset the PID controller state */
-    if ((int64_t)pid->output == remainingCascade) {
+    if ((int64_t)pid->output == remaining_cascade) {
         pid_reset(pid);
     } else {
         uint64_t end = ustime();
         double elapsed = (double)(end - start);
 
-        printf("Time limit: %lld uc\n", timeLimit);
+        printf("Time limit: %lld uc\n", time_limit);
         printf("Elapsed: %f uc\n", elapsed);
         printf("Cascaded: %ld\n", cascaded);
 
-        double newOutput = pid_update(pid, (double)timeLimit, elapsed);
-        printf("New cascade quota: %f\n", newOutput);
+        double new_output = pid_update(pid, (double)time_limit, elapsed);
+        printf("New cascade quota: %f\n", new_output);
     }
 
     return (uint64_t)cascaded;
@@ -462,13 +468,33 @@ void estoreReduceTTLSum(estore *es, long long elapsed) {
     }
 }
 
-/* Perform active expiration on keys using ebuckets */
-unsigned int estoreActiveExpire(redisDb *db, unsigned int max_keys) {
+/**
+ * Incrementally expires keys in the estore using an active expiration strategy,
+ * guided by a PID controller to maintain a target execution time per call.
+ *
+ * This function aims to prevent latency spikes caused by bulk expiration by 
+ * dynamically adjusting the number of keys to expire based on prior execution time.
+ * 
+ * Key behavior:
+ * - If the estore or expiration store is empty, no action is taken.
+ * - A PID controller determines the allowed expiration budget (max number of keys).
+ * - If cluster mode is disabled, expiration is performed only on the first bucket.
+ * - The expiration effort and time are measured each run.
+ * - If no keys are expired during a run, the PID controller is reset.
+ * - If keys were expired, the PID controller is updated based on how long the run took,
+ *   tuning the budget for future calls to stay within the desired time limit.
+ *
+ * @param db         Pointer to the Redis database containing the estore.
+ * @param now        Current timestamp to guide expiration logic.
+ * @param time_limit Desired execution time (in microseconds) for this call.
+ *
+ * @return Number of keys expired during this invocation.
+ */
+unsigned int estoreActiveExpire(redisDb *db, uint64_t now, long long time_limit) {
     if (db == NULL || db->expiresNew == NULL) return 0;
     if (estoreSize(db->expiresNew) == 0) return 0;
 
     unsigned int keys_expired = 0;
-    mstime_t now = mstime();
 
     static mstime_t last_run_time = 0;
     if (last_run_time == 0)
@@ -477,56 +503,53 @@ unsigned int estoreActiveExpire(redisDb *db, unsigned int max_keys) {
     mstime_t elapsed = server.mstime - last_run_time;
     last_run_time = server.mstime;
 
-    /* In cluster mode, we need to process only slots that belong to this node */
-    int start_slot = 0;
-    int end_slot = db->expiresNew->num_buckets;
+    estore *es = db->expiresNew;
 
-    UNUSED(start_slot);
-    UNUSED(end_slot);
+    /* Initialize PID controller if not already present */
+    if (es->expire_controller == NULL) {
+        es->expire_controller = pid_create(
+            EXPIRE_CONTROLLER_KP, EXPIRE_CONTROLLER_KI, EXPIRE_CONTROLLER_KD,
+            EXPIRE_INIT_COUNT, EXPIRE_MIN_COUNT, INT64_MAX
+        );
+    }
 
-    if (server.cluster_enabled) {
-//        /* Process only slots that belong to this node */
-//        for (int i = start_slot; i < end_slot && keys_expired < max_keys; i++) {
-//            /* Skip slots that don't belong to this node */
-//            if (server.cluster && !clusterNodeCoversSlot(getMyClusterNode(), i)) {
-//                continue;
-//            }
-//
-//            /* Skip empty slots */
-//            if (estoreSlotIsEmpty(db->expiresNew, i)) continue;
-//
-//            ebuckets *bucket = estoreGetBucket(db->expiresNew, i);
-//
-//            ExpireInfo info = {
-//                .maxToExpire = max_keys - keys_expired,
-//                .onExpireItem = keyExpireCallback,
-//                .ctx = db,
-//                .now = now,
-//                .itemsExpired = 0
-//            };
-//
-//            ebExpire(bucket, db->expiresNew->bucket_type, &info);
-//            keys_expired += info.itemsExpired;
-//        }
-    } else {
-        /* In non-cluster mode, we just have a single bucket */
-        ebuckets *bucket = estoreGetBucket(db->expiresNew, 0);
+    PidController *pid = (PidController *)es->expire_controller;
+
+    uint64_t start = ustime();
+    int64_t expire_budget = (int64_t)pid->output;
+
+    if (!server.cluster_enabled) {
+        ebuckets *bucket = estoreGetBucket(es, 0);
 
         ExpireInfo info = {
-            .maxToExpire = max_keys,
+            .maxToExpire = expire_budget,
             .onExpireItem = keyExpireCallback,
             .ctx = db,
             .now = now,
             .itemsExpired = 0
         };
 
-        ebExpire(bucket, db->expiresNew->bucket_type, &info);
-        estoreReduceTTLSum(db->expiresNew, elapsed);
-        db->avg_ttl = estoreGetAvgTTL(db->expiresNew);
-
-        /* Move expired keys from secondary ebuckets */
-        
+        ebExpire(bucket, es->bucket_type, &info);
         keys_expired = info.itemsExpired;
+
+        estoreReduceTTLSum(es, elapsed);
+        db->avg_ttl = estoreGetAvgTTL(es);
+    } else {
+        /* Cluster mode logic could be added here if needed. */
+    }
+
+    uint64_t end = ustime();
+    double actual_elapsed = (double)(end - start); /* microseconds */
+
+    /* Update PID controller */
+    if (keys_expired == 0) {
+        pid_reset(pid); /* No keys expired, reset controller */
+    } else {
+        double newOutput = pid_update(pid, (double)time_limit, actual_elapsed);
+        printf("Time limit: %lld uc\n", time_limit);
+        printf("Elapsed: %f uc\n", actual_elapsed);
+        printf("Expired keys: %d\n", keys_expired);
+        printf("New expire quota: %f\n", newOutput);
     }
 
     return keys_expired;
@@ -564,89 +587,34 @@ long long estoreGetAvgTTL(estore *es) {
 }
 
 void activeExpireCycle(int type) {
-    /* Adjust the running parameters according to the configured expire
-     * effort. The default effort is 1, and the maximum configurable effort
-     * is 10. */
-    unsigned long
-    effort = server.active_expire_effort-1, /* Rescale from 0 to 9. */
-    config_keys_per_loop = ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP +
-                           ACTIVE_EXPIRE_CYCLE_KEYS_PER_LOOP/4*effort,
-    config_cycle_fast_duration = ACTIVE_EXPIRE_CYCLE_FAST_DURATION +
-                                 ACTIVE_EXPIRE_CYCLE_FAST_DURATION/4*effort,
-    config_cycle_slow_time_perc = ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC +
-                                  2*effort,
-    config_cycle_acceptable_stale = ACTIVE_EXPIRE_CYCLE_ACCEPTABLE_STALE-
-                                    effort;
-
     /* This function has some global state in order to continue the work
      * incrementally across calls. */
     static unsigned int current_db = 0; /* Next DB to test. */
-    static int timelimit_exit = 0;      /* Time limit hit in previous call? */
-    static long long last_fast_cycle = 0; /* When last fast cycle ran. */
-
-    int j, iteration = 0;
-    int dbs_per_call = CRON_DBS_PER_CALL;
-    int dbs_performed = 0;
-    long long start = ustime(), timelimit, elapsed;
 
     /* If 'expire' action is paused, for whatever reason, then don't expire any key.
      * Typically, at the end of the pause we will properly expire the key OR we
      * will have failed over and the new primary will send us the expire. */
     if (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)) return;
 
-    if (type == ACTIVE_EXPIRE_CYCLE_FAST) {
-        /* Don't start a fast cycle if the previous cycle did not exit
-         * for time limit, unless the percentage of estimated stale keys is
-         * too high. Also never repeat a fast cycle for the same period
-         * as the fast cycle total duration itself. */
-        if (!timelimit_exit &&
-            server.stat_expired_stale_perc < config_cycle_acceptable_stale)
-            return;
-
-        if (start < last_fast_cycle + (long long)config_cycle_fast_duration*2)
-            return;
-
-        last_fast_cycle = start;
-    }
-
-    /* We usually should test CRON_DBS_PER_CALL per iteration, with
-     * two exceptions:
-     *
-     * 1) Don't test more DBs than we have.
-     * 2) If last time we hit the time limit, we want to scan all DBs
-     * in this iteration, as there is work to do in some DB and we don't want
-     * expired keys to use memory for too much time. */
-    if (dbs_per_call > server.dbnum || timelimit_exit)
-        dbs_per_call = server.dbnum;
-
-    /* We can use at max 'config_cycle_slow_time_perc' percentage of CPU
-     * time per iteration. Since this function gets called with a frequency of
-     * server.hz times per second, the following is the max amount of
-     * microseconds we can spend in this function. */
-
-    timelimit = config_cycle_slow_time_perc*1000000/server.hz/100;
-    timelimit_exit = 0;
+    long long start = ustime(), timelimit, elapsed;
+    timelimit = ACTIVE_EXPIRE_CYCLE_SLOW_TIME_PERC*1000000/server.hz/100;
     if (timelimit <= 0) timelimit = 1;
 
     if (type == ACTIVE_EXPIRE_CYCLE_FAST)
-        timelimit = config_cycle_fast_duration; /* in microseconds. */
+        timelimit = ACTIVE_EXPIRE_CYCLE_FAST_DURATION; /* in microseconds. */
 
     /* Accumulate some global stats as we expire keys, to have some idea
      * about the number of keys that are already logically expired, but still
      * existing inside the database. */
-    long total_sampled = 0;
+    long total_cascaded = 0;
     long total_expired = 0;
+    int empty_dbs = 0; /* Count of empty DBs. */
 
     /* Try to smoke-out bugs (server.also_propagate should be empty here) */
     serverAssert(server.also_propagate.numops == 0);
 
-    /* Stop iteration when one of the following conditions is met:
-     *
-     * 1) We have checked a sufficient number of databases with expiration time.
-     * 2) The time limit has been exceeded.
-     * 3) All databases have been traversed. */
-    for (j = 0; dbs_performed < dbs_per_call && timelimit_exit == 0 && j < server.dbnum; j++) {
-        redisDb *db = server.db+(current_db % server.dbnum);
+    do {
+        redisDb *db = server.db + (current_db % server.dbnum);
 
         /* Increment the DB now so we are sure if we run out of time
          * in the current DB we'll restart from the next. This allows to
@@ -659,53 +627,25 @@ void activeExpireCycle(int type) {
         activeExpireHashFieldCycle(type);
 
         /* Cascade items from L2 to L1 if needed */
-        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), timelimit / 3);
+        long cascaded = estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), timelimit / 3);
+        total_cascaded += cascaded;
 
-        /* Now check if we have keys to expire in the new ebuckets-based structure */
-        if (estoreSize(db->expiresNew)) {
-            dbs_performed++;
-            unsigned int expired;
-            /* Perform active expiration using ebuckets */
-            do {
-                iteration++;
-                expired = estoreActiveExpire(db, config_keys_per_loop);
-                total_expired += expired;
-                if ((iteration & 0xf) == 0) { /* check time limit every 16 iterations. */
-                    elapsed = ustime()-start;
-                    if (elapsed > timelimit) {
-                        timelimit_exit = 1;
-                        server.stat_expired_time_cap_reached_count++;
-                        break;
-                    }
-                }
-            } while (expired == config_keys_per_loop);
-            
-            
+        long expired = estoreActiveExpire(db, commandTimeSnapshot(), timelimit / 3);
+        total_expired += expired;
 
-            /* We can't block forever here even if there are many keys to
-             * expire. So after a given amount of milliseconds return to the
-             * caller waiting for the other active expire cycle. */
-            elapsed = ustime()-start;
-            if (elapsed > timelimit) {
-                timelimit_exit = 1;
-                server.stat_expired_time_cap_reached_count++;
+        if(expired == 0 && cascaded == 0) {
+            empty_dbs++;
+            if(empty_dbs == server.dbnum) {
+                /* If all databases are empty, we can stop the cycle here. */
+                break;
             }
         }
-    }
 
-    elapsed = ustime()-start;
+        elapsed = ustime() - start;
+    } while(elapsed < timelimit);
+
     server.stat_expire_cycle_time_used += elapsed;
-    latencyAddSampleIfNeeded("expire-cycle",elapsed/1000);
-
-    /* Update our estimate of keys existing but yet to be expired.
-     * Running average with this sample accounting for 5%. */
-    double current_perc;
-    if (total_sampled) {
-        current_perc = (double)total_expired/total_sampled;
-    } else
-        current_perc = 0;
-    server.stat_expired_stale_perc = (current_perc*0.05)+
-                                     (server.stat_expired_stale_perc*0.95);
+    latencyAddSampleIfNeeded("expire-cycle", elapsed/1000);
 }
 
 /*-----------------------------------------------------------------------------
