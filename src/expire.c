@@ -19,8 +19,8 @@ EbucketsType estoreBucketsType = {
     .onDeleteItem = NULL,
     .getExpireMeta = kvobjGetExpireMeta,   /* get ExpireMeta attached to each hash */
     .itemsAddrAreOdd = 0,                 /* Addresses of kvobj are even */
-    .ebp.precision = 10,
-    .ebp.keySize = EB_PRECISION2KEYSIZE(10 /*.precision*/),
+    .ebp.precision = 11,
+    .ebp.keySize = EB_PRECISION2KEYSIZE(11 /*.precision*/),
     .isEbStack = 1,
 };
 
@@ -108,7 +108,7 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
 
 void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade) {
     if (!server.cluster_enabled) {
-        ebCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
+        ebStackCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
         return;
     } else {
         assert(0); // TODO_MOTI: Support cluster mode (See:kvstoreIncrementalCascade())
@@ -952,7 +952,8 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
     when += basetime;
 
     /* No key, return zero. */
-    kvobj *kv = lookupKeyWrite(c->db,key); 
+    dictEntryLink link;
+    kvobj *kv = lookupKeyWriteWithLink(c->db, key, &link);
     if (kv == NULL) {
         addReply(c,shared.czero);
         return;
@@ -1017,7 +1018,7 @@ void expireGenericCommand(client *c, long long basetime, int unit) {
         addReply(c, shared.cone);
         return;
     } else {
-        kv = setExpire(c,c->db,key,when); /* might realloc kv */
+        kv = setExpireByLink(c,c->db,key->ptr,when, link); /* might realloc kv */
         addReply(c,shared.cone);
         /* Propagate as PEXPIREAT millisecond-timestamp
          * Only rewrite the command arg if not already PEXPIREAT */
