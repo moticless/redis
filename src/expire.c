@@ -115,14 +115,35 @@ void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade) {
     }
 }
 
+void estoreCombineStats(ebucketsStats *from, ebucketsStats *into) {
+    into->totalItems += from->totalItems;
+    into->totalBuckets += from->totalBuckets;
+    into->totalSegments += from->totalSegments;
+    into->totalL1Items += from->totalL1Items;
+    into->totalL2Items += from->totalL2Items;
+    into->totalL3Items += from->totalL3Items;
+
+    if (into->totalBuckets == 0) return;
+
+    into->avgItemsPerBucket = into->totalItems / into->totalBuckets;
+    into->avgItemsPerSegment = into->totalItems / into->totalSegments;
+    into->avgSegPerBucket = into->totalSegments / into->totalBuckets;        
+}
+
 void estoreGetStats(estore *es, char *buf, size_t bufsize, int full) {
     if (!server.cluster_enabled) {
         ebucketsStats stats = {0}; /* must be zeroed */
         ebGetStats(es->buckets[0], es->bucket_type, &stats);
         ebGetStatsMsg(buf, bufsize, &stats, full);
     } else {
-        assert(0); // TODO_MOTI: Support cluster mode (See:kvstoreGetStats())
-    }        
+        ebucketsStats clusterStats = {0}; /* must be zeroed */
+        for (int i = 0; i < es->num_buckets; i++) {
+            ebucketsStats stats = {0}; /* must be zeroed */
+            ebGetStats(es->buckets[i], es->bucket_type, &stats);
+            estoreCombineStats(&stats, &clusterStats);
+        }
+        ebGetStatsMsg(buf, bufsize, &clusterStats, full);
+    }
 }
 
 /* Get the total number of items in the expiration store */
@@ -1107,3 +1128,174 @@ void touchCommand(client *c) {
         if (lookupKeyRead(c->db,c->argv[j]) != NULL) touched++;
     addReplyLongLong(c,touched);
 }
+
+#ifdef REDIS_TEST
+#include <stdio.h>
+#include "testhelp.h"
+
+#define TEST(name) printf("test — %s\n", name);
+typedef struct TestKVObj {
+    kvobj obj;
+    ExpireMeta mexpire;
+} TestKVObj;
+
+ExpireMeta *getTestKVObjExpireMeta(const void *item) {
+    return &((TestKVObj *)item)->mexpire;
+}
+
+void deleteTestKVObjCallback(eItem item, void *ctx) {
+    UNUSED(ctx);
+    UNUSED(item);
+}
+
+EbucketsType testEbType = {
+    .getExpireMeta = getTestKVObjExpireMeta,
+    .onDeleteItem = deleteTestKVObjCallback,
+    .itemsAddrAreOdd = 0,
+    .ebp.precision = 0,
+    .ebp.keySize = EB_PRECISION2KEYSIZE(0 /*.precision*/),
+};
+
+/* ./redis-server test expire */
+int expireTest(int argc, char **argv, int flags) {
+    UNUSED(argc);
+    UNUSED(argv);
+    UNUSED(flags);
+
+    TEST("estoreCombineStats correctly combines statistics") {
+        ebucketsStats from = {
+            .totalItems = 20,
+            .totalBuckets = 4,
+            .totalSegments = 2,
+            .avgItemsPerBucket = 0, /* will be recalculated */
+            .avgItemsPerSegment = 0,
+            .avgSegPerBucket = 0
+        };
+
+        ebucketsStats into = {
+            .totalItems = 10,
+            .totalBuckets = 2,
+            .totalSegments = 1,
+            .avgItemsPerBucket = 0,
+            .avgItemsPerSegment = 0,
+            .avgSegPerBucket = 0
+        };
+
+        estoreCombineStats(&from, &into);
+
+        /* Validate combined totals */
+        assert(into.totalItems == 30);
+        assert(into.totalBuckets == 6);
+        assert(into.totalSegments == 3);
+
+        /* Validate recomputed averages */
+        assert(into.avgItemsPerBucket == 5);   /* 30 / 6 */
+        assert(into.avgItemsPerSegment == 10); /* 30 / 3 */
+        assert(into.avgSegPerBucket == 0);     /* 3 / 6 = 0 (integer division) */
+
+        /* Edge case: totalBuckets = 0 */
+        ebucketsStats zeroBucketsFrom = {
+            .totalItems = 5,
+            .totalBuckets = 0,
+            .totalSegments = 2
+        };
+
+        ebucketsStats zeroBucketsInto = {
+            .totalItems = 0,
+            .totalBuckets = 0,
+            .totalSegments = 0
+        };
+
+        estoreCombineStats(&zeroBucketsFrom, &zeroBucketsInto);
+
+        /* Should add values, but skip average calculations */
+        assert(zeroBucketsInto.totalItems == 5);
+        assert(zeroBucketsInto.totalBuckets == 0);
+        assert(zeroBucketsInto.totalSegments == 2);
+        assert(zeroBucketsInto.avgItemsPerBucket == 0);
+        assert(zeroBucketsInto.avgItemsPerSegment == 0);
+        assert(zeroBucketsInto.avgSegPerBucket == 0);
+    }
+
+    TEST("estoreGetStats returns correct stats in non-clustered mode") {
+        server.cluster_enabled = 0;
+        EbucketsType stackType = testEbType;
+        stackType.isEbStack = 1;
+
+        estore *es = estoreCreate(&stackType, 0); /* only one bucket */
+
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv4 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 1);
+        estoreAdd(es, (kvobj*)kv2, 0, 1);
+        estoreAdd(es, (kvobj*)kv3, 0, EB_EXPIRE_TIME_MAX -1); /* Level 2 */
+        estoreAdd(es, (kvobj*)kv4, 0, EB_EXPIRE_TIME_MAX + 1); /* Level 3 */
+
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+
+        estoreGetStats(es, buf, sizeof(buf), 1);
+
+        /* Validate that output includes expected stats */
+        assert(strstr(buf, " total items: 4") != NULL);
+        assert(strstr(buf, " total buckets: 2") != NULL);
+        assert(strstr(buf, " total segments: 2") != NULL);
+
+        assert(strstr(buf, " total items in L1: 2") != NULL);
+        assert(strstr(buf, " total items in L2: 1") != NULL);
+        assert(strstr(buf, " total items in L3: 1") != NULL);
+
+        assert(strstr(buf, " avg items per bucket: 2") != NULL);
+        assert(strstr(buf, " avg items per segment: 2") != NULL);
+        assert(strstr(buf, " avg segments per bucket: 1") != NULL);
+
+        zfree(kv1);
+        zfree(kv2);
+        zfree(kv3);
+        zfree(kv4);
+        estoreRelease(es);
+    }
+
+    TEST("estoreGetStats returns combined stats in clustered mode") {
+        server.cluster_enabled = 1;
+
+        estore *es = estoreCreate(&testEbType, 1); /* two buckets */
+
+        /* Add objects to different buckets */
+        TestKVObj *kv1 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv2 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv3 = zmalloc(sizeof(TestKVObj));
+        TestKVObj *kv4 = zmalloc(sizeof(TestKVObj));
+
+        estoreAdd(es, (kvobj*)kv1, 0, 1); /* bucket 0 */
+        estoreAdd(es, (kvobj*)kv2, 1, 1); /* bucket 1 */
+        estoreAdd(es, (kvobj*)kv3, 1, 2); /* bucket 1 */
+        estoreAdd(es, (kvobj*)kv4, 0, 2); /* bucket 0 */
+
+        char buf[1024];
+        memset(buf, 0, sizeof(buf));
+
+        estoreGetStats(es, buf, sizeof(buf), 1); /* full = 1 for verbose output */
+
+        /* Validate that combined values are present */
+        assert(strstr(buf, " total items: 4") != NULL);
+        assert(strstr(buf, " total buckets: 2") != NULL);
+        assert(strstr(buf, " total segments: 2") != NULL);
+
+        assert(strstr(buf, " avg items per bucket: 2") != NULL);
+        assert(strstr(buf, " avg items per segment: 2") != NULL);
+        assert(strstr(buf, " avg segments per bucket: 1") != NULL);
+
+        zfree(kv1);
+        zfree(kv2);
+        zfree(kv3);
+        zfree(kv4);
+        estoreRelease(es);
+    }
+
+    return 0;
+}
+#endif

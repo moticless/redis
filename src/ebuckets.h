@@ -394,6 +394,9 @@ typedef struct ebucketsStats {
     uint64_t totalItems;           /* Total number of items */
     uint64_t totalBuckets;         /* Total number of buckets */
     uint64_t totalSegments;        /* Total number of segments */
+    uint64_t totalL1Items;         /* Total number of items in L1 */
+    uint64_t totalL2Items;         /* Total number of items in L2 */
+    uint64_t totalL3Items;         /* Total number of items in L3 */
     uint64_t avgItemsPerBucket;    /* Average number of items per bucket */
     uint64_t avgItemsPerSegment;   /* Average number of items per segment */
     uint64_t avgSegPerBucket;      /* Average number of segments per bucket */
