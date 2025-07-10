@@ -2407,8 +2407,12 @@ void ebGetStats(ebuckets eb, EbucketsType *type, ebucketsStats *stats) {
     }
     if (type->isEbStack) {
         ebStack *stack = (ebStack *) eb;
-        EB_STACK_EXEC_L1(type, ebGetStats(stack->l1, type, stats));        
-        EB_STACK_EXEC_L2(type, ebGetStats(stack->l2, type, stats));
+        EB_STACK_EXEC_L1(type, ebGetStats(stack->l1, type, stats));
+        stats->totalL1Items = stats->totalItems;
+        EB_STACK_EXEC_L1(type, ebGetStats(stack->l2, type, stats));
+        stats->totalL2Items = stats->totalItems - stats->totalL1Items;
+        stats->totalL3Items = stack->l3 ? stack->l3->items : 0;
+        stats->totalItems += stats->totalL3Items;
     } else if (ebIsList(eb)) {
         eItem head = ebGetListPtr(type, eb);
         ExpireMeta *meta = type->getExpireMeta(head);
@@ -2447,8 +2451,12 @@ size_t ebGetStatsMsg(char *buf, size_t bufsize, ebucketsStats *stats, int full) 
                   "Ebuckets stats:\n"
                   " total items: %lu\n"
                   " total buckets: %lu\n"
-                  " total segments: %lu\n",
-                  stats->totalItems, stats->totalBuckets, stats->totalSegments);
+                  " total segments: %lu\n"
+                  " total items in L1: %lu\n"
+                  " total items in L2: %lu\n"
+                  " total items in L3: %lu\n",
+                  stats->totalItems, stats->totalBuckets, stats->totalSegments,
+                  stats->totalL1Items, stats->totalL2Items, stats->totalL3Items);
 
     if (full && stats->totalBuckets > 0 && stats->totalSegments > 0) {
         l += snprintf(buf + l, bufsize - l,
