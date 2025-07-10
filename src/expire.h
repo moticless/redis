@@ -59,4 +59,8 @@ ebuckets *estoreGetBucket(estore *es, int slot);
 
 size_t estoreMemUsage(estore *es);
 
+#ifdef REDIS_TEST
+int expireTest(int argc, char *argv[], int flags);
+#endif
+
 #endif

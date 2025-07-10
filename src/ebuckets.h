@@ -377,6 +377,8 @@ size_t ebGetStatsMsg(char *buf, size_t bufsize, ebucketsStats *stats, int full);
 
 /* ebuckets API (cannot be used with ebStack) */
 
+size_t ebMemUsage(ebuckets eb, EbucketsType *type);
+
 uint64_t ebGetExpireTime(EbucketsType *type, eItem item);
 
 void ebStart(EbucketsIterator *iter, ebuckets eb, EbucketsType *type);
