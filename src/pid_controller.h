@@ -52,4 +52,4 @@ void pid_reset(PidController *controller);
  */
 void pid_destroy(PidController *controller);
 
-#endif // PID_CONTROLLER_H
+#endif

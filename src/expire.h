@@ -18,8 +18,10 @@ typedef struct _estore {
     int num_buckets;                      /* Number of buckets (1 << num_buckets_bits) */
     unsigned long long count;             /* Total number of kv's in this estore */
     long long sum_ttl;                    /* Sum of TTLs of all kv's in this estore */
-    void *cascade_controller;              /* Pointer to the cascade controller */
-    void *expire_controller;               /* Pointer to the expire controller */
+    void *cascade_controller;             /* Pointer to the cascade controller */
+    void *expire_controller;              /* Pointer to the expire controller */
+    int current_cascade_bucket;           /* Current bucket for cascade operations */
+    int current_expire_bucket;            /* Current bucket for expire operations */
 } estore;
 
 extern EbucketsType estoreBucketsType;

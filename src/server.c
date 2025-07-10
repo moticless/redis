@@ -1825,11 +1825,6 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
      * sets of metrics. */
     monotime cron_start_time_before_aof = getMonotonicUs();
 
-    /* Run a fast expire cycle (the called function will return
-     * ASAP if a fast cycle is not needed). */
-    if (server.active_expire_enabled && iAmMaster())
-        activeExpireCycle(ACTIVE_EXPIRE_CYCLE_FAST);
-
     if (moduleCount()) {
         moduleFireServerEvent(REDISMODULE_EVENT_EVENTLOOP,
                               REDISMODULE_SUBEVENT_EVENTLOOP_BEFORE_SLEEP,
