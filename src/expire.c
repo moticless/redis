@@ -60,6 +60,8 @@ estore *estoreCreate(EbucketsType *type, int num_buckets_bits) {
     }
 
     es->count = 0;
+    es->current_cascade_bucket = 0;
+    es->current_expire_bucket = 0;
     return es;
 }
 
@@ -73,6 +75,8 @@ void estoreEmpty(estore *es) {
     }
 
     es->count = 0;
+    es->current_cascade_bucket = 0;
+    es->current_expire_bucket = 0;
 }
 
 /* Release an expiration store (free all memory) */
@@ -106,13 +110,23 @@ void estoreAdd(estore *es, kvobj *kv, int slot, long long when) {
         es->count++;
 }
 
-void estoreIncrementalCascade(estore *es, uint64_t now, uint64_t maxCascade) {
+unsigned int estoreIncrementalCascade(estore *es, uint64_t now, unsigned int maxCascade) {
+    unsigned int cascaded = 0;
     if (!server.cluster_enabled) {
-        ebCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
-        return;
+        cascaded = ebCascade(es->buckets + 0, es->bucket_type, now, maxCascade);
     } else {
-        assert(0); // TODO_MOTI: Support cluster mode (See:kvstoreIncrementalCascade())
+        int i = 0;
+        for (; i < es->num_buckets && maxCascade > 0; i++) {
+            int index = (i + es->current_cascade_bucket) % es->num_buckets;
+            cascaded += ebCascade(es->buckets + index, es->bucket_type, now, maxCascade - cascaded);
+            if (maxCascade - cascaded <= 0)
+                break;
+        }
+        es->current_cascade_bucket = (i + es->current_cascade_bucket) % es->num_buckets;
     }
+
+    server.stat_cascadedkeys += cascaded;
+    return cascaded;
 }
 
 void estoreGetStats(estore *es, char *buf, size_t bufsize, int full) {
@@ -336,66 +350,48 @@ static ExpireAction keyExpireCallback(eItem item, void *ctx) {
     exitExecutionUnit();
     postExecutionUnitOperations();
 
-    server.stat_expiredkeys++;
-
     return ACT_REMOVE_EXP_ITEM;
 }
 
 /* Perform active expiration on keys using ebuckets */
 unsigned int estoreActiveExpire(redisDb *db, unsigned int max_keys) {
     if (db == NULL || db->expiresNew == NULL) return 0;
-    if (estoreSize(db->expiresNew) == 0) return 0;
+
+    estore *es = db->expiresNew; 
+    if (estoreSize(es) == 0) return 0;
 
     unsigned int keys_expired = 0;
     mstime_t now = mstime();
 
     /* In cluster mode, we need to process only slots that belong to this node */
     int start_slot = 0;
-    int end_slot = db->expiresNew->num_buckets;
+    int end_slot = es->num_buckets;
 
     UNUSED(start_slot);
     UNUSED(end_slot);
 
-    if (server.cluster_enabled) {
-//        /* Process only slots that belong to this node */
-//        for (int i = start_slot; i < end_slot && keys_expired < max_keys; i++) {
-//            /* Skip slots that don't belong to this node */
-//            if (server.cluster && !clusterNodeCoversSlot(getMyClusterNode(), i)) {
-//                continue;
-//            }
-//
-//            /* Skip empty slots */
-//            if (estoreSlotIsEmpty(db->expiresNew, i)) continue;
-//
-//            ebuckets *bucket = estoreGetBucket(db->expiresNew, i);
-//
-//            ExpireInfo info = {
-//                .maxToExpire = max_keys - keys_expired,
-//                .onExpireItem = keyExpireCallback,
-//                .ctx = db,
-//                .now = now,
-//                .itemsExpired = 0
-//            };
-//
-//            ebExpire(bucket, db->expiresNew->bucket_type, &info);
-//            keys_expired += info.itemsExpired;
-//        }
+    ExpireInfo info = {
+        .maxToExpire = max_keys,
+        .onExpireItem = keyExpireCallback,
+        .ctx = db,
+        .now = now,
+        .itemsExpired = 0
+    };
+
+    if (!server.cluster_enabled) {
+        ebExpire(es->buckets + 0, es->bucket_type, &info);
+        keys_expired = info.itemsExpired;
     } else {
-        /* In non-cluster mode, we just have a single bucket */
-        ebuckets *bucket = estoreGetBucket(db->expiresNew, 0);
-
-        ExpireInfo info = {
-            .maxToExpire = max_keys,
-            .onExpireItem = keyExpireCallback,
-            .ctx = db,
-            .now = now,
-            .itemsExpired = 0
-        };
-
-        ebExpire(bucket, db->expiresNew->bucket_type, &info);
-        
-        /* Move expired keys from secondary ebuckets */
-        
+        int i = 0;
+        for (; i < es->num_buckets && max_keys > 0; i++) {
+            info.maxToExpire = max_keys;
+            int index = (i + es->current_expire_bucket) % es->num_buckets;
+            ebExpire(es->buckets + index, es->bucket_type, &info);
+            max_keys -= info.itemsExpired;
+            if (max_keys <= 0)
+                break;
+        }
+        es->current_expire_bucket = (i + es->current_expire_bucket) % es->num_buckets;
         keys_expired = info.itemsExpired;
     }
 
@@ -513,9 +509,6 @@ void activeExpireCycle(int type) {
         redisDb *db = server.db+(current_db % server.dbnum);
         data.db = db;
 
-        //int db_done = 0; /* The scan of the current DB is done? */
-        //int update_avg_ttl_times = 0, repeat = 0;
-
         /* Increment the DB now so we are sure if we run out of time
          * in the current DB we'll restart from the next. This allows to
          * distribute the time evenly across DBs. */
@@ -526,138 +519,32 @@ void activeExpireCycle(int type) {
          * active expiration */
         activeExpireHashFieldCycle(type);
 
-//        /* Check if we have keys to expire in the old dict-based structure */
-//        if (kvstoreSize(db->expires)) {
-//            dbs_performed++;
-//
-//            /* Continue to expire if at the end of the cycle there are still
-//             * a big percentage of keys to expire, compared to the number of keys
-//             * we scanned. The percentage, stored in config_cycle_acceptable_stale
-//             * is not fixed, but depends on the Redis configured "expire effort". */
-//            do {
-//                unsigned long num;
-//                iteration++;
-//
-//                /* If there is nothing to expire try next DB ASAP. */
-//                if ((num = kvstoreSize(db->expires)) == 0) {
-//                    db->avg_ttl = 0;
-//                    break;
-//                }
-//                data.now = mstime();
-//
-//                /* The main collection cycle. Scan through keys among keys
-//                 * with an expire set, checking for expired ones. */
-//                data.sampled = 0;
-//                data.expired = 0;
-//
-//                if (num > config_keys_per_loop)
-//                    num = config_keys_per_loop;
-//
-//                /* Here we access the low level representation of the hash table
-//                 * for speed concerns: this makes this code coupled with dict.c,
-//                 * but it hardly changed in ten years.
-//                 *
-//                 * Note that certain places of the hash table may be empty,
-//                 * so we want also a stop condition about the number of
-//                 * buckets that we scanned. However scanning for free buckets
-//                 * is very fast: we are in the cache line scanning a sequential
-//                 * array of NULL pointers, so we can scan a lot more buckets
-//                 * than keys in the same time. */
-//                long max_buckets = num*20;
-//                long checked_buckets = 0;
-//
-//                int origin_ttl_samples = data.ttl_samples;
-//
-//                while (data.sampled < num && checked_buckets < max_buckets) {
-//                    db->expires_cursor = kvstoreScan(db->expires, db->expires_cursor, -1, expireScanCallback, isExpiryDictValidForSamplingCb, &data);
-//                    if (db->expires_cursor == 0) {
-//                        db_done = 1;
-//                        break;
-//                    }
-//                    checked_buckets++;
-//                }
-//                total_expired += data.expired;
-//                total_sampled += data.sampled;
-//
-//                /* If find keys with ttl not yet expired, we need to update the average TTL stats once. */
-//                if (data.ttl_samples - origin_ttl_samples > 0) update_avg_ttl_times++;
-//
-//                /* We don't repeat the cycle for the current database if the db is done
-//                 * for scanning or an acceptable number of stale keys (logically expired
-//                 * but yet not reclaimed). */
-//                repeat = db_done ? 0 : (data.sampled == 0 || (data.expired * 100 / data.sampled) > config_cycle_acceptable_stale);
-//
-//                /* We can't block forever here even if there are many keys to
-//                 * expire. So after a given amount of microseconds return to the
-//                 * caller waiting for the other active expire cycle. */
-//                if ((iteration & 0xf) == 0 || !repeat) { /* Update the average TTL stats every 16 iterations or about to exit. */
-//                    /* Update the average TTL stats for this database,
-//                     * because this may reach the time limit. */
-//                    if (data.ttl_samples) {
-//                        long long avg_ttl = data.ttl_sum / data.ttl_samples;
-//
-//                        /* Do a simple running average with a few samples.
-//                         * We just use the current estimate with a weight of 2%
-//                         * and the previous estimate with a weight of 98%. */
-//                        if (db->avg_ttl == 0) {
-//                            db->avg_ttl = avg_ttl;
-//                        } else {
-//                            /* The origin code is as follow.
-//                             * for (int i = 0; i < update_avg_ttl_times; i++) {
-//                             *   db->avg_ttl = (db->avg_ttl/50)*49 + (avg_ttl/50);
-//                             * }
-//                             * We can convert the loop into a sum of a geometric progression.
-//                             * db->avg_ttl = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-//                             *                  avg_ttl / 50 * (pow(0.98, update_avg_ttl_times - 1) + ... + 1)
-//                             *             = db->avg_ttl * pow(0.98, update_avg_ttl_times) +
-//                             *                  avg_ttl * (1 - pow(0.98, update_avg_ttl_times))
-//                             *             = avg_ttl +  (db->avg_ttl - avg_ttl) * pow(0.98, update_avg_ttl_times)
-//                             * Notice that update_avg_ttl_times is between 1 and 16, we use a constant table
-//                             * to accelerate the calculation of pow(0.98, update_avg_ttl_times).*/
-//                            db->avg_ttl = avg_ttl + (db->avg_ttl - avg_ttl) * avg_ttl_factor[update_avg_ttl_times - 1] ;
-//                        }
-//                        update_avg_ttl_times = 0;
-//                        data.ttl_sum = 0;
-//                        data.ttl_samples = 0;
-//                    }
-//                    if ((iteration & 0xf) == 0) { /* check time limit every 16 iterations. */
-//                        elapsed = ustime()-start;
-//                        if (elapsed > timelimit) {
-//                            timelimit_exit = 1;
-//                            server.stat_expired_time_cap_reached_count++;
-//                            break;
-//                        }
-//                    }
-//                }
-//            } while (repeat);
-//        }
-
-        /* Cascade items from L2 to L1 if needed */
-        // TODO_MOTI: Fine tune estoreIncrementalCascade()
-        uint64_t maxCascade = 20000 / server.hz; 
-        estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), maxCascade);
-
         /* Now check if we have keys to expire in the new ebuckets-based structure */
         if (estoreSize(db->expiresNew)) {
             dbs_performed++;
-            unsigned int expired;
-            /* Perform active expiration using ebuckets */
+
+            unsigned int cascaded = 0, expired = 0;
             do {
                 iteration++;
+
+                /* Cascade items from L2 to L1 if needed */
+                cascaded = estoreIncrementalCascade(db->expiresNew, commandTimeSnapshot(), config_keys_per_loop);
+                total_expired += cascaded;
+
+                /* Perform active expiration using ebuckets */
                 expired = estoreActiveExpire(db, config_keys_per_loop);
                 total_expired += expired;
-                if ((iteration & 0xf) == 0) { /* check time limit every 16 iterations. */
-                    elapsed = ustime()-start;
+
+                if ((iteration & 0xf) == 0) { /* every 16 iterations */
+                    elapsed = ustime() - start;
                     if (elapsed > timelimit) {
                         timelimit_exit = 1;
                         server.stat_expired_time_cap_reached_count++;
                         break;
                     }
-                }            
-            } while (expired == config_keys_per_loop);
+                }
+            } while (cascaded == config_keys_per_loop || expired == config_keys_per_loop);
             
-            
-
             /* We can't block forever here even if there are many keys to
              * expire. So after a given amount of milliseconds return to the
              * caller waiting for the other active expire cycle. */

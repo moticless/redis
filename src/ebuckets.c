@@ -1732,6 +1732,8 @@ int ebAdd(ebuckets *eb, EbucketsType *type, eItem item, uint64_t expireTime) {
  * @param info - Providing information about the expiration action.
  */
 void ebExpire(ebuckets *eb, EbucketsType *type, ExpireInfo *info) {
+    if(ebIsEmpty(*eb) || type == NULL || info == NULL)
+        return;
 
     if (type->isEbStack) {
         /* Only items from L1 get expired */

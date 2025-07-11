@@ -2695,6 +2695,7 @@ void resetServerStats(void) {
     server.stat_numcommands = 0;
     server.stat_numconnections = 0;
     server.stat_expiredkeys = 0;
+    server.stat_cascadedkeys = 0;
     server.stat_expired_subkeys = 0;
     server.stat_expired_stale_perc = 0;
     server.stat_expired_time_cap_reached_count = 0;
@@ -6192,6 +6193,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "sync_partial_err:%lld\r\n", server.stat_sync_partial_err,
             "expired_subkeys:%lld\r\n", server.stat_expired_subkeys,
             "expired_keys:%lld\r\n", server.stat_expiredkeys,
+            "cascaded_keys:%lld\r\n", server.stat_cascadedkeys,
             "expired_stale_perc:%.2f\r\n", server.stat_expired_stale_perc*100,
             "expired_time_cap_reached_count:%lld\r\n", server.stat_expired_time_cap_reached_count,
             "expire_cycle_cpu_milliseconds:%lld\r\n", server.stat_expire_cycle_time_used/1000,
