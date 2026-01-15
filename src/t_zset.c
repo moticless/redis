@@ -109,11 +109,11 @@ static inline zskiplistNodeInfo *zslGetNodeInfo(const zskiplistNode *node) {
 
 /* Set zskiplistNodeInfo in node (stored in level[0].span) */
 static_assert(sizeof(zskiplistNodeInfo) <= sizeof(((zskiplistNode *)0)->level[0].span), "Must fit in level[0].span");
-static inline void zslSetNodeInfo(zskiplistNode *node, uint8_t levels, uint16_t sdsOffset) {
+static inline void zslSetNodeInfo(zskiplistNode *node, uint8_t levels, uint16_t sdsoffset) {
     union {
         zskiplistNodeInfo info;
         unsigned long span;
-    } u = { .info = { .levels = levels, .sdsOffset = sdsOffset } };
+    } u = { .info = { .levels = levels, .sdsoffset = sdsoffset } };
     node->level[0].span = u.span;
 }
 
@@ -132,8 +132,8 @@ static int zslCompareWithNode(double score, sds ele, const zskiplistNode *n) {
 /* Get embedded sds from node. Uses the stored offset to directly access the sds data */
 sds zslGetNodeElement(const zskiplistNode *node) {
     zskiplistNodeInfo *info = zslGetNodeInfo(node);
-    debugServerAssert(info->sdsOffset != ZSL_OFFSET_NO_ELE);
-    return (char*)node + info->sdsOffset;
+    debugServerAssert(info->sdsoffset != ZSL_OFFSET_NO_ELE);
+    return (char*)node + info->sdsoffset;
 }
 
 /* Wrapper for dict getKeyId callback - extracts sds from node pointer.
@@ -842,7 +842,7 @@ static zskiplistNode *zslGetElementByRankFromNode(zskiplistNode *start_node, int
         }
         if (traversed == rank) {
             /* Never return the header node - check if x has moved from start_node */
-            if (x == start_node && zslGetNodeInfo(x)->sdsOffset == ZSL_OFFSET_NO_ELE) {
+            if (x == start_node && zslGetNodeInfo(x)->sdsoffset == ZSL_OFFSET_NO_ELE) {
                 return NULL; /* This is the header node */
             }
             return x;
@@ -3742,7 +3742,8 @@ void genericZrangebyscoreCommand(zrange_result_handler *handler,
             }
 
             rangelen++;
-            sds ele = zslGetNodeElement(ln); handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
+            sds ele = zslGetNodeElement(ln);
+			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
 
             /* Move to next node */
             if (reverse) {
@@ -4015,7 +4016,8 @@ void genericZrangebylexCommand(zrange_result_handler *handler,
             }
 
             rangelen++;
-            sds ele = zslGetNodeElement(ln); handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
+            sds ele = zslGetNodeElement(ln);
+			handler->emitResultFromCBuffer(handler, ele, sdslen(ele), ln->score);
 
             /* Move to next node */
             if (reverse) {

@@ -1629,7 +1629,7 @@ struct sharedObjectsStruct {
 
 /* Node info placed in level[0].span since it's unused at level 0 (static assert verified) */
 typedef struct zskiplistNodeInfo {
-    uint16_t sdsOffset;  /* Offset from node start to sds data (after sds header) */
+    uint16_t sdsoffset;  /* Offset from node start to sds data (after sds header) */
     uint8_t levels;      /* Number of levels in this node (1-32) */
     uint8_t reserved;
 } zskiplistNodeInfo;
