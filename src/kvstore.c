@@ -257,6 +257,10 @@ void kvstoreOverlayMerge(kvstore *kvs, int didx) {
         if (link) {
             void *orig = dictGetKey(*link);
             uintptr_t st = ovStateGet(ov, key);
+            /* The state dict borrows the original's key pointer: drop the
+             * entry before the original is freed, or later lookups walk a
+             * chain with a dangling key. */
+            dictDelete(ov->state, key);
             dictSetKeyAtLink(d, kv, &link, 0);
             ov->free_orig(ov->privdata, didx, orig, (st & OV_STATE_SHARED) != 0);
         } else {

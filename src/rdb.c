@@ -461,7 +461,8 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
 
     /* Try LZF compression - under 20 bytes it's unable to compress even
      * aaaaaaaaaaaaaaaaaa so skip it */
-    if (server.rdb_compression && len > 20) {
+    int compression = snapOnScanThread() ? snapScanRdbCompression() : server.rdb_compression;
+    if (compression && len > 20) {
         n = rdbSaveLzfStringObject(rdb,s,len);
         if (n == -1) return -1;
         if (n > 0) return n;
@@ -1584,8 +1585,13 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
-    int savelru = server.maxmemory_policy & MAXMEMORY_FLAG_LRU;
-    int savelfu = server.maxmemory_policy & MAXMEMORY_FLAG_LFU;
+    /* The hybrid scan thread uses the policy frozen at save start (CONFIG SET
+     * may change the live one) and a clock it computes itself (LRU_CLOCK reads
+     * server.hz, which dynamic-hz adjusts on the main thread). */
+    int on_scan = snapOnScanThread();
+    int policy = on_scan ? snapScanMaxmemoryPolicy() : server.maxmemory_policy;
+    int savelru = policy & MAXMEMORY_FLAG_LRU;
+    int savelfu = policy & MAXMEMORY_FLAG_LFU;
 
     /* Save the expire time */
     if (expiretime != -1) {
@@ -1595,7 +1601,8 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
 
     /* Save the LRU info. */
     if (savelru) {
-        uint64_t idletime = estimateObjectIdleTime(val);
+        uint64_t idletime = on_scan ? estimateObjectIdleTimeWithClock(val, getLRUClock())
+                                    : estimateObjectIdleTime(val);
         idletime /= 1000; /* Using seconds is enough and requires less space.*/
         if (rdbSaveType(rdb,RDB_OPCODE_IDLE) == -1) return -1;
         if (rdbSaveLen(rdb,idletime) == -1) return -1;

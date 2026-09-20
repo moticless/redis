@@ -365,9 +365,17 @@ void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shar
 
     /* SNAP_NOFORK: the scan thread reads the original live -> the clone gets a
      * private copy of the value (in the arena when there is one). SNAP_FORK:
-     * the child reads its CoW copy -> the clone shares the value. */
-    int nofork = snapKeyClass(orig) == SNAP_NOFORK;
+     * the child reads its CoW copy -> the clone shares the value.
+     *
+     * Without the arena the class of a single-allocation value is a size
+     * decision the scan thread takes by reading the value's allocation, so a
+     * shared value that the clone then reallocates would be read after free.
+     * Single-allocation values are therefore always copied in that mode;
+     * only multi-allocation values (never dereferenced by the scan thread)
+     * are shared. */
     int to_arena = snapArenaAvailable();
+    int nofork = to_arena ? snapKeyClass(orig) == SNAP_NOFORK
+                          : snapEncodingIsNoforkClass(orig->type, orig->encoding);
     if (!snapValueIsInline(orig->type, orig->encoding)) {
         switch (orig->encoding) {
         case OBJ_ENCODING_RAW:
@@ -609,13 +617,22 @@ struct snapScanCtx {
     void **ov_priv;                 /* Per store. */
     int frozen_all;                 /* snapScanFreeze() done. */
     snapScanThreadDoneFn *thread_done;
+    void (*thread_init)(void *privdata);   /* first thing on the scan thread */
 };
 
 static __thread int snap_on_scan_thread = 0;
+static __thread int snap_scan_maxmemory_policy = 0;
+static __thread int snap_scan_rdb_compression = 0;
 int snapOnScanThread(void) { return snap_on_scan_thread; }
+int snapScanMaxmemoryPolicy(void) { return snap_scan_maxmemory_policy; }
+int snapScanRdbCompression(void) { return snap_scan_rdb_compression; }
 
 void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn) {
     ctx->thread_done = fn;
+}
+
+void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata)) {
+    ctx->thread_init = fn;
 }
 
 void snapScanSetOverlay(snapScanCtx *ctx, kvstoreOverlayCloneFn *clone,
@@ -728,6 +745,7 @@ static void *snapScanThreadMain(void *arg) {
     redis_set_thread_title("snap_scan");
     makeThreadKillable();
     snap_on_scan_thread = 1;
+    if (ctx->thread_init) ctx->thread_init(ctx->privdata);
 
     for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
         for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
@@ -971,6 +989,7 @@ typedef struct snapSave {
     size_t retained_bytes;     /* originals kept alive by the overlay (main thread) */
     size_t retained_peak;
     redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
+    int maxmemory_policy, rdb_compression;   /* config frozen at start for the scan thread */
     /* Scan-thread staging buffer (single thread in M1). */
     sds stage;
     int stage_dbid, stage_slot;
@@ -1157,6 +1176,13 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         atomicIncr(sv->keys_nofork, 1);
         if (sdslen(sv->stage) >= SNAP_STAGE_BYTES) snapStageFlush(sv);
     }
+}
+
+/* Scan thread, before the first slot: publish the frozen config to this thread. */
+static void snapSaveThreadInit(void *priv) {
+    snapSave *sv = priv;
+    snap_scan_maxmemory_policy = sv->maxmemory_policy;
+    snap_scan_rdb_compression = sv->rdb_compression;
 }
 
 /* Scan thread: after the last slot (or on abort). */
@@ -1373,9 +1399,12 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     sv->stage = sdsempty();
     sv->stage_dbid = sv->stage_slot = -1;
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
+    sv->maxmemory_policy = server.maxmemory_policy;
+    sv->rdb_compression = server.rdb_compression;
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     snapScanSetOverlay(sv->scan, snapOverlayCloneKey, snapOverlayFreeOriginal, sv->privs);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
+    snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
 
     server.stat_rdb_saves++;
     server.dirty_before_bgsave = server.dirty;

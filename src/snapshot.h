@@ -218,6 +218,7 @@ int snapScanStartThread(snapScanCtx *ctx);
 /* Optional hook run on the scan thread after the last slot (or on abort),
  * before the scan is published as finished. */
 typedef void (snapScanThreadDoneFn)(void *privdata, int aborted);
+void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata));
 void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn);
 
 /* 1 when called from the scan thread. */
@@ -256,6 +257,11 @@ int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
 void snapSaveCron(void);
 /* CONFIG SET rdb-key-save-delay apply hook: reaches the running scan thread. */
 void snapSaveSetKeySaveDelay(int usec);
+/* Configuration the serializer consults, frozen at save start for the scan
+ * thread (the main thread may CONFIG SET them meanwhile). Valid on the scan
+ * thread only; rdb.c uses them when snapOnScanThread(). */
+int snapScanMaxmemoryPolicy(void);
+int snapScanRdbCompression(void);
 /* Bytes the overlay currently keeps alive for the running save (replaced or
  * tombstoned originals), the peak of the last completed save, and the
  * hard-mark abort counter. */

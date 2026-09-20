@@ -3415,6 +3415,7 @@ void execCommandAbort(client *c, sds error);
 unsigned char *getObjectReadOnlyString(robj *o, long *len, char *llbuf);
 
 unsigned long long estimateObjectIdleTime(robj *o);
+unsigned long long estimateObjectIdleTimeWithClock(robj *o, unsigned int lruclock);
 #define sdsEncodedObject(objptr) (objptr->encoding == OBJ_ENCODING_RAW || objptr->encoding == OBJ_ENCODING_EMBSTR)
 
 /* Synchronous I/O with timeout */
