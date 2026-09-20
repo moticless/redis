@@ -26,7 +26,7 @@ proc snap_placement {{db ""}} {
     return [dict create {*}[r debug snap-placement $db]]
 }
 
-start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes}} {
+start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
     if {[string match {*jemalloc*} [s mem_allocator]] && $::tcl_platform(os) eq "Linux"} {
         r config set save-small-max-bytes 4096
 
@@ -153,7 +153,173 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes}} {
             assert_match {*encoding:listpack*} [r debug object hash:lp]
         }
 
-        # NOTE: replication full sync with bgsave-hybrid requires the hybrid save
-        # path (TASK-1.9); a stock fork child cannot read DONTFORK headers.
+        proc wait_hybrid_bgsave_done {} {
+            wait_for_condition 300 100 {
+                [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
+            } else { fail "hybrid bgsave did not finish" }
+        }
+
+        proc populate_fillers {n} {
+            for {set i 0} {$i < $n} {incr i} { r set filler:$i [string repeat f 60] }
+        }
+
+        test {Hybrid BGSAVE: static dataset saves and reloads identically} {
+            populate_all_types
+            populate_fillers 500
+            set digest [debug_digest]
+            r bgsave
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 0 [s rdb_changes_since_last_save]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            assert_equal 0 [dict get [snap_placement] violations]
+            assert_equal 0 [dict get [snap_placement] headers_outside]
+        }
+
+        test {Hybrid BGSAVE: INFO exposes progress while the save runs} {
+            populate_fillers 3000
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            assert {[s snap_save_slots_total] >= 1}
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert {[s snap_save_in_progress] == 0}
+        }
+
+        test {Hybrid BGSAVE: writes during the save land in the overlay, snapshot keeps the fork instant} {
+            populate_all_types
+            populate_fillers 3000
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            # mutate owed keys of every kind while the scan runs
+            r set str:small changed
+            r del str:raw
+            r set brand:new 1
+            r append str:embstr [string repeat z 6000]
+            r hset hash:lp f3 v3
+            r hset hash:lpex f9 v9
+            r expire set:intset 1000
+            r incr str:int
+            r rpush list:lp d
+            r rename zset:lp zset:renamed
+            r setrange str:big 0 XYZ
+            r sadd set:ht extra
+            r zadd zset:sl 999 extra
+            r xadd stream:x * g w
+            r del filler:1
+            r set filler:1 back
+            r del filler:2
+            # header-only clones of SNAP_FORK keys (value shared with the original)
+            r expire hash:ht 1000
+            r expire list:ql 1000
+            r persist list:ql
+            # the live keyspace reflects the writes immediately
+            assert_equal changed [r get str:small]
+            assert_equal 0 [r exists str:raw]
+            assert_equal 1 [r exists brand:new]
+            assert_equal v3 [r hget hash:lp f3]
+            assert_equal back [r get filler:1]
+            assert_equal 0 [r exists filler:2]
+            assert_equal 1 [s snap_save_in_progress]
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            # after the merge the live keyspace is unchanged
+            assert_equal changed [r get str:small]
+            assert_equal 0 [r exists str:raw]
+            assert_equal 12346 [r get str:int]
+            assert_equal v3 [r hget hash:lp f3]
+            assert_equal v9 [r hget hash:lpex f9]
+            assert {[r ttl set:intset] > 0}
+            assert_equal 1 [r exists zset:renamed]
+            assert_equal 0 [r exists zset:lp]
+            assert_equal XYZ [string range [r get str:big] 0 2]
+            assert_equal 1 [r sismember set:ht extra]
+            assert_equal 999 [r zscore zset:sl extra]
+            assert_equal d [r lindex list:lp -1]
+            assert_equal back [r get filler:1]
+            assert_equal 0 [r exists filler:2]
+            assert {[r ttl hash:ht] > 0}
+            assert_equal -1 [r ttl list:ql]
+            assert_equal 600 [r hlen hash:ht]
+            assert_equal 2000 [r llen list:ql]
+            set st [snap_placement]
+            assert_equal 0 [dict get $st violations]
+            assert_equal 0 [dict get $st headers_outside]
+            # the file holds exactly the fork-instant keyspace
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            assert_equal hello [r get str:small]
+            assert_equal 1 [r exists str:raw]
+            assert_equal 0 [r exists brand:new]
+            assert_equal 1 [r exists filler:2]
+        }
+
+        test {Hybrid BGSAVE: FLUSHALL during the save aborts it and the next save works} {
+            populate_all_types
+            populate_fillers 3000
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            r flushall
+            assert_equal 0 [r dbsize]
+            assert_equal 0 [s snap_save_in_progress]
+            wait_hybrid_bgsave_done
+            r config set rdb-key-save-delay 0
+            r set after 1
+            r bgsave
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal 1 [r get after]
+            assert_equal 1 [r dbsize]
+        }
+
+        test {Hybrid BGSAVE: FLUSHDB and SWAPDB during the save abort it} {
+            populate_fillers 3000
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            r flushdb
+            assert_equal 0 [s snap_save_in_progress]
+            wait_hybrid_bgsave_done
+            populate_fillers 3000
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            r swapdb 9 10
+            assert_equal 0 [s snap_save_in_progress]
+            wait_hybrid_bgsave_done
+            r swapdb 9 10
+            r config set rdb-key-save-delay 0
+            assert_equal 3000 [r dbsize]
+            r bgsave
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+        }
+
+        test {Hybrid BGSAVE: disk-based full sync places values on the replica and matches the master} {
+            populate_all_types
+            set digest [debug_digest]
+            start_server {overrides {bgsave-hybrid yes}} {
+                r replicaof [srv -1 host] [srv -1 port]
+                wait_for_condition 100 100 {
+                    [s master_link_status] eq {up}
+                } else { fail "replication not established" }
+                wait_for_condition 50 100 {
+                    [r dbsize] == [[srv -1 client] dbsize]
+                } else { fail "replica did not receive all keys" }
+                assert_equal $digest [debug_digest]
+                set st [snap_placement]
+                assert_equal 0 [dict get $st violations]
+                assert_equal 0 [dict get $st headers_outside]
+                assert_equal 10 [dict get $st class_nofork]
+                assert_equal 6 [dict get $st class_fork]
+            }
+        }
     }
 }

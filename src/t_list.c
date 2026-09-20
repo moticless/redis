@@ -46,6 +46,9 @@ static void listTypeTryConvertListpack(robj *o, robj **argv, int start, int end,
         quicklist *ql = quicklistNew(server.list_max_listpack_size, server.list_compress_depth);
 
         /* Append listpack to quicklist if it's not empty, otherwise release it. */
+        /* Hybrid BGSAVE: the quicklist adopts this listpack as its first node; a
+         * SNAP_FORK value must not contain arena memory (unreadable by the child). */
+        snapValueDetachFromArena(o);
         if (lpLength(o->ptr))
             quicklistAppendListpack(ql, o->ptr);
         else

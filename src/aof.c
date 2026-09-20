@@ -2861,7 +2861,7 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    if (server.bgsave_hybrid) {
+    if (snapArenaAvailable()) {
         /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
          * fork child cannot walk the keyspace. Until the hybrid save path is
          * wired (snapshot.c), refuse rather than crash the child. */

@@ -1238,7 +1238,11 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         {
             /* Save min/next HFE expiration time if needed */
             if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-                uint64_t minExpire = hashTypeGetMinExpire(o, 0);
+                /* On the hybrid BGSAVE scan thread the ExpireMeta of a
+                 * fork-instant original may be rewritten by the main thread
+                 * (ebuckets bookkeeping), so compute the min TTL from the
+                 * listpack itself there. */
+                uint64_t minExpire = hashTypeGetMinExpire(o, snapOnScanThread());
                 /* if invalid time then save 0 */
                 if (minExpire == EB_EXPIRE_TIME_INVALID)
                     minExpire = 0;
@@ -1877,12 +1881,10 @@ werr:
  * When the function returns C_ERR and if 'error' is not NULL, the
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
-int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+/* Everything that precedes the databases: magic, aux fields, module aux
+ * (before), functions. Shared by rdbSaveRio() and the hybrid BGSAVE child. */
+int rdbSaveRioHeader(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     char magic[10];
-    uint64_t cksum;
-    long key_counter = 0;
-    unsigned long long skipped = 0;
-    int j;
 
     if (server.rdb_checksum)
         rdb->update_cksum = rioGenericUpdateChecksum;
@@ -1893,6 +1895,40 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
 
     /* save functions */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) goto werr;
+    return C_OK;
+
+werr:
+    if (error) *error = errno;
+    return C_ERR;
+}
+
+/* Everything that follows the databases: module aux (after), EOF, checksum. */
+int rdbSaveRioFooter(int req, rio *rdb, int *error) {
+    uint64_t cksum;
+
+    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
+
+    /* EOF opcode */
+    if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
+
+    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
+     * loading code skips the check in this case. */
+    cksum = rdb->cksum;
+    memrev64ifbe(&cksum);
+    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    return C_OK;
+
+werr:
+    if (error) *error = errno;
+    return C_ERR;
+}
+
+int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
+    long key_counter = 0;
+    unsigned long long skipped = 0;
+    int j;
+
+    if (rdbSaveRioHeader(req, rdb, error, rdbflags, rsi) == C_ERR) return C_ERR;
 
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
@@ -1905,16 +1941,7 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
         }
     }
 
-    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA) && rdbSaveModulesAux(rdb, REDISMODULE_AUX_AFTER_RDB) == -1) goto werr;
-
-    /* EOF opcode */
-    if (rdbSaveType(rdb,RDB_OPCODE_EOF) == -1) goto werr;
-
-    /* CRC64 checksum. It will be zero if checksum computation is disabled, the
-     * loading code skips the check in this case. */
-    cksum = rdb->cksum;
-    memrev64ifbe(&cksum);
-    if (rioWrite(rdb,&cksum,8) == 0) goto werr;
+    if (rdbSaveRioFooter(req, rdb, error) == C_ERR) return C_ERR;
     serverLog(LL_NOTICE, "BGSAVE done, %ld keys saved, %llu keys skipped, %zu bytes written.", key_counter, skipped, rdb->processed_bytes);
     return C_OK;
 
@@ -2071,14 +2098,12 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    if (server.bgsave_hybrid) {
-        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
-         * fork child cannot walk the keyspace. Until the hybrid save path is
-         * wired (snapshot.c), refuse rather than crash the child. */
-        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
-                              "operation yet; refusing to fork a stock serializer.");
-        return C_ERR;
-    }
+    /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
+     * fork child cannot walk the keyspace; the snapshot.c path scans on a
+     * parent thread and streams to the child. Functions-only saves have no
+     * keyspace content and keep the stock path. */
+    if (snapArenaAvailable() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA))
+        return snapSaveBackground(req, filename, rsi, rdbflags);
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
@@ -4594,6 +4619,9 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
+    /* Hybrid BGSAVE: stop the scan thread if still running, merge the
+     * remaining slots and release the save before the stock bookkeeping. */
+    snapSaveChildDone(exitcode, bysignal);
     int type = server.rdb_child_type;
     time_t save_end = time(NULL);
     if (server.bgsave_aborted)
@@ -4623,6 +4651,9 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
  * the child did not exit for an error, but because we wanted), and performs
  * the cleanup needed. */
 void killRDBChild(void) {
+    /* Hybrid BGSAVE: the scan thread must stop reading the frozen keyspace and
+     * the overlay must be merged before anyone destroys or mutates the dicts. */
+    snapSaveAbort();
     kill(server.child_pid, SIGUSR1);
     /* Because we are not using here waitpid (like we have in killAppendOnlyChild
      * and TerminateModuleForkChild), all the cleanup operations is done by
@@ -4649,7 +4680,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
 
     if (hasActiveChildProcess()) return C_ERR;
-    if (server.bgsave_hybrid) {
+    if (snapArenaAvailable()) {
         /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
          * fork child cannot walk the keyspace. Until the hybrid save path is
          * wired (snapshot.c), refuse rather than crash the child. */

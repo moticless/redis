@@ -235,23 +235,33 @@ int snapKeyClass(const robj *o) {
     return SNAP_NOFORK;
 }
 
-/* Copy an sds into the requested arena and free the original. */
-static sds snapSdsMove(sds s, int to_nofork) {
+/* Copy an sds into the requested arena. */
+static sds snapSdsCopy(sds s, int to_nofork) {
     size_t len = sdslen(s);
     char type = sdsReqType(len);
     size_t need = sdsReqSize(len, type);
     size_t usable = 0;
     char *buf = to_nofork ? snapNoforkAllocUsable(need, &usable) : zmalloc_usable(need, &usable);
-    sds ns = sdsnewplacement(buf, usable, type, s, len);
+    return sdsnewplacement(buf, usable, type, s, len);
+}
+
+/* Copy an sds into the requested arena and free the original. */
+static sds snapSdsMove(sds s, int to_nofork) {
+    sds ns = snapSdsCopy(s, to_nofork);
     sdsfree(s); /* range-aware */
     return ns;
 }
 
-/* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested
- * arena and free the original. */
-static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
+/* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested arena. */
+static void *snapBlobCopy(void *p, size_t bytes, int to_nofork) {
     void *n = to_nofork ? snapNoforkAlloc(bytes) : zmalloc(bytes);
     memcpy(n, p, bytes);
+    return n;
+}
+
+/* Same, freeing the original. */
+static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
+    void *n = snapBlobCopy(p, bytes, to_nofork);
     zfree(p); /* range-aware */
     return n;
 }
@@ -319,6 +329,117 @@ static void snapPlacementScanTables(kvstore *kvs, snapPlacementStats *st) {
     }
 }
 
+/* ---- Clone-on-write for the keyspace overlay ---------------------------- */
+
+/* Duplicate the whole kvobj allocation (metadata slots, robj, embedded key
+ * and, for EMBSTR, the embedded value) into a fresh SNAP_NOFORK block. The
+ * value pointer is left as-is (the caller decides copy vs share). */
+static kvobj *snapKvobjCloneHeader(kvobj *orig) {
+    char *alloc = kvobjGetAllocPtr(orig);
+    size_t size = zmalloc_size(alloc);
+    char *nalloc = snapNoforkAlloc(size);
+    memcpy(nalloc, alloc, size);
+    kvobj *kv = (kvobj *)(nalloc + ((char *)orig - alloc));
+    if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
+        kv->ptr = (char *)kv->ptr + (nalloc - alloc);
+    kv->refcount = 1;
+    return kv;
+}
+
+void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
+    redisDb *db = privdata;
+    kvobj *orig = orig_;
+    kvobj *kv = snapKvobjCloneHeader(orig);
+    *value_shared = 0;
+
+    if (!snapValueIsInline(orig->type, orig->encoding)) {
+        switch (orig->encoding) {
+        case OBJ_ENCODING_RAW: {
+            /* In the arena: the scan thread reads it live -> private copy.
+             * Outside (big string): the child reads its CoW copy -> share. */
+            void *a = sdsAllocPtr(orig->ptr);
+            if (zmalloc_is_nofork(a)) kv->ptr = snapSdsCopy(orig->ptr, 1);
+            else *value_shared = 1;
+            break;
+        }
+        case OBJ_ENCODING_LISTPACK:
+            if (zmalloc_is_nofork(orig->ptr)) kv->ptr = snapBlobCopy(orig->ptr, lpBytes(orig->ptr), 1);
+            else *value_shared = 1;
+            break;
+        case OBJ_ENCODING_INTSET:
+            if (zmalloc_is_nofork(orig->ptr)) kv->ptr = snapBlobCopy(orig->ptr, intsetBlobLen(orig->ptr), 1);
+            else *value_shared = 1;
+            break;
+        case OBJ_ENCODING_LISTPACK_EX: {
+            /* Served by the scan thread whenever the struct is in the arena:
+             * always a private copy (struct + listpack), fresh ExpireMeta. */
+            listpackEx *o = orig->ptr;
+            if (zmalloc_is_nofork(o)) {
+                listpackEx *n = snapNoforkCalloc(sizeof(*n));
+                n->meta.trash = 1;
+                n->lp = snapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
+                kv->ptr = n;
+            } else {
+                *value_shared = 1;
+            }
+            break;
+        }
+        default:
+            /* Multi-allocation value (hashtable, skiplist, quicklist, stream,
+             * module, array): SNAP_FORK, the child has its own copy. */
+            *value_shared = 1;
+            break;
+        }
+    }
+
+    /* Point the expiry structures at the clone: they are not part of the
+     * scanned snapshot, and every later TTL operation must act on the clone. */
+    if (db) {
+        sds key = kvobjGetKey(orig);
+        if (kvobjGetExpire(orig) != -1) {
+            dictEntryLink link = kvstoreDictFindLink(db->expires, didx, key, NULL);
+            if (link) kvstoreDictSetAtLink(db->expires, didx, kv, &link, 0);
+        }
+        if (orig->type == OBJ_HASH) {
+            /* Writes trash=1 into the original's ExpireMeta; the scan thread
+             * never reads meta (it recomputes the min field TTL from the
+             * listpack), so this is tolerated. */
+            uint64_t sub = estoreRemove(db->subexpires, didx, orig);
+            if (sub != EB_EXPIRE_TIME_INVALID) estoreAdd(db->subexpires, didx, kv, sub);
+        }
+    }
+    return kv;
+}
+
+void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_, int value_shared) {
+    UNUSED(privdata);
+    UNUSED(didx);
+    kvobj *orig = orig_;
+    /* The clone carries the key metadata (no keyMetaOnFree here) and, when
+     * shared, owns the value. */
+    if (!value_shared) kvobjFreeValueOnly(orig);
+    zfree(kvobjGetAllocPtr(orig));
+}
+
+void snapValueDetachFromArena(robj *o) {
+    if (!snapArenaAvailable()) return;
+    switch (o->encoding) {
+    case OBJ_ENCODING_RAW: {
+        void *a = sdsAllocPtr(o->ptr);
+        if (zmalloc_is_nofork(a)) o->ptr = snapSdsMove(o->ptr, 0);
+        break;
+    }
+    case OBJ_ENCODING_LISTPACK:
+        if (zmalloc_is_nofork(o->ptr)) o->ptr = snapBlobMove(o->ptr, lpBytes(o->ptr), 0);
+        break;
+    case OBJ_ENCODING_INTSET:
+        if (zmalloc_is_nofork(o->ptr)) o->ptr = snapBlobMove(o->ptr, intsetBlobLen(o->ptr), 0);
+        break;
+    default:
+        break;
+    }
+}
+
 void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
     memset(st, 0, sizeof(*st));
     snapPlacementScanTables(db->keys, st);
@@ -338,6 +459,12 @@ void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
         if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
             /* Multi-allocation value: its top-level allocation must be forkable. */
             if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) st->violations++;
+            /* Quicklists adopt listpacks: every node must be forkable too. */
+            if (kv->encoding == OBJ_ENCODING_QUICKLIST) {
+                quicklist *ql = kv->ptr;
+                for (quicklistNode *node = ql->head; node; node = node->next)
+                    if (zmalloc_is_nofork(node->entry)) st->violations++;
+            }
             continue;
         }
         if (snapValueIsInline(kv->type, kv->encoding)) continue;
@@ -419,7 +546,30 @@ struct snapScanCtx {
     redisAtomic long slots_scanned;
     long slots_done;                /* Main thread only. */
     redisAtomic long long keys_dispatched;
+
+    /* Keyspace overlay (optional). */
+    kvstoreOverlayCloneFn *ov_clone;
+    kvstoreOverlayFreeOrigFn *ov_free;
+    void **ov_priv;                 /* Per store. */
+    int frozen_all;                 /* snapScanFreeze() done. */
+    snapScanThreadDoneFn *thread_done;
 };
+
+static __thread int snap_on_scan_thread = 0;
+int snapOnScanThread(void) { return snap_on_scan_thread; }
+
+void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn) {
+    ctx->thread_done = fn;
+}
+
+void snapScanSetOverlay(snapScanCtx *ctx, kvstoreOverlayCloneFn *clone,
+                        kvstoreOverlayFreeOrigFn *free_orig, void **store_privdata)
+{
+    serverAssert(!ctx->started);
+    ctx->ov_clone = clone;
+    ctx->ov_free = free_orig;
+    ctx->ov_priv = store_privdata;
+}
 
 #define SNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
 #define SNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
@@ -466,6 +616,11 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
             dictPauseRehashing(d);
             dictPauseAutoResize(d);
         }
+        /* Every slot gets an overlay (also empty ones: adds must not touch
+         * the frozen store while the scan runs). */
+        if (ctx->ov_clone)
+            kvstoreOverlayFreeze(ctx->stores[s], didx, ctx->ov_clone, ctx->ov_free,
+                                 ctx->ov_priv ? ctx->ov_priv[s] : NULL);
     }
     ctx->frozen[s] = 1;
 }
@@ -509,6 +664,7 @@ static void *snapScanThreadMain(void *arg) {
     snapScanCtx *ctx = arg;
     redis_set_thread_title("snap_scan");
     makeThreadKillable();
+    snap_on_scan_thread = 1;
 
     for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
         for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
@@ -530,28 +686,58 @@ static void *snapScanThreadMain(void *arg) {
             snapScanPublishScanned(ctx, s, didx);
         }
     }
+    if (ctx->thread_done) ctx->thread_done(ctx->privdata, snapScanAborted(ctx));
     atomicSetWithSync(ctx->finished, 1);
     triggerEventNotifier(ctx->en);
     return NULL;
 }
 
-int snapScanStart(snapScanCtx *ctx) {
-    serverAssert(!ctx->started);
+/* Main thread. Freeze every store: from here on the dicts are the fork-instant
+ * keyspace and all writes go to the overlay. Nothing else may run on the main
+ * thread between this call and the fork of the writer child. */
+void snapScanFreeze(snapScanCtx *ctx) {
+    serverAssert(!ctx->started && !ctx->frozen_all);
     for (int s = 0; s < ctx->num_stores; s++) snapScanFreezeStore(ctx, s);
+    ctx->frozen_all = 1;
+}
+
+/* Main thread. Spawn the scan thread over an already frozen keyspace. */
+int snapScanStartThread(snapScanCtx *ctx) {
+    serverAssert(!ctx->started && ctx->frozen_all);
     if (pthread_create(&ctx->tid, NULL, snapScanThreadMain, ctx) != 0) {
-        serverLog(LL_WARNING, "snapScanStart: pthread_create failed: %s", strerror(errno));
-        for (int s = 0; s < ctx->num_stores; s++) {
-            for (int didx = 0; didx < ctx->num_dicts[s]; didx++) snapScanUnfreezeDict(ctx, s, didx);
-            ctx->frozen[s] = 0;
-        }
+        serverLog(LL_WARNING, "snapScanStartThread: pthread_create failed: %s", strerror(errno));
         return C_ERR;
     }
     ctx->started = 1;
     return C_OK;
 }
 
-/* Main thread: finish one slot (merge hook, unfreeze, publish DONE). */
+static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted);
+
+int snapScanStart(snapScanCtx *ctx) {
+    snapScanFreeze(ctx);
+    if (snapScanStartThread(ctx) != C_OK) {
+        /* Nothing was scanned: complete every slot as aborted (merges an
+         * empty overlay, unfreezes). */
+        for (int s = 0; s < ctx->num_stores; s++)
+            for (int didx = 0; didx < ctx->num_dicts[s]; didx++)
+                snapScanCompleteSlot(ctx, s, didx, 1);
+        ctx->frozen_all = 0;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
+/* Thread-side request to stop (e.g. the channel to the child broke). */
+static inline void snapScanRequestAbort(snapScanCtx *ctx) {
+    atomicSetWithSync(ctx->abort, 1);
+}
+
+/* Main thread: finish one slot (merge, slot-done hook, unfreeze, publish DONE). */
 static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
+    /* The thread no longer reads this slot: apply the temp dict to the real
+     * dict and free the replaced originals. */
+    if (ctx->ov_clone) kvstoreOverlayMerge(ctx->stores[s], didx);
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
     snapScanUnfreezeDict(ctx, s, didx);
     snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
@@ -584,7 +770,16 @@ static void snapScanJoin(snapScanCtx *ctx) {
 }
 
 void snapScanAbort(snapScanCtx *ctx) {
-    if (!ctx->started) return;
+    if (!ctx->started) {
+        /* Frozen but no thread (fork failure path): unfreeze everything. */
+        if (ctx->frozen_all) {
+            for (int s = 0; s < ctx->num_stores; s++)
+                for (int didx = 0; didx < ctx->num_dicts[s]; didx++)
+                    if (snapSlotGetState(ctx, s, didx) != SNAP_SLOT_DONE)
+                        snapScanCompleteSlot(ctx, s, didx, 1);
+        }
+        return;
+    }
     atomicSetWithSync(ctx->abort, 1);
     snapScanJoin(ctx);
     /* Fully scanned slots complete normally. */
@@ -644,6 +839,450 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
     if (slots_scanned) atomicGet(ctx->slots_scanned, *slots_scanned);
     if (slots_done) *slots_done = ctx->slots_done;
     if (keys_dispatched) atomicGet(ctx->keys_dispatched, *keys_dispatched);
+}
+
+/* ============================================================================
+ * Hybrid BGSAVE: orchestration, channel, child writer
+ * ============================================================================
+ *
+ * Fork-instant sequence (main thread, nothing interleaves):
+ *   1. capture per-db (and per-slot) key/expire counts for RESIZEDB/SLOT_INFO
+ *   2. snapScanFreeze(): every keyspace dict is frozen, all writes now go to
+ *      the overlay (clone-on-write), reads consult the overlay first
+ *   3. redisFork(): the child inherits the frozen keyspace's SNAP_FORK values
+ *      (CoW) but none of the DONTFORK memory (headers, NOFORK values, tables)
+ *   4. snapScanStartThread(): the parent thread walks the frozen dicts and
+ *      streams records to the child over a pipe
+ *
+ * The child owns the output file: header (aux, functions, module aux),
+ * SELECTDB/RESIZEDB/SLOT_INFO tracking per message, records, footer, fsync,
+ * rename. Completion and abort both flow through the stock child machinery
+ * (checkChildrenDone -> backgroundSaveDoneHandler -> snapSaveChildDone).
+ */
+
+#define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
+#define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
+#define SNAP_MSG_END    3
+#define SNAP_MSG_ABORT  4
+#define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
+
+typedef struct snapMsgHdr {
+    uint32_t type;
+    int32_t dbid;
+    int32_t slot;
+    uint32_t len;        /* payload bytes */
+    uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation */
+} snapMsgHdr;
+
+typedef struct snapDbSizes {
+    unsigned long long keys, expires;
+    unsigned long long *slot_keys, *slot_expires;   /* cluster mode */
+    int nslots;
+} snapDbSizes;
+
+typedef struct snapSave {
+    snapScanCtx *scan;
+    kvstore **stores;
+    void **privs;              /* redisDb * per store */
+    int dbnum;
+    int pipe_rd, pipe_wr;
+    snapDbSizes *sizes;
+    int req, rdbflags;
+    char *filename;
+    rdbSaveInfo rsi;
+    int has_rsi;
+    int ae_registered;
+    int aborted;               /* snapSaveAbort() ran; waiting for the child to exit */
+    /* Scan-thread staging buffer (single thread in M1). */
+    sds stage;
+    int stage_dbid, stage_slot;
+    redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
+} snapSave;
+
+static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
+
+int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
+
+int snapKeyIsOwed(redisDb *db, sds key) {
+    if (!snap_save || snap_save->aborted) return 0;
+    int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
+    return snapScanKeyIsOwed(snap_save->scan, db->id, slot);
+}
+
+void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+                      long long *keys_fork, long long *bytes_sent)
+{
+    *slots_total = *slots_done = 0;
+    *keys_nofork = *keys_fork = *bytes_sent = 0;
+    if (!snap_save || snap_save->aborted) return;
+    snapScanProgress(snap_save->scan, slots_total, NULL, slots_done, NULL);
+    atomicGet(snap_save->keys_nofork, *keys_nofork);
+    atomicGet(snap_save->keys_fork, *keys_fork);
+    atomicGet(snap_save->bytes_sent, *bytes_sent);
+}
+
+static int snapWriteAll(int fd, const void *p, size_t n) {
+    const char *c = p;
+    while (n) {
+        ssize_t w = write(fd, c, n);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        c += w;
+        n -= w;
+    }
+    return 0;
+}
+
+static int snapReadAll(int fd, void *p, size_t n) {
+    char *c = p;
+    while (n) {
+        ssize_t r = read(fd, c, n);
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (r == 0) return -1;   /* EOF */
+        c += r;
+        n -= r;
+    }
+    return 0;
+}
+
+/* Scan thread: send one message; a failure (child gone) aborts the scan. */
+static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+                       const void *payload, uint32_t len, uint32_t robj_off)
+{
+    snapMsgHdr h = { type, dbid, slot, len, robj_off };
+    if (snapWriteAll(sv->pipe_wr, &h, sizeof(h)) != 0 ||
+        (len && snapWriteAll(sv->pipe_wr, payload, len) != 0))
+    {
+        snapScanRequestAbort(sv->scan);
+        return -1;
+    }
+    atomicIncr(sv->msgs_sent, 1);
+    atomicIncr(sv->bytes_sent, (long long)(sizeof(h) + len));
+    return 0;
+}
+
+static void snapStageFlush(snapSave *sv) {
+    if (sdslen(sv->stage) == 0) return;
+    snapSendMsg(sv, SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot, sv->stage, sdslen(sv->stage), 0);
+    sdsclear(sv->stage);
+}
+
+/* Scan thread: one fork-instant key. Read-only on the keyspace. */
+static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
+    snapSave *sv = priv;
+    if (sv->stage_dbid != s || sv->stage_slot != didx) {
+        snapStageFlush(sv);
+        sv->stage_dbid = s;
+        sv->stage_slot = didx;
+    }
+    int cls = snapKeyClass(kv);
+    /* Module key metadata is serialized through module callbacks: child only. */
+    if (cls == SNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = SNAP_FORK;
+
+    if (cls == SNAP_FORK) {
+        snapStageFlush(sv);   /* keep the child's stream in scan order */
+        char *alloc = kvobjGetAllocPtr(kv);
+        size_t len = zmalloc_size(alloc);
+        /* The child resolves kv->ptr in its own memory: it must be forkable. */
+        debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
+                          !zmalloc_is_nofork(kv->ptr));
+        snapSendMsg(sv, SNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc));
+        atomicIncr(sv->keys_fork, 1);
+    } else {
+        rio r;
+        rioInitWithBuffer(&r, sv->stage);
+        robj key;
+        initStaticStringObject(key, kvobjGetKey(kv));
+        if (rdbSaveKeyValuePair(&r, &key, kv, kvobjGetExpire(kv), s) == -1) {
+            serverLog(LL_WARNING, "Hybrid BGSAVE: failed to serialize a key on the scan thread");
+            snapScanRequestAbort(sv->scan);
+        }
+        sv->stage = r.io.buffer.ptr;
+        atomicIncr(sv->keys_nofork, 1);
+        if (sdslen(sv->stage) >= SNAP_STAGE_BYTES) snapStageFlush(sv);
+    }
+}
+
+/* Scan thread: after the last slot (or on abort). */
+static void snapSaveThreadDone(void *priv, int aborted) {
+    snapSave *sv = priv;
+    if (aborted) {
+        snapSendMsg(sv, SNAP_MSG_ABORT, -1, -1, NULL, 0, 0);
+    } else {
+        snapStageFlush(sv);
+        snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0);
+    }
+}
+
+/* ---- child ---- */
+
+static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_db, int *cur_slot) {
+    if (dbid != *cur_db) {
+        if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) return -1;
+        if (rdbSaveLen(rdb, dbid) == -1) return -1;
+        if (rdbSaveType(rdb, RDB_OPCODE_RESIZEDB) == -1) return -1;
+        if (rdbSaveLen(rdb, sv->sizes[dbid].keys) == -1) return -1;
+        if (rdbSaveLen(rdb, sv->sizes[dbid].expires) == -1) return -1;
+        *cur_db = dbid;
+        *cur_slot = -1;
+    }
+    if (server.cluster_enabled && slot != *cur_slot) {
+        if (rdbSaveType(rdb, RDB_OPCODE_SLOT_INFO) == -1) return -1;
+        if (rdbSaveLen(rdb, slot) == -1) return -1;
+        if (rdbSaveLen(rdb, sv->sizes[dbid].slot_keys[slot]) == -1) return -1;
+        if (rdbSaveLen(rdb, sv->sizes[dbid].slot_expires[slot]) == -1) return -1;
+        *cur_slot = slot;
+    }
+    return 0;
+}
+
+static int snapSaveChildWrite(snapSave *sv) {
+    char tmpfile[256];
+    char *err_op = "";
+    int error = 0;
+    char *payload = NULL;
+    size_t payload_cap = 0;
+    long key_counter = 0, msgs = 0;
+    long long info_updated_time = 0;
+    int cur_db = -1, cur_slot = -1;
+    int aborted = 0;
+
+    startSaving(sv->rdbflags);
+    snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
+    FILE *fp = fopen(tmpfile, "w");
+    if (!fp) {
+        serverLog(LL_WARNING, "Hybrid BGSAVE: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
+        stopSaving(0);
+        return C_ERR;
+    }
+    rio rdb;
+    rioInitWithFile(&rdb, fp);
+    if (server.rdb_save_incremental_fsync) {
+        rioSetAutoSync(&rdb, REDIS_AUTOSYNC_BYTES);
+        if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(&rdb, 1);
+    }
+    if (rdbSaveRioHeader(sv->req, &rdb, &error, sv->rdbflags, sv->has_rsi ? &sv->rsi : NULL) == C_ERR) {
+        err_op = "rdbSaveRioHeader";
+        goto werr;
+    }
+
+    for (;;) {
+        snapMsgHdr h;
+        if (snapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
+        if (h.type == SNAP_MSG_END) break;
+        if (h.type == SNAP_MSG_ABORT) { aborted = 1; goto werr; }
+        if (h.len > payload_cap) {
+            payload = zrealloc(payload, h.len);
+            payload_cap = h.len;
+        }
+        if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+        if (snapChildSelect(&rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+
+        if (h.type == SNAP_MSG_BUFFER) {
+            if (rioWrite(&rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
+        } else if (h.type == SNAP_MSG_KVOBJ) {
+            kvobj *kv = (kvobj *)(payload + h.robj_off);
+            robj key;
+            initStaticStringObject(key, kvobjGetKey(kv));
+            if (rdbSaveKeyValuePair(&rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
+            key_counter++;
+        } else {
+            err_op = "unknown message";
+            goto werr;
+        }
+        if ((msgs++ & 1023) == 0) {
+            long long now = mstime();
+            if (now - info_updated_time >= 1000) {
+                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, "RDB");
+                info_updated_time = now;
+            }
+        }
+    }
+    zfree(payload);
+    payload = NULL;
+
+    if (rdbSaveRioFooter(sv->req, &rdb, &error) == C_ERR) { err_op = "rdbSaveRioFooter"; goto werr; }
+    if (fflush(fp)) { err_op = "fflush"; goto werr; }
+    if (fsync(fileno(fp))) { err_op = "fsync"; goto werr; }
+    if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE) && reclaimFilePageCache(fileno(fp), 0, 0) == -1)
+        serverLog(LL_NOTICE, "Unable to reclaim cache after saving RDB: %s", strerror(errno));
+    if (fclose(fp)) { fp = NULL; err_op = "fclose"; goto werr; }
+    fp = NULL;
+    if (rename(tmpfile, sv->filename) == -1) {
+        serverLog(LL_WARNING, "Hybrid BGSAVE: error moving temp DB file %s to %s: %s", tmpfile, sv->filename, strerror(errno));
+        unlink(tmpfile);
+        stopSaving(0);
+        return C_ERR;
+    }
+    if (fsyncFileDir(sv->filename) != 0) {
+        serverLog(LL_WARNING, "Hybrid BGSAVE: failed to fsync directory: %s", strerror(errno));
+        stopSaving(0);
+        return C_ERR;
+    }
+    serverLog(LL_NOTICE, "Hybrid BGSAVE done, %ld SNAP_FORK keys serialized by the child, %zu bytes written.",
+              key_counter, rdb.processed_bytes);
+    stopSaving(1);
+    return C_OK;
+
+werr:
+    if (aborted)
+        serverLog(LL_NOTICE, "Hybrid BGSAVE aborted by the parent.");
+    else
+        serverLog(LL_WARNING, "Hybrid BGSAVE: write error (%s): %s", err_op, strerror(errno));
+    zfree(payload);
+    if (fp) fclose(fp);
+    unlink(tmpfile);
+    stopSaving(0);
+    return aborted ? SERVER_CHILD_NOERROR_RETVAL : C_ERR;
+}
+
+static void snapSaveChild(snapSave *sv) {
+    close(sv->pipe_wr);
+    redisSetProcTitle("redis-rdb-bgsave");
+    redisSetCpuAffinity(server.bgsave_cpulist);
+    int retval = snapSaveChildWrite(sv);
+    if (retval == C_OK) {
+        sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
+        exitFromChild(0, 0);
+    }
+    /* A parent-requested abort mirrors a SIGUSR1 kill (no error counted). */
+    exitFromChild(retval == SERVER_CHILD_NOERROR_RETVAL ? SERVER_CHILD_NOERROR_RETVAL : 1, 0);
+}
+
+/* ---- parent ---- */
+
+static void snapSaveFree(snapSave *sv) {
+    if (sv->ae_registered)
+        aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
+    if (sv->scan) snapScanRelease(sv->scan);
+    if (sv->pipe_wr != -1) close(sv->pipe_wr);
+    if (sv->pipe_rd != -1) close(sv->pipe_rd);
+    if (sv->sizes) {
+        for (int j = 0; j < sv->dbnum; j++) {
+            zfree(sv->sizes[j].slot_keys);
+            zfree(sv->sizes[j].slot_expires);
+        }
+        zfree(sv->sizes);
+    }
+    sdsfree(sv->stage);
+    zfree(sv->stores);
+    zfree(sv->privs);
+    zfree(sv);
+}
+
+int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    if (hasActiveChildProcess()) return C_ERR;
+    serverAssert(snap_save == NULL);
+
+    snapSave *sv = zcalloc(sizeof(*sv));
+    sv->pipe_rd = sv->pipe_wr = -1;
+    sv->dbnum = server.dbnum;
+    sv->req = req;
+    sv->rdbflags = rdbflags;
+    sv->filename = filename;
+    if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
+    sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
+    sv->privs = zmalloc(sizeof(void *) * sv->dbnum);
+    sv->sizes = zcalloc(sizeof(snapDbSizes) * sv->dbnum);
+    for (int j = 0; j < sv->dbnum; j++) {
+        redisDb *db = &server.db[j];
+        sv->stores[j] = db->keys;
+        sv->privs[j] = db;
+        sv->sizes[j].keys = kvstoreSize(db->keys);
+        sv->sizes[j].expires = kvstoreSize(db->expires);
+        if (server.cluster_enabled) {
+            int n = kvstoreNumDicts(db->keys);
+            sv->sizes[j].nslots = n;
+            sv->sizes[j].slot_keys = zmalloc(sizeof(unsigned long long) * n);
+            sv->sizes[j].slot_expires = zmalloc(sizeof(unsigned long long) * n);
+            for (int didx = 0; didx < n; didx++) {
+                sv->sizes[j].slot_keys[didx] = kvstoreDictSize(db->keys, didx);
+                sv->sizes[j].slot_expires[didx] = kvstoreDictSize(db->expires, didx);
+            }
+        }
+    }
+    int fds[2];
+    if (pipe(fds) != 0) {
+        serverLog(LL_WARNING, "Hybrid BGSAVE: pipe() failed: %s", strerror(errno));
+        snapSaveFree(sv);
+        return C_ERR;
+    }
+    sv->pipe_rd = fds[0];
+    sv->pipe_wr = fds[1];
+#ifdef F_SETPIPE_SZ
+    fcntl(sv->pipe_wr, F_SETPIPE_SZ, 1 << 20);   /* best effort: deeper back-pressure buffer */
+#endif
+    sv->stage = sdsempty();
+    sv->stage_dbid = sv->stage_slot = -1;
+    sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
+    snapScanSetOverlay(sv->scan, snapOverlayCloneKey, snapOverlayFreeOriginal, sv->privs);
+    snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
+
+    server.stat_rdb_saves++;
+    server.dirty_before_bgsave = server.dirty;
+    server.lastbgsave_try = time(NULL);
+
+    /* FORK INSTANT: freeze, then fork. */
+    snapScanFreeze(sv->scan);
+    pid_t childpid = redisFork(CHILD_TYPE_RDB);
+    if (childpid == 0) {
+        snapSaveChild(sv);   /* never returns */
+    }
+    if (childpid == -1) {
+        server.lastbgsave_status = C_ERR;
+        serverLog(LL_WARNING, "Can't save in background (hybrid): fork: %s", strerror(errno));
+        snapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
+        snapSaveFree(sv);
+        return C_ERR;
+    }
+    close(sv->pipe_rd);
+    sv->pipe_rd = -1;
+    snap_save = sv;
+    if (snapScanStartThread(sv->scan) != C_OK) {
+        /* The child is waiting on the channel: kill it, unfreeze. */
+        serverLog(LL_WARNING, "Hybrid BGSAVE: cannot start the scan thread; aborting the save");
+        killRDBChild();   /* -> snapSaveAbort() unfreezes; the done handler releases */
+    } else {
+        aeCreateFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE, snapScanAeHandler, sv->scan);
+        sv->ae_registered = 1;
+    }
+    serverLog(LL_NOTICE, "Hybrid background saving started by pid %ld (scan thread streams to the child)", (long)childpid);
+    server.rdb_save_time_start = time(NULL);
+    server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+    return C_OK;
+}
+
+void snapSaveAbort(void) {
+    if (!snap_save || snap_save->aborted) return;
+    snapSave *sv = snap_save;
+    sv->aborted = 1;
+    /* Stops the thread within one cursor step, joins it, merges every slot.
+     * A thread blocked on write() returns once the child reads or dies. */
+    snapScanAbort(sv->scan);
+    if (sv->ae_registered) {
+        aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
+        sv->ae_registered = 0;
+    }
+    serverLog(LL_NOTICE, "Hybrid BGSAVE: scan aborted, keyspace overlay merged.");
+}
+
+void snapSaveChildDone(int exitcode, int bysignal) {
+    UNUSED(exitcode);
+    UNUSED(bysignal);
+    if (!snap_save) return;
+    snapSave *sv = snap_save;
+    if (!snapScanIsFinished(sv->scan)) {
+        /* The child is gone before the scan completed: stop and merge. */
+        snapScanAbort(sv->scan);
+    }
+    snap_save = NULL;
+    snapSaveFree(sv);   /* drains completions (merges), joins, unregisters */
+    serverLog(LL_NOTICE, "Hybrid BGSAVE: scan thread joined and overlay released.");
 }
 
 /* ---- Unit tests ---------------------------------------------------------- */
@@ -788,6 +1427,8 @@ struct snapScanTestState {
     int rehashing_at_done;
 };
 
+/* Test keys are aligned C strings owned by the dict (no_value dicts need
+ * aligned stored keys; the real keyspace stores kvobj pointers). */
 static char *snapTestKey(int s, int didx, int i) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "k:%d:%d:%d", s, didx, i);
@@ -1171,6 +1812,174 @@ static void snapPlacementTests(void) {
     }
 }
 
+/* ---- Overlay tests (kvstore level: entries are plain C strings) ---- */
+struct ovTestCounters { int clones; int frees; int frees_shared; };
+
+static void *ovTestClone(void *priv, int didx, void *orig, int *shared) {
+    UNUSED(didx);
+    struct ovTestCounters *c = priv;
+    c->clones++;
+    *shared = 0;
+    return zstrdup(orig);
+}
+
+static void ovTestFree(void *priv, int didx, void *orig, int shared) {
+    UNUSED(didx);
+    struct ovTestCounters *c = priv;
+    c->frees++;
+    if (shared) c->frees_shared++;
+    zfree(orig);
+}
+
+static long ovTestCountIter(kvstore *ks, int *has_new, void **entry_for_5) {
+    long n = 0;
+    kvstoreIterator it;
+    dictEntry *de;
+    kvstoreIteratorInit(&it, ks);
+    while ((de = kvstoreIteratorNext(&it)) != NULL) {
+        const char *k = dictGetKey(de);
+        if (!strcmp(k, "k:0:0:new")) *has_new = 1;
+        if (!strcmp(k, "k:0:0:5") && entry_for_5) *entry_for_5 = dictGetKey(de);
+        n++;
+    }
+    kvstoreIteratorReset(&it);
+    return n;
+}
+
+static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink) {
+    UNUSED(plink); UNUSED(de);
+    (*(long *)priv)++;
+}
+
+static void snapOverlayTests(int abort_variant) {
+    dictType noval = KvstoreDictTestType;
+    noval.no_value = 1;
+    noval.keyCompare = snapTestKeyCompare;
+    kvstore *stores[1];
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstore *ks = stores[0];
+    const int N = 1000;
+    char *orig5 = NULL, *orig7 = NULL;
+    for (int i = 0; i < N; i++) {
+        char *k = snapTestKey(0, 0, i);
+        if (i == 5) orig5 = k;
+        if (i == 7) orig7 = k;
+        serverAssert(kvstoreDictAddRaw(ks, 0, k, NULL) != NULL);
+    }
+    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    st->inserted[0][0] = N;
+    st->dispatch_sleep_us = abort_variant ? 50 : 0;
+    struct ovTestCounters cnt = {0, 0, 0};
+    void *privs[1] = { &cnt };
+
+    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    snapScanSetOverlay(ctx, ovTestClone, ovTestFree, privs);
+    test_cond("overlay: start", snapScanStart(ctx) == C_OK);
+    test_cond("overlay: slot 0 is frozen", kvstoreOverlayIsFrozen(ks, 0) && kvstoreOverlayIsFrozen(ks, 3));
+    dict *frozen = kvstoreGetDict(ks, 0);
+
+    /* Read: original, no clone. */
+    dictEntry *de = kvstoreDictFind(ks, 0, "k:0:0:5");
+    test_cond("overlay: read lookup returns the original without cloning", de && dictGetKey(de) == orig5 && cnt.clones == 0);
+
+    /* Write lookup: clone in temp, frozen untouched. */
+    dictEntryLink bucket = NULL;
+    dictEntryLink link = kvstoreDictFindLink(ks, 0, "k:0:0:5", &bucket);
+    char *clone5 = link ? dictGetKey(*link) : NULL;
+    test_cond("overlay: write lookup returns a clone", link && clone5 && clone5 != orig5 && !strcmp(clone5, "k:0:0:5") && cnt.clones == 1);
+    test_cond("overlay: frozen dict still holds the original", dictGetKey(dictFind(frozen, "k:0:0:5")) == orig5);
+    de = kvstoreDictFind(ks, 0, "k:0:0:5");
+    test_cond("overlay: subsequent read returns the clone", de && dictGetKey(de) == clone5);
+    link = kvstoreDictFindLink(ks, 0, "k:0:0:5", &bucket);
+    test_cond("overlay: second write lookup reuses the clone", link && dictGetKey(*link) == clone5 && cnt.clones == 1);
+
+    /* Delete an untouched key: clone-then-delete, tombstone. */
+    int table;
+    link = kvstoreDictTwoPhaseUnlinkFind(ks, 0, "k:0:0:7", &table);
+    test_cond("overlay: two-phase unlink find on an owed key returns a temp link", link != NULL && dictGetKey(*link) != orig7);
+    kvstoreDictTwoPhaseUnlinkFree(ks, 0, link, table);
+    test_cond("overlay: deleted key is invisible", kvstoreDictFind(ks, 0, "k:0:0:7") == NULL);
+    test_cond("overlay: frozen dict still holds the deleted original", dictGetKey(dictFind(frozen, "k:0:0:7")) == orig7);
+    test_cond("overlay: logical size dropped to N-1", kvstoreDictSize(ks, 0) == (unsigned long)N - 1 && kvstoreSize(ks) == (unsigned long long)N - 1);
+    test_cond("overlay: deleting a deleted key fails", kvstoreDictTwoPhaseUnlinkFind(ks, 0, "k:0:0:7", &table) == NULL &&
+              kvstoreDictDelete(ks, 0, "k:0:0:7") == DICT_ERR);
+
+    /* Add a new key and re-add the deleted one. */
+    link = kvstoreDictFindLink(ks, 0, "k:0:0:new", &bucket);
+    test_cond("overlay: miss returns no link", link == NULL);
+    kvstoreDictSetAtLink(ks, 0, zstrdup("k:0:0:new"), &bucket, 1);
+    char *readd7 = zstrdup("k:0:0:7");
+    kvstoreDictSetAtLink(ks, 0, readd7, NULL, 1);
+    test_cond("overlay: added and re-added keys are visible",
+              kvstoreDictFind(ks, 0, "k:0:0:new") && dictGetKey(kvstoreDictFind(ks, 0, "k:0:0:7")) == readd7);
+    test_cond("overlay: logical size is N+1", kvstoreDictSize(ks, 0) == (unsigned long)N + 1 && kvstoreSize(ks) == (unsigned long long)N + 1);
+    test_cond("overlay: frozen dict does not contain the added key", dictFind(frozen, "k:0:0:new") == NULL);
+    /* Add to an empty frozen slot (no dict allocated). */
+    kvstoreDictSetAtLink(ks, 3, zstrdup("k:0:3:0"), NULL, 1);
+    test_cond("overlay: add into an empty frozen slot works", kvstoreDictFind(ks, 3, "k:0:3:0") != NULL && kvstoreDictSize(ks, 3) == 1 && kvstoreGetDict(ks, 3) == NULL);
+
+    /* Enumeration sees the logical keyspace. */
+    int has_new = 0; void *e5 = NULL;
+    long n = ovTestCountIter(ks, &has_new, &e5);
+    test_cond("overlay: kvstore iterator yields the logical keyspace (N+2 keys, add included, clone substituted)",
+              n == N + 2 && has_new && e5 == clone5);
+    long scanned = 0;
+    unsigned long long cursor = 0;
+    do { cursor = kvstoreScan(ks, cursor, -1, ovTestScanCb, NULL, &scanned); } while (cursor);
+    test_cond("overlay: kvstoreScan yields the logical keyspace", scanned == N + 2);
+    int bad_random = 0;
+    for (int i = 0; i < 200; i++) {
+        dictEntry *r = kvstoreDictGetFairRandomKey(ks, 0);
+        if (!r) { bad_random++; continue; }
+        const char *k = dictGetKey(r);
+        if (!strcmp(k, "k:0:0:5") && dictGetKey(r) != clone5) bad_random++;
+    }
+    test_cond("overlay: random sampling never returns NULL or a shadowed original", bad_random == 0);
+    dictEntry *some[8];
+    unsigned int got = kvstoreDictGetSomeKeys(ks, 0, some, 8);
+    test_cond("overlay: GetSomeKeys returns entries", got > 0);
+
+    /* The scan thread must have dispatched exactly the fork-instant set. */
+    if (abort_variant) {
+        long d0;
+        do { usleep(500); atomicGet(st->dispatched, d0); } while (d0 < 10 && !snapScanIsFinished(ctx));
+        snapScanAbort(ctx);
+    } else {
+        while (!snapScanIsFinished(ctx)) usleep(200);
+        snapScanHandleCompletions(ctx);
+    }
+    long dispatched, bad;
+    atomicGet(st->dispatched, dispatched);
+    atomicGet(st->bad, bad);
+    if (!abort_variant) {
+        int all_seen = 1;
+        for (int i = 0; i < N; i++) if (!st->seen[0][0][i]) all_seen = 0;
+        test_cond("overlay: scan dispatched exactly the fork-instant set (deleted key included, added keys excluded)",
+                  dispatched == N && bad == 0 && all_seen);
+    }
+
+    /* After merge: a single live dict with the logical contents. */
+    test_cond("overlay: slots are unfrozen after completion", !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3));
+    frozen = kvstoreGetDict(ks, 0);
+    test_cond("overlay: merged dict holds the clone, the re-added key and the new key",
+              dictGetKey(dictFind(frozen, "k:0:0:5")) == clone5 &&
+              dictGetKey(dictFind(frozen, "k:0:0:7")) == readd7 &&
+              dictFind(frozen, "k:0:0:new") != NULL &&
+              kvstoreGetDict(ks, 3) && dictFind(kvstoreGetDict(ks, 3), "k:0:3:0") != NULL);
+    test_cond("overlay: merged sizes are consistent",
+              dictSize(frozen) == (unsigned long)N + 1 && kvstoreDictSize(ks, 0) == (unsigned long)N + 1 &&
+              kvstoreSize(ks) == (unsigned long long)N + 2);
+    test_cond("overlay: exactly the two replaced originals were freed", cnt.frees == 2 && cnt.frees_shared == 0 && cnt.clones == 2);
+    has_new = 0; e5 = NULL;
+    n = ovTestCountIter(ks, &has_new, &e5);
+    test_cond("overlay: iteration after merge matches", n == N + 2 && has_new && e5 == clone5);
+
+    snapScanRelease(ctx);
+    kvstoreRelease(ks);
+    zfree(st);
+}
+
 int snapshotTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -1191,8 +2000,10 @@ int snapshotTest(int argc, char **argv, int flags) {
     void *fb = snapNoforkAlloc(100);
     test_cond("fallback alloc goes to the default allocator", fb != NULL && !snapPtrIsNofork(fb));
     snapNoforkFree(fb);
-    /* The background scan does not depend on the arena. */
+    /* The background scan and the keyspace overlay do not depend on the arena. */
     snapScanTests(accurate);
+    snapOverlayTests(0);
+    snapOverlayTests(1);
     test_report();
     return 0;
 #endif
@@ -1358,6 +2169,8 @@ int snapshotTest(int argc, char **argv, int flags) {
 
     snapPlacementTests();
     snapScanTests(accurate);
+    snapOverlayTests(0);
+    snapOverlayTests(1);
 
     test_report();
     return 0;

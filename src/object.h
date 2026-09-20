@@ -126,6 +126,7 @@ uint64_t *kvobjMetaRef(kvobj *kv, int metaId);
 
 /* Redis object implementation */
 void decrRefCount(robj *o);
+void kvobjFreeValueOnly(robj *o);
 void incrRefCount(robj *o);
 robj *makeObjectShared(robj *o);
 void freeStringObject(robj *o);

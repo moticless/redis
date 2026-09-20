@@ -783,7 +783,9 @@ GetFieldRes hashTypeGetValue(redisDb *db, kvobj *o, sds field, unsigned char **v
 
     if ((server.loading) ||
         (hfeFlags & HFE_LAZY_AVOID_FIELD_DEL) ||
-        (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)))
+        (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)) ||
+        /* Hybrid BGSAVE: never mutate an owed fork-instant original on a read. */
+        (o->iskvobj && snapKeyIsOwed(db, kvobjGetKey(o))))
         return GETF_EXPIRED;
 
     /* delete the field and propagate the deletion */
@@ -1999,7 +2001,8 @@ static int hashTypeExpireIfNeeded(redisDb *db, kvobj *o) {
     if ( (server.loading) ||
          (server.allow_access_expired) ||
          (server.masterhost) ||  /* master-client or user-client, don't delete */
-         (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)))
+         (isPausedActionsWithUpdate(PAUSE_ACTION_EXPIRE)) ||
+         (o->iskvobj && snapKeyIsOwed(db, kvobjGetKey(o))))   /* hybrid BGSAVE */
         return 0;
 
     /* Take care to expire all the fields */

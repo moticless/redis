@@ -230,6 +230,10 @@ static inline void activeSubexpiresCycle(int type) {
     static unsigned int currentDb = 0;
     static int currentSlot = -1;
 
+    /* Hybrid BGSAVE: field expiry rewrites hash values in place; fork-instant
+     * originals of owed slots must not be touched. Suspended for the save. */
+    if (snapSaveInProgress()) return;
+
     /* Tracks the count of fields actively expired for the current database.
      * This count continues as long as it fails to actively expire all expired
      * fields of currentDb, indicating a possible need to adjust the value of

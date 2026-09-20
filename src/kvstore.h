@@ -37,6 +37,7 @@ typedef struct _kvstoreIterator {
     long long didx;
     long long next_didx;
     dictIterator di;
+    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = temp dict (ADDs) */
 } kvstoreIterator;
 
 /* Structure for kvstore dict iterator that allows iterating the corresponding dict. */
@@ -44,7 +45,27 @@ typedef struct _kvstoreDictIterator {
     kvstore *kvs;
     long long didx;
     dictIterator di;
+    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = temp dict (ADDs) */
 } kvstoreDictIterator;
+
+/* ---- Snapshot overlay (hybrid BGSAVE) --------------------------------------
+ *
+ * While a dict is "frozen" (owed to a running snapshot scan) it is never
+ * modified: every write goes to a per-dict temp dict and every read consults
+ * the temp dict first. The first write-lookup of a key that only exists in the
+ * frozen dict calls 'clone' to obtain a private copy that is stored in the temp
+ * dict and returned to the caller, so all in-place mutation done by callers
+ * lands on the clone. Deletes leave a tombstone. Enumeration and sizes describe
+ * the logical keyspace (frozen minus tombstones, clones substituted, plus
+ * adds). kvstoreOverlayMerge() applies the temp dict to the real dict on the
+ * owner thread once the scan of that dict has finished. */
+typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
+typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
+void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
+                          kvstoreOverlayFreeOrigFn *free_orig, void *privdata);
+int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
+void kvstoreOverlayMerge(kvstore *kvs, int didx);
+void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);
 
 typedef int (kvstoreScanShouldSkipDict)(dict *d, int didx);
 typedef int (kvstoreExpandShouldSkipDictIndex)(int didx);

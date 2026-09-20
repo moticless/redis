@@ -645,6 +645,28 @@ void incrRefCount(robj *o) {
     }
 }
 
+/* Free only the VALUE of an object (inner allocations reachable from o->ptr),
+ * leaving the robj/kvobj header allocation and its key metadata alone. Used
+ * by the hybrid BGSAVE merge to release a fork-instant original whose header
+ * was cloned (the clone carries the key metadata) but whose value was not
+ * shared with the clone. */
+void kvobjFreeValueOnly(robj *o) {
+    switch(o->type) {
+    case OBJ_STRING: freeStringObject(o); break;
+    case OBJ_LIST: freeListObject(o); break;
+    case OBJ_SET: freeSetObject(o); break;
+    case OBJ_ZSET: freeZsetObject(o); break;
+    case OBJ_HASH: freeHashObject(o); break;
+    case OBJ_MODULE: freeModuleObject(o); break;
+    case OBJ_STREAM: freeStreamObject(o); break;
+#ifdef ENABLE_GCRA
+    case OBJ_GCRA: freeGCRAObject(o); break;
+#endif
+    case OBJ_ARRAY: freeArrayObject(o); break;
+    default: serverPanic("Unknown object type"); break;
+    }
+}
+
 void decrRefCount(robj *o) {
     if (o->refcount == OBJ_SHARED_REFCOUNT)
         return; /* Nothing to do: this refcount is immutable. */

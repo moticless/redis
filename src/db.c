@@ -277,8 +277,17 @@ void dbgRunAssertions(redisDb *db) {
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
 kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
+    kvobj *val;
 
-    kvobj *val = dbFindByLink(db, key->ptr, link);
+    /* Write intent matters during a hybrid BGSAVE: a link lookup on an owed
+     * key clones it into the snapshot overlay (see kvstoreDictFindLink), so
+     * reads use the plain find and never clone. */
+    if (flags & LOOKUP_WRITE) {
+        val = dbFindByLink(db, key->ptr, link);
+    } else {
+        val = dbFind(db, key->ptr);
+        if (link) *link = NULL;
+    }
 
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
@@ -1026,6 +1035,12 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
  * database(s). Otherwise -1 is returned in the specific case the
  * DB number is out of range, and errno is set to EINVAL. */
 long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
+    /* A hybrid BGSAVE scans the live dicts from a thread: stop it (and the
+     * child) before the keyspace is destroyed. */
+    if (snapSaveInProgress()) {
+        snapSaveAbort();
+        killRDBChild();
+    }
     int async = (flags & EMPTYDB_ASYNC);
     int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
     RedisModuleFlushInfoV1 fi = {REDISMODULE_FLUSHINFO_VERSION,!async,dbnum};
@@ -2548,6 +2563,11 @@ void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with, slotRa
  * Returns C_ERR if at least one of the DB ids are out of range, otherwise
  * C_OK is returned. */
 int dbSwapDatabases(int id1, int id2) {
+    /* Hybrid BGSAVE: slot ownership is per db; abort before swapping. */
+    if (snapSaveInProgress()) {
+        snapSaveAbort();
+        killRDBChild();
+    }
     if (id1 < 0 || id1 >= server.dbnum ||
         id2 < 0 || id2 >= server.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;

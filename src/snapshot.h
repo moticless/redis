@@ -104,6 +104,12 @@ int snapKeyClass(const robj *o);
  * Only the value moves; the header (and thus every pointer to it) stays. */
 void snapPlaceValue(robj *o);
 
+/* Move a single-allocation value out of the arena if it is there. Must be
+ * called before such a buffer is ADOPTED by a multi-allocation structure
+ * (e.g. a listpack becoming the first quicklist node): every piece of a
+ * SNAP_FORK value has to be readable by the fork child. */
+void snapValueDetachFromArena(robj *o);
+
 /* Keyspace placement statistics (DEBUG SNAP-PLACEMENT). */
 typedef struct snapPlacementStats {
     long long keys;
@@ -175,6 +181,22 @@ void snapScanAbort(snapScanCtx *ctx);
  * Every slot must be DONE by then unless the ctx was never started. */
 void snapScanRelease(snapScanCtx *ctx);
 
+/* Attach the keyspace overlay (kvstore.h) to the scan: every dict of every
+ * store is frozen at snapScanStart() with these callbacks and merged on the
+ * main thread when its slot completes. 'store_privdata[s]' is passed to the
+ * callbacks for store s (the server passes the redisDb). Must be called
+ * before snapScanStart(). */
+void snapScanSetOverlay(snapScanCtx *ctx, kvstoreOverlayCloneFn *clone,
+                        kvstoreOverlayFreeOrigFn *free_orig, void **store_privdata);
+
+/* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
+ * copies the whole kvobj allocation into a fresh arena block; SNAP_NOFORK
+ * values (single allocation in the arena) are deep-copied, everything else
+ * is shared with the original. db->expires and db->subexpires are pointed
+ * at the clone. The free releases a fork-instant original after merge. */
+void *snapOverlayCloneKey(void *privdata, int didx, void *orig, int *value_shared);
+void snapOverlayFreeOriginal(void *privdata, int didx, void *orig, int value_shared);
+
 /* Cheap, lock-free state queries usable on every write path. */
 int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx);
@@ -185,9 +207,38 @@ int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx);
 int snapScanReadEventFd(snapScanCtx *ctx);
 void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask);
 
+/* Two-step start: freeze first (fork-instant), spawn the thread later.
+ * snapScanStart() == snapScanFreeze() + snapScanStartThread(). */
+void snapScanFreeze(snapScanCtx *ctx);
+int snapScanStartThread(snapScanCtx *ctx);
+
+/* Optional hook run on the scan thread after the last slot (or on abort),
+ * before the scan is published as finished. */
+typedef void (snapScanThreadDoneFn)(void *privdata, int aborted);
+void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn);
+
+/* 1 when called from the scan thread. */
+int snapOnScanThread(void);
+
 /* Progress for INFO / tests. */
 void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched);
+
+/* ---- Hybrid BGSAVE ------------------------------------------------------- */
+
+/* Start a hybrid background save: freeze the keyspace (overlay), fork the
+ * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
+int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
+int snapSaveInProgress(void);
+/* Stop the scan thread and merge every slot (main thread). Safe to call when
+ * no hybrid save is running. Does not touch the child (see killRDBChild). */
+void snapSaveAbort(void);
+/* Called by backgroundSaveDoneHandler() when the RDB child exited. */
+void snapSaveChildDone(int exitcode, int bysignal);
+/* 1 if 'key' of 'db' is still owed to a running hybrid save. */
+int snapKeyIsOwed(redisDb *db, sds key);
+void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+                      long long *keys_fork, long long *bytes_sent);
 
 /* ---- Tests --------------------------------------------------------------- */
 #ifdef REDIS_TEST

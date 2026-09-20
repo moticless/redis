@@ -6543,6 +6543,9 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
 
     /* Persistence */
     if (all_sections || (dictFind(section_dict,"persistence") != NULL)) {
+        long snap_slots_total = 0, snap_slots_done = 0;
+        long long snap_keys_nofork = 0, snap_keys_fork = 0, snap_bytes_sent = 0;
+        snapSaveProgress(&snap_slots_total, &snap_slots_done, &snap_keys_nofork, &snap_keys_fork, &snap_bytes_sent);
         if (sections++) info = sdscat(info,"\r\n");
         double fork_perc = 0;
         if (server.stat_module_progress) {
@@ -6565,6 +6568,12 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
             "rdb_changes_since_last_save:%lld\r\n", server.dirty,
             "rdb_bgsave_in_progress:%d\r\n", server.child_type == CHILD_TYPE_RDB,
+            "snap_save_in_progress:%d\r\n", snapSaveInProgress(),
+            "snap_save_slots_total:%ld\r\n", snap_slots_total,
+            "snap_save_slots_done:%ld\r\n", snap_slots_done,
+            "snap_save_keys_nofork:%lld\r\n", snap_keys_nofork,
+            "snap_save_keys_fork:%lld\r\n", snap_keys_fork,
+            "snap_save_bytes_sent:%lld\r\n", snap_bytes_sent,
             "rdb_last_save_time:%jd\r\n", (intmax_t)server.lastsave,
             "rdb_last_bgsave_status:%s\r\n", (server.lastbgsave_status == C_OK) ? "ok" : "err",
             "rdb_last_bgsave_time_sec:%jd\r\n", (intmax_t)server.rdb_save_time_last,
@@ -7609,7 +7618,10 @@ void dismissMemoryInChild(void) {
 
     /* Dismiss expires kvstore bucket arrays since the child process never
      * accesses them, expire times are embedded in key objects. */
-    if (server.in_fork_child == CHILD_TYPE_RDB || server.in_fork_child == CHILD_TYPE_AOF) {
+    /* Hybrid BGSAVE: the keyspace kvstores live in the DONTFORK arena and are
+     * not mapped in the child at all; touching them here would fault. */
+    if (!snapArenaAvailable() &&
+        (server.in_fork_child == CHILD_TYPE_RDB || server.in_fork_child == CHILD_TYPE_AOF)) {
         for (int dbid = 0; dbid < server.dbnum; dbid++) {
             dismissKvstoreBucketsMemory(server.db[dbid].expires);
         }
