@@ -593,6 +593,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
     }
     kvobj *old = dictGetKV(*link);
     kvobj *kvNew;
+    snapDebugAssertNotFrozenOriginal(db, old);
 
     int64_t oldlen = (int64_t) getObjectLength(old);
     int oldtype = old->type;
@@ -858,6 +859,7 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
 
     if (link) {
         kvobj *kv = dictGetKV(*link);
+        snapDebugAssertNotFrozenOriginal(db, kv);
 
         int64_t oldlen = (int64_t) getObjectLength(kv);
         int type = kv->type;
@@ -970,6 +972,7 @@ kvobj *dbUnshareStringValue(redisDb *db, robj *key, kvobj *kv) {
 /* Like dbUnshareStringValue(), but accepts a optional link,
  * which can be used if we already have one, thus saving the dbFind call. */
 kvobj *dbUnshareStringValueByLink(redisDb *db, robj *key, kvobj *o, dictEntryLink link) {
+    snapDebugAssertNotFrozenOriginal(db, o);
     serverAssert(o->type == OBJ_STRING);
     if (o->refcount != 1 || o->encoding != OBJ_ENCODING_RAW) {
         robj *decoded = getDecodedObject(o);
@@ -1178,6 +1181,7 @@ long long dbTotalServerKeyCount(void) {
  * - signal: if true, trigger WATCH and client-side tracking invalidation
  */
 void keyModified(client *c, redisDb *db, robj *key, robj *val, int signal) {
+    snapDebugAssertNotFrozenOriginal(db, val);
     if (val) updateLRM(val);
     if (signal) {
         touchWatchedKey(db,key);
@@ -2711,6 +2715,7 @@ int removeExpire(redisDb *db, robj *key) {
     dictEntry *de = *link;
     kvobj *kv = dictGetKV(de);
     kvobj *newkv = kvobjSetExpire(kv, -1);
+    snapDebugAssertNotFrozenOriginal(db, kv);
     serverAssert(newkv == kv);
     kvstoreDictTwoPhaseUnlinkFree(db->expires, slot, link, table);
     return 1;
@@ -2738,6 +2743,7 @@ kvobj *setExpireByLink(client *c, redisDb *db, sds key, long long when, dictEntr
     }
     kvobj *kv = dictGetKV(*keyLink);
     long long old_when = kvobjGetExpire(kv);
+    snapDebugAssertNotFrozenOriginal(db, kv);
 
     if (old_when != -1) { /* old expire */
         kvobj *kvnew = kvobjSetExpire(kv, when); /* release kv if reallocated */

@@ -237,6 +237,13 @@ void snapSaveAbort(void);
 void snapSaveChildDone(int exitcode, int bysignal);
 /* 1 if 'key' of 'db' is still owed to a running hybrid save. */
 int snapKeyIsOwed(redisDb *db, sds key);
+
+/* 1 if 'kv' is the frozen (fork-instant) entry of its key in a slot that is
+ * still owed: such an object must never reach a mutator, only its clone may.
+ * Used by debug-build assertions at the keyspace write funnels. */
+int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
+#define snapDebugAssertNotFrozenOriginal(db, kv) \
+    debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !snapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent);
 

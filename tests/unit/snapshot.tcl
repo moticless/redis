@@ -218,6 +218,18 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r expire hash:ht 1000
             r expire list:ql 1000
             r persist list:ql
+            # encoding conversions on owed SNAP_NOFORK clones
+            for {set i 0} {$i < 600} {incr i} { r hset hash:lp c$i v }
+            assert_equal hashtable [r object encoding hash:lp]
+            r sadd set:intset notanint
+            for {set i 0} {$i < 600} {incr i} { r sadd set:intset s$i }
+            assert_equal hashtable [r object encoding set:intset]
+            for {set i 0} {$i < 300} {incr i} { r zadd zset:renamed $i n$i }
+            assert_equal skiplist [r object encoding zset:renamed]
+            for {set i 0} {$i < 2000} {incr i} { r rpush list:lp [string repeat y 100] }
+            assert_equal quicklist [r object encoding list:lp]
+            for {set i 0} {$i < 1998} {incr i} { r lpop list:ql }
+            assert_equal listpack [r object encoding list:ql]
             # the live keyspace reflects the writes immediately
             assert_equal changed [r get str:small]
             assert_equal 0 [r exists str:raw]
@@ -241,13 +253,16 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal XYZ [string range [r get str:big] 0 2]
             assert_equal 1 [r sismember set:ht extra]
             assert_equal 999 [r zscore zset:sl extra]
-            assert_equal d [r lindex list:lp -1]
+            assert_equal 2 [r llen list:ql]
+            assert_equal 2004 [r llen list:lp]
+            assert_equal 603 [r hlen hash:lp]
+            assert_equal 606 [r scard set:intset]
+            assert_equal 302 [r zcard zset:renamed]
             assert_equal back [r get filler:1]
             assert_equal 0 [r exists filler:2]
             assert {[r ttl hash:ht] > 0}
             assert_equal -1 [r ttl list:ql]
             assert_equal 600 [r hlen hash:ht]
-            assert_equal 2000 [r llen list:ql]
             set st [snap_placement]
             assert_equal 0 [dict get $st violations]
             assert_equal 0 [dict get $st headers_outside]
@@ -258,6 +273,54 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [r exists str:raw]
             assert_equal 0 [r exists brand:new]
             assert_equal 1 [r exists filler:2]
+        }
+
+        foreach policy {allkeys-lru allkeys-lfu} {
+            test "Hybrid BGSAVE: reads and writes during the save under $policy" {
+                r config set maxmemory-policy $policy
+                populate_all_types
+                populate_fillers 3000
+                set digest [debug_digest]
+                r config set rdb-key-save-delay 300
+                r bgsave
+                wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+                for {set i 0} {$i < 500} {incr i} { r get filler:$i; r hget hash:lp f1; r lindex list:ql 0 }
+                r set str:small changed
+                r incr str:int
+                r config set rdb-key-save-delay 0
+                wait_hybrid_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                assert_equal changed [r get str:small]
+                r debug reload nosave
+                assert_equal $digest [debug_digest]
+                r config set maxmemory-policy noeviction
+            }
+        }
+
+        test {Hybrid BGSAVE: active defrag enabled during a save} {
+            populate_all_types
+            populate_fillers 3000
+            set digest [debug_digest]
+            r config set active-defrag-ignore-bytes 1
+            r config set active-defrag-threshold-lower 0
+            r config set active-defrag-cycle-min 50
+            if {[catch {r config set activedefrag yes} e]} {
+                # defrag not supported on this allocator build
+                r config set activedefrag no
+            }
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            for {set i 0} {$i < 1000} {incr i} { r set filler:$i [string repeat g 70] }
+            for {set i 1000} {$i < 1500} {incr i} { r del filler:$i }
+            after 300
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r config set activedefrag no
+            assert_equal 0 [dict get [snap_placement] violations]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
         }
 
         test {Hybrid BGSAVE: FLUSHALL during the save aborts it and the next save works} {

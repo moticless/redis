@@ -909,6 +909,17 @@ int snapKeyIsOwed(redisDb *db, sds key) {
     return snapScanKeyIsOwed(snap_save->scan, db->id, slot);
 }
 
+int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
+    if (!snap_save || snap_save->aborted) return 0;
+    sds key = kvobjGetKey(kv);
+    int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
+    if (!kvstoreOverlayIsFrozen(db->keys, slot)) return 0;
+    dict *d = kvstoreGetDict(db->keys, slot);
+    if (!d) return 0;
+    dictEntry *de = dictFind(d, key);
+    return de && dictGetKV(de) == kv;
+}
+
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent)
 {
