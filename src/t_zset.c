@@ -1512,6 +1512,7 @@ void zsetConvertAndExpand(robj *zobj, int encoding, unsigned long cap) {
         zfree(zs);
         zobj->ptr = zl;
         zobj->encoding = OBJ_ENCODING_LISTPACK;
+        snapPlaceValue(zobj); /* hybrid BGSAVE: a fresh single-allocation value */
     } else {
         serverPanic("Unknown sorted set encoding");
     }

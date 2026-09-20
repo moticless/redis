@@ -53,6 +53,8 @@ struct _kvstore {
 #define OV_STATE_SHARED 2   /* the clone shares the original's value allocation */
 
 typedef struct kvstoreDictOverlay {
+    kvstore *kvs;               /* owner and slot, for the temp dict's destructor */
+    int didx;
     dict *temp;                 /* clones and adds; same type as the real dict minus kvstore callbacks */
     dictType temp_type;
     dict *state;                /* frozen key (borrowed pointer) -> OV_STATE_* flags */
@@ -104,26 +106,42 @@ static void ovKeyCountAdd(kvstore *kvs, int didx, long delta);
 static dict *createDictIfNeeded(kvstore *kvs, int didx);
 static void freeDictIfNeeded(kvstore *kvs, int didx);
 
+/* Key destructor of a temp dict: run the store's destructor against the REAL
+ * dict of the slot, so per-dict accounting (kvstore metadata, e.g. slot
+ * alloc sizes) lands where adds were counted. The real dict exists whenever
+ * a temp entry exists (adds create it, clones come from it). */
+static void ovTempKeyDestructor(dict *tempd, void *key) {
+    kvstoreDictOverlay *ov = tempd->type->userdata;
+    dict *real = ov->kvs->dicts[ov->didx];
+    assert(real != NULL);
+    ov->kvs->dtype.keyDestructor(real, key);
+}
+
 void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
                           kvstoreOverlayFreeOrigFn *free_orig, void *privdata)
 {
     if (!kvs->ov) kvs->ov = zcalloc(sizeof(kvstoreDictOverlay *) * kvs->num_dicts);
     assert(kvs->ov[didx] == NULL);
     kvstoreDictOverlay *ov = zcalloc(sizeof(*ov));
+    ov->kvs = kvs;
+    ov->didx = didx;
     ov->temp_type = kvs->dtype;
     /* The temp dict must not touch kvstore-level accounting (rehash list,
-     * bucket counts, per-dict metadata). */
+     * bucket counts, per-dict metadata); its destructor accounts on the real dict. */
     ov->temp_type.rehashingStarted = NULL;
     ov->temp_type.rehashingCompleted = NULL;
     ov->temp_type.bucketChanged = NULL;
     ov->temp_type.dictMetadataBytes = NULL;
-    ov->temp_type.userdata = NULL;
+    ov->temp_type.userdata = ov;
+    if (kvs->dtype.keyDestructor) ov->temp_type.keyDestructor = ovTempKeyDestructor;
     ov->temp = dictCreate(&ov->temp_type);
     /* The state dict is keyed by lookup keys (not stored keys) borrowed from
-     * the frozen entries: same hash/compare as the store, no ownership. */
+     * the frozen entries: same hash/compare as the store, no ownership. Lives
+     * where the store's tables live (arena): it is written during a save. */
     memset(&ov->state_type, 0, sizeof(ov->state_type));
     ov->state_type.hashFunction = kvs->dtype.hashFunction;
     ov->state_type.keyCompare = kvs->dtype.keyCompare;
+    ov->state_type.nofork_alloc = kvs->dtype.nofork_alloc;
     ov->state = dictCreate(&ov->state_type);
     ov->clone = clone;
     ov->free_orig = free_orig;
@@ -1334,11 +1352,20 @@ dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *
 }
 
 void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, int table_index) {
+    kvstoreDictTwoPhaseUnlinkFreeKey(kvs, didx, link, table_index, NULL);
+}
+
+/* As above, with the key given explicitly: callers that already detached the
+ * value from the entry (dbGenericDelete's async path stores NULL at the link
+ * before unlinking) cannot have it read back from the entry. 'key' may be
+ * NULL when the entry still holds it. */
+void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
         if (link && *link) {
             /* Bookkeeping first: the key pointer dies with the temp entry. */
-            ovOnTempRemove(kvs, didx, ov, ovEntryKey(kvs, *link));
+            if (!key) key = ovEntryKey(kvs, *link);
+            ovOnTempRemove(kvs, didx, ov, key);
             dictTwoPhaseUnlinkFree(ov->temp, link, table_index);
         }
         return;

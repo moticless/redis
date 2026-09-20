@@ -124,6 +124,9 @@ typedef struct snapPlacementStats {
     long long dict_tables_outside;
 } snapPlacementStats;
 void snapPlacementScan(redisDb *db, snapPlacementStats *st);
+/* Reply with up to 'limit' keys whose value placement disagrees with its
+ * class: "key type encoding drift" per entry (test aid, DEBUG SNAP-DRIFT). */
+void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
 
 /* ---- Per-slot background scan ------------------------------------------- */
 
@@ -235,6 +238,11 @@ int snapSaveInProgress(void);
 void snapSaveAbort(void);
 /* Called by backgroundSaveDoneHandler() when the RDB child exited. */
 void snapSaveChildDone(int exitcode, int bysignal);
+/* 1 when bgsave-hybrid is on: saves take the hybrid path whether or not the
+ * SNAP_NOFORK arena exists (without it the CoW benefit is gone but the
+ * mechanics are identical, which is what sanitizer builds exercise). */
+int snapHybridEnabled(void);
+
 /* 1 if 'key' of 'db' is still owed to a running hybrid save. */
 int snapKeyIsOwed(redisDb *db, sds key);
 
@@ -244,6 +252,16 @@ int snapKeyIsOwed(redisDb *db, sds key);
 int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
 #define snapDebugAssertNotFrozenOriginal(db, kv) \
     debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !snapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
+/* Main thread, serverCron/beforeSleep: act on a pending hard-mark abort. */
+void snapSaveCron(void);
+/* CONFIG SET rdb-key-save-delay apply hook: reaches the running scan thread. */
+void snapSaveSetKeySaveDelay(int usec);
+/* Bytes the overlay currently keeps alive for the running save (replaced or
+ * tombstoned originals), the peak of the last completed save, and the
+ * hard-mark abort counter. */
+size_t snapSaveRetainedBytes(void);
+size_t snapSaveLastRetainedPeak(void);
+
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent);
 

@@ -1624,8 +1624,10 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     if (rdbSaveStringObject(rdb,key) == -1) return -1;
     if (rdbSaveObject(rdb,val,key,dbid) == -1) return -1;
 
-    /* Delay return if required (for testing) */
-    if (server.rdb_key_save_delay)
+    /* Delay return if required (for testing). The hybrid scan thread applies
+     * its own atomic copy of the delay (snapshot.c): the config may be
+     * changed by the main thread while it runs. */
+    if (!snapOnScanThread() && server.rdb_key_save_delay)
         debugDelay(server.rdb_key_save_delay);
 
     return 1;
@@ -2102,7 +2104,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
      * fork child cannot walk the keyspace; the snapshot.c path scans on a
      * parent thread and streams to the child. Functions-only saves have no
      * keyspace content and keep the stock path. */
-    if (snapArenaAvailable() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA))
+    if (snapHybridEnabled() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA))
         return snapSaveBackground(req, filename, rsi, rdbflags);
     server.stat_rdb_saves++;
 

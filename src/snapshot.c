@@ -223,9 +223,16 @@ static void *snapValueAllocPtr(const robj *o) {
     }
 }
 
+int snapHybridEnabled(void) { return server.bgsave_hybrid; }
+
 int snapKeyClass(const robj *o) {
     if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return SNAP_FORK;
     if (snapValueIsInline(o->type, o->encoding)) return SNAP_NOFORK;
+    /* No arena: nothing is placed, the class is a pure size decision. */
+    if (!snapArenaAvailable()) {
+        void *a = snapValueAllocPtr(o);
+        return snapClassify(o->type, o->encoding, a ? zmalloc_size(a) : 0);
+    }
     /* LISTPACK_EX: the class follows the struct. The struct holds the
      * ExpireMeta registered in the db's ebuckets, so it is never moved; when
      * it is in the arena the child cannot read it and the key MUST be served
@@ -346,35 +353,39 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
     return kv;
 }
 
+static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
+static void snapSaveRetainedSub(kvobj *orig, int value_shared);
+void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int64_t newsize);   /* db.c */
+
 void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
     redisDb *db = privdata;
     kvobj *orig = orig_;
     kvobj *kv = snapKvobjCloneHeader(orig);
     *value_shared = 0;
 
+    /* SNAP_NOFORK: the scan thread reads the original live -> the clone gets a
+     * private copy of the value (in the arena when there is one). SNAP_FORK:
+     * the child reads its CoW copy -> the clone shares the value. */
+    int nofork = snapKeyClass(orig) == SNAP_NOFORK;
+    int to_arena = snapArenaAvailable();
     if (!snapValueIsInline(orig->type, orig->encoding)) {
         switch (orig->encoding) {
-        case OBJ_ENCODING_RAW: {
-            /* In the arena: the scan thread reads it live -> private copy.
-             * Outside (big string): the child reads its CoW copy -> share. */
-            void *a = sdsAllocPtr(orig->ptr);
-            if (zmalloc_is_nofork(a)) kv->ptr = snapSdsCopy(orig->ptr, 1);
+        case OBJ_ENCODING_RAW:
+            if (nofork) kv->ptr = snapSdsCopy(orig->ptr, to_arena);
             else *value_shared = 1;
             break;
-        }
         case OBJ_ENCODING_LISTPACK:
-            if (zmalloc_is_nofork(orig->ptr)) kv->ptr = snapBlobCopy(orig->ptr, lpBytes(orig->ptr), 1);
+            if (nofork) kv->ptr = snapBlobCopy(orig->ptr, lpBytes(orig->ptr), to_arena);
             else *value_shared = 1;
             break;
         case OBJ_ENCODING_INTSET:
-            if (zmalloc_is_nofork(orig->ptr)) kv->ptr = snapBlobCopy(orig->ptr, intsetBlobLen(orig->ptr), 1);
+            if (nofork) kv->ptr = snapBlobCopy(orig->ptr, intsetBlobLen(orig->ptr), to_arena);
             else *value_shared = 1;
             break;
         case OBJ_ENCODING_LISTPACK_EX: {
-            /* Served by the scan thread whenever the struct is in the arena:
-             * always a private copy (struct + listpack), fresh ExpireMeta. */
+            /* Private copy (struct + listpack) with a fresh ExpireMeta. */
             listpackEx *o = orig->ptr;
-            if (zmalloc_is_nofork(o)) {
+            if (nofork) {
                 listpackEx *n = snapNoforkCalloc(sizeof(*n));
                 n->meta.trash = 1;
                 n->lp = snapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
@@ -391,6 +402,14 @@ void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shar
             break;
         }
     }
+
+    snapSaveRetainedAdd(orig, *value_shared);
+
+    /* The clone takes over the original's per-slot accounting: later in-place
+     * updates and the delete of the clone are counted against the slot, the
+     * original is released unaccounted at merge time. */
+    if (db && server.memory_tracking_enabled)
+        updateSlotAllocSize(db, didx, kv, kvobjAllocSize(orig), kvobjAllocSize(kv));
 
     /* Point the expiry structures at the clone: they are not part of the
      * scanned snapshot, and every later TTL operation must act on the clone. */
@@ -415,6 +434,7 @@ void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_, int value_sh
     UNUSED(privdata);
     UNUSED(didx);
     kvobj *orig = orig_;
+    snapSaveRetainedSub(orig, value_shared);
     /* The clone carries the key metadata (no keyMetaOnFree here) and, when
      * shared, owns the value. */
     if (!value_shared) kvobjFreeValueOnly(orig);
@@ -438,6 +458,42 @@ void snapValueDetachFromArena(robj *o) {
     default:
         break;
     }
+}
+
+void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
+    kvstoreIterator kvs_it;
+    dictEntry *de;
+    void *replylen = addReplyDeferredLen(c);
+    int n = 0;
+    kvstoreIteratorInit(&kvs_it, db->keys);
+    while ((de = kvstoreIteratorNext(&kvs_it)) != NULL && n < limit) {
+        kvobj *kv = dictGetKV(de);
+        const char *drift = NULL;
+        if (!zmalloc_is_nofork(kv)) drift = "header-outside";
+        else if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
+            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) drift = "fork-value-in-arena";
+        } else if (snapValueIsInline(kv->type, kv->encoding)) {
+            drift = NULL;
+        } else if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
+            listpackEx *lpt = kv->ptr;
+            if (zmalloc_is_nofork(lpt) != zmalloc_is_nofork(lpt->lp)) drift = "listpackex-split";
+        } else {
+            void *a = snapValueAllocPtr(kv);
+            int want = snapClassify(kv->type, kv->encoding, zmalloc_size(a));
+            int in = zmalloc_is_nofork(a);
+            if (want == SNAP_NOFORK && !in) drift = "nofork-outside";
+            if (want == SNAP_FORK && in) drift = "fork-inside";
+        }
+        if (!drift) continue;
+        addReplyArrayLen(c, 4);
+        addReplyBulkCBuffer(c, kvobjGetKey(kv), sdslen(kvobjGetKey(kv)));
+        addReplyBulkCString(c, getObjectTypeName(kv));
+        addReplyBulkCString(c, strEncoding(kv->encoding));
+        addReplyBulkCString(c, drift);
+        n++;
+    }
+    kvstoreIteratorReset(&kvs_it);
+    setDeferredArrayLen(c, replylen, n);
 }
 
 void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
@@ -612,12 +668,18 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
 static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
     for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
         dict *d = kvstoreGetDict(ctx->stores[s], didx);
-        if (d) {
-            dictPauseRehashing(d);
-            dictPauseAutoResize(d);
+        if (d == NULL || dictSize(d) == 0) {
+            /* Nothing to snapshot: the slot is DONE from the start, writes go
+             * to the real dict as usual and the scan thread never reads it
+             * (so creating its dict later races with nobody). */
+            snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
+            atomicIncr(ctx->slots_scanned, 1);
+            if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, 0);
+            ctx->slots_done++;
+            continue;
         }
-        /* Every slot gets an overlay (also empty ones: adds must not touch
-         * the frozen store while the scan runs). */
+        dictPauseRehashing(d);
+        dictPauseAutoResize(d);
         if (ctx->ov_clone)
             kvstoreOverlayFreeze(ctx->stores[s], didx, ctx->ov_clone, ctx->ov_free,
                                  ctx->ov_priv ? ctx->ov_priv[s] : NULL);
@@ -627,6 +689,7 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
 
 static void snapScanUnfreezeDict(snapScanCtx *ctx, int s, int didx) {
     if (!ctx->frozen[s]) return;
+    if (snapSlotGetState(ctx, s, didx) == SNAP_SLOT_DONE) return;   /* never frozen */
     dict *d = kvstoreGetDict(ctx->stores[s], didx);
     if (d) {
         dictResumeRehashing(d);
@@ -669,11 +732,10 @@ static void *snapScanThreadMain(void *arg) {
     for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
         for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
             if (snapScanAborted(ctx)) break;
+            /* Empty at freeze: completed by the main thread already, and its
+             * dict pointer may be changing under us. Never touch it. */
+            if (snapSlotGetState(ctx, s, didx) == SNAP_SLOT_DONE) continue;
             dict *d = kvstoreGetDict(ctx->stores[s], didx);
-            if (d == NULL || dictSize(d) == 0) {
-                snapScanPublishScanned(ctx, s, didx);
-                continue;
-            }
             snapSlotSetState(ctx, s, didx, SNAP_SLOT_SCANNING);
             struct snapScanEntryArgs a = { ctx, s, didx };
             unsigned long cursor = 0;
@@ -737,7 +799,13 @@ static inline void snapScanRequestAbort(snapScanCtx *ctx) {
 static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
     /* The thread no longer reads this slot: apply the temp dict to the real
      * dict and free the replaced originals. */
-    if (ctx->ov_clone) kvstoreOverlayMerge(ctx->stores[s], didx);
+    if (ctx->ov_clone) {
+        mstime_t lat;
+        latencyStartMonitor(lat);
+        kvstoreOverlayMerge(ctx->stores[s], didx);
+        latencyEndMonitor(lat);
+        latencyAddSampleIfNeeded("hybrid-merge", lat);
+    }
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
     snapScanUnfreezeDict(ctx, s, didx);
     snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
@@ -797,8 +865,13 @@ void snapScanRelease(snapScanCtx *ctx) {
     if (ctx == NULL) return;
     snapScanJoin(ctx);
     if (ctx->started) {
-        /* Drain the tail so no slot is left frozen. */
+        /* Drain the tail, then complete whatever the thread left owed (it
+         * stopped early on a broken channel) so no slot stays frozen. */
         snapScanHandleCompletions(ctx);
+        for (int s = 0; s < ctx->num_stores; s++)
+            for (int didx = 0; didx < ctx->num_dicts[s]; didx++)
+                if (snapSlotGetState(ctx, s, didx) != SNAP_SLOT_DONE)
+                    snapScanCompleteSlot(ctx, s, didx, 1);
         serverAssert(ctx->slots_done == ctx->slots_total);
     }
     for (int s = 0; s < ctx->num_stores; s++) zfree(ctx->state[s]);
@@ -893,6 +966,11 @@ typedef struct snapSave {
     int has_rsi;
     int ae_registered;
     int aborted;               /* snapSaveAbort() ran; waiting for the child to exit */
+    int hard_mark_hit;         /* retained bytes passed the configured maximum */
+    int failed;                /* a defined failure of ours (hard mark): report status err */
+    size_t retained_bytes;     /* originals kept alive by the overlay (main thread) */
+    size_t retained_peak;
+    redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
     /* Scan-thread staging buffer (single thread in M1). */
     sds stage;
     int stage_dbid, stage_slot;
@@ -900,8 +978,63 @@ typedef struct snapSave {
 } snapSave;
 
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
+static size_t snap_last_retained_peak = 0;
 
 int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
+size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
+size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
+
+void snapSaveSetKeySaveDelay(int usec) {
+    if (snap_save) atomicSet(snap_save->key_save_delay, usec);
+}
+
+/* Bytes of an original the overlay keeps alive: its kvobj allocation plus,
+ * when the clone took a private copy, its value allocation(s). */
+static size_t snapOriginalRetainedBytes(kvobj *orig, int value_shared) {
+    size_t n = zmalloc_size(kvobjGetAllocPtr(orig));
+    if (value_shared || snapValueIsInline(orig->type, orig->encoding)) return n;
+    switch (orig->encoding) {
+    case OBJ_ENCODING_RAW: n += zmalloc_size(sdsAllocPtr(orig->ptr)); break;
+    case OBJ_ENCODING_LISTPACK:
+    case OBJ_ENCODING_INTSET: n += zmalloc_size(orig->ptr); break;
+    case OBJ_ENCODING_LISTPACK_EX: {
+        listpackEx *o = orig->ptr;
+        n += zmalloc_size(o) + zmalloc_size(o->lp);
+        break;
+    }
+    default: break;
+    }
+    return n;
+}
+
+/* Main thread, from the overlay clone callback: account a retained original
+ * and arm the hard-mark abort. The abort itself runs from snapSaveCron():
+ * we are inside a keyspace write here and the overlay must stay intact. */
+static void snapSaveRetainedAdd(kvobj *orig, int value_shared) {
+    if (!snap_save || snap_save->aborted) return;
+    snapSave *sv = snap_save;
+    sv->retained_bytes += snapOriginalRetainedBytes(orig, value_shared);
+    if (sv->retained_bytes > sv->retained_peak) sv->retained_peak = sv->retained_bytes;
+    if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit &&
+        sv->retained_bytes > server.bgsave_hybrid_max_retained_bytes) {
+        sv->hard_mark_hit = 1;
+        serverLog(LL_WARNING, "Hybrid BGSAVE: overlay retains %zu bytes, past bgsave-hybrid-max-retained-bytes (%zu): aborting the save",
+                  sv->retained_bytes, server.bgsave_hybrid_max_retained_bytes);
+    }
+}
+
+static void snapSaveRetainedSub(kvobj *orig, int value_shared) {
+    if (!snap_save) return;
+    size_t n = snapOriginalRetainedBytes(orig, value_shared);
+    snap_save->retained_bytes = n > snap_save->retained_bytes ? 0 : snap_save->retained_bytes - n;
+}
+
+void snapSaveCron(void) {
+    if (!snap_save || snap_save->aborted || !snap_save->hard_mark_hit) return;
+    snap_save->failed = 1;
+    server.stat_snap_hard_mark_aborts++;
+    killRDBChild();   /* -> snapSaveAbort(): merges the overlay; the done handler releases */
+}
 
 int snapKeyIsOwed(redisDb *db, sds key) {
     if (!snap_save || snap_save->aborted) return 0;
@@ -954,7 +1087,7 @@ static int snapReadAll(int fd, void *p, size_t n) {
             if (errno == EINTR) continue;
             return -1;
         }
-        if (r == 0) return -1;   /* EOF */
+        if (r == 0) { errno = 0; return -1; }   /* EOF */
         c += r;
         n -= r;
     }
@@ -1009,6 +1142,13 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         rioInitWithBuffer(&r, sv->stage);
         robj key;
         initStaticStringObject(key, kvobjGetKey(kv));
+        int delay;
+        atomicGet(sv->key_save_delay, delay);
+        while (delay > 0 && !snapScanAborted(sv->scan)) {
+            int slice = delay > 10000 ? 10000 : delay;
+            debugDelay(slice);
+            delay -= slice;
+        }
         if (rdbSaveKeyValuePair(&r, &key, kv, kvobjGetExpire(kv), s) == -1) {
             serverLog(LL_WARNING, "Hybrid BGSAVE: failed to serialize a key on the scan thread");
             snapScanRequestAbort(sv->scan);
@@ -1143,6 +1283,8 @@ static int snapSaveChildWrite(snapSave *sv) {
 werr:
     if (aborted)
         serverLog(LL_NOTICE, "Hybrid BGSAVE aborted by the parent.");
+    else if (errno == 0)
+        serverLog(LL_WARNING, "Hybrid BGSAVE: the parent closed the channel (%s)", err_op);
     else
         serverLog(LL_WARNING, "Hybrid BGSAVE: write error (%s): %s", err_op, strerror(errno));
     zfree(payload);
@@ -1230,6 +1372,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
 #endif
     sv->stage = sdsempty();
     sv->stage_dbid = sv->stage_slot = -1;
+    atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     snapScanSetOverlay(sv->scan, snapOverlayCloneKey, snapOverlayFreeOriginal, sv->privs);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
@@ -1239,7 +1382,11 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     server.lastbgsave_try = time(NULL);
 
     /* FORK INSTANT: freeze, then fork. */
+    mstime_t freeze_lat;
+    latencyStartMonitor(freeze_lat);
     snapScanFreeze(sv->scan);
+    latencyEndMonitor(freeze_lat);
+    latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
     pid_t childpid = redisFork(CHILD_TYPE_RDB);
     if (childpid == 0) {
         snapSaveChild(sv);   /* never returns */
@@ -1283,14 +1430,20 @@ void snapSaveAbort(void) {
 }
 
 void snapSaveChildDone(int exitcode, int bysignal) {
-    UNUSED(exitcode);
-    UNUSED(bysignal);
     if (!snap_save) return;
     snapSave *sv = snap_save;
-    if (!snapScanIsFinished(sv->scan)) {
-        /* The child is gone before the scan completed: stop and merge. */
+    /* The child is gone. If the scan did not complete (or the thread stopped
+     * on its own when the channel broke, leaving slots owed), stop it and
+     * merge every remaining slot. Harmless after a clean finish. */
+    if (!(!bysignal && exitcode == 0) || !snapScanIsFinished(sv->scan))
         snapScanAbort(sv->scan);
+    if (sv->failed) {
+        /* Our own defined failure (hard mark): the child was ended with the
+         * whitelisted SIGUSR1, which the plain done handler does not count. */
+        server.lastbgsave_status = C_ERR;
+        server.stat_rdb_consecutive_failures++;
     }
+    snap_last_retained_peak = sv->retained_peak;
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions (merges), joins, unregisters */
     serverLog(LL_NOTICE, "Hybrid BGSAVE: scan thread joined and overlay released.");
@@ -1582,8 +1735,13 @@ static void snapScanTests(int accurate) {
     test_cond("scan: every inserted key was dispatched exactly once", all_seen && bad == 0);
     test_cond("scan: dispatch always ran with its slot in SCANNING state", wrong_state == 0);
     test_cond("scan: concurrent owner-thread lookups all hit", reads > 0 && misses == 0);
+    /* Slots empty at freeze complete right there (no ring entry), the rest
+     * through the completion ring: together, every slot exactly once. */
+    int empty_slots = 0;
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) if (st->inserted[s][didx] == 0) empty_slots++;
     test_cond("scan: every slot completed exactly once, none aborted",
-              done_once && completions == SNAP_TEST_STORES * SNAP_TEST_DICTS);
+              done_once && completions + empty_slots == SNAP_TEST_STORES * SNAP_TEST_DICTS);
     test_cond("scan: all slots DONE at the end", snapTestAllState(ctx, SNAP_SLOT_DONE));
     test_cond("scan: no slot is owed after completion", !snapScanKeyIsOwed(ctx, 0, 0) && !snapScanKeyIsOwed(ctx, 1, 3));
     test_cond("scan: all dicts unfrozen at the end", snapTestAllUnfrozen(stores));
@@ -1642,9 +1800,11 @@ static void snapScanTests(int accurate) {
         st->ctx = NULL;
         test_cond("empty: start", snapScanStart(ectx) == C_OK);
         while (!snapScanIsFinished(ectx)) usleep(100);
-        int n = snapScanHandleCompletions(ectx);
+        snapScanHandleCompletions(ectx);
         atomicGet(st->dispatched, dispatched);
-        test_cond("empty: all 9 slots completed with zero dispatches", n == 9 && dispatched == 0);
+        long et, esc, edn; long long ekd;
+        snapScanProgress(ectx, &et, &esc, &edn, &ekd);
+        test_cond("empty: all 9 slots completed (at freeze) with zero dispatches", et == 9 && edn == 9 && esc == 9 && dispatched == 0);
         snapScanRelease(ectx);
         kvstoreRelease(empty[0]);
         kvstoreRelease(empty[1]);
@@ -1887,7 +2047,8 @@ static void snapOverlayTests(int abort_variant) {
     st->ctx = ctx;
     snapScanSetOverlay(ctx, ovTestClone, ovTestFree, privs);
     test_cond("overlay: start", snapScanStart(ctx) == C_OK);
-    test_cond("overlay: slot 0 is frozen", kvstoreOverlayIsFrozen(ks, 0) && kvstoreOverlayIsFrozen(ks, 3));
+    test_cond("overlay: the populated slot is frozen, the empty one is DONE and not frozen",
+              kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !snapScanKeyIsOwed(ctx, 0, 3));
     dict *frozen = kvstoreGetDict(ks, 0);
 
     /* Read: original, no clone. */
@@ -1926,9 +2087,9 @@ static void snapOverlayTests(int abort_variant) {
               kvstoreDictFind(ks, 0, "k:0:0:new") && dictGetKey(kvstoreDictFind(ks, 0, "k:0:0:7")) == readd7);
     test_cond("overlay: logical size is N+1", kvstoreDictSize(ks, 0) == (unsigned long)N + 1 && kvstoreSize(ks) == (unsigned long long)N + 1);
     test_cond("overlay: frozen dict does not contain the added key", dictFind(frozen, "k:0:0:new") == NULL);
-    /* Add to an empty frozen slot (no dict allocated). */
+    /* Add to a slot that was empty at freeze: not frozen, goes to a real dict. */
     kvstoreDictSetAtLink(ks, 3, zstrdup("k:0:3:0"), NULL, 1);
-    test_cond("overlay: add into an empty frozen slot works", kvstoreDictFind(ks, 3, "k:0:3:0") != NULL && kvstoreDictSize(ks, 3) == 1 && kvstoreGetDict(ks, 3) == NULL);
+    test_cond("overlay: add into a slot empty at freeze goes to its real dict", kvstoreDictFind(ks, 3, "k:0:3:0") != NULL && kvstoreDictSize(ks, 3) == 1 && kvstoreGetDict(ks, 3) != NULL);
 
     /* Enumeration sees the logical keyspace. */
     int has_new = 0; void *e5 = NULL;

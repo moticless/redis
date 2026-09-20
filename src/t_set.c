@@ -558,6 +558,7 @@ int setTypeConvertAndExpand(robj *setobj, int enc, unsigned long cap, int panic)
         freeSetObject(setobj); /* frees the internals but not setobj itself */
         setobj->encoding = OBJ_ENCODING_LISTPACK;
         setobj->ptr = lp;
+        snapPlaceValue(setobj); /* hybrid BGSAVE: a fresh single-allocation value */
     } else {
         serverPanic("Unsupported set conversion");
     }

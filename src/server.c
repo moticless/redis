@@ -347,6 +347,9 @@ static void dictDestructorKV(dict *d, void *key) {
         kvstoreMetadata *kvstoreMeta = kvstoreGetMetadata(kvs);
         kvstoreDictMetadata *meta = (kvstoreDictMetadata *)dictMetadata(d);
         size_t alloc_size = kvobjAllocSize(kv);
+        if (alloc_size > meta->alloc_size)
+            serverLog(LL_WARNING, "slot alloc_size drift: key '%s' type %d enc %d size %zu > meta %zu (hybrid save in progress: %d)",
+                      kvobjGetKey(kv), kv->type, kv->encoding, alloc_size, meta->alloc_size, snapSaveInProgress());
         debugServerAssert(alloc_size <= meta->alloc_size);
         meta->alloc_size -= alloc_size;
         /* kvstoreMeta may be NULL when freeing kvstore created with kvstoreBaseType
@@ -1683,6 +1686,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
+    snapSaveCron();
     if (hasActiveChildProcess() || ldbPendingChildren())
     {
         run_with_period(1000) receiveChildInfo();
@@ -6574,6 +6578,9 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "snap_save_keys_nofork:%lld\r\n", snap_keys_nofork,
             "snap_save_keys_fork:%lld\r\n", snap_keys_fork,
             "snap_save_bytes_sent:%lld\r\n", snap_bytes_sent,
+            "snap_save_retained_bytes:%zu\r\n", snapSaveRetainedBytes(),
+            "snap_last_save_retained_peak:%zu\r\n", snapSaveLastRetainedPeak(),
+            "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
             "rdb_last_save_time:%jd\r\n", (intmax_t)server.lastsave,
             "rdb_last_bgsave_status:%s\r\n", (server.lastbgsave_status == C_OK) ? "ok" : "err",
             "rdb_last_bgsave_time_sec:%jd\r\n", (intmax_t)server.rdb_save_time_last,

@@ -12221,6 +12221,13 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
 int RM_Fork(RedisModuleForkDoneHandler cb, void *user_data) {
     pid_t childpid;
 
+    /* Hybrid BGSAVE arena: the keyspace is MADV_DONTFORK, a module child
+     * reading keys would fault. Refused rather than crash. */
+    if (snapArenaAvailable()) {
+        serverLog(LL_WARNING, "RedisModule_Fork refused: the keyspace lives in the SNAP_NOFORK arena (bgsave-hybrid)");
+        errno = EPERM;
+        return -1;
+    }
     if ((childpid = redisFork(CHILD_TYPE_MODULE)) == 0) {
         /* Child */
         redisSetProcTitle("redis-module-fork");

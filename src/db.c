@@ -655,6 +655,8 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         kvNew = old;
         old = val;
+        /* The adopted value was allocated by the command: place it (hybrid BGSAVE). */
+        snapPlaceValue(kvNew);
 
         /* Handle TTL in the optimization path */
         if ((!keepTTL) && (oldExpire >= 0))
@@ -899,7 +901,7 @@ int dbGenericDelete(redisDb *db, robj *key, int async, int flags) {
             /* Set the key to NULL in the main dictionary. */
             kvstoreDictSetAtLink(db->keys, slot, NULL, &link, 0);
         }
-        kvstoreDictTwoPhaseUnlinkFree(db->keys, slot, link, table);
+        kvstoreDictTwoPhaseUnlinkFreeKey(db->keys, slot, link, table, key->ptr);
 
         /* remove key from histogram */
         if(!(flags & DB_FLAG_NO_UPDATE_KEYSIZES))

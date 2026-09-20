@@ -2450,6 +2450,8 @@ struct redisServer {
     /* Zip structure config, see redis.conf for more information  */
     int bgsave_hybrid;              /* Hybrid BGSAVE: SNAP_NOFORK arena + background scan (snapshot.c). Startup only. */
     size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
+    size_t bgsave_hybrid_max_retained_bytes; /* Hybrid save aborts when the overlay retains more than this (0 = no limit). */
+    long long stat_snap_hard_mark_aborts;    /* Hybrid saves aborted at the retained-bytes hard mark. */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;
     size_t set_max_intset_entries;

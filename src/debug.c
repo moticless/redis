@@ -464,6 +464,9 @@ void debugCommand(client *c) {
 "OBJECT <key>",
 "    Show low level info about `key` and associated value.",
 "SNAP-PLACEMENT [<dbid>]",
+"    Hybrid BGSAVE: placement statistics of the keyspace (arena vs class).",
+"SNAP-DRIFT [<dbid>]",
+"    Hybrid BGSAVE: list up to 50 keys whose value placement disagrees with its class.",
 "    Report SNAP_NOFORK/SNAP_FORK placement statistics of a database (hybrid BGSAVE).",
 "DROP-CLUSTER-PACKET-FILTER <packet-type>",
 "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
@@ -701,6 +704,18 @@ NULL
         addReplyBulkCString(c, "drift_nofork_outside"); addReplyLongLong(c, st.drift_nofork_outside);
         addReplyBulkCString(c, "drift_fork_inside"); addReplyLongLong(c, st.drift_fork_inside);
         addReplyBulkCString(c, "violations"); addReplyLongLong(c, st.violations);
+    } else if (!strcasecmp(c->argv[1]->ptr,"snap-drift") && (c->argc == 2 || c->argc == 3)) {
+        redisDb *db = c->db;
+        if (c->argc == 3) {
+            long long dbid;
+            if (getLongLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return;
+            if (dbid < 0 || dbid >= server.dbnum) {
+                addReplyError(c, "Out of range database");
+                return;
+            }
+            db = &server.db[dbid];
+        }
+        snapPlacementDriftReply(c, db, 50);
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         kvobj *kv;
         char *strenc;
