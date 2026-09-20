@@ -209,7 +209,9 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             populate_all_types
             populate_fillers 3000
             set digest [debug_digest]
-            r config set rdb-key-save-delay 300
+            # slow enough that the writes below always race the scan, even on a
+            # loaded CI box (the delay is reset to 0 once they are done)
+            r config set rdb-key-save-delay 5000
             r bgsave
             wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
             # mutate owed keys of every kind while the scan runs

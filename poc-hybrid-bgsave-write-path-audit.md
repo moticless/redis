@@ -393,3 +393,15 @@ Reviewed line by line against the tree. The primitive inventory, the command tab
 | Serializer reads of `lpt->meta` | `rdbSaveObject` uses `hashTypeGetMinExpire(o, 1)` on the scan thread (`snapOnScanThread`). |
 
 Blockers still open: eviction during a save only tombstones (no memory reclaimed until merge); cluster ASM slot import/trim during a save is not guarded; diskless sync and AOF rewrite are refused in hybrid mode (M2).
+
+### Additions found by the harness (2026-09-21)
+
+| Path | Treatment |
+|---|---|
+| SET overwrite, in-place swap path of `dbSetValue` (old kvobj kept, `ptr` swapped) | `snapPlaceValue(kvNew)` after the swap: the adopted value follows the placement policy |
+| `setTypeConvertAndExpand` to listpack, `zsetConvertAndExpand` to listpack | `snapPlaceValue` after installing the fresh listpack |
+| Async delete (UNLINK) of an owed key | key passed explicitly to `kvstoreDictTwoPhaseUnlinkFreeKey`: the entry's value is already detached |
+| Slot empty at freeze | never frozen (DONE from the start); adds go to a real dict created on demand |
+| Cluster memory tracking on the overlay | temp dict destructor accounts on the real dict; a clone takes over its original's `alloc_size` |
+| Scan-thread reads of `server.*` | `rdb_key_save_delay`, `maxmemory_policy`, `rdb_compression` copied per save; LRU clock computed with `getLRUClock()`; `hashTypeNext` only reads `allow_access_expired` when skipping was requested |
+| Arena-free mode | single-allocation values are always copied on clone (the scan thread classifies by reading the allocation) |
