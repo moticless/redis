@@ -351,6 +351,14 @@ void zfree_with_flags(void *ptr, int flags) {
     update_zmalloc_stat_free(zmalloc_size(ptr));
     dallocx(ptr, flags);
 }
+
+/* Sized free with explicit jemalloc flags (arena / tcache selection). 'size'
+ * must be the usable size so used_memory accounting stays accurate. */
+void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
+    if (ptr == NULL) return;
+    update_zmalloc_stat_free(size);
+    je_sdallocx(ptr, size, flags);
+}
 #endif
 
 /* Allocation and free functions that bypass the thread cache

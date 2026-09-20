@@ -1508,6 +1508,14 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_resident,
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
+        if (server.snap_nofork_arena != UINT_MAX) {
+            zmalloc_get_allocator_info_by_arena(server.snap_nofork_arena,
+                                                0,
+                                                &server.cron_malloc_stats.nofork_allocator_allocated,
+                                                &server.cron_malloc_stats.nofork_allocator_active,
+                                                &server.cron_malloc_stats.nofork_allocator_resident,
+                                                &server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes);
+        }
         /* in case the allocator isn't providing these stats, fake them so that
          * fragmentation info still shows some (inaccurate metrics) */
         if (!server.cron_malloc_stats.allocator_resident)
@@ -3028,6 +3036,10 @@ void initServer(void) {
         exit(1);
     }
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
+
+    /* Create the SNAP_NOFORK (MADV_DONTFORK) arena before any keyspace
+     * structure is allocated (see snapshot.c). */
+    snapArenaInit();
 
     /* Create the Redis databases, and initialize other internal state. */
     int slot_count_bits = 0;
@@ -6514,6 +6526,11 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "mem_aof_buffer:%zu\r\n", mh->aof_buffer,
             "mem_allocator:%s\r\n", ZMALLOC_LIB,
             "mem_overhead_db_hashtable_rehashing:%zu\r\n", mh->overhead_db_hashtable_rehashing,
+            "allocator_allocated_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_allocated,
+            "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
+            "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
+            "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
+            "snap_nofork_arena_available:%d\r\n", snapArenaAvailable(),
             "active_defrag_running:%d\r\n", server.active_defrag_running,
             "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
             "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
@@ -7886,6 +7903,7 @@ struct redisTest {
     {"zset", zsetTest},
     {"topk", chkTopKTest},
     {"fastfloat", fastFloatTest},
+    {"snapshot", snapshotTest},
 };
 redisTestProc *getTestProcByName(const char *name) {
     int numtests = sizeof(redisTests)/sizeof(struct redisTest);

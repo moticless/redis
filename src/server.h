@@ -1896,6 +1896,10 @@ struct malloc_stats {
     size_t lua_allocator_active;
     size_t lua_allocator_resident;
     size_t lua_allocator_frag_smallbins_bytes;
+    size_t nofork_allocator_allocated;
+    size_t nofork_allocator_active;
+    size_t nofork_allocator_resident;
+    size_t nofork_allocator_frag_smallbins_bytes;
 };
 
 /*-----------------------------------------------------------------------------
@@ -2444,6 +2448,7 @@ struct redisServer {
     int sort_bypattern;
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
+    size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;
     size_t set_max_intset_entries;
@@ -2522,6 +2527,7 @@ struct redisServer {
     int cluster_slot_stats_enabled; /* Cluster slot usage statistics tracking enabled. */
     /* Scripting */
     unsigned int lua_arena;         /* eval lua arena used in jemalloc. */
+    unsigned int snap_nofork_arena; /* SNAP_NOFORK (MADV_DONTFORK) jemalloc arena, UINT_MAX if unavailable. */
     mstime_t busy_reply_threshold;  /* Script / module timeout in milliseconds */
     int pre_command_oom_state;         /* OOM before command (script?) was started */
     int script_disable_deny_script;    /* Allow running commands marked "noscript" inside a script. */
@@ -4618,5 +4624,7 @@ int iAmMaster(void);
 
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
+
+#include "snapshot.h"
 
 #endif

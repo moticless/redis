@@ -136,6 +136,7 @@ void zmadvise_dontneed(void *ptr);
 void *zmalloc_with_flags(size_t size, int flags);
 void *zrealloc_with_flags(void *ptr, size_t size, int flags);
 void zfree_with_flags(void *ptr, int flags);
+void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #endif
 
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))
