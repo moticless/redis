@@ -545,6 +545,14 @@ void zfree_nofork_size(void *ptr, size_t size) {
     zfree_with_size_and_flags(ptr, size, noforkFlags());
 }
 
+void *ztrycalloc_nofork(size_t size) {
+    if (nofork_arena == UINT_MAX) return ztrycalloc(size);
+    if (size >= SIZE_MAX/2) return NULL;
+    void *ptr = mallocx(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
+    if (ptr) update_zmalloc_stat_alloc(zmalloc_size(ptr));
+    return ptr;
+}
+
 /* For defrag: bypass the thread cache so a freed block cannot be handed back. */
 void *zmalloc_nofork_no_tcache(size_t size) {
     if (nofork_arena == UINT_MAX) return zmalloc(size);

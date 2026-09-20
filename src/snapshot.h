@@ -114,6 +114,8 @@ typedef struct snapPlacementStats {
     long long drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
     long long drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
     long long violations;              /* header outside, or multi-allocation value inside */
+    long long dict_tables_in_arena;    /* dict structs + bucket arrays of db->keys / db->expires */
+    long long dict_tables_outside;
 } snapPlacementStats;
 void snapPlacementScan(redisDb *db, snapPlacementStats *st);
 

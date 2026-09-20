@@ -689,8 +689,10 @@ NULL
         }
         snapPlacementStats st;
         snapPlacementScan(db, &st);
-        addReplyMapLen(c, 9);
+        addReplyMapLen(c, 11);
         addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
+        addReplyBulkCString(c, "dict_tables_in_arena"); addReplyLongLong(c, st.dict_tables_in_arena);
+        addReplyBulkCString(c, "dict_tables_outside"); addReplyLongLong(c, st.dict_tables_outside);
         addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, snapArenaAvailable());
         addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
         addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);

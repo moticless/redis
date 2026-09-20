@@ -652,6 +652,7 @@ dictType dbDictType = {
     .keyFromStoredKey = kvGetKey,    /* get key from stored-key */
     .prefetchEntryKey = dbDictPrefetchEntryKey,
     .prefetchEntryValue = dbDictPrefetchEntryValue,
+    .nofork_alloc = 1,      /* hybrid BGSAVE: tables live in the SNAP_NOFORK arena */
 };
 
 /* Db->expires */
@@ -666,6 +667,7 @@ dictType dbExpiresDictType = {
     .no_value = 1,              /* keys and values are unified (kvobj) */
     .keys_are_odd = 0,          /* simple kvobj (robj) struct */
     .keyFromStoredKey = kvGetKey,   /* get key from stored-key */
+    .nofork_alloc = 1,          /* hybrid BGSAVE: tables live in the SNAP_NOFORK arena */
 };
 
 /* Command table. sds string -> command struct pointer. */

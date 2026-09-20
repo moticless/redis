@@ -71,6 +71,8 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes}} {
             assert_equal 0 [dict get $st violations]
             assert_equal 0 [dict get $st drift_nofork_outside]
             assert_equal 0 [dict get $st drift_fork_inside]
+            assert_equal 0 [dict get $st dict_tables_outside]
+            assert {[dict get $st dict_tables_in_arena] >= 2}
             # NOFORK: str:small str:embstr str:raw str:int hash:lp hash:lpex set:intset set:lp zset:lp list:lp = 10
             assert_equal 10 [dict get $st class_nofork]
             # FORK: str:big hash:ht set:ht zset:sl list:ql stream:x = 6

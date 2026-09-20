@@ -307,8 +307,22 @@ void snapPlaceValue(robj *o) {
     }
 }
 
+static void snapPlacementScanTables(kvstore *kvs, snapPlacementStats *st) {
+    for (int didx = 0; didx < kvstoreNumDicts(kvs); didx++) {
+        dict *d = kvstoreGetDict(kvs, didx);
+        if (d == NULL) continue;
+        if (zmalloc_is_nofork(d)) st->dict_tables_in_arena++; else st->dict_tables_outside++;
+        for (int t = 0; t < 2; t++) {
+            if (d->ht_table[t] == NULL) continue;
+            if (zmalloc_is_nofork(d->ht_table[t])) st->dict_tables_in_arena++; else st->dict_tables_outside++;
+        }
+    }
+}
+
 void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
     memset(st, 0, sizeof(*st));
+    snapPlacementScanTables(db->keys, st);
+    snapPlacementScanTables(db->expires, st);
     kvstoreIterator kvs_it;
     dictEntry *de;
     kvstoreIteratorInit(&kvs_it, db->keys);
@@ -1126,6 +1140,35 @@ static void snapPlacementTests(void) {
         decrRefCount(kv);
     }
     sdsfree(key);
+
+    /* Keyspace-style dicts (nofork_alloc) put struct, tables and entry nodes in the arena. */
+    {
+        dictType nofork = KvstoreDictTestType;
+        nofork.no_value = 1;
+        nofork.nofork_alloc = 1;
+        dictType plain = KvstoreDictTestType;
+        plain.no_value = 1;
+        kvstore *ks = kvstoreCreate(&KvstoreTestType, &nofork, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+        kvstore *kp = kvstoreCreate(&KvstoreTestType, &plain, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+        dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+        for (int i = 0; i < 3000; i++) {
+            serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
+            serverAssert(kvstoreDictAddRaw(kp, 0, snapTestKey(0, 0, i), NULL) != NULL);
+        }
+        dict *ds = kvstoreGetDict(ks, 0), *dp = kvstoreGetDict(kp, 0);
+        while (dictIsRehashing(ds)) dictRehash(ds, 100);
+        test_cond("nofork_alloc dict: kvstore struct, dict struct and bucket array are in the arena",
+                  zmalloc_is_nofork(ks) && zmalloc_is_nofork(ds) && zmalloc_is_nofork(ds->ht_table[0]));
+        test_cond("default dict: struct and bucket array are outside the arena",
+                  !zmalloc_is_nofork(kp) && !zmalloc_is_nofork(dp) && !zmalloc_is_nofork(dp->ht_table[0]));
+        /* Force another expand (rehash allocates a new table) and check it too. */
+        for (int i = 3000; i < 9000; i++)
+            serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
+        test_cond("nofork_alloc dict: table allocated by rehash is in the arena",
+                  zmalloc_is_nofork(ds->ht_table[0]) && (ds->ht_table[1] == NULL || zmalloc_is_nofork(ds->ht_table[1])));
+        kvstoreRelease(ks);
+        kvstoreRelease(kp);
+    }
 }
 
 int snapshotTest(int argc, char **argv, int flags) {

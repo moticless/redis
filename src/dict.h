@@ -125,6 +125,11 @@ typedef struct dictType {
 
     /* Ensures that the entire hash table is rehashed at once if set. */
     unsigned int force_full_rehash:1;
+
+    /* Allocate the dict struct, bucket arrays and entry nodes in the
+     * SNAP_NOFORK arena (hybrid BGSAVE, keyspace dicts only). Frees need no
+     * special handling: the generic zfree/zrealloc are arena-aware. */
+    unsigned int nofork_alloc:1;
     
     /* Callback to extract key from stored-key object. When set, the dict can
      * store keys in one format (e.g., a structure) but look them up using a

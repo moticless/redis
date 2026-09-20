@@ -166,6 +166,7 @@ void *zrealloc_nofork(void *ptr, size_t size);
 void zfree_nofork(void *ptr);
 void zfree_nofork_size(void *ptr, size_t size);
 __attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);
+void *ztrycalloc_nofork(size_t size);           /* NULL on OOM */
 void zmalloc_nofork_va_stats(size_t *reserved, size_t *used);
 /* Allocate 'size' bytes in the same arena as 'like' (default or SNAP_NOFORK),
  * for containers that replace a buffer instead of reallocating it in place. */
@@ -178,6 +179,10 @@ static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *u
     (void)like;
     return zmalloc_usable(size, usable);
 }
+/* No arena on this platform: the SNAP_NOFORK entry points are the defaults. */
+#define zmalloc_nofork(size) zmalloc(size)
+#define zcalloc_nofork(size) zcalloc(size)
+#define ztrycalloc_nofork(size) ztrycalloc(size)
 #endif
 
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))

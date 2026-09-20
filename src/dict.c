@@ -145,8 +145,8 @@ static inline int entryIsNormal(const dictEntry *de) {
 }
 
 /* Creates an entry without a value field. */
-static inline dictEntry *createEntryNoValue(void *key __stored_key, dictEntry *next) {
-    dictEntryNoValue *entry = zmalloc(sizeof(*entry));
+static inline dictEntry *createEntryNoValue(dict *d, void *key __stored_key, dictEntry *next) {
+    dictEntryNoValue *entry = d->type->nofork_alloc ? zmalloc_nofork(sizeof(*entry)) : zmalloc(sizeof(*entry));
     entry->key = key;
     entry->next = next;
     return (dictEntry *) entry;
@@ -198,7 +198,7 @@ static void _dictReset(dict *d, int htidx)
 dict *dictCreate(dictType *type)
 {
     size_t metasize = type->dictMetadataBytes ? type->dictMetadataBytes(NULL) : 0;
-    dict *d = zmalloc(sizeof(*d)+metasize);
+    dict *d = type->nofork_alloc ? zmalloc_nofork(sizeof(*d)+metasize) : zmalloc(sizeof(*d)+metasize);
     if (metasize > 0) {
         memset(dictMetadata(d), 0, metasize);
     }
@@ -257,12 +257,14 @@ int _dictResize(dict *d, unsigned long size, int* malloc_failed)
 
     /* Allocate the new hash table and initialize all pointers to NULL */
     if (malloc_failed) {
-        new_ht_table = ztrycalloc(newsize*sizeof(dictEntry*));
+        new_ht_table = d->type->nofork_alloc ? ztrycalloc_nofork(newsize*sizeof(dictEntry*))
+                                             : ztrycalloc(newsize*sizeof(dictEntry*));
         *malloc_failed = new_ht_table == NULL;
         if (*malloc_failed)
             return DICT_ERR;
     } else
-        new_ht_table = zcalloc(newsize*sizeof(dictEntry*));
+        new_ht_table = d->type->nofork_alloc ? zcalloc_nofork(newsize*sizeof(dictEntry*))
+                                             : zcalloc(newsize*sizeof(dictEntry*));
 
     new_ht_used = 0;
 
@@ -361,7 +363,7 @@ static void rehashEntriesInBucketAtIndex(dict *d, uint64_t idx) {
                 
             } else if (entryIsKey(de)) {
                 /* We don't have an allocated entry but we need one. */
-                de = createEntryNoValue(storedKey, d->ht_table[1][h]);
+                de = createEntryNoValue(d, storedKey, d->ht_table[1][h]);
             } else {
                 dictSetNext(de, d->ht_table[1][h]);
             }
@@ -556,14 +558,14 @@ dictEntry *dictInsertKeyAtLink(dict *d, void *key __stored_key, dictEntryLink li
             assert(entryIsKey(entry));
         } else {
             /* Allocate an entry without value. */
-            entry = createEntryNoValue(key, *bucket);
+            entry = createEntryNoValue(d, key, *bucket);
         }
     } else {
         /* Allocate the memory and store the new entry.
          * Insert the element in top, with the assumption that in a database
          * system it is more likely that recently added entries are accessed
          * more frequently. */
-        entry = zmalloc(sizeof(*entry));
+        entry = d->type->nofork_alloc ? zmalloc_nofork(sizeof(*entry)) : zmalloc(sizeof(*entry));
         assert(entryIsNormal(entry)); /* Check alignment of allocation */
         entry->key = key;
         entry->next = *bucket;
