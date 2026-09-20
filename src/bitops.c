@@ -801,6 +801,7 @@ static kvobj *lookupStringForBitCommand(client *c, uint64_t maxbit,
         if (server.memory_tracking_enabled)
             oldAllocSize = kvobjAllocSize(o);
         o->ptr = sdsgrowzero(o->ptr,byte+1);
+        snapPlaceValue(o); /* may leave the SNAP_NOFORK arena when crossing the threshold */
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldAllocSize, kvobjAllocSize(o));
         *strGrowSize = sdslen(o->ptr) - *strOldSize;

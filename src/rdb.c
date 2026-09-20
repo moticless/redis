@@ -2071,6 +2071,14 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
+    if (server.bgsave_hybrid) {
+        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
+         * fork child cannot walk the keyspace. Until the hybrid save path is
+         * wired (snapshot.c), refuse rather than crash the child. */
+        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
+                              "operation yet; refusing to fork a stock serializer.");
+        return C_ERR;
+    }
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
@@ -4641,6 +4649,14 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
 
     if (hasActiveChildProcess()) return C_ERR;
+    if (server.bgsave_hybrid) {
+        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
+         * fork child cannot walk the keyspace. Until the hybrid save path is
+         * wired (snapshot.c), refuse rather than crash the child. */
+        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
+                              "operation yet; refusing to fork a stock serializer.");
+        return C_ERR;
+    }
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */

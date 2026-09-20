@@ -31,12 +31,19 @@ struct listpackEx;
 
 /* Create the SNAP_NOFORK arena. Must be called once, in the main thread,
  * before any snapNofork* allocation (initServer does it before creating the
- * db kvstores). On platforms without jemalloc or MADV_DONTFORK this is a
- * no-op and snapArenaAvailable() returns 0. */
+ * db kvstores). Only creates the arena when the startup config
+ * `bgsave-hybrid` is enabled: with headers in a DONTFORK arena no fork child
+ * can read the keyspace, so the stock fork-based serializers cannot be used
+ * and every save must go through the hybrid path. On platforms without
+ * jemalloc or MADV_DONTFORK this is a no-op and snapArenaAvailable() is 0. */
 void snapArenaInit(void);
 
 /* 1 if the DONTFORK arena exists and the hybrid save path may be used. */
 int snapArenaAvailable(void);
+
+/* Reserved / bump-allocated bytes of the arena's address range (0 if unavailable). */
+size_t snapArenaVaReserved(void);
+size_t snapArenaVaUsed(void);
 
 /* ---- Fast allocation API for SNAP_NOFORK memory -------------------------- */
 
@@ -47,6 +54,7 @@ int snapArenaAvailable(void);
  * on SNAP_NOFORK memory). When the arena is unavailable they degrade to
  * zmalloc/zrealloc/zfree. Calling any of them from a fork child panics. */
 void *snapNoforkAlloc(size_t size);
+void *snapNoforkCalloc(size_t size);
 void *snapNoforkAllocUsable(size_t size, size_t *usable);
 void *snapNoforkRealloc(void *ptr, size_t size);
 void snapNoforkFree(void *ptr);
@@ -64,10 +72,50 @@ void snapLpFree(unsigned char *lp);
 void snapIntsetFree(intset *is);
 void snapListpackExFree(struct listpackEx *lpt);
 
-/* 1 if 'ptr' was allocated from the SNAP_NOFORK arena. Costs an allocator
- * metadata lookup; intended for assertions and tests, not hot paths. 'ptr'
- * must be a live allocator pointer (heap memory). */
+/* 1 if 'ptr' lies in the SNAP_NOFORK arena's reserved address range. A
+ * two-compare range check (see zmalloc_is_nofork), cheap enough for hot paths. */
 int snapPtrIsNofork(const void *ptr);
+
+/* ---- Classification and placement ---------------------------------------- */
+
+/* 1 if a value with this type/encoding is a single allocation that MAY be
+ * SNAP_NOFORK (strings; listpack list/set/zset/hash; intset; listpack-ex).
+ * Multi-allocation encodings (hashtable, skiplist, quicklist, stream, module,
+ * arrays) are always SNAP_FORK. */
+int snapEncodingIsNoforkClass(int type, int encoding);
+
+/* Placement policy: SNAP_NOFORK iff the encoding qualifies and the value's
+ * allocation is at most save-small-max-bytes (INT/EMBSTR values have no
+ * separate allocation and are always SNAP_NOFORK). */
+int snapClassify(int type, int encoding, size_t alloc_bytes);
+
+/* Actual class of a stored key, decided by where its value memory IS: a key is
+ * SNAP_NOFORK when its value has no separate allocation or when its single
+ * allocation (for listpack-ex: both the struct and its listpack) lies in the
+ * SNAP_NOFORK arena; otherwise SNAP_FORK. The background scan serializes
+ * SNAP_NOFORK keys itself and ships SNAP_FORK keys to the fork child, so this
+ * is correct regardless of policy drift. */
+int snapKeyClass(const robj *o);
+
+/* Apply the placement policy to a value: move a single-allocation value into
+ * the arena when snapClassify() says SNAP_NOFORK and it is outside, or out of
+ * the arena when it says SNAP_FORK and it is inside. Called by kvobjSet() at
+ * every keyspace insertion and after unbounded in-place growth of strings.
+ * Only the value moves; the header (and thus every pointer to it) stays. */
+void snapPlaceValue(robj *o);
+
+/* Keyspace placement statistics (DEBUG SNAP-PLACEMENT). */
+typedef struct snapPlacementStats {
+    long long keys;
+    long long headers_in_arena;        /* every kvobj header should be here */
+    long long headers_outside;
+    long long class_nofork;            /* snapKeyClass() == SNAP_NOFORK */
+    long long class_fork;
+    long long drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
+    long long drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
+    long long violations;              /* header outside, or multi-allocation value inside */
+} snapPlacementStats;
+void snapPlacementScan(redisDb *db, snapPlacementStats *st);
 
 /* ---- Per-slot background scan ------------------------------------------- */
 

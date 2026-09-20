@@ -285,7 +285,9 @@ static void hashDictWithExpireOnRelease(dict *d) {
 #define HASH_LP_NO_TTL 0
 
 struct listpackEx *listpackExCreate(void) {
-    listpackEx *lpt = zcalloc(sizeof(*lpt));
+    /* Hybrid BGSAVE: the struct is always SNAP_NOFORK and is never moved
+     * afterwards (its ExpireMeta may be registered in ebuckets). */
+    listpackEx *lpt = snapNoforkCalloc(sizeof(*lpt));
     lpt->meta.trash = 1;
     lpt->lp = NULL;
     return lpt;

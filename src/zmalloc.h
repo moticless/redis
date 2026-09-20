@@ -139,6 +139,47 @@ void zfree_with_flags(void *ptr, int flags);
 void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #endif
 
+/* ---- SNAP_NOFORK arena (hybrid BGSAVE, see snapshot.c) ----------------------
+ *
+ * A dedicated jemalloc arena whose data extents are carved out of ONE reserved
+ * virtual address range that is madvise(MADV_DONTFORK)ed, so a fork child never
+ * maps it. Because the range is contiguous, "does this pointer belong to the
+ * arena" is a two-compare range check (zmalloc_is_nofork), and the generic
+ * zfree()/zrealloc() paths use it to keep arena memory in the arena: a block
+ * allocated in the arena stays there across realloc and is never recycled
+ * through a default-arena thread cache. New allocations go to the arena only
+ * through the explicit zmalloc_nofork*() entry points. */
+#if defined(USE_JEMALLOC) && defined(__linux__)
+#define HAVE_NOFORK_ARENA 1
+extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
+extern char *zmalloc_nofork_hi;
+static inline int zmalloc_is_nofork(const void *p) {
+    return (const char *)p >= zmalloc_nofork_lo && (const char *)p < zmalloc_nofork_hi;
+}
+int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unavailable */
+int zmalloc_nofork_arena_available(void);
+unsigned zmalloc_nofork_arena_index(void);           /* UINT_MAX if unavailable */
+__attribute__((malloc)) void *zmalloc_nofork(size_t size);
+__attribute__((malloc)) void *zcalloc_nofork(size_t size);
+void *zmalloc_nofork_usable(size_t size, size_t *usable);
+void *zrealloc_nofork(void *ptr, size_t size);
+void zfree_nofork(void *ptr);
+void zfree_nofork_size(void *ptr, size_t size);
+__attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);
+void zmalloc_nofork_va_stats(size_t *reserved, size_t *used);
+/* Allocate 'size' bytes in the same arena as 'like' (default or SNAP_NOFORK),
+ * for containers that replace a buffer instead of reallocating it in place. */
+static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *usable) {
+    return zmalloc_is_nofork(like) ? zmalloc_nofork_usable(size, usable) : zmalloc_usable(size, usable);
+}
+#else
+static inline int zmalloc_is_nofork(const void *p) { (void)p; return 0; }
+static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *usable) {
+    (void)like;
+    return zmalloc_usable(size, usable);
+}
+#endif
+
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))
 void zfree_no_tcache(void *ptr);
 __attribute__((malloc)) void *zmalloc_no_tcache(size_t size);

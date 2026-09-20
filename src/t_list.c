@@ -93,6 +93,7 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
     ql->alloc_size -= ql->head->sz;
     quicklistRelease(ql);
     o->encoding = OBJ_ENCODING_LISTPACK;
+    snapPlaceValue(o); /* the listpack came from the quicklist: apply placement policy */
 }
 
 /* Check if the list needs to be converted to appropriate encoding due to

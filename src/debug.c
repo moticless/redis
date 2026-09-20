@@ -463,6 +463,8 @@ void debugCommand(client *c) {
 #endif
 "OBJECT <key>",
 "    Show low level info about `key` and associated value.",
+"SNAP-PLACEMENT [<dbid>]",
+"    Report SNAP_NOFORK/SNAP_FORK placement statistics of a database (hybrid BGSAVE).",
 "DROP-CLUSTER-PACKET-FILTER <packet-type>",
 "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
 "ENABLE-KEYMETA-RUNTIME-REGISTRATION <0|1>",
@@ -674,6 +676,29 @@ NULL
             return;
         server.cluster_drop_packet_filter = packet_type;
         addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"snap-placement") && (c->argc == 2 || c->argc == 3)) {
+        redisDb *db = c->db;
+        if (c->argc == 3) {
+            long dbid;
+            if (getLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return;
+            if (dbid < 0 || dbid >= server.dbnum) {
+                addReplyError(c, "Out of range database");
+                return;
+            }
+            db = &server.db[dbid];
+        }
+        snapPlacementStats st;
+        snapPlacementScan(db, &st);
+        addReplyMapLen(c, 9);
+        addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
+        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, snapArenaAvailable());
+        addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
+        addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);
+        addReplyBulkCString(c, "class_nofork"); addReplyLongLong(c, st.class_nofork);
+        addReplyBulkCString(c, "class_fork"); addReplyLongLong(c, st.class_fork);
+        addReplyBulkCString(c, "drift_nofork_outside"); addReplyLongLong(c, st.drift_nofork_outside);
+        addReplyBulkCString(c, "drift_fork_inside"); addReplyLongLong(c, st.drift_fork_inside);
+        addReplyBulkCString(c, "violations"); addReplyLongLong(c, st.violations);
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         kvobj *kv;
         char *strenc;

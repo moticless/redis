@@ -159,7 +159,12 @@ void* activeDefragAllocWithoutFree(void *ptr) {
      * make sure not to use the thread cache. so that we don't get back the same
      * pointers we try to free */
     size = zmalloc_usable_size(ptr);
+#ifdef HAVE_NOFORK_ARENA
+    /* SNAP_NOFORK arena memory must stay in the arena. */
+    newptr = zmalloc_is_nofork(ptr) ? zmalloc_nofork_no_tcache(size) : zmalloc_no_tcache(size);
+#else
     newptr = zmalloc_no_tcache(size);
+#endif
     memcpy(newptr, ptr, size);
     server.stat_active_defrag_hits++;
     return newptr;

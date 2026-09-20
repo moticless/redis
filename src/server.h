@@ -2448,6 +2448,7 @@ struct redisServer {
     int sort_bypattern;
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
+    int bgsave_hybrid;              /* Hybrid BGSAVE: SNAP_NOFORK arena + background scan (snapshot.c). Startup only. */
     size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;

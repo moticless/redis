@@ -635,6 +635,7 @@ void setrangeCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(kv);
         kv->ptr = sdsgrowzero(kv->ptr,offset+value_len);
+        snapPlaceValue(kv); /* may leave the SNAP_NOFORK arena when crossing the threshold */
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
         memcpy((char*)kv->ptr+offset,value,value_len);
@@ -1427,6 +1428,7 @@ void appendCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(o);
         o->ptr = sdscatlen(o->ptr,append->ptr,append_len);
+        snapPlaceValue(o); /* may leave the SNAP_NOFORK arena when crossing the threshold */
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
         totlen = sdslen(o->ptr);

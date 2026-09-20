@@ -2861,6 +2861,14 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
+    if (server.bgsave_hybrid) {
+        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
+         * fork child cannot walk the keyspace. Until the hybrid save path is
+         * wired (snapshot.c), refuse rather than crash the child. */
+        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
+                              "operation yet; refusing to fork a stock serializer.");
+        return C_ERR;
+    }
 
     if (dirCreateIfMissing(server.aof_dirname) == -1) {
         serverLog(LL_WARNING, "Can't open or create append-only dir %s: %s",

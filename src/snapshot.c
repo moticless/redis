@@ -32,7 +32,7 @@
 #include "snapshot.h"
 #include <sys/mman.h>
 
-#if defined(USE_JEMALLOC) && defined(__linux__) && defined(MADV_DONTFORK)
+#ifdef HAVE_NOFORK_ARENA
 #define SNAP_NOFORK_ARENA_SUPPORTED 1
 #endif
 
@@ -43,179 +43,115 @@ static inline void snapAssertNotChild(void) {
         serverPanic("SNAP_NOFORK arena accessed from a fork child");
 }
 
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-
-/* jemalloc's default hooks, read from arena 0 at init. They ignore the
- * extent_hooks_t pointer they receive and key off 'arena_ind', so wrapping
- * them is safe. */
-static extent_hooks_t *snap_default_hooks = NULL;
-/* Our hooks: a copy of the defaults with 'alloc' and 'commit' wrapped. The
- * struct must outlive the arena, hence static. */
-static extent_hooks_t snap_hooks;
-/* Precomputed MIB for "arenas.lookup" (pointer -> arena index). */
-static size_t snap_lookup_mib[4];
-static size_t snap_lookup_miblen = 4;
-
-static void snapApplyDontfork(void *addr, size_t size) {
-    if (madvise(addr, size, MADV_DONTFORK) != 0) {
-        static int warned = 0;
-        if (!warned) {
-            warned = 1;
-            serverLog(LL_WARNING, "madvise(MADV_DONTFORK) failed on a SNAP_NOFORK arena extent: %s",
-                      strerror(errno));
-        }
-    }
-}
-
-static void *snapExtentAlloc(extent_hooks_t *hooks, void *new_addr, size_t size,
-                             size_t alignment, bool *zero, bool *commit, unsigned arena_ind)
-{
-    UNUSED(hooks);
-    void *addr = snap_default_hooks->alloc(snap_default_hooks, new_addr, size,
-                                           alignment, zero, commit, arena_ind);
-    if (addr) snapApplyDontfork(addr, size);
-    return addr;
-}
-
-/* Hooks return false on success. Re-apply the flag after a successful commit
- * since a decommit may have replaced the mapping. */
-static bool snapExtentCommit(extent_hooks_t *hooks, void *addr, size_t size,
-                             size_t offset, size_t length, unsigned arena_ind)
-{
-    UNUSED(hooks);
-    bool err = snap_default_hooks->commit(snap_default_hooks, addr, size, offset, length, arena_ind);
-    if (!err) snapApplyDontfork((char*)addr + offset, length);
-    return err;
-}
-
+/* The arena itself (reserved DONTFORK address range, extent hooks, per-thread
+ * tcache flags, range-aware zfree/zrealloc) lives in zmalloc.c so that sds,
+ * listpack, intset and dict code keep arena memory in the arena without
+ * knowing about classes. These are the snapshot-facing entry points. */
 void snapArenaInit(void) {
     server.snap_nofork_arena = UINT_MAX;
-
-    size_t sz = sizeof(extent_hooks_t *);
-    if (je_mallctl("arena.0.extent_hooks", &snap_default_hooks, &sz, NULL, 0) != 0 ||
-        snap_default_hooks == NULL)
-    {
-        serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: cannot read jemalloc default extent hooks.");
+    if (!server.bgsave_hybrid) {
+        serverLog(LL_NOTICE, "Hybrid BGSAVE disabled (bgsave-hybrid no): SNAP_NOFORK arena not created.");
         return;
     }
-    snap_hooks = *snap_default_hooks;
-    snap_hooks.alloc = snapExtentAlloc;
-    snap_hooks.commit = snapExtentCommit;
-
-    if (je_mallctlnametomib("arenas.lookup", snap_lookup_mib, &snap_lookup_miblen) != 0) {
-        serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: arenas.lookup is unavailable.");
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    if (!zmalloc_nofork_arena_init()) {
+        serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
+                              "range or create the jemalloc arena; hybrid BGSAVE unavailable.");
         return;
     }
-
-    /* Create the arena with "experimental.arenas_create_ext" rather than
-     * "arenas.create": the latter allocates the arena's own metadata (arena
-     * struct, bins, mutexes, extent records) THROUGH the arena's extent hooks,
-     * which would make that metadata DONTFORK too and crash jemalloc's
-     * post-fork handler in every child. metadata_use_hooks=false keeps the
-     * metadata in normal forkable mappings; only data extents are DONTFORK.
-     * The struct mirrors jemalloc's internal arena_config_t (5.3). */
-    struct { extent_hooks_t *extent_hooks; bool metadata_use_hooks; } cfg = {
-        .extent_hooks = &snap_hooks,
-        .metadata_use_hooks = false,
-    };
-    unsigned arena;
-    sz = sizeof(arena);
-    int err = je_mallctl("experimental.arenas_create_ext", &arena, &sz, &cfg, sizeof(cfg));
-    if (err) {
-        serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: experimental.arenas_create_ext failed (err=%d).", err);
-        return;
-    }
-    server.snap_nofork_arena = arena;
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, MADV_DONTFORK).", arena);
+    server.snap_nofork_arena = zmalloc_nofork_arena_index();
+    serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of MADV_DONTFORK "
+                         "address space reserved).", server.snap_nofork_arena,
+                         snapArenaVaReserved() >> 30);
+#else
+    serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator; "
+                         "hybrid BGSAVE disabled.");
+#endif
 }
 
 int snapArenaAvailable(void) {
     return server.snap_nofork_arena != UINT_MAX;
 }
 
-/* Per-thread mallocx flags: MALLOCX_ARENA(arena) | MALLOCX_TCACHE(tc).
- * 0 means "not initialized yet" (both macros yield non-zero values). Threads
- * are long lived in Redis, so the explicit tcache is never destroyed. */
-static __thread int snap_thread_flags = 0;
-
-static int snapThreadFlagsInit(void) {
-    unsigned tcache;
-    size_t sz = sizeof(tcache);
-    int flags = MALLOCX_ARENA(server.snap_nofork_arena);
-    if (je_mallctl("tcache.create", &tcache, &sz, NULL, 0) == 0)
-        flags |= MALLOCX_TCACHE(tcache);
-    else
-        flags |= MALLOCX_TCACHE_NONE;
-    snap_thread_flags = flags;
-    return flags;
+size_t snapArenaVaReserved(void) {
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    size_t reserved = 0;
+    if (snapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
+    return reserved;
+#else
+    return 0;
+#endif
 }
 
-static inline int snapFlags(void) {
-    int flags = snap_thread_flags;
-    if (unlikely(flags == 0)) flags = snapThreadFlagsInit();
-    return flags;
+size_t snapArenaVaUsed(void) {
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    size_t used = 0;
+    if (snapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
+    return used;
+#else
+    return 0;
+#endif
 }
 
 void *snapNoforkAlloc(size_t size) {
     snapAssertNotChild();
-    if (unlikely(!snapArenaAvailable())) return zmalloc(size);
-    /* mallocx() rejects size 0; mirror zmalloc's minimum allocation. */
-    if (unlikely(size == 0)) size = sizeof(long);
-    return zmalloc_with_flags(size, snapFlags());
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    return zmalloc_nofork(size);
+#else
+    return zmalloc(size);
+#endif
+}
+
+void *snapNoforkCalloc(size_t size) {
+    snapAssertNotChild();
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    return zcalloc_nofork(size);
+#else
+    return zcalloc(size);
+#endif
 }
 
 void *snapNoforkAllocUsable(size_t size, size_t *usable) {
-    void *ptr = snapNoforkAlloc(size);
-    if (usable) *usable = zmalloc_size(ptr);
-    return ptr;
+    snapAssertNotChild();
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    return zmalloc_nofork_usable(size, usable);
+#else
+    return zmalloc_usable(size, usable);
+#endif
 }
 
 void *snapNoforkRealloc(void *ptr, size_t size) {
     snapAssertNotChild();
-    if (unlikely(!snapArenaAvailable())) return zrealloc(ptr, size);
-    return zrealloc_with_flags(ptr, size, snapFlags());
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    return zrealloc_nofork(ptr, size);
+#else
+    return zrealloc(ptr, size);
+#endif
 }
 
 void snapNoforkFree(void *ptr) {
     if (ptr == NULL) return;
     snapAssertNotChild();
-    if (unlikely(!snapArenaAvailable())) { zfree(ptr); return; }
-    zfree_with_flags(ptr, snapFlags());
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    zfree_nofork(ptr);
+#else
+    zfree(ptr);
+#endif
 }
 
 void snapNoforkFreeSize(void *ptr, size_t usable) {
     if (ptr == NULL) return;
     snapAssertNotChild();
-    if (unlikely(!snapArenaAvailable())) { zfree_with_size(ptr, usable); return; }
-    zfree_with_size_and_flags(ptr, usable, snapFlags());
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    zfree_nofork_size(ptr, usable);
+#else
+    zfree_with_size(ptr, usable);
+#endif
 }
 
 int snapPtrIsNofork(const void *ptr) {
-    if (ptr == NULL || !snapArenaAvailable()) return 0;
-    unsigned ind;
-    size_t sz = sizeof(ind);
-    if (je_mallctlbymib(snap_lookup_mib, snap_lookup_miblen, &ind, &sz,
-                        (void *)&ptr, sizeof(ptr)) != 0)
-        return 0;
-    return ind == server.snap_nofork_arena;
+    return zmalloc_is_nofork(ptr);
 }
-
-#else /* !SNAP_NOFORK_ARENA_SUPPORTED: degrade to the default allocator. */
-
-void snapArenaInit(void) {
-    server.snap_nofork_arena = UINT_MAX;
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator; "
-                         "hybrid BGSAVE disabled.");
-}
-int snapArenaAvailable(void) { return 0; }
-void *snapNoforkAlloc(size_t size) { snapAssertNotChild(); return zmalloc(size); }
-void *snapNoforkAllocUsable(size_t size, size_t *usable) { snapAssertNotChild(); return zmalloc_usable(size, usable); }
-void *snapNoforkRealloc(void *ptr, size_t size) { snapAssertNotChild(); return zrealloc(ptr, size); }
-void snapNoforkFree(void *ptr) { snapAssertNotChild(); zfree(ptr); }
-void snapNoforkFreeSize(void *ptr, size_t usable) { snapAssertNotChild(); zfree_with_size(ptr, usable); }
-int snapPtrIsNofork(const void *ptr) { UNUSED(ptr); return 0; }
-
-#endif
 
 size_t snapNoforkUsableSize(void *ptr) {
     return zmalloc_size(ptr);
@@ -242,6 +178,171 @@ void snapListpackExFree(struct listpackEx *lpt) {
     snapNoforkFree(lpt);
 }
 
+
+/* ============================================================================
+ * Classification and placement
+ * ============================================================================ */
+
+int snapEncodingIsNoforkClass(int type, int encoding) {
+    switch (type) {
+    case OBJ_STRING:
+        return 1; /* int, embstr, raw */
+    case OBJ_LIST:
+        return encoding == OBJ_ENCODING_LISTPACK;
+    case OBJ_SET:
+        return encoding == OBJ_ENCODING_INTSET || encoding == OBJ_ENCODING_LISTPACK;
+    case OBJ_ZSET:
+        return encoding == OBJ_ENCODING_LISTPACK;
+    case OBJ_HASH:
+        return encoding == OBJ_ENCODING_LISTPACK || encoding == OBJ_ENCODING_LISTPACK_EX;
+    default:
+        return 0; /* module, stream, array, ... */
+    }
+}
+
+/* INT and EMBSTR strings carry their value inside the object. */
+static inline int snapValueIsInline(int type, int encoding) {
+    return type == OBJ_STRING && (encoding == OBJ_ENCODING_INT || encoding == OBJ_ENCODING_EMBSTR);
+}
+
+int snapClassify(int type, int encoding, size_t alloc_bytes) {
+    if (!snapEncodingIsNoforkClass(type, encoding)) return SNAP_FORK;
+    if (snapValueIsInline(type, encoding)) return SNAP_NOFORK;
+    return alloc_bytes <= server.save_small_max_bytes ? SNAP_NOFORK : SNAP_FORK;
+}
+
+/* The single value allocation of a single-allocation value (the sds
+ * allocation start for raw strings), or NULL when the value is inline. */
+static void *snapValueAllocPtr(const robj *o) {
+    switch (o->encoding) {
+    case OBJ_ENCODING_RAW: return sdsAllocPtr(o->ptr);
+    case OBJ_ENCODING_LISTPACK:
+    case OBJ_ENCODING_INTSET:
+    case OBJ_ENCODING_LISTPACK_EX: return o->ptr;
+    default: return NULL;
+    }
+}
+
+int snapKeyClass(const robj *o) {
+    if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return SNAP_FORK;
+    if (snapValueIsInline(o->type, o->encoding)) return SNAP_NOFORK;
+    /* LISTPACK_EX: the class follows the struct. The struct holds the
+     * ExpireMeta registered in the db's ebuckets, so it is never moved; when
+     * it is in the arena the child cannot read it and the key MUST be served
+     * by the background thread, wherever the listpack itself lives. */
+    void *a = snapValueAllocPtr(o);
+    if (a == NULL || !zmalloc_is_nofork(a)) return SNAP_FORK;
+    return SNAP_NOFORK;
+}
+
+/* Copy an sds into the requested arena and free the original. */
+static sds snapSdsMove(sds s, int to_nofork) {
+    size_t len = sdslen(s);
+    char type = sdsReqType(len);
+    size_t need = sdsReqSize(len, type);
+    size_t usable = 0;
+    char *buf = to_nofork ? snapNoforkAllocUsable(need, &usable) : zmalloc_usable(need, &usable);
+    sds ns = sdsnewplacement(buf, usable, type, s, len);
+    sdsfree(s); /* range-aware */
+    return ns;
+}
+
+/* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested
+ * arena and free the original. */
+static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
+    void *n = to_nofork ? snapNoforkAlloc(bytes) : zmalloc(bytes);
+    memcpy(n, p, bytes);
+    zfree(p); /* range-aware */
+    return n;
+}
+
+void snapPlaceValue(robj *o) {
+    if (!snapArenaAvailable()) return;
+    if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return;
+    if (snapValueIsInline(o->type, o->encoding)) return;
+
+    switch (o->encoding) {
+    case OBJ_ENCODING_RAW: {
+        sds s = o->ptr;
+        void *a = sdsAllocPtr(s);
+        int want = snapClassify(o->type, o->encoding, zmalloc_size(a));
+        int in = zmalloc_is_nofork(a);
+        if (want == SNAP_NOFORK && !in) o->ptr = snapSdsMove(s, 1);
+        else if (want == SNAP_FORK && in) o->ptr = snapSdsMove(s, 0);
+        break;
+    }
+    case OBJ_ENCODING_LISTPACK: {
+        unsigned char *lp = o->ptr;
+        int want = snapClassify(o->type, o->encoding, zmalloc_size(lp));
+        int in = zmalloc_is_nofork(lp);
+        if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(lp, lpBytes(lp), 1);
+        else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(lp, lpBytes(lp), 0);
+        break;
+    }
+    case OBJ_ENCODING_INTSET: {
+        intset *is = o->ptr;
+        int want = snapClassify(o->type, o->encoding, zmalloc_size(is));
+        int in = zmalloc_is_nofork(is);
+        if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 1);
+        else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 0);
+        break;
+    }
+    case OBJ_ENCODING_LISTPACK_EX: {
+        /* Two allocations. The struct is arena-born (listpackExCreate) and is
+         * NEVER moved: its ExpireMeta may be registered in the db's ebuckets.
+         * The listpack follows the struct: struct in the arena -> listpack in
+         * the arena (the key is served by the background thread regardless of
+         * size, so no "too big" move-out); struct outside (legacy) -> the
+         * listpack must be outside too, or the fork child would dereference
+         * arena memory. */
+        listpackEx *lpt = o->ptr;
+        int lp_in = zmalloc_is_nofork(lpt->lp);
+        int st_in = zmalloc_is_nofork(lpt);
+        if (st_in && !lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 1);
+        else if (!st_in && lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
+        break;
+    }
+    default:
+        break;
+    }
+}
+
+void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
+    memset(st, 0, sizeof(*st));
+    kvstoreIterator kvs_it;
+    dictEntry *de;
+    kvstoreIteratorInit(&kvs_it, db->keys);
+    while ((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
+        kvobj *kv = dictGetKV(de);
+        st->keys++;
+        int hdr_in = zmalloc_is_nofork(kv);
+        if (hdr_in) st->headers_in_arena++; else { st->headers_outside++; st->violations++; }
+
+        int cls = snapKeyClass(kv);
+        if (cls == SNAP_NOFORK) st->class_nofork++; else st->class_fork++;
+
+        if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
+            /* Multi-allocation value: its top-level allocation must be forkable. */
+            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) st->violations++;
+            continue;
+        }
+        if (snapValueIsInline(kv->type, kv->encoding)) continue;
+        if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
+            listpackEx *lpt = kv->ptr;
+            int st_in = zmalloc_is_nofork(lpt), lp_in = zmalloc_is_nofork(lpt->lp);
+            if (st_in && !lp_in) st->drift_nofork_outside++;
+            if (!st_in && lp_in) st->violations++;   /* child would read arena memory */
+            if (!st_in && hdr_in) st->drift_nofork_outside++;   /* legacy struct outside */
+            continue;
+        }
+        void *a = snapValueAllocPtr(kv);
+        int want = snapClassify(kv->type, kv->encoding, zmalloc_size(a));
+        int in = zmalloc_is_nofork(a);
+        if (want == SNAP_NOFORK && !in) st->drift_nofork_outside++;
+        if (want == SNAP_FORK && in) st->drift_fork_inside++;
+    }
+    kvstoreIteratorReset(&kvs_it);
+}
 
 /* ============================================================================
  * Per-slot background scan
@@ -887,6 +988,146 @@ static void snapScanTests(int accurate) {
     zfree(st);
 }
 
+/* ---- Placement / range-aware allocator tests ---- */
+static void snapPlacementTests(void) {
+    if (!snapArenaAvailable()) return;
+    server.save_small_max_bytes = 4096;
+
+    /* Generic allocator paths keep arena memory in the arena. */
+    {
+        char *p = snapNoforkAlloc(100);
+        p = zrealloc(p, 5000);
+        test_cond("zrealloc() of an arena pointer stays in the arena (grow)", zmalloc_is_nofork(p));
+        p = zrealloc(p, 40);
+        test_cond("zrealloc() of an arena pointer stays in the arena (shrink)", zmalloc_is_nofork(p));
+        zfree(p);
+        char *q = zmalloc(100);
+        q = zrealloc(q, 5000);
+        test_cond("zrealloc() of a default pointer stays outside the arena", !zmalloc_is_nofork(q));
+        zfree(q);
+
+        const int N = 2000;
+        void **a = zmalloc(sizeof(void*) * N);
+        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
+        for (int i = 0; i < N; i++) zfree(a[i]);                     /* generic zfree */
+        int leaked = 0;
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) zfree(a[i]);
+        test_cond("arena blocks freed with plain zfree() never come back from zmalloc()", leaked == 0);
+        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
+        for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);       /* sized generic free */
+        leaked = 0;
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) zfree(a[i]);
+        test_cond("arena blocks freed with zfree_with_size() never come back from zmalloc()", leaked == 0);
+        zfree(a);
+        void *nt = zmalloc_nofork_no_tcache(300);
+        test_cond("zmalloc_nofork_no_tcache() allocates in the arena", zmalloc_is_nofork(nt));
+        zfree_no_tcache(nt);
+    }
+
+    /* sds growth through the sds API keeps the arena. */
+    {
+        sds s = sdsnewlen("x", 1);
+        sds t = snapSdsMove(s, 1);
+        test_cond("sds moved into the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
+        t = sdsMakeRoomFor(t, 20000);
+        test_cond("sdsMakeRoomFor() on an arena sds stays in the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
+        sdsfree(t);
+    }
+
+    /* Classification table. */
+    test_cond("classify: small raw string is NOFORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 100) == SNAP_NOFORK);
+    test_cond("classify: 4096-byte raw string is NOFORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4096) == SNAP_NOFORK);
+    test_cond("classify: 4097-byte raw string is FORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4097) == SNAP_FORK);
+    test_cond("classify: INT / EMBSTR are NOFORK regardless of size",
+              snapClassify(OBJ_STRING, OBJ_ENCODING_INT, 0) == SNAP_NOFORK &&
+              snapClassify(OBJ_STRING, OBJ_ENCODING_EMBSTR, 100000) == SNAP_NOFORK);
+    test_cond("classify: small listpack hash/set/zset/list are NOFORK",
+              snapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
+              snapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK_EX, 100) == SNAP_NOFORK &&
+              snapClassify(OBJ_SET, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
+              snapClassify(OBJ_SET, OBJ_ENCODING_INTSET, 100) == SNAP_NOFORK &&
+              snapClassify(OBJ_ZSET, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
+              snapClassify(OBJ_LIST, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK);
+    test_cond("classify: multi-allocation encodings and other types are FORK",
+              snapClassify(OBJ_HASH, OBJ_ENCODING_HT, 10) == SNAP_FORK &&
+              snapClassify(OBJ_SET, OBJ_ENCODING_HT, 10) == SNAP_FORK &&
+              snapClassify(OBJ_ZSET, OBJ_ENCODING_SKIPLIST, 10) == SNAP_FORK &&
+              snapClassify(OBJ_LIST, OBJ_ENCODING_QUICKLIST, 10) == SNAP_FORK &&
+              snapClassify(OBJ_STREAM, OBJ_ENCODING_STREAM, 10) == SNAP_FORK &&
+              snapClassify(OBJ_MODULE, OBJ_ENCODING_RAW, 10) == SNAP_FORK &&
+              snapClassify(OBJ_ARRAY, OBJ_ENCODING_SLICED_ARRAY, 10) == SNAP_FORK);
+
+    /* Placement through kvobjSet(). */
+    sds key = sdsnew("placement-key");
+    char buf[20000];
+    memset(buf, 'v', sizeof(buf));
+    {
+        kvobj *kv = kvobjSet(key, createRawStringObject(buf, 100), 0);
+        test_cond("kvobj header (raw string) is in the arena", zmalloc_is_nofork(kv));
+        test_cond("small raw string value moved into the arena", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && snapKeyClass(kv) == SNAP_NOFORK);
+        test_cond("value content preserved after the move", sdslen(kv->ptr) == 100 && memcmp(kv->ptr, buf, 100) == 0);
+        /* Unbounded in-place growth keeps the arena; the policy hook moves it out. */
+        kv->ptr = sdscatlen(kv->ptr, buf, 10000);
+        test_cond("grown string still in the arena before the policy hook", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)));
+        snapPlaceValue(kv);
+        test_cond("snapPlaceValue() moves a string over the threshold out of the arena",
+                  !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_FORK);
+        test_cond("content preserved after moving out", sdslen(kv->ptr) == 10100 && memcmp(kv->ptr, buf, 100) == 0);
+        decrRefCount(kv);
+    }
+    {
+        kvobj *kv = kvobjSet(key, createRawStringObject(buf, 10000), 0);
+        test_cond("large raw string: header in arena, value outside, class FORK",
+                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && snapKeyClass(kv) == SNAP_FORK);
+        decrRefCount(kv);
+    }
+    {
+        kvobj *kv = kvobjSet(key, createStringObject("tiny", 4), 0);
+        test_cond("embstr value: header in arena, class NOFORK",
+                  kv->encoding == OBJ_ENCODING_EMBSTR && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_NOFORK);
+        decrRefCount(kv);
+        kv = kvobjSet(key, createStringObjectFromLongLongForValue(1234567), 0);
+        test_cond("int value: header in arena, class NOFORK",
+                  kv->encoding == OBJ_ENCODING_INT && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_NOFORK);
+        decrRefCount(kv);
+    }
+    {
+        robj *o = createObject(OBJ_HASH, lpNew(0));
+        o->encoding = OBJ_ENCODING_LISTPACK;
+        o->ptr = lpAppend(o->ptr, (unsigned char*)"field", 5);
+        o->ptr = lpAppend(o->ptr, (unsigned char*)"value", 5);
+        kvobj *kv = kvobjSet(key, o, 0);
+        test_cond("small listpack hash moved into the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK);
+        unsigned char *p = lpFirst(kv->ptr);
+        int64_t l; unsigned char *sv = lpGet(p, &l, NULL);
+        test_cond("listpack content preserved", sv && l == 5 && memcmp(sv, "field", 5) == 0);
+        /* Grow in place past the threshold: stays in the arena, class stays NOFORK by placement. */
+        kv->ptr = lpAppend(kv->ptr, (unsigned char*)buf, 6000);
+        test_cond("listpack grown in place stays in the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK);
+        snapPlaceValue(kv);
+        test_cond("policy hook moves an oversized listpack out", !zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_FORK);
+        decrRefCount(kv);
+    }
+    {
+        robj *o = createIntsetObject();
+        uint8_t ok;
+        for (long long i = 0; i < 50; i++) o->ptr = intsetAdd(o->ptr, i * 7, &ok);
+        kvobj *kv = kvobjSet(key, o, 0);
+        test_cond("intset moved into the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK && intsetLen(kv->ptr) == 50);
+        decrRefCount(kv);
+    }
+    {
+        robj *o = createSetObject();   /* hashtable encoding */
+        kvobj *kv = kvobjSet(key, o, 0);
+        test_cond("hashtable set: header in arena, dict outside, class FORK",
+                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_FORK);
+        decrRefCount(kv);
+    }
+    sdsfree(key);
+}
+
 int snapshotTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -897,6 +1138,7 @@ int snapshotTest(int argc, char **argv, int flags) {
     server.in_fork_child = CHILD_TYPE_NONE;
     server.logfile = "";
     server.verbosity = LL_DEBUG;
+    server.bgsave_hybrid = 1;
     snapArenaInit();
 
 #ifdef SNAP_NOFORK_ARENA_SUPPORTED
@@ -1071,6 +1313,7 @@ int snapshotTest(int argc, char **argv, int flags) {
         test_cond("VMA count stays far below vm.max_map_count default (65530)", maps_after < 10000);
     }
 
+    snapPlacementTests();
     snapScanTests(accurate);
 
     test_report();

@@ -321,7 +321,7 @@ sds _sdsMakeRoomFor(sds s, size_t addlen, int greedy) {
     } else {
         /* Since the header size changes, need to move the string forward,
          * and can't use realloc */
-        newsh = s_malloc_usable(hdrlen + newlen + 1, &bufsize);
+        newsh = s_malloc_usable_like(sh, hdrlen + newlen + 1, &bufsize) /* same arena as the old buffer */;
         if (newsh == NULL) return NULL;
         adjustTypeIfNeeded(&type, &hdrlen, bufsize);
         memcpy((char*)newsh+hdrlen, s, len+1);
@@ -423,7 +423,7 @@ sds sdsResize(sds s, size_t size, int would_regrow) {
         newsize = bufsize - oldhdrlen - 1;
         debugAssert(oldtype == SDS_TYPE_5 || newsize <= sdsTypeMaxSize(oldtype));
     } else {
-        newsh = s_malloc_usable(newlen, &bufsize);
+        newsh = s_malloc_usable_like(sh, newlen, &bufsize) /* same arena as the old buffer */;
         if (newsh == NULL) return NULL;
         adjustTypeIfNeeded(&type, &hdrlen, bufsize);
         memcpy((char *)newsh + hdrlen, s, len + 1);

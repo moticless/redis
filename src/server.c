@@ -6531,6 +6531,8 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
             "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
             "snap_nofork_arena_available:%d\r\n", snapArenaAvailable(),
+            "snap_nofork_va_reserved:%zu\r\n", snapArenaVaReserved(),
+            "snap_nofork_va_used:%zu\r\n", snapArenaVaUsed(),
             "active_defrag_running:%d\r\n", server.active_defrag_running,
             "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
             "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
