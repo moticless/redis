@@ -295,6 +295,7 @@ int dictRehashMicroseconds(dict *d, uint64_t us);
 void dictSetHashFunctionSeed(uint8_t *seed);
 unsigned long dictScan(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 unsigned long dictScanDefrag(dict *d, unsigned long v, dictScanFunction *fn, dictDefragFunctions *defragfns, void *privdata);
+unsigned long dictScanNoPause(dict *d, unsigned long v, dictScanFunction *fn, void *privdata);
 uint64_t dictGetHash(dict *d, const void *key);
 void dictRehashingInfo(dict *d, unsigned long long *from_size, unsigned long long *to_size);
 

@@ -242,6 +242,295 @@ void snapListpackExFree(struct listpackEx *lpt) {
     snapNoforkFree(lpt);
 }
 
+
+/* ============================================================================
+ * Per-slot background scan
+ * ============================================================================
+ *
+ * The scan walks every kvstore dict ("slot") of every store in sequence on a
+ * dedicated thread and hands each fork-instant kvobj to a dispatch callback.
+ *
+ * Immutability contract (spec §4, invariant 2): from snapScanStart() until a
+ * slot is DONE, its dict is never modified. The main thread guarantees no
+ * insert/delete (writes go to the per-slot temp dict) and pauses rehashing
+ * and auto-resize; the thread only reads (dictScanNoPause never writes to the
+ * dict, unlike dictScan which bumps d->pauserehash). Cron-driven resize and
+ * rehash are already skipped by databasesCron while a child process exists.
+ *
+ * Publication: slot states are atomics written with release semantics by the
+ * thread (SCANNING, SCANNED) and by the main thread (PENDING, DONE), and read
+ * with acquire semantics. Completed slots are handed to the main thread over
+ * a single-producer/single-consumer ring (no locks, no allocation on the
+ * thread) plus an eventNotifier so the event loop wakes up.
+ *
+ * M1 decision on granularity: the scan unit is one kvstore dict. In cluster
+ * mode that is one of 16384 slots; in standalone mode a db has a single dict,
+ * so the whole db stays owed until fully scanned and the clone-on-write
+ * burden does not shrink during the save. The write hooks only depend on
+ * snapScanKeyIsOwed(), so refining the unit to bucket ranges later (compare
+ * the key's bucket, in dictScan cursor order, with the published cursor; valid
+ * because the dict is frozen) is a local change to this file.
+ */
+
+#include "atomicvar.h"
+#include "ae.h"
+#include "eventnotifier.h"
+#include <pthread.h>
+
+struct snapScanCtx {
+    kvstore **stores;               /* One per db (db->keys). */
+    int num_stores;
+    int *num_dicts;                 /* kvstoreNumDicts() per store. */
+    redisAtomic uint8_t **state;    /* Per store: num_dicts slot states. */
+    int *frozen;                    /* Per store: 1 if its dicts were paused by us. */
+
+    snapScanDispatchFn *dispatch;
+    snapScanSlotDoneFn *slot_done;
+    void *privdata;
+
+    /* SPSC completion ring, capacity == slots_total. */
+    uint64_t *ring;
+    redisAtomic long ring_wr;       /* Written by the thread. */
+    long ring_rd;                   /* Main thread only. */
+    eventNotifier *en;
+
+    pthread_t tid;
+    int started;
+    int joined;
+    redisAtomic int abort;          /* Main -> thread. */
+    redisAtomic int finished;       /* Thread -> main. */
+
+    long slots_total;
+    redisAtomic long slots_scanned;
+    long slots_done;                /* Main thread only. */
+    redisAtomic long long keys_dispatched;
+};
+
+#define SNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
+#define SNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
+#define SNAP_SCAN_DEC_DIDX(v) ((int)((v) & 0xffffffffu))
+
+static inline void snapSlotSetState(snapScanCtx *ctx, int s, int didx, uint8_t st) {
+    atomicSetWithSync(ctx->state[s][didx], st);
+}
+
+static inline uint8_t snapSlotGetState(snapScanCtx *ctx, int s, int didx) {
+    uint8_t st;
+    atomicGetWithSync(ctx->state[s][didx], st);
+    return st;
+}
+
+snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
+                            snapScanDispatchFn *dispatch,
+                            snapScanSlotDoneFn *slot_done, void *privdata)
+{
+    snapScanCtx *ctx = zcalloc(sizeof(*ctx));
+    ctx->stores = zmalloc(sizeof(kvstore*) * num_stores);
+    memcpy(ctx->stores, stores, sizeof(kvstore*) * num_stores);
+    ctx->num_stores = num_stores;
+    ctx->num_dicts = zmalloc(sizeof(int) * num_stores);
+    ctx->state = zmalloc(sizeof(redisAtomic uint8_t*) * num_stores);
+    ctx->frozen = zcalloc(sizeof(int) * num_stores);
+    for (int s = 0; s < num_stores; s++) {
+        ctx->num_dicts[s] = kvstoreNumDicts(stores[s]);
+        ctx->state[s] = zcalloc(sizeof(redisAtomic uint8_t) * ctx->num_dicts[s]); /* PENDING */
+        ctx->slots_total += ctx->num_dicts[s];
+    }
+    ctx->ring = zmalloc(sizeof(uint64_t) * (ctx->slots_total ? ctx->slots_total : 1));
+    ctx->dispatch = dispatch;
+    ctx->slot_done = slot_done;
+    ctx->privdata = privdata;
+    ctx->en = createEventNotifier();
+    return ctx;
+}
+
+static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
+    for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
+        dict *d = kvstoreGetDict(ctx->stores[s], didx);
+        if (d) {
+            dictPauseRehashing(d);
+            dictPauseAutoResize(d);
+        }
+    }
+    ctx->frozen[s] = 1;
+}
+
+static void snapScanUnfreezeDict(snapScanCtx *ctx, int s, int didx) {
+    if (!ctx->frozen[s]) return;
+    dict *d = kvstoreGetDict(ctx->stores[s], didx);
+    if (d) {
+        dictResumeRehashing(d);
+        dictResumeAutoResize(d);
+    }
+}
+
+/* dictScan callback on the scan thread: decode the entry and dispatch. */
+struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
+
+static void snapScanEntryCb(void *privdata, const dictEntry *de, dictEntry **plink) {
+    UNUSED(plink);
+    struct snapScanEntryArgs *a = privdata;
+    atomicIncr(a->ctx->keys_dispatched, 1);
+    a->ctx->dispatch(a->ctx->privdata, a->s, a->didx, dictGetKV(de));
+}
+
+static inline int snapScanAborted(snapScanCtx *ctx) {
+    int v;
+    atomicGet(ctx->abort, v);
+    return v;
+}
+
+static void snapScanPublishScanned(snapScanCtx *ctx, int s, int didx) {
+    snapSlotSetState(ctx, s, didx, SNAP_SLOT_SCANNED);
+    long wr;
+    atomicGet(ctx->ring_wr, wr);
+    ctx->ring[wr] = SNAP_SCAN_ENC(s, didx);
+    atomicSetWithSync(ctx->ring_wr, wr + 1);   /* release: ring[wr] visible before wr+1 */
+    atomicIncr(ctx->slots_scanned, 1);
+    triggerEventNotifier(ctx->en);
+}
+
+static void *snapScanThreadMain(void *arg) {
+    snapScanCtx *ctx = arg;
+    redis_set_thread_title("snap_scan");
+    makeThreadKillable();
+
+    for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
+        for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
+            if (snapScanAborted(ctx)) break;
+            dict *d = kvstoreGetDict(ctx->stores[s], didx);
+            if (d == NULL || dictSize(d) == 0) {
+                snapScanPublishScanned(ctx, s, didx);
+                continue;
+            }
+            snapSlotSetState(ctx, s, didx, SNAP_SLOT_SCANNING);
+            struct snapScanEntryArgs a = { ctx, s, didx };
+            unsigned long cursor = 0;
+            int aborted = 0;
+            do {
+                cursor = dictScanNoPause(d, cursor, snapScanEntryCb, &a);
+                if (snapScanAborted(ctx)) { aborted = 1; break; }
+            } while (cursor);
+            if (aborted) break;   /* Leave the slot SCANNING; snapScanAbort() completes it. */
+            snapScanPublishScanned(ctx, s, didx);
+        }
+    }
+    atomicSetWithSync(ctx->finished, 1);
+    triggerEventNotifier(ctx->en);
+    return NULL;
+}
+
+int snapScanStart(snapScanCtx *ctx) {
+    serverAssert(!ctx->started);
+    for (int s = 0; s < ctx->num_stores; s++) snapScanFreezeStore(ctx, s);
+    if (pthread_create(&ctx->tid, NULL, snapScanThreadMain, ctx) != 0) {
+        serverLog(LL_WARNING, "snapScanStart: pthread_create failed: %s", strerror(errno));
+        for (int s = 0; s < ctx->num_stores; s++) {
+            for (int didx = 0; didx < ctx->num_dicts[s]; didx++) snapScanUnfreezeDict(ctx, s, didx);
+            ctx->frozen[s] = 0;
+        }
+        return C_ERR;
+    }
+    ctx->started = 1;
+    return C_OK;
+}
+
+/* Main thread: finish one slot (merge hook, unfreeze, publish DONE). */
+static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
+    if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
+    snapScanUnfreezeDict(ctx, s, didx);
+    snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
+    ctx->slots_done++;
+}
+
+int snapScanHandleCompletions(snapScanCtx *ctx) {
+    int n = 0;
+    long wr;
+    atomicGetWithSync(ctx->ring_wr, wr);   /* acquire */
+    while (ctx->ring_rd < wr) {
+        uint64_t v = ctx->ring[ctx->ring_rd++];
+        snapScanCompleteSlot(ctx, SNAP_SCAN_DEC_STORE(v), SNAP_SCAN_DEC_DIDX(v), 0);
+        n++;
+    }
+    return n;
+}
+
+int snapScanIsFinished(snapScanCtx *ctx) {
+    int v;
+    atomicGetWithSync(ctx->finished, v);
+    return v;
+}
+
+static void snapScanJoin(snapScanCtx *ctx) {
+    if (ctx->started && !ctx->joined) {
+        pthread_join(ctx->tid, NULL);
+        ctx->joined = 1;
+    }
+}
+
+void snapScanAbort(snapScanCtx *ctx) {
+    if (!ctx->started) return;
+    atomicSetWithSync(ctx->abort, 1);
+    snapScanJoin(ctx);
+    /* Fully scanned slots complete normally. */
+    snapScanHandleCompletions(ctx);
+    /* Everything else was interrupted. */
+    for (int s = 0; s < ctx->num_stores; s++) {
+        for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
+            if (snapSlotGetState(ctx, s, didx) != SNAP_SLOT_DONE)
+                snapScanCompleteSlot(ctx, s, didx, 1);
+        }
+    }
+}
+
+void snapScanRelease(snapScanCtx *ctx) {
+    if (ctx == NULL) return;
+    snapScanJoin(ctx);
+    if (ctx->started) {
+        /* Drain the tail so no slot is left frozen. */
+        snapScanHandleCompletions(ctx);
+        serverAssert(ctx->slots_done == ctx->slots_total);
+    }
+    for (int s = 0; s < ctx->num_stores; s++) zfree(ctx->state[s]);
+    zfree(ctx->state);
+    zfree(ctx->num_dicts);
+    zfree(ctx->frozen);
+    zfree(ctx->stores);
+    zfree(ctx->ring);
+    freeEventNotifier(ctx->en);
+    zfree(ctx);
+}
+
+int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
+    return snapSlotGetState(ctx, store_idx, didx);
+}
+
+int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
+    return snapSlotGetState(ctx, store_idx, didx) != SNAP_SLOT_DONE;
+}
+
+int snapScanReadEventFd(snapScanCtx *ctx) {
+    return ctx->en ? getReadEventFd(ctx->en) : -1;
+}
+
+void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
+    UNUSED(el);
+    UNUSED(fd);
+    UNUSED(mask);
+    snapScanCtx *ctx = privdata;
+    handleEventNotifier(ctx->en);
+    snapScanHandleCompletions(ctx);
+}
+
+void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
+                      long *slots_done, long long *keys_dispatched)
+{
+    if (slots_total) *slots_total = ctx->slots_total;
+    if (slots_scanned) atomicGet(ctx->slots_scanned, *slots_scanned);
+    if (slots_done) *slots_done = ctx->slots_done;
+    if (keys_dispatched) atomicGet(ctx->keys_dispatched, *keys_dispatched);
+}
+
 /* ---- Unit tests ---------------------------------------------------------- */
 #ifdef REDIS_TEST
 #include "testhelp.h"
@@ -360,6 +649,244 @@ static void snapTestPurgeArena(void) {
 #endif
 }
 
+
+/* ---- Scan tests ---- */
+extern dictType KvstoreDictTestType;   /* kvstore.c (REDIS_TEST) */
+extern kvstoreType KvstoreTestType;
+
+#define SNAP_TEST_STORES 2
+#define SNAP_TEST_DICT_BITS 2
+#define SNAP_TEST_DICTS (1 << SNAP_TEST_DICT_BITS)
+#define SNAP_TEST_MAXKEYS 6000
+
+struct snapScanTestState {
+    unsigned char seen[SNAP_TEST_STORES][SNAP_TEST_DICTS][SNAP_TEST_MAXKEYS];
+    int inserted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    redisAtomic long dispatched;
+    redisAtomic long bad;             /* unparsable / out-of-range / duplicate */
+    int done_calls[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    int done_aborted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    int dispatch_sleep_us;
+    redisAtomic int wrong_state;      /* dispatch saw its slot not SCANNING */
+    snapScanCtx *ctx;
+    kvstore **stores;
+    int rehashing_at_done;
+};
+
+static char *snapTestKey(int s, int didx, int i) {
+    char buf[64];
+    int len = snprintf(buf, sizeof(buf), "k:%d:%d:%d", s, didx, i);
+    char *k = zmalloc(len + 1);
+    memcpy(k, buf, len + 1);
+    return k;
+}
+
+static void snapTestDispatch(void *priv, int s, int didx, kvobj *kv) {
+    struct snapScanTestState *st = priv;
+    const char *key = (const char*)kv;   /* test dict stores plain C strings */
+    int ps, pd, pi;
+    if (sscanf(key, "k:%d:%d:%d", &ps, &pd, &pi) != 3 || ps != s || pd != didx ||
+        pi < 0 || pi >= st->inserted[s][didx] || st->seen[s][didx][pi])
+    {
+        atomicIncr(st->bad, 1);
+    } else {
+        st->seen[s][didx][pi] = 1;
+    }
+    if (st->ctx && snapScanSlotState(st->ctx, s, didx) != SNAP_SLOT_SCANNING) atomicSetWithSync(st->wrong_state, 1);
+    atomicIncr(st->dispatched, 1);
+    if (st->dispatch_sleep_us) usleep(st->dispatch_sleep_us);
+}
+
+static int snapTestKeyCompare(dictCmpCache *cache, const void *k1, const void *k2) {
+    UNUSED(cache);
+    return strcmp(k1, k2) == 0;
+}
+
+static void snapTestSlotDone(void *priv, int s, int didx, int aborted) {
+    struct snapScanTestState *st = priv;
+    st->done_calls[s][didx]++;
+    st->done_aborted[s][didx] = aborted;
+    /* The dict is still frozen here: record whether the mid-rehash dict is
+     * still mid-rehash, i.e. the scan itself never rehashed it. */
+    if (s == 0 && didx == 3 && st->stores)
+        st->rehashing_at_done = dictIsRehashing(kvstoreGetDict(st->stores[0], 3));
+}
+
+static int snapTestAllUnfrozen(kvstore **stores) {
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+            dict *d = kvstoreGetDict(stores[s], didx);
+            if (d && (d->pauserehash != 0 || d->pauseAutoResize != 0)) return 0;
+        }
+    return 1;
+}
+
+static int snapTestAllState(snapScanCtx *ctx, int state) {
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+            if (snapScanSlotState(ctx, s, didx) != state) return 0;
+    return 1;
+}
+
+static void snapScanTests(int accurate) {
+    dictType noval = KvstoreDictTestType;
+    noval.no_value = 1;
+    noval.keyCompare = snapTestKeyCompare;   /* the kvstore test type compares pointers */
+    kvstore *stores[SNAP_TEST_STORES];
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        stores[s] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+
+    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    st->stores = stores;
+
+    /* Population: store 0: d0 = 1 key, d1 = empty (never allocated), d2 = 5000
+     * keys, d3 = left mid-rehash. Store 1: d0..d2 = 100 keys each, d3 empty. */
+    dictSetResizeEnabled(DICT_RESIZE_ENABLE);
+    int plan[SNAP_TEST_STORES][SNAP_TEST_DICTS] = { {1, 0, 5000, -1}, {100, 100, 100, 0} };
+    for (int s = 0; s < SNAP_TEST_STORES; s++) {
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+            int n = plan[s][didx];
+            if (n == -1) {
+                /* Insert until the dict is rehashing (expand just triggered). */
+                int i = 0;
+                while (i < SNAP_TEST_MAXKEYS) {
+                    serverAssert(kvstoreDictAddRaw(stores[s], didx, snapTestKey(s, didx, i), NULL) != NULL);
+                    i++;
+                    if (i > 64 && dictIsRehashing(kvstoreGetDict(stores[s], didx))) break;
+                }
+                n = i;
+            } else {
+                for (int i = 0; i < n; i++)
+                    serverAssert(kvstoreDictAddRaw(stores[s], didx, snapTestKey(s, didx, i), NULL) != NULL);
+            }
+            st->inserted[s][didx] = n;
+        }
+    }
+    long total_keys = 0;
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) total_keys += st->inserted[s][didx];
+    test_cond("scan test: a dict was left mid-rehash at scan start",
+              dictIsRehashing(kvstoreGetDict(stores[0], 3)));
+    test_cond("scan test: an empty slot has no dict allocated", kvstoreGetDict(stores[0], 1) == NULL);
+
+    /* ---- Full scan with concurrent main-thread reads ---- */
+    snapScanCtx *ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    st->dispatch_sleep_us = 0;
+    test_cond("scan: all slots PENDING before start", snapTestAllState(ctx, SNAP_SLOT_PENDING));
+    test_cond("scan: snapScanStart() succeeds", snapScanStart(ctx) == C_OK);
+    {
+        dict *d = kvstoreGetDict(stores[0], 0);
+        test_cond("scan: dicts are frozen after start", d->pauserehash == 1 && d->pauseAutoResize == 1);
+    }
+    /* Concurrent reads from the owner thread while the scan runs. */
+    long reads = 0, misses = 0;
+    unsigned seed = 7;
+    int completions = 0;
+    while (!snapScanIsFinished(ctx)) {
+        seed = seed * 1103515245u + 12345u;
+        int s = (seed >> 8) % SNAP_TEST_STORES, didx = (seed >> 12) % SNAP_TEST_DICTS;
+        if (st->inserted[s][didx] > 0) {
+            int i = (seed >> 16) % st->inserted[s][didx];
+            char *k = snapTestKey(s, didx, i);
+            if (kvstoreDictFind(stores[s], didx, k) == NULL) misses++;
+            zfree(k);
+            reads++;
+        }
+        completions += snapScanHandleCompletions(ctx);
+    }
+    completions += snapScanHandleCompletions(ctx);
+    long dispatched, bad;
+    atomicGet(st->dispatched, dispatched);
+    atomicGet(st->bad, bad);
+    int wrong_state;
+    atomicGet(st->wrong_state, wrong_state);
+    long all_seen = 1;
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+            for (int i = 0; i < st->inserted[s][didx]; i++) if (!st->seen[s][didx][i]) all_seen = 0;
+    int done_once = 1;
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+            if (st->done_calls[s][didx] != 1 || st->done_aborted[s][didx] != 0) done_once = 0;
+    printf("scan: %ld keys dispatched, %ld concurrent reads (%ld misses), %d completions\n",
+           dispatched, reads, misses, completions);
+    test_cond("scan: dispatched exactly the inserted key set (count)", dispatched == total_keys);
+    test_cond("scan: every inserted key was dispatched exactly once", all_seen && bad == 0);
+    test_cond("scan: dispatch always ran with its slot in SCANNING state", wrong_state == 0);
+    test_cond("scan: concurrent owner-thread lookups all hit", reads > 0 && misses == 0);
+    test_cond("scan: every slot completed exactly once, none aborted",
+              done_once && completions == SNAP_TEST_STORES * SNAP_TEST_DICTS);
+    test_cond("scan: all slots DONE at the end", snapTestAllState(ctx, SNAP_SLOT_DONE));
+    test_cond("scan: no slot is owed after completion", !snapScanKeyIsOwed(ctx, 0, 0) && !snapScanKeyIsOwed(ctx, 1, 3));
+    test_cond("scan: all dicts unfrozen at the end", snapTestAllUnfrozen(stores));
+    test_cond("scan: mid-rehash dict was still mid-rehash when its slot completed (scan did not rehash)",
+              st->rehashing_at_done);
+    {
+        long t, sc, dn; long long kd;
+        snapScanProgress(ctx, &t, &sc, &dn, &kd);
+        test_cond("scan: progress counters consistent", t == SNAP_TEST_STORES * SNAP_TEST_DICTS && sc == t && dn == t && kd == total_keys);
+    }
+    snapScanRelease(ctx);
+
+    /* ---- Abort mid-scan ---- */
+    memset(st->seen, 0, sizeof(st->seen));
+    memset(st->done_calls, 0, sizeof(st->done_calls));
+    memset(st->done_aborted, 0, sizeof(st->done_aborted));
+    atomicSet(st->dispatched, 0);
+    atomicSet(st->bad, 0);
+    st->dispatch_sleep_us = accurate ? 200 : 100;   /* 5000-key slot takes >= 0.5 s */
+    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    test_cond("abort: start", snapScanStart(ctx) == C_OK);
+    /* Wait until the thread is inside the first big slot. */
+    long d0;
+    do { usleep(1000); atomicGet(st->dispatched, d0); } while (d0 < 50 && !snapScanIsFinished(ctx));
+    long long t0 = snapTestNowNs();
+    snapScanAbort(ctx);
+    long long abort_ms = (snapTestNowNs() - t0) / 1000000;
+    atomicGet(st->dispatched, dispatched);
+    int aborted_slots = 0, normal_slots = 0, calls = 0;
+    for (int s = 0; s < SNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+            calls += st->done_calls[s][didx];
+            if (st->done_aborted[s][didx]) aborted_slots++; else normal_slots++;
+        }
+    printf("abort: after %ld dispatched keys, abort took %lld ms; %d slots aborted, %d completed normally\n",
+           dispatched, abort_ms, aborted_slots, normal_slots);
+    test_cond("abort: stopped well before the scan would have finished", dispatched < total_keys);
+    test_cond("abort: returned promptly (< 500 ms)", abort_ms < 500);
+    test_cond("abort: thread finished", snapScanIsFinished(ctx));
+    test_cond("abort: every slot completed exactly once", calls == SNAP_TEST_STORES * SNAP_TEST_DICTS);
+    test_cond("abort: interrupted slots reported as aborted", aborted_slots >= 1);
+    test_cond("abort: slots scanned before the abort completed normally", normal_slots >= 2);
+    test_cond("abort: all slots DONE", snapTestAllState(ctx, SNAP_SLOT_DONE));
+    test_cond("abort: all dicts unfrozen", snapTestAllUnfrozen(stores));
+    snapScanRelease(ctx);
+
+    /* ---- Empty stores ---- */
+    {
+        kvstore *empty[2];
+        empty[0] = kvstoreCreate(&KvstoreTestType, &noval, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+        empty[1] = kvstoreCreate(&KvstoreTestType, &noval, 3, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+        atomicSet(st->dispatched, 0);
+        st->dispatch_sleep_us = 0;
+        snapScanCtx *ectx = snapScanCreate(empty, 2, snapTestDispatch, NULL, st);
+        st->ctx = NULL;
+        test_cond("empty: start", snapScanStart(ectx) == C_OK);
+        while (!snapScanIsFinished(ectx)) usleep(100);
+        int n = snapScanHandleCompletions(ectx);
+        atomicGet(st->dispatched, dispatched);
+        test_cond("empty: all 9 slots completed with zero dispatches", n == 9 && dispatched == 0);
+        snapScanRelease(ectx);
+        kvstoreRelease(empty[0]);
+        kvstoreRelease(empty[1]);
+    }
+
+    for (int s = 0; s < SNAP_TEST_STORES; s++) kvstoreRelease(stores[s]);
+    zfree(st);
+}
+
 int snapshotTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     UNUSED(argv);
@@ -379,6 +906,8 @@ int snapshotTest(int argc, char **argv, int flags) {
     void *fb = snapNoforkAlloc(100);
     test_cond("fallback alloc goes to the default allocator", fb != NULL && !snapPtrIsNofork(fb));
     snapNoforkFree(fb);
+    /* The background scan does not depend on the arena. */
+    snapScanTests(accurate);
     test_report();
     return 0;
 #endif
@@ -541,6 +1070,8 @@ int snapshotTest(int argc, char **argv, int flags) {
                maps_before, N, maps_after, maps_after - maps_before);
         test_cond("VMA count stays far below vm.max_map_count default (65530)", maps_after < 10000);
     }
+
+    snapScanTests(accurate);
 
     test_report();
     return 0;

@@ -1557,11 +1557,12 @@ void dictScanDefragBucket(dict *d,dictScanFunction *fn,
  * can reallocate. The callbacks should return a new memory address or NULL,
  * where NULL means that no reallocation happened and the old memory is still
  * valid. */
-unsigned long dictScanDefrag(dict *d,
-                             unsigned long v,
-                             dictScanFunction *fn,
-                             dictDefragFunctions *defragfns,
-                             void *privdata)
+static unsigned long dictScanGeneric(dict *d,
+                                     unsigned long v,
+                                     dictScanFunction *fn,
+                                     dictDefragFunctions *defragfns,
+                                     void *privdata,
+                                     int pause_rehash)
 {
     int htidx0, htidx1;
     unsigned long m0, m1;
@@ -1569,7 +1570,7 @@ unsigned long dictScanDefrag(dict *d,
     if (dictSize(d) == 0) return 0;
 
     /* This is needed in case the scan callback tries to do dictFind or alike. */
-    dictPauseRehashing(d);
+    if (pause_rehash) dictPauseRehashing(d);
 
     if (!dictIsRehashing(d)) {
         htidx0 = 0;
@@ -1615,9 +1616,32 @@ unsigned long dictScanDefrag(dict *d,
         } while (v & (m0 ^ m1));
     }
 
-    dictResumeRehashing(d);
+    if (pause_rehash) dictResumeRehashing(d);
 
     return v;
+}
+
+unsigned long dictScanDefrag(dict *d,
+                             unsigned long v,
+                             dictScanFunction *fn,
+                             dictDefragFunctions *defragfns,
+                             void *privdata)
+{
+    return dictScanGeneric(d, v, fn, defragfns, privdata, 1);
+}
+
+/* Like dictScan() but does NOT touch the dict at all (no pauserehash
+ * increment/decrement). The caller must guarantee that the dict is frozen for
+ * the whole scan: rehashing paused and no insertions/deletions. This is the
+ * only scan primitive that may be used from a thread other than the owner of
+ * the dict (see snapshot.c): dictScan() performs a non-atomic read-modify-write
+ * on d->pauserehash which would race with the owner's own dictScan/iterators. */
+unsigned long dictScanNoPause(dict *d,
+                              unsigned long v,
+                              dictScanFunction *fn,
+                              void *privdata)
+{
+    return dictScanGeneric(d, v, fn, NULL, privdata, 0);
 }
 
 /* ------------------------- private functions ------------------------------ */
