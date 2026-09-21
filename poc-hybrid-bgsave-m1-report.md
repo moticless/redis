@@ -205,3 +205,14 @@ and the mechanics survive TSan and ASan. Conditions before M2 work starts:
 2. Decide the eviction-during-save policy (tombstone-only vs. abort past a count).
 3. M2 order: diskless sync and AOF rewrite through the hybrid session first, since
    both are refused today and the sibling branch shows they fit the same child.
+
+## 11. Addendum (2026-09-22): serialize-before-write replaces the overlay's clone-on-write
+
+After M1 the write side was redesigned (spec §11.z, backlog TASK-1.21): the
+scan thread publishes the bucket window it reads, and the main thread emits a
+bucket's chain into the snapshot itself before the first post-fork write to it
+(per-save bucket bitmaps decide who emits). Clone-on-write survives only for
+buckets inside the window being read. Verification and the four-way benchmark
+against upstream and Valkey (fork and forkless) are in
+`utils/snap-bench/RESULTS.md` run 6; leftovers in spec §11.z.1. Sections 3-5
+above describe the M1 state and remain valid as the record of that milestone.
