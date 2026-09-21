@@ -1663,6 +1663,36 @@ unsigned long dictScanNoPause(dict *d,
     return dictScanGeneric(d, v, fn, NULL, privdata, 0);
 }
 
+/* The bucket 'key' lives in, or would be inserted into: table 0 unless the
+ * dict is rehashing, in which case a key still present in table 0 (its bucket
+ * not yet moved) is there and every other key maps to table 1. Pure: no
+ * rehash step, no resize. */
+void dictKeyBucket(dict *d, const void *key, int *table, unsigned long *idx) {
+    uint64_t h = dictGetHash(d, key);
+    unsigned long i0 = h & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+    if (!dictIsRehashing(d)) {
+        *table = 0;
+        *idx = i0;
+        return;
+    }
+    if ((long)i0 >= d->rehashidx) {
+        dictCmpCache cmpCache = {0};
+        keyCmpFunc cmpFunc = dictGetCmpFunc(d);
+        dictEntry *he = d->ht_table[0][i0];
+        while (he) {
+            const void *visitedKey = dictStoredKey2Key(d, dictGetKey(he));
+            if (key == visitedKey || cmpFunc(&cmpCache, key, visitedKey)) {
+                *table = 0;
+                *idx = i0;
+                return;
+            }
+            he = dictGetNext(he);
+        }
+    }
+    *table = 1;
+    *idx = h & DICTHT_SIZE_MASK(d->ht_size_exp[1]);
+}
+
 /* Visit every entry of buckets [lo, hi) of table 'table' (0 or 1) in bucket
  * order, calling fn(privdata, de, NULL). Chain pointers are read with atomic
  * loads and the dict is not written, so this may run on a thread other than

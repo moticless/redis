@@ -61,27 +61,23 @@ typedef struct _kvstoreDictIterator {
  * owner thread once the scan of that dict has finished. */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
-/* 1 if the snapshot is done reading this frozen original: a write lookup may
- * then hand out the frozen entry itself instead of a clone. Optional. */
-typedef int (kvstoreOverlayScannedFn)(void *privdata, int didx, void *orig);
-/* Placeholder for a deleted, already-scanned frozen original: a header-only
- * stand-in that keeps the key alive in the frozen entry until merge, released
- * through free_orig with value_shared = 1. Required when 'scanned' is set. */
-typedef void *(kvstoreOverlayTombFn)(void *privdata, int didx, void *orig);
 /* Called at the start of every main-thread write operation on a frozen dict
  * (before the overlay decides between in-place and temp-dict paths). Optional. */
 typedef void (kvstoreOverlayEnterFn)(void *privdata);
-/* 1 if the snapshot thread is currently reading the bucket 'key' maps to in
- * dict 'd': the overlay must then leave the frozen chain untouched (no
- * in-place writes, no placeholder swaps). Optional (absent: never covered). */
-typedef int (kvstoreOverlayCoversFn)(void *privdata, dict *d, const void *key);
+/* Called before a structural write (add, unlink, replace) of 'key' in frozen
+ * dict 'd', after 'enter'. KVSTORE_OV_INPLACE: the snapshot already holds
+ * this bucket (the callee may have just emitted it), the frozen chain may be
+ * written in place. KVSTORE_OV_DEFER: the snapshot thread is reading the
+ * bucket right now, the write must go to the temp dict. Optional (absent:
+ * always DEFER, i.e. pure clone-on-write). */
+#define KVSTORE_OV_DEFER   0
+#define KVSTORE_OV_INPLACE 1
+typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key);
 typedef struct kvstoreOverlayHooks {
     kvstoreOverlayCloneFn *clone;
     kvstoreOverlayFreeOrigFn *free_orig;
-    kvstoreOverlayScannedFn *scanned;
-    kvstoreOverlayTombFn *tomb;
     kvstoreOverlayEnterFn *enter;
-    kvstoreOverlayCoversFn *covers;
+    kvstoreOverlayPrepareFn *prepare;
 } kvstoreOverlayHooks;
 void kvstoreOverlayFreeze(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);

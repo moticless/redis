@@ -258,6 +258,12 @@ int snapScanStartThread(snapScanCtx *ctx);
 typedef void (snapScanThreadDoneFn)(void *privdata, int aborted);
 void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata));
 void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn);
+/* Optional hook run on the scan thread after every bucket window and once
+ * more before thread_done (with no window published and the main thread's
+ * open write section closed): where the main-thread queue is drained. */
+void snapScanSetWindowDone(snapScanCtx *ctx, void (*fn)(void *privdata));
+/* Slot state (SNAP_SLOT_*) of (store, dict). */
+int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 
 /* 1 when called from the scan thread. */
 int snapOnScanThread(void);
@@ -282,13 +288,18 @@ void snapSaveChildDone(int exitcode, int bysignal);
  * mechanics are identical, which is what sanitizer builds exercise). */
 static inline int snapHybridEnabled(void) { return server.bgsave_hybrid; }
 
-/* 1 if 'key' of 'db' is still owed to a running hybrid save. */
-int snapKeyIsOwed(redisDb *db, sds key);
-
-/* 1 if 'kv' is the frozen (fork-instant) entry of its key in a slot that is
- * still owed: such an object must never reach a mutator, only its clone may.
- * Used by debug-build assertions at the keyspace write funnels. */
+/* 1 if 'kv' is a fork-instant original the running save has not taken yet:
+ * its bucket is ahead of the scan thread and not emitted by the main thread,
+ * or the thread is reading it right now. Such an object must not be mutated
+ * in place (a write funnel emits or clones first; read paths that would
+ * mutate, e.g. lazy field expiry, must skip). Opens a write section. */
+int snapKvobjIsOwed(redisDb *db, kvobj *kv);
+/* Same test, for the debug-build assertions at the keyspace write funnels:
+ * after the funnel's prepare step the object is no longer owed. */
 int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
+/* 1 while the main thread serializes a bucket for the snapshot (rdb.c skips
+ * the rdb-key-save-delay there: it is meant to slow the scan thread). */
+int snapMainEmitting(void);
 
 /* Scan generation (kvBits.save_gen, 3 bits). Every hybrid save bumps
  * server.snap_gen; the scan thread stamps each key it finished reading with
@@ -300,9 +311,6 @@ int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
 #define SNAP_GEN_MAX_SINCE_SUCCESS 7
 int snapKvobjScanned(const kvobj *kv);           /* main thread */
 void snapKvobjMarkScanned(kvobj *kv);            /* scan thread */
-int snapOverlayKeyScanned(void *privdata, int didx, void *orig);   /* kvstore overlay callback */
-void *snapOverlayTombstoneKey(void *privdata, int didx, void *orig); /* placeholder for a deleted scanned key */
-int snapKvobjIsOwed(redisDb *db, kvobj *kv);     /* owed slot and not yet scanned */
 int snapSaveMarksValid(void);
 long long snapSaveInplaceWrites(void);
 long long snapSaveLastInplaceWrites(void);
@@ -322,6 +330,11 @@ int snapScanRdbCompression(void);
  * hard-mark abort counter. */
 size_t snapSaveRetainedBytes(void);
 size_t snapSaveLastRetainedPeak(void);
+/* Main-thread emission (spec 11.z): bytes queued for the scan thread to
+ * forward to the child, buckets and keys the main thread emitted itself. */
+size_t snapSaveQueuedBytes(void);
+long long snapSaveMainBuckets(void);
+long long snapSaveMainKeys(void);
 
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent);

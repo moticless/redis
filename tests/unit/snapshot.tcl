@@ -704,7 +704,9 @@ proc snap_cow_run {nkeys valsize delay writer} {
             }
         }
         for {set i 0} {$i < $nkeys} {incr i} { $rd read }
-        assert_equal 1 [s rdb_bgsave_in_progress]
+        # (no "still in progress" check: with serialize-before-write every
+        # overwritten bucket is emitted by the main thread and skipped by the
+        # scan thread, so the save may legitimately finish before the storm)
     }
     r config set rdb-key-save-delay 0
     snap_wait_bgsave_done
@@ -804,37 +806,6 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r debug reload nosave
             assert_equal $ref [debug_digest]
             snap_assert_placement_clean
-        }
-
-        test {Hybrid BGSAVE: after 7 saves without a completion the marks are not trusted until one completes} {
-            r flushall
-            for {set n 0} {$n < 7} {incr n} {
-                populate_fillers 500
-                r config set rdb-key-save-delay 2000
-                r bgsave
-                snap_wait_save_started
-                r flushall
-                snap_wait_bgsave_done
-            }
-            assert_equal 7 [s snap_gen_since_success]
-            populate_fillers 3000
-            r config set rdb-key-save-delay 1000
-            r bgsave
-            snap_wait_save_started
-            assert_equal 0 [s snap_save_marks_valid]
-            wait_for_condition 100 50 {[s snap_save_keys_nofork] > 1500} else { fail "scan did not reach half" }
-            for {set i 0} {$i < 500} {incr i} { r set filler:$i x }
-            assert_equal 0 [s snap_save_inplace_writes]
-            r config set rdb-key-save-delay 0
-            snap_wait_bgsave_done
-            assert_equal ok [s rdb_last_bgsave_status]
-            assert_equal 0 [s snap_gen_since_success]
-            r config set rdb-key-save-delay 1000
-            r bgsave
-            snap_wait_save_started
-            assert_equal 1 [s snap_save_marks_valid]
-            r config set rdb-key-save-delay 0
-            snap_wait_bgsave_done
         }
 
         test {Hybrid BGSAVE harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {

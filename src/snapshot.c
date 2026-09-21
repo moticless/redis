@@ -419,14 +419,6 @@ void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shar
 /* A deleted key the scan already read keeps a header-only stand-in in its
  * frozen entry until merge (kvstore ovTombstoneInPlace). Released through
  * snapOverlayFreeOriginal with value_shared = 1: header only. */
-void *snapOverlayTombstoneKey(void *privdata, int didx, void *orig_) {
-    UNUSED(privdata); UNUSED(didx);
-    kvobj *orig = orig_;
-    kvobj *ph = snapKvobjCloneHeader(orig);
-    ph->ptr = NULL;
-    snapSaveRetainedAdd(ph, 1);
-    return ph;
-}
 
 void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_, int value_shared) {
     UNUSED(privdata);
@@ -614,6 +606,7 @@ struct snapScanCtx {
     redisAtomic long long buckets_skipped;   /* buckets the thread skipped (already emitted) */
     snapScanThreadDoneFn *thread_done;
     void (*thread_init)(void *privdata);   /* first thing on the scan thread */
+    void (*window_done)(void *privdata);   /* after every window, and before thread_done */
 };
 
 static __thread int snap_on_scan_thread = 0;
@@ -752,6 +745,10 @@ void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata)) {
     ctx->thread_init = fn;
 }
 
+void snapScanSetWindowDone(snapScanCtx *ctx, void (*fn)(void *privdata)) {
+    ctx->window_done = fn;
+}
+
 void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata)
 {
     serverAssert(!ctx->started);
@@ -871,6 +868,7 @@ static int snapScanWalkDict(snapScanCtx *ctx, int s, int didx, dict *d) {
                 dictWalkBucketRange(d, t, i, i + 1, snapScanEntryCb, &a);
             }
             if (snapScanAborted(ctx)) return 1;
+            if (ctx->window_done) ctx->window_done(ctx->privdata);
             lo = hi;
         }
     }
@@ -907,8 +905,12 @@ static void *snapScanThreadMain(void *arg) {
             snapScanPublishScanned(ctx, s, didx);
         }
     }
-    /* No window: from here on the main thread may write every bucket. */
+    /* No window: from here on the main thread may write every bucket. Once
+     * the section that may still be emitting has closed, everything the main
+     * thread produced is in the queue: drain it before the end marker. */
     snapWindowPublish(NULL, 0, 0, 0);
+    snapWalkerQuiesce(ctx);
+    if (ctx->window_done) ctx->window_done(ctx->privdata);
     if (ctx->thread_done) ctx->thread_done(ctx->privdata, snapScanAborted(ctx));
     atomicSetWithSync(ctx->finished, 1);
     triggerEventNotifier(ctx->en);
@@ -1147,7 +1149,25 @@ typedef struct snapSave {
     sds stage;
     int stage_dbid, stage_slot;
     redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
+    /* Main-thread emission (spec 11.z): records the main thread serialized
+     * before writing a bucket the thread had not reached. mq_lock guards
+     * mq (ready messages) and mstage (the partial BUFFER of one (db, slot));
+     * the scan thread takes both at every window boundary and forwards them. */
+    pthread_mutex_t mq_lock;
+    list *mq;
+    sds mstage;
+    int mstage_dbid, mstage_slot;
+    sds mscratch;                       /* main thread only: one record at a time */
+    redisAtomic size_t mq_bytes;        /* payload bytes queued and not yet sent */
+    long long main_buckets, main_keys;  /* main thread only */
 } snapSave;
+
+typedef struct snapQueuedMsg {
+    snapMsgHdr h;
+    sds payload;
+} snapQueuedMsg;
+static int snap_main_emitting = 0;
+int snapMainEmitting(void) { return snap_main_emitting; }
 
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 static size_t snap_last_retained_peak = 0;
@@ -1163,22 +1183,182 @@ int snapKvobjScanned(const kvobj *kv) {
     return kvobjBitsGetAcquire(kv).save_gen == (unsigned)snap_save->gen;
 }
 
-int snapOverlayKeyScanned(void *privdata, int didx, void *orig) {
-    UNUSED(privdata); UNUSED(didx);
-    if (!snapKvobjScanned(orig)) return 0;
-    snap_save->inplace_writes++;
-    server.stat_snap_inplace_writes++;
-    return 1;
-}
-
-int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
-    if (!snapKeyIsOwed(db, kvobjGetKey(kv))) return 0;
-    return !snapKvobjScanned(kv);
-}
-
 int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
 size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
+size_t snapSaveQueuedBytes(void) {
+    if (!snap_save) return 0;
+    size_t n;
+    atomicGet(snap_save->mq_bytes, n);
+    return n;
+}
+long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
+long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; }
+
+/* ---- Bucket position and main-thread emission (spec 11.z) ---- */
+
+static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+                       const void *payload, uint32_t len, uint32_t robj_off);
+static void snapStageFlush(snapSave *sv);
+
+#define SNAP_POS_BEHIND 0   /* the thread already read this bucket */
+#define SNAP_POS_INSIDE 1   /* the thread is reading it now */
+#define SNAP_POS_AHEAD  2   /* the thread has not reached it */
+
+/* Main thread, inside a write section. */
+static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx) {
+    uint8_t st = snapSlotGetState(ctx, s, didx);
+    if (st == SNAP_SLOT_PENDING) return SNAP_POS_AHEAD;
+    if (st != SNAP_SLOT_SCANNING) return SNAP_POS_BEHIND;
+    uint64_t seq;
+    atomicGetWithSync(snap_win_seq, seq);
+    if (seq == 0) return SNAP_POS_AHEAD;
+    const snapWindow *w = &snap_win[seq & 1];
+    /* SCANNING but the window is another dict's (or none): the thread set the
+     * state and has not published its first window of this dict yet. */
+    if (w->d != d) return SNAP_POS_AHEAD;
+    if (table != w->table) return table < w->table ? SNAP_POS_BEHIND : SNAP_POS_AHEAD;
+    if (idx < w->lo) return SNAP_POS_BEHIND;
+    if (idx >= w->hi) return SNAP_POS_AHEAD;
+    return SNAP_POS_INSIDE;
+}
+
+static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds payload, uint32_t robj_off) {
+    snapQueuedMsg *m = zmalloc(sizeof(*m));
+    m->h.type = type;
+    m->h.dbid = dbid;
+    m->h.slot = slot;
+    m->h.len = (uint32_t)sdslen(payload);
+    m->h.robj_off = robj_off;
+    m->payload = payload;
+    listAddNodeTail(sv->mq, m);
+    atomicIncr(sv->mq_bytes, sdslen(payload));
+}
+
+/* Main thread, mq_lock held: hand the partial BUFFER over as a message. */
+static void snapSaveMainStageFlushLocked(snapSave *sv) {
+    if (sdslen(sv->mstage) == 0) return;
+    snapSaveQueuePushLocked(sv, SNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0);
+    sv->mstage = sdsempty();
+}
+
+/* Main thread: serialize the whole chain of bucket (table, idx) of dict d of
+ * slot (s, didx) as it is now, i.e. still at its fork-instant state (no key of
+ * a not yet emitted bucket ahead of the thread was ever written in place). */
+static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table, unsigned long idx) {
+    snap_main_emitting = 1;
+    for (dictEntry *de = d->ht_table[table][idx]; de; de = dictGetNext(de)) {
+        kvobj *kv = dictGetKV(de);
+        int cls = snapKeyClass(kv);
+        if (cls == SNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = SNAP_FORK;
+        if (cls == SNAP_FORK) {
+            /* The child resolves kv->ptr in its own memory: it must be forkable. */
+            char *alloc = kvobjGetAllocPtr(kv);
+            debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
+                              !zmalloc_is_nofork(kv->ptr));
+            sds copy = sdsnewlen(alloc, zmalloc_size(alloc));
+            pthread_mutex_lock(&sv->mq_lock);
+            snapSaveQueuePushLocked(sv, SNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc));
+            pthread_mutex_unlock(&sv->mq_lock);
+        } else {
+            rio r;
+            sdsclear(sv->mscratch);
+            rioInitWithBuffer(&r, sv->mscratch);
+            robj key;
+            initStaticStringObject(key, kvobjGetKey(kv));
+            if (rdbSaveKeyValuePair(&r, &key, kv, kvobjGetExpire(kv), s) == -1)
+                serverPanic("Hybrid BGSAVE: failed to serialize a key on the main thread");
+            sv->mscratch = r.io.buffer.ptr;
+            pthread_mutex_lock(&sv->mq_lock);
+            if (sv->mstage_dbid != s || sv->mstage_slot != didx) {
+                snapSaveMainStageFlushLocked(sv);
+                sv->mstage_dbid = s;
+                sv->mstage_slot = didx;
+            }
+            sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
+            atomicIncr(sv->mq_bytes, sdslen(sv->mscratch));
+            if (sdslen(sv->mstage) >= SNAP_STAGE_BYTES) snapSaveMainStageFlushLocked(sv);
+            pthread_mutex_unlock(&sv->mq_lock);
+        }
+        sv->main_keys++;
+    }
+    sv->main_buckets++;
+    snap_main_emitting = 0;
+}
+
+/* Scan thread, at every window boundary and before END: forward what the
+ * main thread emitted. */
+static void snapSaveWindowDone(void *priv) {
+    snapSave *sv = priv;
+    pthread_mutex_lock(&sv->mq_lock);
+    list *ready = sv->mq;
+    sv->mq = listCreate();
+    if (sdslen(sv->mstage)) snapSaveMainStageFlushLocked(sv);
+    /* The flush above moved the stage into 'sv->mq': move it over too. */
+    if (listLength(sv->mq)) {
+        listJoin(ready, sv->mq);
+    }
+    pthread_mutex_unlock(&sv->mq_lock);
+    if (listLength(ready)) snapStageFlush(sv);   /* this thread's partial buffer first (order is free anyway) */
+    listNode *ln;
+    while ((ln = listFirst(ready)) != NULL) {
+        snapQueuedMsg *m = listNodeValue(ln);
+        if (!snapScanAborted(sv->scan))
+            snapSendMsg(sv, m->h.type, m->h.dbid, m->h.slot, m->payload, m->h.len, m->h.robj_off);
+        atomicDecr(sv->mq_bytes, m->h.len);
+        sdsfree(m->payload);
+        zfree(m);
+        listDelNode(ready, ln);
+    }
+    listRelease(ready);
+}
+
+/* Overlay 'prepare' hook (privdata = redisDb *): may the frozen chain of
+ * 'key' be written in place? Emits the bucket first when the thread has not
+ * reached it. */
+static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key) {
+    redisDb *db = privdata;
+    snapSave *sv = snap_save;
+    if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
+    int table;
+    unsigned long idx;
+    dictKeyBucket(d, key, &table, &idx);
+    int pos = snapBucketPosition(sv->scan, db->id, didx, d, table, idx);
+    if (pos == SNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
+    if (pos == SNAP_POS_AHEAD && !snapScanBucketEmitted(sv->scan, db->id, didx, table, idx)) {
+        snapSaveEmitBucket(sv, db->id, didx, d, table, idx);
+        snapScanMarkBucketEmitted(sv->scan, db->id, didx, table, idx);
+    } else {
+        sv->inplace_writes++;
+        server.stat_snap_inplace_writes++;
+    }
+    return KVSTORE_OV_INPLACE;
+}
+
+int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
+    snapSave *sv = snap_save;
+    if (!sv || sv->aborted) return 0;
+    sds key = kvobjGetKey(kv);
+    int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
+    uint8_t st = snapSlotGetState(sv->scan, db->id, slot);
+    if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) return 0;
+    if (!kvstoreOverlayIsFrozen(db->keys, slot)) return 0;
+    dict *d = kvstoreGetDict(db->keys, slot);
+    if (!d) return 0;
+    snapFunnelOpen();   /* the window must hold still while we look */
+    int table;
+    unsigned long idx;
+    dictKeyBucket(d, key, &table, &idx);
+    int pos = snapBucketPosition(sv->scan, db->id, slot, d, table, idx);
+    if (pos == SNAP_POS_BEHIND) return 0;
+    if (pos == SNAP_POS_AHEAD && snapScanBucketEmitted(sv->scan, db->id, slot, table, idx)) return 0;
+    /* Ahead and not emitted, or being read: the frozen entry itself is owed,
+     * a temp-dict clone of it is not. */
+    dictEntryLink l = dictFindLink(d, key, NULL);
+    return l && dictGetKV(*l) == kv;
+}
+
+int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) { return snapKvobjIsOwed(db, kv); }
 
 void snapSaveSetKeySaveDelay(int usec) {
     if (snap_save) atomicSet(snap_save->key_save_delay, usec);
@@ -1226,29 +1406,23 @@ static void snapSaveRetainedSub(kvobj *orig, int value_shared) {
 }
 
 void snapSaveCron(void) {
-    if (!snap_save || snap_save->aborted || !snap_save->hard_mark_hit) return;
+    if (!snap_save || snap_save->aborted) return;
+    snapSave *sv = snap_save;
+    if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
+        size_t queued;
+        atomicGet(sv->mq_bytes, queued);
+        if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
+            sv->hard_mark_hit = 1;
+            serverLog(LL_WARNING, "Hybrid BGSAVE: %zu bytes retained plus %zu queued for the child, past bgsave-hybrid-max-retained-bytes (%zu): aborting the save",
+                      sv->retained_bytes, queued, server.bgsave_hybrid_max_retained_bytes);
+        }
+    }
+    if (!sv->hard_mark_hit) return;
     snap_save->failed = 1;
     server.stat_snap_hard_mark_aborts++;
     killRDBChild();   /* -> snapSaveAbort(): merges the overlay; the done handler releases */
 }
 
-int snapKeyIsOwed(redisDb *db, sds key) {
-    if (!snap_save || snap_save->aborted) return 0;
-    int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
-    return snapScanKeyIsOwed(snap_save->scan, db->id, slot);
-}
-
-int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
-    if (!snap_save || snap_save->aborted) return 0;
-    if (snapKvobjScanned(kv)) return 0;   /* the scan is done with it: in-place writes are fine */
-    sds key = kvobjGetKey(kv);
-    int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
-    if (!kvstoreOverlayIsFrozen(db->keys, slot)) return 0;
-    dict *d = kvstoreGetDict(db->keys, slot);
-    if (!d) return 0;
-    dictEntry *de = dictFind(d, key);
-    return de && dictGetKV(de) == kv;
-}
 
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent)
@@ -1547,6 +1721,19 @@ static void snapSaveFree(snapSave *sv) {
         zfree(sv->sizes);
     }
     sdsfree(sv->stage);
+    if (sv->mq) {
+        listNode *ln;
+        while ((ln = listFirst(sv->mq)) != NULL) {
+            snapQueuedMsg *m = listNodeValue(ln);
+            sdsfree(m->payload);
+            zfree(m);
+            listDelNode(sv->mq, ln);
+        }
+        listRelease(sv->mq);
+        pthread_mutex_destroy(&sv->mq_lock);
+    }
+    sdsfree(sv->mstage);
+    sdsfree(sv->mscratch);
     zfree(sv->stores);
     zfree(sv->privs);
     zfree(sv);
@@ -1554,13 +1741,8 @@ static void snapSaveFree(snapSave *sv) {
 
 /* Overlay hooks for the server keyspace (privdata = redisDb *). */
 static void snapOverlayEnter(void *privdata) { UNUSED(privdata); snapFunnelOpen(); }
-static int snapOverlayCovers(void *privdata, dict *d, const void *key) {
-    UNUSED(privdata);
-    return snapWindowCoversKey(d, key);
-}
 static const kvstoreOverlayHooks snap_server_hooks = {
-    snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayKeyScanned, snapOverlayTombstoneKey,
-    snapOverlayEnter, snapOverlayCovers,
+    snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayEnter, snapOverlayPrepare,
 };
 
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
@@ -1607,6 +1789,11 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
 #endif
     sv->stage = sdsempty();
     sv->stage_dbid = sv->stage_slot = -1;
+    pthread_mutex_init(&sv->mq_lock, NULL);
+    sv->mq = listCreate();
+    sv->mstage = sdsempty();
+    sv->mscratch = sdsempty();
+    sv->mstage_dbid = sv->mstage_slot = -1;
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
     sv->maxmemory_policy = server.maxmemory_policy;
     sv->rdb_compression = server.rdb_compression;
@@ -1623,6 +1810,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     snapScanSetOverlay(sv->scan, &snap_server_hooks, sv->privs);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
     snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
+    snapScanSetWindowDone(sv->scan, snapSaveWindowDone);
 
     server.stat_rdb_saves++;
     server.dirty_before_bgsave = server.dirty;
@@ -2423,7 +2611,7 @@ static void snapOverlayTests(int abort_variant) {
 
     snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
     st->ctx = ctx;
-    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, NULL, NULL, snapOverlayEnter, snapOverlayCovers };
+    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL };
     snapScanSetOverlay(ctx, &hooks, privs);
     test_cond("overlay: start", snapScanStart(ctx) == C_OK);
     test_cond("overlay: the populated slot is frozen, the empty one is DONE and not frozen",
