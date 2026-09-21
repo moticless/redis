@@ -745,6 +745,28 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             }
         }
 
+        test {Hybrid BGSAVE harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
+            r flushall
+            r himport prepare fieldset a b c d
+            r himport set tmpl:small fieldset 1 2 3 4
+            r himport set tmpl:wide fieldset 1 2 3 4
+            r hset tmpl:wide a [string repeat x 100]
+            assert_encoding template-listpack tmpl:small
+            assert_encoding template-array tmpl:wide
+            populate_fillers 100
+            set ref [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_match {*RDB looks OK*} [exec [file normalize src/redis-check-rdb] [snap_rdb_path]]
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            assert_equal {1 2 3 4} [r hmget tmpl:small a b c d]
+            assert_equal [string repeat x 100] [r hget tmpl:wide a]
+            assert_encoding template-listpack tmpl:small
+            snap_assert_placement_clean
+        }
+
         test {Hybrid BGSAVE harness: FLUSHALL ASYNC during the save aborts it and the next save works} {
             snap_populate_race 0 1
             r config set rdb-key-save-delay 400

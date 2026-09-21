@@ -2054,6 +2054,14 @@ int rdbSaveRioHeader(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *r
 
     /* save functions */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_FUNCTIONS) && rdbSaveFunctions(rdb) == -1) goto werr;
+
+    /* Save the hash template registry (id -> field names). Template encoded
+     * hashes are then written in compact REF form (id + values) by
+     * rdbSaveKeyValuePair. Part of the header so that every producer of the
+     * database records (this loop, the hybrid BGSAVE child) is preceded by it. */
+    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
+        if (rdbSaveHashTemplates(rdb) == -1) goto werr;
+    }
     return C_OK;
 
 werr:
@@ -2088,12 +2096,6 @@ int rdbSaveRio(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     int j;
 
     if (rdbSaveRioHeader(req, rdb, error, rdbflags, rsi) == C_ERR) return C_ERR;
-
-    /* Save the hash template registry (id -> field names). Template encoded
-     * hashes are then written in compact REF form (id + values) by rdbSaveKeyValuePair. */
-    if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
-        if (rdbSaveHashTemplates(rdb) == -1) goto werr;
-    }
 
     /* save all databases, skip this if we're in functions-only mode */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
