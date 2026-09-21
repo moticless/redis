@@ -94,9 +94,9 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     kv->lru = 0;
     kv->iskvobj = 1;
     kv->metabits = keyMetaBits;
-    kvobjBits(kv)->key_sds_type = key_sds_type;
-    kvobjBits(kv)->no_evict = 0;
-    kvobjBits(kv)->unused = 0;
+    kvBits bits = { .key_sds_type = key_sds_type, .no_evict = 0,
+                    .save_gen = server.snap_gen & KVBITS_GEN_MASK, .unused = 0 };
+    kvobjBitsSet(kv, bits);
 
     /* Store embedded key, right after the kvBits. */
     char *data = (char *) (kvobjBits(kv) + 1);
@@ -196,9 +196,9 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     o->lru = 0;
     o->metabits = keyMetaBits;
     o->iskvobj = 1;
-    kvobjBits(o)->key_sds_type = key_sds_type;
-    kvobjBits(o)->no_evict = 0;
-    kvobjBits(o)->unused = 0;
+    kvBits bits = { .key_sds_type = key_sds_type, .no_evict = 0,
+                    .save_gen = server.snap_gen & KVBITS_GEN_MASK, .unused = 0 };
+    kvobjBitsSet(o, bits);
 
     /* Store embedded key, right after the kvBits. */
     char *data = (char *) (kvobjBits(o) + 1);
@@ -255,8 +255,8 @@ sds kvobjGetKey(const kvobj *kv) {
         sizeof(struct sdshdr16), sizeof(struct sdshdr32)
     };
     debugServerAssert(kv->iskvobj);
-    kvBits *bits = kvobjBits(kv);
-    return (sds) ((char *) (bits + 1) + kvobjKeyHdrSize[bits->key_sds_type]);
+    kvBits bits = kvobjBitsGet(kv);
+    return (sds) ((char *) (kvobjBits(kv) + 1) + kvobjKeyHdrSize[bits.key_sds_type]);
 }
 
 long long kvobjGetExpire(const kvobj *kv) {
@@ -328,7 +328,11 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
     }
     
     kv->lru = val->lru;
-    if (val->iskvobj) kvobjBits(kv)->no_evict = kvobjBits(val)->no_evict;
+    if (val->iskvobj) {
+        kvBits b = kvobjBitsGet(kv);
+        b.no_evict = kvobjBitsGet(val).no_evict;
+        kvobjBitsSet(kv, b);
+    }
 
     /* Transfer module metadata from `val` to new `kv` (if `val` of type kvobj with metadata). */
     if (val->metabits & KEY_META_MASK_MODULES)

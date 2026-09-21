@@ -745,6 +745,65 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             }
         }
 
+        test {Hybrid BGSAVE: writes to keys the scan already passed are applied in place, not cloned} {
+            r flushall
+            populate_fillers 3000
+            set ref [debug_digest]
+            set gen0 [s snap_gen]
+            r config set rdb-key-save-delay 1000
+            r bgsave
+            snap_wait_save_started
+            assert_equal 1 [s snap_save_marks_valid]
+            wait_for_condition 100 50 {[s snap_save_keys_nofork] > 1500} else { fail "scan did not reach half" }
+            for {set i 0} {$i < 3000} {incr i} { r set filler:$i [string repeat h 60] }
+            set inplace [s snap_save_inplace_writes]
+            assert {$inplace > 500}
+            assert {$inplace < 3000}
+            # the scanned half was written in place, only the rest is retained
+            assert {[s snap_save_retained_bytes] > 0}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 0 [s snap_gen_since_success]
+            assert {[s snap_gen] != $gen0}
+            assert {[s snap_last_save_inplace_writes] >= $inplace}
+            assert_equal [string repeat h 60] [r get filler:0]
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            snap_assert_placement_clean
+        }
+
+        test {Hybrid BGSAVE: after 7 saves without a completion the marks are not trusted until one completes} {
+            r flushall
+            for {set n 0} {$n < 7} {incr n} {
+                populate_fillers 500
+                r config set rdb-key-save-delay 2000
+                r bgsave
+                snap_wait_save_started
+                r flushall
+                snap_wait_bgsave_done
+            }
+            assert_equal 7 [s snap_gen_since_success]
+            populate_fillers 3000
+            r config set rdb-key-save-delay 1000
+            r bgsave
+            snap_wait_save_started
+            assert_equal 0 [s snap_save_marks_valid]
+            wait_for_condition 100 50 {[s snap_save_keys_nofork] > 1500} else { fail "scan did not reach half" }
+            for {set i 0} {$i < 500} {incr i} { r set filler:$i x }
+            assert_equal 0 [s snap_save_inplace_writes]
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 0 [s snap_gen_since_success]
+            r config set rdb-key-save-delay 1000
+            r bgsave
+            snap_wait_save_started
+            assert_equal 1 [s snap_save_marks_valid]
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+        }
+
         test {Hybrid BGSAVE harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
             r flushall
             r himport prepare fieldset a b c d

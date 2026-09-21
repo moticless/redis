@@ -61,8 +61,16 @@ typedef struct _kvstoreDictIterator {
  * owner thread once the scan of that dict has finished. */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
+/* 1 if the snapshot is done reading this frozen original: a write lookup may
+ * then hand out the frozen entry itself instead of a clone. Optional. */
+typedef int (kvstoreOverlayScannedFn)(void *privdata, int didx, void *orig);
+/* Placeholder for a deleted, already-scanned frozen original: a header-only
+ * stand-in that keeps the key alive in the frozen entry until merge, released
+ * through free_orig with value_shared = 1. Required when 'scanned' is set. */
+typedef void *(kvstoreOverlayTombFn)(void *privdata, int didx, void *orig);
 void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
-                          kvstoreOverlayFreeOrigFn *free_orig, void *privdata);
+                          kvstoreOverlayFreeOrigFn *free_orig, kvstoreOverlayScannedFn *scanned,
+                          kvstoreOverlayTombFn *tomb, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
 void kvstoreOverlayMerge(kvstore *kvs, int didx);
 void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);

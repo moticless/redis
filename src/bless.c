@@ -98,13 +98,15 @@ static void blessUntrack(redisDb *db, sds keyname) {
 
 int blessIsNoEvict(kvobj *kv) {
     debugServerAssert(kv->iskvobj);
-    return kvobjBits(kv)->no_evict;
+    return kvobjBitsGet(kv).no_evict;
 }
 
 /* Update the bit and its derived index without reallocating the key. */
 void blessSetNoEvict(redisDb *db, kvobj *kv, int enabled) {
     serverAssert(kv->iskvobj);
-    kvobjBits(kv)->no_evict = enabled != 0;
+    kvBits b = kvobjBitsGet(kv);
+    b.no_evict = enabled != 0;
+    kvobjBitsSet(kv, b);
     if (enabled) blessTrack(db, kvobjGetKey(kv));
     else blessUntrack(db, kvobjGetKey(kv));
 }

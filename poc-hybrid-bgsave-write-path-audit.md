@@ -405,3 +405,5 @@ Blockers still open: eviction during a save only tombstones (no memory reclaimed
 | Cluster memory tracking on the overlay | temp dict destructor accounts on the real dict; a clone takes over its original's `alloc_size` |
 | Scan-thread reads of `server.*` | `rdb_key_save_delay`, `maxmemory_policy`, `rdb_compression` copied per save; LRU clock computed with `getLRUClock()`; `hashTypeNext` only reads `allow_access_expired` when skipping was requested |
 | Arena-free mode | single-allocation values are always copied on clone (the scan thread classifies by reading the allocation) |
+| Write lookup on a frozen slot, key already scanned (kvBits.save_gen == current) | `kvstoreDictFindLink` returns the frozen entry: in-place write, no clone (`snapOverlayKeyScanned`) |
+| Delete of an already-scanned frozen key | tombstone via a header-only clone that owns the value (`snapOverlayCloneKey` with the scanned check) |

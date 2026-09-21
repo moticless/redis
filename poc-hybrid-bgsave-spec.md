@@ -270,3 +270,18 @@ surfaced, not worked around.
   `rdb-compression` are frozen per save; the LRU clock is computed, not read.
 - Slots empty at the freeze instant are DONE immediately and never frozen.
 - See `poc-hybrid-bgsave-m1-report.md` for the M1 evidence and go/no-go.
+
+### 11.y Per-key scan generation (2026-09-21)
+
+`kvBits.save_gen` (3 bits, upstream kvBits byte) records the generation of the
+hybrid save whose scan thread serialized the key. `server.snap_gen` bumps at
+every hybrid save start before the freeze; the scan thread stamps a key as its
+last touch (release store); a write lookup on a frozen slot checks the mark with
+an acquire load and, when it matches, hands out the frozen entry itself: the
+write is applied in place, no clone, no temp entry, no retention, nothing to
+merge. Deletes still tombstone (with a header-only clone that owns and frees
+the value at once), adds still go to the temp dict. Marks are trusted only while
+fewer than 7 saves ran without one completing; otherwise the save clones
+everything as before and its completion resets the counter. kvBits is accessed
+only through byte-wide atomics. INFO exposes `snap_gen`,
+`snap_gen_since_success`, `snap_save_marks_valid`, `snap_save_inplace_writes`.

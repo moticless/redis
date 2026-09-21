@@ -311,6 +311,7 @@ void dictFreeStats(dictStats *stats);
 
 dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
+dictEntry *dictEncodeKeyAsEntry(dict *d, void *key);
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 
 void dictSetKey(dict *d, dictEntry* de, void *key __stored_key);

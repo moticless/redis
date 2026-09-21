@@ -63,6 +63,9 @@ typedef struct kvstoreDictOverlay {
     long tombs;                 /* frozen keys hidden by a tombstone (and not re-added) */
     kvstoreOverlayCloneFn *clone;
     kvstoreOverlayFreeOrigFn *free_orig;
+    kvstoreOverlayScannedFn *scanned;
+    kvstoreOverlayTombFn *tomb;
+    dictEntry *scratch;         /* in-place delete of a scanned key: the original, handed to the caller as a link */
     void *privdata;
 } kvstoreDictOverlay;
 
@@ -118,7 +121,8 @@ static void ovTempKeyDestructor(dict *tempd, void *key) {
 }
 
 void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
-                          kvstoreOverlayFreeOrigFn *free_orig, void *privdata)
+                          kvstoreOverlayFreeOrigFn *free_orig, kvstoreOverlayScannedFn *scanned,
+                          kvstoreOverlayTombFn *tomb, void *privdata)
 {
     if (!kvs->ov) kvs->ov = zcalloc(sizeof(kvstoreDictOverlay *) * kvs->num_dicts);
     assert(kvs->ov[didx] == NULL);
@@ -145,6 +149,8 @@ void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
     ov->state = dictCreate(&ov->state_type);
     ov->clone = clone;
     ov->free_orig = free_orig;
+    ov->scanned = scanned;
+    ov->tomb = tomb;
     ov->privdata = privdata;
     kvs->ov[didx] = ov;
     kvs->ov_count++;
@@ -179,6 +185,33 @@ static dictEntry *ovEnsureClone(kvstore *kvs, int didx, kvstoreDictOverlay *ov, 
     assert(te != NULL);
     if (shared) ovStateSet(kvs, didx, ov, key, st | OV_STATE_SHARED);
     return te;
+}
+
+/* Delete of a frozen original the snapshot has already read. The bucket chain
+ * stays untouched (the scan thread may still be walking it towards later
+ * entries), but this entry itself is ours now: swap in a header-only
+ * placeholder that keeps the key alive for lookups and for the state dict,
+ * tombstone it, and hand the real object back to the caller through the
+ * overlay's scratch link so the normal unlink/free path releases it (and
+ * anything still holding a reference, e.g. MOVE, keeps a valid object).
+ * Returns NULL when the key does not qualify. */
+static dictEntryLink ovTombstoneInPlace(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
+    if (!ov->scanned || !ov->tomb) return NULL;
+    if (dictFind(ov->temp, key)) return NULL;
+    if (ovStateGet(ov, key) & OV_STATE_TOMB) return NULL;
+    dict *d = kvs->dicts[didx];
+    dictEntryLink fl = d ? dictFindLink(d, key, NULL) : NULL;
+    if (!fl) return NULL;
+    void *orig = dictGetKey(*fl);
+    if (!ov->scanned(ov->privdata, didx, orig)) return NULL;
+    void *ph = ov->tomb(ov->privdata, didx, orig);
+    dictSetKeyAtLink(d, ph, &fl, 0);               /* pointer swap inside our own entry */
+    ovStateSet(kvs, didx, ov, key, OV_STATE_TOMB | OV_STATE_SHARED);   /* borrows the placeholder's key */
+    ov->tombs++;
+    ovKeyCountAdd(kvs, didx, -1);
+    assert(ov->scratch == NULL);
+    ov->scratch = dictEncodeKeyAsEntry(d, orig);          /* a tagged bare-key entry, as the dict stores them */
+    return &ov->scratch;
 }
 
 /* Called after a temp entry for 'key' was inserted (new item). */
@@ -1271,9 +1304,18 @@ dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLi
     if (bucket) *bucket = NULL;    
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
-        /* Write intent: never hand out a link into the frozen dict. Clone the
-         * original into the temp dict on first touch; a miss returns the temp
-         * bucket so the insertion lands in the temp dict. */
+        /* Write intent. A frozen original the snapshot has already read (the
+         * scan thread published its generation mark) may be written in place:
+         * the thread never revisits it, and rehash/resize are paused so the
+         * bucket it sits in is stable. Otherwise clone the original into the
+         * temp dict on first touch; a miss returns the temp bucket so the
+         * insertion lands in the temp dict. */
+        if (ov->scanned && !dictFind(ov->temp, key) && !(ovStateGet(ov, key) & OV_STATE_TOMB)) {
+            dict *d = kvs->dicts[didx];
+            dictEntry *fe = d ? dictFind(d, key) : NULL;
+            if (fe && ov->scanned(ov->privdata, didx, dictGetKey(fe)))
+                return dictFindLink(d, key, NULL);
+        }
         ovEnsureClone(kvs, didx, ov, key);
         return dictFindLink(ov->temp, key, bucket);
     }
@@ -1299,7 +1341,12 @@ void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link,
     dict *d;
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
-        /* Frozen: links refer to the temp dict (see kvstoreDictFindLink). */
+        if (link && *link == &ov->scratch) {        /* in-place delete in progress (see ovTombstoneInPlace) */
+            ov->scratch = kv ? dictEncodeKeyAsEntry(kvs->dicts[didx], kv) : NULL;
+            return;
+        }
+        /* Frozen: links refer to the temp dict, or to a scanned frozen entry
+         * (see kvstoreDictFindLink); either way the type is the store's. */
         dictSetKeyAtLink(ov->temp, kv, link, newItem);
         if (newItem) {
             const void *key = kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(kv) : kv;
@@ -1348,6 +1395,8 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
 dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
+        dictEntryLink l = ovTombstoneInPlace(kvs, didx, ov, key);
+        if (l) { if (table_index) *table_index = 0; return l; }
         if (!ovEnsureClone(kvs, didx, ov, key)) return NULL;
         return dictTwoPhaseUnlinkFind(ov->temp, key, table_index);
     }
@@ -1368,6 +1417,14 @@ void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, i
 void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
+        if (link == &ov->scratch) {
+            /* In-place delete of a scanned key: the frozen entry already holds
+             * the placeholder; release the original like the dict would. */
+            if (ov->scratch && kvs->dtype.keyDestructor)
+                kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
+            ov->scratch = NULL;
+            return;
+        }
         if (link && *link) {
             /* Bookkeeping first: the key pointer dies with the temp entry. */
             if (!key) key = ovEntryKey(kvs, *link);
@@ -1385,6 +1442,11 @@ void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link
 int kvstoreDictDelete(kvstore *kvs, int didx, const void *key) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
     if (ov) {
+        if (ovTombstoneInPlace(kvs, didx, ov, key)) {
+            if (kvs->dtype.keyDestructor) kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
+            ov->scratch = NULL;
+            return DICT_OK;
+        }
         if (!ovEnsureClone(kvs, didx, ov, key)) return DICT_ERR;
         ovOnTempRemove(kvs, didx, ov, key);
         int ret = dictDelete(ov->temp, key);

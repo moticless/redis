@@ -190,7 +190,8 @@ void snapScanRelease(snapScanCtx *ctx);
  * callbacks for store s (the server passes the redisDb). Must be called
  * before snapScanStart(). */
 void snapScanSetOverlay(snapScanCtx *ctx, kvstoreOverlayCloneFn *clone,
-                        kvstoreOverlayFreeOrigFn *free_orig, void **store_privdata);
+                        kvstoreOverlayFreeOrigFn *free_orig, kvstoreOverlayScannedFn *scanned,
+                        kvstoreOverlayTombFn *tomb, void **store_privdata);
 
 /* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
  * copies the whole kvobj allocation into a fresh arena block; SNAP_NOFORK
@@ -251,6 +252,23 @@ int snapKeyIsOwed(redisDb *db, sds key);
  * still owed: such an object must never reach a mutator, only its clone may.
  * Used by debug-build assertions at the keyspace write funnels. */
 int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
+
+/* Scan generation (kvBits.save_gen, 3 bits). Every hybrid save bumps
+ * server.snap_gen; the scan thread stamps each key it finished reading with
+ * it (release store), so the main thread can tell an already-scanned frozen
+ * original (acquire load, gen == current) from one still owed. Marks are only
+ * trusted while fewer than 7 saves ran without one completing: a completed
+ * save stamps every key, an aborted one leaves a mix, and after 7 aborts the
+ * 8th generation would alias a stale mark. */
+#define SNAP_GEN_MAX_SINCE_SUCCESS 7
+int snapKvobjScanned(const kvobj *kv);           /* main thread */
+void snapKvobjMarkScanned(kvobj *kv);            /* scan thread */
+int snapOverlayKeyScanned(void *privdata, int didx, void *orig);   /* kvstore overlay callback */
+void *snapOverlayTombstoneKey(void *privdata, int didx, void *orig); /* placeholder for a deleted scanned key */
+int snapKvobjIsOwed(redisDb *db, kvobj *kv);     /* owed slot and not yet scanned */
+int snapSaveMarksValid(void);
+long long snapSaveInplaceWrites(void);
+long long snapSaveLastInplaceWrites(void);
 #define snapDebugAssertNotFrozenOriginal(db, kv) \
     debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !snapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
 /* Main thread, serverCron/beforeSleep: act on a pending hard-mark abort. */

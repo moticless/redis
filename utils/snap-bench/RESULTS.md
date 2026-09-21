@@ -148,3 +148,24 @@ Laptop-class host (governor powersave, turbo on), 2 reps, datasets of 250-300 MB
 Traffic is same-size in-place writes (or inserts for big-grow) with uniform key choice; skewed
 workloads concentrate CoW on fewer pages and favour stock less than this. Production-shaped data
 (as in the sibling branch's t083 measurements) is the next step.
+
+## Addendum: per-key scan generation (kvBits.save_gen), 2026-09-21
+
+With the 3-bit generation mark, a write to a key the scan thread has already
+serialized is applied in place instead of being cloned into the overlay. Hybrid
+cells rerun on tmpfs with the plain build (`/tmp/snap-bench6.csv`), medians of 2;
+the "before" column is the clone-everything hybrid from the main table.
+
+| dataset, rate | save s | extra mem MB | parent growth MB | retained peak MB | worst PING ms (merge) |
+|---|---|---|---|---|---|
+| small, 20k/s | 1.48 -> 1.58 | 9.0 -> 6.0 | 4.5 -> 2.0 | 7.6 -> 4.0 | 13.7 -> 6.7 |
+| small, 50k/s | 1.52 -> 1.52 | 13.5 -> 9.0 | 9.0 -> 4.5 | 18.5 -> 10.0 | 31.1 -> 19.0 |
+| mixed, 20k/s | 1.06 -> 1.08 | 35.5 -> 38.0 | 0.5 -> 1.5 | 0.9 -> 0.5 | 7.6 -> 3.1 |
+| mixed, 50k/s | 1.08 -> 1.10 | 57.0 -> 58.5 | 2.0 -> 2.0 | 2.0 -> 1.2 | 12.4 -> 12.1 |
+
+As expected for uniform writes during a linear scan, about half of the writes
+now bypass the overlay: retained bytes, parent growth and the merge spike all
+drop by roughly half on the small dataset. The mixed dataset's extra memory is
+dominated by the SNAP_FORK hashes' CoW in the child, which the marks do not
+touch. The remaining merge spike is proportional to the keys written before the
+scan reached them; bounding it needs an incremental merge.
