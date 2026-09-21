@@ -271,7 +271,7 @@ surfaced, not worked around.
 - Slots empty at the freeze instant are DONE immediately and never frozen.
 - See `poc-hybrid-bgsave-m1-report.md` for the M1 evidence and go/no-go.
 
-### 11.y Per-key scan generation (2026-09-21)
+### 11.y Per-key scan generation (2026-09-21; superseded by 11.z)
 
 `kvBits.save_gen` (3 bits, upstream kvBits byte) records the generation of the
 hybrid save whose scan thread serialized the key. `server.snap_gen` bumps at
@@ -289,22 +289,23 @@ only through byte-wide atomics. INFO exposes `snap_gen`,
 ### 11.z Serialize-before-write with a bucket window (design for the next spike, 2026-09-21)
 
 Proposed by the user after the generation-mark results; replaces the frozen-dict
-overlay of §4 (temp dicts, tombstones, merge) with the scheme below. Precedent:
-Dragonfly's bucket versioning (a write to a bucket whose version is older than
-the running snapshot first serializes that bucket, then proceeds in place). Our
-differences: the walker is a separate thread, so a published bucket window keeps
-it off the chains the main thread mutates; our version is `kvBits.save_gen`
-(3 bits per key) rather than 64 bits per bucket; and SNAP_FORK values are still
-owned by the fork child, so the main thread never serializes a big value.
+overlay of §4 (temp dicts, tombstones, merge) and the per-key generation of
+§11.y. Precedent: Dragonfly's bucket versioning (a write to a bucket whose
+version is older than the running snapshot first serializes that bucket, then
+proceeds in place). Our differences: the walker is a separate thread, so a
+published bucket window keeps it off the chains the main thread mutates; the
+"already in the snapshot" state is a per-save bitmap with one bit per bucket
+rather than a 64-bit version per bucket; and SNAP_FORK values are still owned
+by the fork child, so the main thread never serializes a big value.
 
 **Invariants (worst-first).**
 
-1. Every key present at the fork instant is emitted exactly once: either by the
-   main thread before the key's first post-fork mutation or removal, or by the
-   walker when it reaches it. The arbiter is `save_gen == G` (G = this save's
-   generation): whoever stamps first emits; the other skips. A false "already
-   emitted" loses a key, a false "not emitted" produces a duplicate that fails
-   the load, so the marks are now a correctness requirement, not a heuristic.
+1. Every key present at the fork instant is emitted exactly once, by bucket:
+   a bucket is emitted either by the walker when the window reaches it or by
+   the main thread before the first post-fork write to it, never both, never
+   neither. The arbiter is the bucket's "emitted" bit: set only by the main
+   thread for buckets ahead of the window, read only by the walker for buckets
+   inside it, and the walker's cursor itself for buckets behind it.
 2. The walker traverses only the chains of the buckets in the published window
    W = (dict, table, [lo, hi)). The main thread makes structural changes to a
    dict under a save (add, unlink, replace of an entry pointer) only in buckets
@@ -312,63 +313,68 @@ owned by the fork child, so the main thread never serializes a big value.
 3. The main thread never blocks on the child. Its records go to the walker
    through a queue; the walker drains that queue before its own work.
 4. Bucket layout of a dict under a save is stable: rehashing paused, expand
-   and shrink forbidden (DICT_RESIZE_FORBID, not AVOID) until the save ends. A
-   dict mid-rehash at freeze keeps both tables; the window names the table.
+   and shrink forbidden for that dict until the save ends (including the
+   kvstore resize cron). A dict mid-rehash at freeze keeps both tables; the
+   window names the table and each table has its own bitmap.
 
 **Main thread, at the write funnel** (the kvstore write lookup, add, unlink and
-set-at-link entry points, i.e. the hooks of the write-path audit). It already
-knows the dict, table and bucket b of the key. Under an active hybrid save:
+set-at-link entry points, i.e. the hooks of the write-path audit). It knows the
+dict, table and bucket b of the key (hash and mask). Under an active hybrid
+save:
 
-- Read W (see the handshake below). If b is outside W:
-  - existing key with `save_gen != G`: emit it first. SNAP_NOFORK class:
-    `rdbSaveKeyValuePair` (with its TTL from the expires dict) into the main
-    thread's own staging buffer; SNAP_FORK class: a `SNAP_MSG_KVOBJ` header
-    copy, the value pointer refers to memory the child owns since the fork.
-    Then stamp `save_gen = G` (release). Small values are listpack, intset or
-    short strings, which RDB writes as raw blobs, so the emission is a bounded
-    memcpy (`save-small-max-bytes`); big values cost a header message.
-  - then apply the operation in place: mutate, unlink and free, or add. A new
-    key is born with `save_gen = G` (already so today). Deleting a SNAP_FORK
-    value in place is fine, the child has its own copy of the pages.
-- If b is inside W: do not emit (the walker may be reading the key at this
-  moment and would emit it too). Behave as the overlay does today, bounded to
-  the window: duplicate into a side table on modify, tombstone on delete, add
-  to the side table on add. Lookups consult the side table first while it is
-  non-empty. The main thread drains the side table (replace in chain and free
-  the original, unlink tombstoned originals, add pending keys) at the next
-  funnel entry or cron tick once W has moved past those buckets. The originals
-  kept alive by the side table are the only retained bytes left.
+- Read W (see the handshake below).
+- b behind W (already walked): write in place, nothing else.
+- b ahead of W: if the bucket's bit is clear, emit the bucket's whole chain
+  first (SNAP_NOFORK class: `rdbSaveKeyValuePair` with the key's TTL into the
+  main thread's own staging buffer; SNAP_FORK class: a `SNAP_MSG_KVOBJ` header
+  copy, the value pointer refers to memory the child owns since the fork), then
+  set the bit. Then apply the operation in place: mutate, unlink and free, or
+  add. This holds for adds too, so a post-fork key never lands in a chain that
+  is still to be emitted. Small values are listpack, intset or short strings,
+  which RDB writes as raw blobs, so an emission is a bounded memcpy per key
+  (`save-small-max-bytes`); a chain is about one key at load factor 1. Deleting
+  a SNAP_FORK value in place is fine, the child has its own copy of the pages.
+- b inside W: do not emit (the walker is emitting it) and do not touch the
+  chain. Behave as the overlay does today, bounded to the window: duplicate
+  into a side table on modify, tombstone on delete, add to the side table on
+  add. Lookups consult the side table first while it is non-empty. The main
+  thread drains the side table (replace in chain and free the original, unlink
+  tombstoned originals, add pending keys) at the next funnel entry or cron tick
+  once W has moved past those buckets. The originals kept alive by the side
+  table are the only retained bytes left.
 
 Value mutations outside the funnel (the command body writing into the value it
-looked up) need no protection: the key is stamped G before they start, and a
-stamped key is skipped by the walker after one atomic byte load. Only chain
-writes are structural and those happen inside the funnel.
+looked up) need no protection: the bucket was emitted or walked before they
+start and the walker never reads it again. Only chain writes are structural and
+those happen inside the funnel.
 
 **Walker.** For each dict and table, publish W of K buckets, wait for
-quiescence, then walk the chains sequentially (no reverse-binary cursor is
-needed with rehash paused): load `save_gen` (acquire); if G skip; else emit and
-stamp (release). Before advancing, drain the main-thread queue, then publish the
-next window. Standalone mode thus gets fine-grained release for free; cluster
-mode windows span the 16,384 small dicts (a window is often a whole dict).
+quiescence, then walk the chains sequentially with atomic loads of the chain
+pointers (no reverse-binary cursor is needed with rehash paused): a bucket whose
+bit is set is skipped, the others are emitted. Before advancing, drain the
+main-thread queue, then publish the next window. Standalone mode thus gets
+fine-grained release for free; cluster mode windows span the 16,384 small dicts
+(a window is often a whole dict).
 
 **Handshake.** No acknowledgement from the main thread (that stalls the walker
 on an idle server). Instead a quiescence sequence: the main thread increments an
-atomic counter on funnel entry (odd = inside) and exit (even), and reads W after
-the entry increment; the walker stores the new W, loads the counter, and if it
-is odd waits until it changes. Both pairs are seq_cst (store-then-load on each
-side is the store-buffer pattern; acquire/release alone is not enough). Cost:
-two seq_cst operations per write funnel, only while a hybrid save is active.
-Possible later optimisation: an asymmetric fence (`membarrier`) on the walker
-side, making the main-thread side plain stores. Module threads that hold the GIL
-reach the keyspace through the same funnels, so they are covered.
+atomic counter when a write section opens (odd = inside) and closes, and reads
+W after the opening increment; the walker stores the new W, loads the counter,
+and if it is odd waits until it changes. Both pairs are seq_cst (store-then-load
+on each side is the store-buffer pattern; acquire/release alone is not enough).
+A write section opens at the first write funnel of a command and closes when
+the outermost command returns, at beforeSleep, and when a module thread
+releases the GIL, so a link obtained by a write lookup stays valid until the
+matching set-at-link: the window cannot move under it. Cost: two seq_cst
+operations per write section, only while a hybrid save is active. Possible
+later optimisation: an asymmetric fence (`membarrier`) on the walker side.
 
-**Generation wrap.** Every save walks to completion even when aborted or failed:
-abort stops emitting to the child but keeps stamping until the last bucket.
-After any save every surviving key carries G, so the next save's G+1 never
-aliases; the `snap_gen_since_success` trust counter and the clone-everything
-fallback are deleted. Exception: FLUSHALL, FLUSHDB and SWAPDB-style aborts of
-dicts that are being emptied stop at once, nothing survives to alias. (With this
-rule one bit would suffice; the three bits stay as slack and telemetry.)
+**Bitmap lifecycle.** Allocated at freeze for every frozen table (one bit per
+bucket, about 256 KB for 2M buckets), written with atomic byte ops so a window
+boundary inside a byte is race-free, freed when the save ends or aborts. Nothing
+about a save survives it, so there is no generation to wrap and no trust rule.
+`kvBits.save_gen` and the byte-wide kvBits atomics of §11.y are removed; kvBits
+returns to the upstream layout.
 
 **Queue and backpressure.** Main to walker: a list of filled staging buffers,
 pushed when full or at command end. The walker drains it before every window
@@ -380,20 +386,22 @@ against 300 MB of walker output.
 
 **What this removes.** The frozen-dict invariant of §4, the kvstore overlay
 (temp dicts, state dict, tombstone placeholders, merge, `hybrid-merge` latency
-event), retained accounting beyond the side table and queue, the marks trust
-counter. Eviction and expiry of unwalked keys now free memory immediately (M1
-limitation 1 disappears). Reads during a save are plain in-place reads except
-for the side-table check while it is non-empty.
+event), retained accounting beyond the side table and queue, the per-key
+generation marks with their atomics and trust counter. Eviction and expiry of
+unwalked keys now free memory immediately (M1 limitation 1 disappears). Reads
+during a save are plain in-place reads except for the side-table check while it
+is non-empty.
 
 **What it keeps.** Arena and placement, scan thread and 64 KB staging protocol,
-pipe and child (SELECTDB/RESIZEDB/SLOT_INFO tracking, `dismissObject`), kvBits
-atomics, the `scanned` funnel hook in `kvstoreDictFindLink`, the write-path
-audit table, the tcl harness (the reload step already fails loudly on a
-duplicate key; a missing key fails the digest).
+pipe and child (SELECTDB/RESIZEDB/SLOT_INFO tracking, `dismissObject`), the
+funnel hooks in kvstore.c, the write-path audit table, the tcl harness (the
+reload step already fails loudly on a duplicate key; a missing key fails the
+digest).
 
-**Costs and risks to measure in the spike.** Main-thread emission per first
-write to an unwalked key (about a microsecond, replacing today's clone); the
-seq_cst pair per funnel during saves; load factor drift under the resize
-lockout for long saves; the walker's wait on a main thread inside a long funnel
-(bounded by one dict operation, not one command). Order of work: standalone
-single db first, TSan and the harness on every step, cluster slots last.
+**Costs and risks to measure in the spike.** Main-thread emission of a bucket
+chain on the first write to it (about a microsecond per key, replacing today's
+clone; an add to a fresh bucket pays it too); the seq_cst pair per write section
+during saves; load factor drift under the resize lockout for long saves; the
+walker's wait on a main thread inside a long write section (bounded by one
+command). Order of work: standalone single db first, TSan and the harness on
+every step, cluster slots last.
