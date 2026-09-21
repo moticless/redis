@@ -1266,8 +1266,15 @@ static int snapSaveChildWrite(snapSave *sv) {
             kvobj *kv = (kvobj *)(payload + h.robj_off);
             robj key;
             initStaticStringObject(key, kvobjGetKey(kv));
+            size_t before = rdb.processed_bytes;
             if (rdbSaveKeyValuePair(&rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
             key_counter++;
+            /* As the stock child does after each key: drop the value's pages from
+             * this process once written, so later parent writes to them do not
+             * leave us a private copy. The value is the parent's forkable
+             * allocation, mapped in our CoW view. */
+            size_t dump_size = rdb.processed_bytes - before;
+            if (dump_size > server.page_size / 2) dismissObject(kv, dump_size);
         } else {
             err_op = "unknown message";
             goto werr;

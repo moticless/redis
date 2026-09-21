@@ -1313,11 +1313,26 @@ void set_jemalloc_bg_thread(int enable) {
     je_mallctl("background_thread", NULL, 0, &val, 1);
 }
 
+/* Flush this thread's SNAP_NOFORK tcache back to the arena. The regions a
+ * tcache holds pin their slabs: after a FLUSHALL about 1 MB of cached regions
+ * kept 30 MB of arena slabs resident, which the arena purge below cannot
+ * release. Called by jemalloc_purge() (FLUSHALL/FLUSHDB, lazyfree, MEMORY
+ * PURGE). */
+static void noforkTcacheFlush(void) {
+#ifdef HAVE_NOFORK_ARENA
+    int flags = nofork_thread_flags;
+    if (nofork_arena == UINT_MAX || flags == 0) return;
+    unsigned tc = ((unsigned)flags >> 8) & 0xfff;   /* MALLOCX_TCACHE(t) == (t+2) << 8 */
+    if (tc >= 2) { tc -= 2; je_mallctl("tcache.flush", NULL, NULL, &tc, sizeof(tc)); }
+#endif
+}
+
 int jemalloc_purge(void) {
     /* return all unused (reserved) pages to the OS */
     char tmp[32];
     unsigned narenas = 0;
     size_t sz = sizeof(unsigned);
+    noforkTcacheFlush();
     if (!je_mallctl("arenas.narenas", &narenas, &sz, NULL, 0)) {
         snprintf(tmp, sizeof(tmp), "arena.%u.purge", narenas);
         if (!je_mallctl(tmp, NULL, 0, NULL, 0))
