@@ -1744,7 +1744,8 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     /* Delay return if required (for testing). The hybrid scan thread applies
      * its own atomic copy of the delay (snapshot.c): the config may be
      * changed by the main thread while it runs. */
-    if (server.rdb_key_save_delay && !snapOnScanThread() && !snapMainEmitting())
+    /* Scan thread and main-thread emission never read the live config here. */
+    if (!snapOnScanThread() && !snapMainEmitting() && server.rdb_key_save_delay)
         debugDelay(server.rdb_key_save_delay);
 
     return 1;

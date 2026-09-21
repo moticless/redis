@@ -1166,7 +1166,9 @@ typedef struct snapQueuedMsg {
     snapMsgHdr h;
     sds payload;
 } snapQueuedMsg;
-static int snap_main_emitting = 0;
+/* Thread-local: set by the main thread around a bucket emission; rdb.c reads
+ * it on whichever thread serializes (the scan thread's copy is always 0). */
+static __thread int snap_main_emitting = 0;
 int snapMainEmitting(void) { return snap_main_emitting; }
 
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
@@ -1408,9 +1410,12 @@ static void snapSaveRetainedSub(kvobj *orig, int value_shared) {
 void snapSaveCron(void) {
     if (!snap_save || snap_save->aborted) return;
     snapSave *sv = snap_save;
+    size_t queued;
+    atomicGet(sv->mq_bytes, queued);
+    /* The peak reported by INFO covers both kinds of save-time memory: the
+     * overlay's retained originals and records queued for the child. */
+    if (sv->retained_bytes + queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + queued;
     if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
-        size_t queued;
-        atomicGet(sv->mq_bytes, queued);
         if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
             sv->hard_mark_hit = 1;
             serverLog(LL_WARNING, "Hybrid BGSAVE: %zu bytes retained plus %zu queued for the child, past bgsave-hybrid-max-retained-bytes (%zu): aborting the save",

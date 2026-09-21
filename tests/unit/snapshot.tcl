@@ -857,7 +857,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             set aborts0 [s snap_hard_mark_aborts]
             r bgsave
             snap_wait_save_started
-            # overwrite a few thousand small keys: each keeps its original alive
+            # overwrite a few thousand small keys ahead of the slow scan thread:
+            # each is serialized into the queue for the child (accounted like
+            # retained bytes) faster than the thread forwards it
             for {set i 0} {$i < 3000} {incr i} { r set filler:$i [string repeat g 60] }
             snap_wait_bgsave_done
             assert_equal err [s rdb_last_bgsave_status]
