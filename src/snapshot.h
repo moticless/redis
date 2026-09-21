@@ -39,7 +39,7 @@ struct listpackEx;
 void snapArenaInit(void);
 
 /* 1 if the DONTFORK arena exists and the hybrid save path may be used. */
-int snapArenaAvailable(void);
+static inline int snapArenaAvailable(void) { return server.snap_nofork_arena != UINT_MAX; }
 
 /* Reserved / bump-allocated bytes of the arena's address range (0 if unavailable). */
 size_t snapArenaVaReserved(void);
@@ -53,9 +53,11 @@ size_t snapArenaVaUsed(void);
  * thread caches are not arena-aware, hence plain zfree() must never be used
  * on SNAP_NOFORK memory). When the arena is unavailable they degrade to
  * zmalloc/zrealloc/zfree. Calling any of them from a fork child panics. */
-void *snapNoforkAlloc(size_t size);
-void *snapNoforkCalloc(size_t size);
-void *snapNoforkAllocUsable(size_t size, size_t *usable);
+/* Allocation in the SNAP_NOFORK arena, or the default allocator when there is
+ * none (zmalloc.h inlines that decision). Never call from a fork child. */
+static inline void *snapNoforkAlloc(size_t size) { return zmalloc_nofork(size); }
+static inline void *snapNoforkCalloc(size_t size) { return zcalloc_nofork(size); }
+static inline void *snapNoforkAllocUsable(size_t size, size_t *usable) { return zmalloc_nofork_usable(size, usable); }
 void *snapNoforkRealloc(void *ptr, size_t size);
 void snapNoforkFree(void *ptr);
 void snapNoforkFreeSize(void *ptr, size_t usable);   /* sized free fast path */
@@ -102,7 +104,8 @@ int snapKeyClass(const robj *o);
  * the arena when it says SNAP_FORK and it is inside. Called by kvobjSet() at
  * every keyspace insertion and after unbounded in-place growth of strings.
  * Only the value moves; the header (and thus every pointer to it) stays. */
-void snapPlaceValue(robj *o);
+void snapPlaceValueArena(robj *o);
+static inline void snapPlaceValue(robj *o) { if (__builtin_expect(snapArenaAvailable(), 0)) snapPlaceValueArena(o); }
 
 /* Move a single-allocation value out of the arena if it is there. Must be
  * called before such a buffer is ADOPTED by a multi-allocation structure
@@ -243,7 +246,7 @@ void snapSaveChildDone(int exitcode, int bysignal);
 /* 1 when bgsave-hybrid is on: saves take the hybrid path whether or not the
  * SNAP_NOFORK arena exists (without it the CoW benefit is gone but the
  * mechanics are identical, which is what sanitizer builds exercise). */
-int snapHybridEnabled(void);
+static inline int snapHybridEnabled(void) { return server.bgsave_hybrid; }
 
 /* 1 if 'key' of 'db' is still owed to a running hybrid save. */
 int snapKeyIsOwed(redisDb *db, sds key);

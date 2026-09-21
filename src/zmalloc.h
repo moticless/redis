@@ -153,15 +153,29 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #define HAVE_NOFORK_ARENA 1
 extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
 extern char *zmalloc_nofork_hi;
+extern unsigned zmalloc_nofork_arena;   /* jemalloc arena index, UINT_MAX until created */
+/* hi is NULL while there is no arena: one load and one compare decide. */
 static inline int zmalloc_is_nofork(const void *p) {
-    return (const char *)p >= zmalloc_nofork_lo && (const char *)p < zmalloc_nofork_hi;
+    return (const char *)p < zmalloc_nofork_hi && (const char *)p >= zmalloc_nofork_lo;
 }
+static inline int zmalloc_nofork_enabled(void) { return zmalloc_nofork_arena != UINT_MAX; }
 int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unavailable */
 int zmalloc_nofork_arena_available(void);
 unsigned zmalloc_nofork_arena_index(void);           /* UINT_MAX if unavailable */
-__attribute__((malloc)) void *zmalloc_nofork(size_t size);
-__attribute__((malloc)) void *zcalloc_nofork(size_t size);
-void *zmalloc_nofork_usable(size_t size, size_t *usable);
+/* The arena entry points: with no arena they ARE the default allocators (one
+ * predictable branch, inlined), so a server with bgsave-hybrid off pays nothing. */
+__attribute__((malloc)) void *zmalloc_nofork_slow(size_t size);
+__attribute__((malloc)) void *zcalloc_nofork_slow(size_t size);
+void *zmalloc_nofork_usable_slow(size_t size, size_t *usable);
+static inline void *zmalloc_nofork(size_t size) {
+    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zmalloc_nofork_slow(size) : zmalloc(size);
+}
+static inline void *zcalloc_nofork(size_t size) {
+    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zcalloc_nofork_slow(size) : zcalloc(size);
+}
+static inline void *zmalloc_nofork_usable(size_t size, size_t *usable) {
+    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zmalloc_nofork_usable_slow(size, usable) : zmalloc_usable(size, usable);
+}
 void *zrealloc_nofork(void *ptr, size_t size);
 void zfree_nofork(void *ptr);
 void zfree_nofork_size(void *ptr, size_t size);
@@ -182,7 +196,9 @@ static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *u
 /* No arena on this platform: the SNAP_NOFORK entry points are the defaults. */
 #define zmalloc_nofork(size) zmalloc(size)
 #define zcalloc_nofork(size) zcalloc(size)
+#define zmalloc_nofork_usable(size, usable) zmalloc_usable(size, usable)
 #define ztrycalloc_nofork(size) ztrycalloc(size)
+static inline int zmalloc_nofork_enabled(void) { return 0; }
 #endif
 
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))

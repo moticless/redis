@@ -69,9 +69,6 @@ void snapArenaInit(void) {
 #endif
 }
 
-int snapArenaAvailable(void) {
-    return server.snap_nofork_arena != UINT_MAX;
-}
 
 size_t snapArenaVaReserved(void) {
 #ifdef SNAP_NOFORK_ARENA_SUPPORTED
@@ -93,32 +90,8 @@ size_t snapArenaVaUsed(void) {
 #endif
 }
 
-void *snapNoforkAlloc(size_t size) {
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    return zmalloc_nofork(size);
-#else
-    return zmalloc(size);
-#endif
-}
 
-void *snapNoforkCalloc(size_t size) {
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    return zcalloc_nofork(size);
-#else
-    return zcalloc(size);
-#endif
-}
 
-void *snapNoforkAllocUsable(size_t size, size_t *usable) {
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    return zmalloc_nofork_usable(size, usable);
-#else
-    return zmalloc_usable(size, usable);
-#endif
-}
 
 void *snapNoforkRealloc(void *ptr, size_t size) {
     snapAssertNotChild();
@@ -223,7 +196,6 @@ static void *snapValueAllocPtr(const robj *o) {
     }
 }
 
-int snapHybridEnabled(void) { return server.bgsave_hybrid; }
 
 int snapKeyClass(const robj *o) {
     if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return SNAP_FORK;
@@ -273,8 +245,7 @@ static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
     return n;
 }
 
-void snapPlaceValue(robj *o) {
-    if (!snapArenaAvailable()) return;
+void snapPlaceValueArena(robj *o) {
     if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return;
     if (snapValueIsInline(o->type, o->encoding)) return;
 

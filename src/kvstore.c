@@ -1262,14 +1262,20 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
     return dictFetchValue(d, key);
 }
 
+/* Overlay (frozen slot) halves of the hot kvstore entry points: out of line so
+ * the common path stays as small as it was and keeps being inlined. */
+static dictEntry * __attribute__((noinline)) ovDictFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key) {
+    /* Read: the logical keyspace, no cloning. */
+    dictEntry *te = dictFind(ov->temp, key);
+    if (te) return te;
+    if (ovStateGet(ov, key) & OV_STATE_TOMB) return NULL;
+    dict *d = kvs->dicts[didx];
+    return d ? dictFind(d, key) : NULL;
+}
+
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        /* Read: the logical keyspace, no cloning. */
-        dictEntry *te = dictFind(ov->temp, key);
-        if (te) return te;
-        if (ovStateGet(ov, key) & OV_STATE_TOMB) return NULL;
-    }
+    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(kvs, didx, ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1300,25 +1306,27 @@ dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
  *      else
  *          kvstoreDictSetAtLink(kvs, didx, kv, &bucket, 1); // Insert new entry
  */
+static dictEntryLink __attribute__((noinline)) ovDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntryLink *bucket) {
+    /* Write intent. A frozen original the snapshot has already read (the
+     * scan thread published its generation mark) may be written in place:
+     * the thread never revisits it, and rehash/resize are paused so the
+     * bucket it sits in is stable. Otherwise clone the original into the
+     * temp dict on first touch; a miss returns the temp bucket so the
+     * insertion lands in the temp dict. */
+    if (ov->scanned && !dictFind(ov->temp, key) && !(ovStateGet(ov, key) & OV_STATE_TOMB)) {
+        dict *d = kvs->dicts[didx];
+        dictEntry *fe = d ? dictFind(d, key) : NULL;
+        if (fe && ov->scanned(ov->privdata, didx, dictGetKey(fe)))
+            return dictFindLink(d, key, NULL);
+    }
+    ovEnsureClone(kvs, didx, ov, key);
+    return dictFindLink(ov->temp, key, bucket);
+}
+
 dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLink *bucket) {
     if (bucket) *bucket = NULL;    
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        /* Write intent. A frozen original the snapshot has already read (the
-         * scan thread published its generation mark) may be written in place:
-         * the thread never revisits it, and rehash/resize are paused so the
-         * bucket it sits in is stable. Otherwise clone the original into the
-         * temp dict on first touch; a miss returns the temp bucket so the
-         * insertion lands in the temp dict. */
-        if (ov->scanned && !dictFind(ov->temp, key) && !(ovStateGet(ov, key) & OV_STATE_TOMB)) {
-            dict *d = kvs->dicts[didx];
-            dictEntry *fe = d ? dictFind(d, key) : NULL;
-            if (fe && ov->scanned(ov->privdata, didx, dictGetKey(fe)))
-                return dictFindLink(d, key, NULL);
-        }
-        ovEnsureClone(kvs, didx, ov, key);
-        return dictFindLink(ov->temp, key, bucket);
-    }
+    if (__builtin_expect(ov != NULL, 0)) return ovDictFindLink(kvs, didx, ov, key, bucket);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d) return NULL;
     return dictFindLink(d, key, bucket);
@@ -1337,23 +1345,24 @@ dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLi
  * newItem: - If set, add a new key with a new dictEntry.
  *          - If not set, update the key of an existing dictEntry.
  */
+static void __attribute__((noinline)) ovDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, dictEntryLink *link, int newItem) {
+    if (link && *link == &ov->scratch) {        /* in-place delete in progress (see ovTombstoneInPlace) */
+        ov->scratch = kv ? dictEncodeKeyAsEntry(kvs->dicts[didx], kv) : NULL;
+        return;
+    }
+    /* Frozen: links refer to the temp dict, or to a scanned frozen entry
+     * (see kvstoreDictFindLink); either way the type is the store's. */
+    dictSetKeyAtLink(ov->temp, kv, link, newItem);
+    if (newItem) {
+        const void *key = kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(kv) : kv;
+        ovOnTempInsert(kvs, didx, ov, key);
+    }
+}
+
 void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link, int newItem) {
     dict *d;
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        if (link && *link == &ov->scratch) {        /* in-place delete in progress (see ovTombstoneInPlace) */
-            ov->scratch = kv ? dictEncodeKeyAsEntry(kvs->dicts[didx], kv) : NULL;
-            return;
-        }
-        /* Frozen: links refer to the temp dict, or to a scanned frozen entry
-         * (see kvstoreDictFindLink); either way the type is the store's. */
-        dictSetKeyAtLink(ov->temp, kv, link, newItem);
-        if (newItem) {
-            const void *key = kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(kv) : kv;
-            ovOnTempInsert(kvs, didx, ov, key);
-        }
-        return;
-    }
+    if (__builtin_expect(ov != NULL, 0)) { ovDictSetAtLink(kvs, didx, ov, kv, link, newItem); return; }
     if (newItem) {
         d = createDictIfNeeded(kvs, didx);
         dictSetKeyAtLink(d, kv, link, newItem);
@@ -1364,16 +1373,18 @@ void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link,
     }
 }
 
+static dictEntry * __attribute__((noinline)) ovDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntry **existing) {
+    const void *lkey = kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(key) : key;
+    dictEntry *te = ovEnsureClone(kvs, didx, ov, lkey);
+    if (te) { if (existing) *existing = te; return NULL; }
+    dictEntry *ret = dictAddRaw(ov->temp, key, existing);
+    if (ret) ovOnTempInsert(kvs, didx, ov, lkey);
+    return ret;
+}
+
 dictEntry *kvstoreDictAddRaw(kvstore *kvs, int didx, void *key, dictEntry **existing) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        const void *lkey = kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(key) : key;
-        dictEntry *te = ovEnsureClone(kvs, didx, ov, lkey);
-        if (te) { if (existing) *existing = te; return NULL; }
-        dictEntry *ret = dictAddRaw(ov->temp, key, existing);
-        if (ret) ovOnTempInsert(kvs, didx, ov, lkey);
-        return ret;
-    }
+    if (__builtin_expect(ov != NULL, 0)) return ovDictAddRaw(kvs, didx, ov, key, existing);
     dict *d = createDictIfNeeded(kvs, didx);
     dictEntry *ret = dictAddRaw(d, key, existing);
     if (ret)
@@ -1392,14 +1403,16 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
     dictSetVal(d, de, val);
 }
 
+static dictEntryLink __attribute__((noinline)) ovDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int *table_index) {
+    dictEntryLink l = ovTombstoneInPlace(kvs, didx, ov, key);
+    if (l) { if (table_index) *table_index = 0; return l; }
+    if (!ovEnsureClone(kvs, didx, ov, key)) return NULL;
+    return dictTwoPhaseUnlinkFind(ov->temp, key, table_index);
+}
+
 dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        dictEntryLink l = ovTombstoneInPlace(kvs, didx, ov, key);
-        if (l) { if (table_index) *table_index = 0; return l; }
-        if (!ovEnsureClone(kvs, didx, ov, key)) return NULL;
-        return dictTwoPhaseUnlinkFind(ov->temp, key, table_index);
-    }
+    if (__builtin_expect(ov != NULL, 0)) return ovDictTwoPhaseUnlinkFind(kvs, didx, ov, key, table_index);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1414,45 +1427,48 @@ void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, i
  * value from the entry (dbGenericDelete's async path stores NULL at the link
  * before unlinking) cannot have it read back from the entry. 'key' may be
  * NULL when the entry still holds it. */
-void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
-    kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        if (link == &ov->scratch) {
-            /* In-place delete of a scanned key: the frozen entry already holds
-             * the placeholder; release the original like the dict would. */
-            if (ov->scratch && kvs->dtype.keyDestructor)
-                kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
-            ov->scratch = NULL;
-            return;
-        }
-        if (link && *link) {
-            /* Bookkeeping first: the key pointer dies with the temp entry. */
-            if (!key) key = ovEntryKey(kvs, *link);
-            ovOnTempRemove(kvs, didx, ov, key);
-            dictTwoPhaseUnlinkFree(ov->temp, link, table_index);
-        }
+static void __attribute__((noinline)) ovDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntryLink link, int table_index, const void *key) {
+    if (link == &ov->scratch) {
+        /* In-place delete of a scanned key: the frozen entry already holds
+         * the placeholder; release the original like the dict would. */
+        if (ov->scratch && kvs->dtype.keyDestructor)
+            kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
+        ov->scratch = NULL;
         return;
     }
+    if (link && *link) {
+        /* Bookkeeping first: the key pointer dies with the temp entry. */
+        if (!key) key = ovEntryKey(kvs, *link);
+        ovOnTempRemove(kvs, didx, ov, key);
+        dictTwoPhaseUnlinkFree(ov->temp, link, table_index);
+    }
+}
+
+void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
+    kvstoreDictOverlay *ov = ovGet(kvs, didx);
+    if (__builtin_expect(ov != NULL, 0)) { ovDictTwoPhaseUnlinkFreeKey(kvs, didx, ov, link, table_index, key); return; }
     dict *d = kvstoreGetDict(kvs, didx);
     dictTwoPhaseUnlinkFree(d, link, table_index);
     cumulativeKeyCountAdd(kvs, didx, -1);
     freeDictIfNeeded(kvs, didx);
 }
 
+static int __attribute__((noinline)) ovDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
+    if (ovTombstoneInPlace(kvs, didx, ov, key)) {
+        if (kvs->dtype.keyDestructor) kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
+        ov->scratch = NULL;
+        return DICT_OK;
+    }
+    if (!ovEnsureClone(kvs, didx, ov, key)) return DICT_ERR;
+    ovOnTempRemove(kvs, didx, ov, key);
+    int ret = dictDelete(ov->temp, key);
+    assert(ret == DICT_OK);
+    return ret;
+}
+
 int kvstoreDictDelete(kvstore *kvs, int didx, const void *key) {
     kvstoreDictOverlay *ov = ovGet(kvs, didx);
-    if (ov) {
-        if (ovTombstoneInPlace(kvs, didx, ov, key)) {
-            if (kvs->dtype.keyDestructor) kvs->dtype.keyDestructor(kvs->dicts[didx], dictGetKey(ov->scratch));
-            ov->scratch = NULL;
-            return DICT_OK;
-        }
-        if (!ovEnsureClone(kvs, didx, ov, key)) return DICT_ERR;
-        ovOnTempRemove(kvs, didx, ov, key);
-        int ret = dictDelete(ov->temp, key);
-        assert(ret == DICT_OK);
-        return ret;
-    }
+    if (__builtin_expect(ov != NULL, 0)) return ovDictDelete(kvs, didx, ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return DICT_ERR;

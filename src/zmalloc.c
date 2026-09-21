@@ -371,7 +371,7 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
 char *zmalloc_nofork_lo = NULL;
 char *zmalloc_nofork_hi = NULL;
 static char *nofork_bump = NULL;                 /* atomic bump pointer inside [lo,hi) */
-static unsigned nofork_arena = UINT_MAX;
+unsigned zmalloc_nofork_arena = UINT_MAX;   /* read inline by zmalloc.h fast paths */
 static extent_hooks_t *nofork_default_hooks = NULL;
 static extent_hooks_t nofork_hooks;              /* must outlive the arena */
 static __thread int nofork_thread_flags = 0;     /* MALLOCX_ARENA|MALLOCX_TCACHE, 0 = uninit */
@@ -447,7 +447,7 @@ static int noforkReserve(void) {
 }
 
 int zmalloc_nofork_arena_init(void) {
-    if (nofork_arena != UINT_MAX) return 1;
+    if (zmalloc_nofork_arena != UINT_MAX) return 1;
 
     size_t sz = sizeof(extent_hooks_t *);
     if (je_mallctl("arena.0.extent_hooks", &nofork_default_hooks, &sz, NULL, 0) != 0 ||
@@ -478,12 +478,12 @@ int zmalloc_nofork_arena_init(void) {
         zmalloc_nofork_lo = zmalloc_nofork_hi = nofork_bump = NULL;
         return 0;
     }
-    nofork_arena = arena;
+    zmalloc_nofork_arena = arena;
     return 1;
 }
 
-int zmalloc_nofork_arena_available(void) { return nofork_arena != UINT_MAX; }
-unsigned zmalloc_nofork_arena_index(void) { return nofork_arena; }
+int zmalloc_nofork_arena_available(void) { return zmalloc_nofork_arena != UINT_MAX; }
+unsigned zmalloc_nofork_arena_index(void) { return zmalloc_nofork_arena; }
 
 void zmalloc_nofork_va_stats(size_t *reserved, size_t *used) {
     if (reserved) *reserved = zmalloc_nofork_hi - zmalloc_nofork_lo;
@@ -497,7 +497,7 @@ void zmalloc_nofork_va_stats(size_t *reserved, size_t *used) {
 static int noforkThreadFlagsInit(void) {
     unsigned tcache;
     size_t sz = sizeof(tcache);
-    int flags = MALLOCX_ARENA(nofork_arena);
+    int flags = MALLOCX_ARENA(zmalloc_nofork_arena);
     if (je_mallctl("tcache.create", &tcache, &sz, NULL, 0) == 0)
         flags |= MALLOCX_TCACHE(tcache);
     else
@@ -512,18 +512,18 @@ static inline int noforkFlags(void) {
     return flags;
 }
 
-void *zmalloc_nofork(size_t size) {
-    if (nofork_arena == UINT_MAX) return zmalloc(size);
+/* Slow halves of the inline entry points in zmalloc.h: only reached when the
+ * arena exists. */
+void *zmalloc_nofork_slow(size_t size) {
     return zmalloc_with_flags(MALLOC_MIN_SIZE(size), noforkFlags());
 }
 
-void *zcalloc_nofork(size_t size) {
-    if (nofork_arena == UINT_MAX) return zcalloc(size);
+void *zcalloc_nofork_slow(size_t size) {
     return zmalloc_with_flags(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
 }
 
-void *zmalloc_nofork_usable(size_t size, size_t *usable) {
-    void *ptr = zmalloc_nofork(size);
+void *zmalloc_nofork_usable_slow(size_t size, size_t *usable) {
+    void *ptr = zmalloc_nofork_slow(size);
     if (usable) *usable = zmalloc_size(ptr);
     return ptr;
 }
@@ -535,18 +535,18 @@ void *zrealloc_nofork(void *ptr, size_t size) {
 
 void zfree_nofork(void *ptr) {
     if (ptr == NULL) return;
-    if (nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree(ptr); return; }
+    if (zmalloc_nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree(ptr); return; }
     zfree_with_flags(ptr, noforkFlags());
 }
 
 void zfree_nofork_size(void *ptr, size_t size) {
     if (ptr == NULL) return;
-    if (nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree_with_size(ptr, size); return; }
+    if (zmalloc_nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree_with_size(ptr, size); return; }
     zfree_with_size_and_flags(ptr, size, noforkFlags());
 }
 
 void *ztrycalloc_nofork(size_t size) {
-    if (nofork_arena == UINT_MAX) return ztrycalloc(size);
+    if (zmalloc_nofork_arena == UINT_MAX) return ztrycalloc(size);
     if (size >= SIZE_MAX/2) return NULL;
     void *ptr = mallocx(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
     if (ptr) update_zmalloc_stat_alloc(zmalloc_size(ptr));
@@ -555,8 +555,8 @@ void *ztrycalloc_nofork(size_t size) {
 
 /* For defrag: bypass the thread cache so a freed block cannot be handed back. */
 void *zmalloc_nofork_no_tcache(size_t size) {
-    if (nofork_arena == UINT_MAX) return zmalloc(size);
-    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), MALLOCX_ARENA(nofork_arena) | MALLOCX_TCACHE_NONE);
+    if (zmalloc_nofork_arena == UINT_MAX) return zmalloc(size);
+    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), MALLOCX_ARENA(zmalloc_nofork_arena) | MALLOCX_TCACHE_NONE);
 }
 
 /* Realloc of an arena pointer: stays in the arena. */
@@ -717,7 +717,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     }
 #ifdef HAVE_NOFORK_ARENA
     /* SNAP_NOFORK arena memory must stay in the arena. */
-    if (zmalloc_is_nofork(ptr)) return noforkRealloc(ptr, size, usable, old_usable);
+    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) return noforkRealloc(ptr, size, usable, old_usable);
 #endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     newptr = realloc_with_usize(ptr, size, &oldsize, &size);
@@ -816,10 +816,20 @@ size_t zmalloc_usable_size(void *ptr) {
 }
 #endif
 
+#ifdef HAVE_NOFORK_ARENA
+static void __attribute__((noinline, cold)) zfreeNoforkCold(void *ptr) { zfree_with_flags(ptr, noforkFlags()); }
+static void __attribute__((noinline, cold)) zfreeNoforkSizeCold(void *ptr, size_t size) { je_sdallocx(ptr, size, noforkFlags()); }
+static void __attribute__((noinline, cold)) zfreeNoforkUsableCold(void *ptr, size_t *usable) {
+    size_t oldsize = zmalloc_size(ptr);
+    zfree_with_size_and_flags(ptr, oldsize, noforkFlags());
+    if (usable) *usable = oldsize;
+}
+#endif
+
 void zfree(void *ptr) {
     if (ptr == NULL) return;
 #ifdef HAVE_NOFORK_ARENA
-    if (zmalloc_is_nofork(ptr)) { zfree_with_flags(ptr, noforkFlags()); return; }
+    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkCold(ptr); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -850,12 +860,7 @@ void zfree_usable(void *ptr, size_t *usable) {
         return;
     }
 #ifdef HAVE_NOFORK_ARENA
-    if (zmalloc_is_nofork(ptr)) {
-        oldsize = zmalloc_size(ptr);
-        zfree_with_size_and_flags(ptr, oldsize, noforkFlags());
-        if (usable) *usable = oldsize;
-        return;
-    }
+    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkUsableCold(ptr, usable); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -882,7 +887,7 @@ void zfree_with_size(void *ptr, size_t size) {
 #ifdef USE_JEMALLOC
     update_zmalloc_stat_free(size);
 #ifdef HAVE_NOFORK_ARENA
-    if (zmalloc_is_nofork(ptr)) { je_sdallocx(ptr, size, noforkFlags()); return; }
+    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkSizeCold(ptr, size); return; }
 #endif
     je_sdallocx(ptr, size, 0);
 #else
@@ -1321,7 +1326,7 @@ void set_jemalloc_bg_thread(int enable) {
 static void noforkTcacheFlush(void) {
 #ifdef HAVE_NOFORK_ARENA
     int flags = nofork_thread_flags;
-    if (nofork_arena == UINT_MAX || flags == 0) return;
+    if (zmalloc_nofork_arena == UINT_MAX || flags == 0) return;
     unsigned tc = ((unsigned)flags >> 8) & 0xfff;   /* MALLOCX_TCACHE(t) == (t+2) << 8 */
     if (tc >= 2) { tc -= 2; je_mallctl("tcache.flush", NULL, NULL, &tc, sizeof(tc)); }
 #endif
