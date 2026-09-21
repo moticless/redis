@@ -1952,6 +1952,15 @@ static void snapScanTests(int accurate) {
     {
         dict *d = kvstoreGetDict(stores[0], 0);
         test_cond("scan: dicts are frozen after start", d->pauserehash == 1 && d->pauseAutoResize == 1);
+        /* The layout lock: neither the insert path nor the resize cron may
+         * touch a frozen table. */
+        dict *big = kvstoreGetDict(stores[0], 2);   /* 5000 keys */
+        signed char exp0 = big->ht_size_exp[0], exp1 = big->ht_size_exp[1];
+        long ridx = big->rehashidx;
+        int r1 = dictExpandIfNeeded(big), r2 = dictShrinkIfNeeded(big);
+        test_cond("scan: dictExpandIfNeeded/dictShrinkIfNeeded are no-ops on a frozen dict",
+                  r1 == DICT_ERR && r2 == DICT_ERR && big->ht_size_exp[0] == exp0 &&
+                  big->ht_size_exp[1] == exp1 && big->rehashidx == ridx);
     }
     /* Concurrent reads from the owner thread while the scan runs. */
     long reads = 0, misses = 0;

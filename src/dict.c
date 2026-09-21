@@ -1704,6 +1704,10 @@ static int dictTypeResizeAllowed(dict *d, size_t size) {
  * and there is nothing else we need to do about this dictionary currently. While DICT_ERR indicates
  * that expand has not been triggered (may be try shrinking?)*/
 int dictExpandIfNeeded(dict *d) {
+    /* Automatic resizing is disallowed (e.g. a snapshot thread is reading the
+     * table and its bucket layout must not change). */
+    if (d->pauseAutoResize > 0) return DICT_ERR;
+
     /* Incremental rehashing already in progress. Return. */
     if (dictIsRehashing(d)) return DICT_OK;
 
@@ -1733,16 +1737,16 @@ int dictExpandIfNeeded(dict *d) {
 
 /* Expand the hash table if needed (OK=Expanded, ERR=Not expanded) */
 static int _dictExpandIfNeeded(dict *d) {
-    /* Automatic resizing is disallowed. Return */
-    if (d->pauseAutoResize > 0) return DICT_ERR;
-    
-    return dictExpandIfNeeded(d);
+    return dictExpandIfNeeded(d);   /* honours pauseAutoResize */
 }
 
 /* Returning DICT_OK indicates a successful shrinking or the dictionary is undergoing rehashing, 
  * and there is nothing else we need to do about this dictionary currently. While DICT_ERR indicates
  * that shrinking has not been triggered (may be try expanding?)*/
 int dictShrinkIfNeeded(dict *d) {
+    /* Automatic resizing is disallowed (see dictExpandIfNeeded). */
+    if (d->pauseAutoResize > 0) return DICT_ERR;
+
     /* Incremental rehashing already in progress. Return. */
     if (dictIsRehashing(d)) return DICT_OK;
     
@@ -1768,10 +1772,7 @@ int dictShrinkIfNeeded(dict *d) {
 
 static void _dictShrinkIfNeeded(dict *d) 
 {
-    /* Automatic resizing is disallowed. Return */
-    if (d->pauseAutoResize > 0) return;
-
-    dictShrinkIfNeeded(d);
+    dictShrinkIfNeeded(d);   /* honours pauseAutoResize */
 }
 
 static void _dictRehashStepIfNeeded(dict *d, uint64_t visitedIdx) {

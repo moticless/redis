@@ -1022,9 +1022,7 @@ void kvstoreTryResizeDicts(kvstore *kvs, int limit, kvstoreResizeShouldSkipDictI
     for (int i = 0; i < limit; i++) {
         int didx = kvs->resize_cursor;
         dict *d = kvstoreGetDict(kvs, didx);
-        /* A dict with auto-resize paused (frozen by a snapshot) keeps its
-         * bucket layout: the public *IfNeeded() do not check the pause. */
-        if (d && d->pauseAutoResize == 0 && (!skip_cb || !skip_cb(didx))) {
+        if (d && (!skip_cb || !skip_cb(didx))) {
             if (dictShrinkIfNeeded(d) == DICT_ERR)
                 dictExpandIfNeeded(d);
         }
