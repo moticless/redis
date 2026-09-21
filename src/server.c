@@ -1976,6 +1976,10 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     updatePeakMemory();
 
+    /* Hybrid BGSAVE: keyspace writes outside call() (expire cycle, eviction,
+     * module timers) end with the event loop iteration at the latest. */
+    snapFunnelClose();
+
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
      * case we keep track of the number of events we are processing, since
@@ -4534,8 +4538,12 @@ static void afterCommandEx(client *c, long duration, int ops_before) {
 
     /* Flush other pending push messages. only when we are not in nested call.
      * So the messages are not interleaved with transaction response. */
-    if (!server.execution_nesting)
+    if (!server.execution_nesting) {
         listJoin(c->reply, server.pending_push_messages);
+        /* Hybrid BGSAVE: links into frozen dicts are never held across
+         * commands, so the write section (if any) ends here. */
+        snapFunnelClose();
+    }
 
     /* Run debug assertions if any are enabled */
     if (unlikely(server.dbg_assert_flags))

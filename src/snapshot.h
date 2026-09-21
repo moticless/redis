@@ -188,13 +188,47 @@ void snapScanAbort(snapScanCtx *ctx);
 void snapScanRelease(snapScanCtx *ctx);
 
 /* Attach the keyspace overlay (kvstore.h) to the scan: every dict of every
- * store is frozen at snapScanStart() with these callbacks and merged on the
+ * store is frozen at snapScanStart() with these hooks and merged on the
  * main thread when its slot completes. 'store_privdata[s]' is passed to the
- * callbacks for store s (the server passes the redisDb). Must be called
- * before snapScanStart(). */
-void snapScanSetOverlay(snapScanCtx *ctx, kvstoreOverlayCloneFn *clone,
-                        kvstoreOverlayFreeOrigFn *free_orig, kvstoreOverlayScannedFn *scanned,
-                        kvstoreOverlayTombFn *tomb, void **store_privdata);
+ * hooks for store s (the server passes the redisDb). Must be called before
+ * snapScanStart(). The hooks struct is copied. */
+void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata);
+
+/* ---- Bucket window and write sections (spec 11.z) -------------------------
+ *
+ * The scan thread reads a frozen dict one bucket window at a time and
+ * publishes the window (dict, table, [lo, hi)) before reading it. The main
+ * thread confines its writes to frozen bucket chains to buckets outside the
+ * published window, and does so inside a "write section": opened by the
+ * first write funnel hook of a command (snapFunnelOpen, through the overlay
+ * 'enter' hook), closed when the outermost command returns, at beforeSleep
+ * and when a module thread releases the GIL (snapFunnelClose). The scan
+ * thread waits for any section open at publication time to close before it
+ * reads the new window, so a link obtained inside a section stays valid
+ * until the section ends. Both sides use seq_cst store-then-load pairs. */
+extern redisAtomic uint64_t snap_funnel_seq;    /* odd: the main thread is inside a write section */
+void snapFunnelOpen(void);                      /* main thread (or a module thread holding the GIL) */
+void snapFunnelCloseSlow(void);
+static inline void snapFunnelClose(void) {
+    uint64_t v;
+    atomicGet(snap_funnel_seq, v);
+    if (__builtin_expect(v & 1, 0)) snapFunnelCloseSlow();
+}
+/* 1 if the scan thread's published window covers the bucket 'key' maps to in
+ * 'd'. Only meaningful inside an open write section. */
+int snapWindowCoversKey(dict *d, const void *key);
+/* Buckets per published window (DEBUG SNAP-WINDOW-BUCKETS; tests). */
+void snapSetWindowBuckets(unsigned long n);
+unsigned long snapGetWindowBuckets(void);
+
+/* Per-save bucket bitmaps: one bit per bucket of every frozen table,
+ * allocated at freeze, freed when the slot completes. A set bit means the
+ * bucket's chain was already emitted into the snapshot by the main thread
+ * (ahead of the window, spec 11.z); the scan thread skips such buckets.
+ * Mark only buckets ahead of the published window, inside a write section. */
+void snapScanMarkBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+int snapScanBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+size_t snapScanBitmapBytes(snapScanCtx *ctx);
 
 /* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
  * copies the whole kvobj allocation into a fresh arena block; SNAP_NOFORK

@@ -68,9 +68,22 @@ typedef int (kvstoreOverlayScannedFn)(void *privdata, int didx, void *orig);
  * stand-in that keeps the key alive in the frozen entry until merge, released
  * through free_orig with value_shared = 1. Required when 'scanned' is set. */
 typedef void *(kvstoreOverlayTombFn)(void *privdata, int didx, void *orig);
-void kvstoreOverlayFreeze(kvstore *kvs, int didx, kvstoreOverlayCloneFn *clone,
-                          kvstoreOverlayFreeOrigFn *free_orig, kvstoreOverlayScannedFn *scanned,
-                          kvstoreOverlayTombFn *tomb, void *privdata);
+/* Called at the start of every main-thread write operation on a frozen dict
+ * (before the overlay decides between in-place and temp-dict paths). Optional. */
+typedef void (kvstoreOverlayEnterFn)(void *privdata);
+/* 1 if the snapshot thread is currently reading the bucket 'key' maps to in
+ * dict 'd': the overlay must then leave the frozen chain untouched (no
+ * in-place writes, no placeholder swaps). Optional (absent: never covered). */
+typedef int (kvstoreOverlayCoversFn)(void *privdata, dict *d, const void *key);
+typedef struct kvstoreOverlayHooks {
+    kvstoreOverlayCloneFn *clone;
+    kvstoreOverlayFreeOrigFn *free_orig;
+    kvstoreOverlayScannedFn *scanned;
+    kvstoreOverlayTombFn *tomb;
+    kvstoreOverlayEnterFn *enter;
+    kvstoreOverlayCoversFn *covers;
+} kvstoreOverlayHooks;
+void kvstoreOverlayFreeze(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
 void kvstoreOverlayMerge(kvstore *kvs, int didx);
 void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);

@@ -205,6 +205,39 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert {[s snap_save_in_progress] == 0}
         }
 
+        proc snap_main_table_size {} {
+            regexp {main hash table\):\n table size: (\d+)} [r debug htstats 9] -> size
+            return $size
+        }
+
+        test {Hybrid BGSAVE: keyspace dicts keep their bucket layout during a save and resize afterwards} {
+            r flushall
+            populate_fillers 2000
+            wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+            set size0 [snap_main_table_size]
+            assert {$size0 >= 2048}
+            r config set rdb-key-save-delay 3000   ;# 2000 keys x 3 ms: about 6 s
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            # far more adds than an expand needs: with the layout locked the
+            # table must not grow or start rehashing while the thread reads it
+            for {set i 0} {$i < 6000} {incr i} { r set grow:$i x }
+            r debug htstats 9   ;# exercised for the "rehashing target" check below
+            assert_equal $size0 [snap_main_table_size]
+            assert {![string match "*rehashing target*" [r debug htstats 9]]}
+            assert_equal 1 [s snap_save_in_progress]
+            assert_equal 8000 [r dbsize]
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            # unfrozen: the table catches up with its 8000 keys
+            wait_for_condition 100 50 {[snap_main_table_size] > $size0 || [string match "*rehashing target*" [r debug htstats 9]]} else {
+                fail "table did not resize after the save"
+            }
+            assert_equal 8000 [r dbsize]
+            r flushall
+        }
+
         test {Hybrid BGSAVE: writes during the save land in the overlay, snapshot keeps the fork instant} {
             populate_all_types
             populate_fillers 3000

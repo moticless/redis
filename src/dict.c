@@ -1663,6 +1663,31 @@ unsigned long dictScanNoPause(dict *d,
     return dictScanGeneric(d, v, fn, NULL, privdata, 0);
 }
 
+/* Visit every entry of buckets [lo, hi) of table 'table' (0 or 1) in bucket
+ * order, calling fn(privdata, de, NULL). Chain pointers are read with atomic
+ * loads and the dict is not written, so this may run on a thread other than
+ * the owner's while the owner keeps rehashing paused and resizing disabled and
+ * confines its own chain writes to buckets outside [lo, hi) (snapshot.c, the
+ * bucket window). 'hi' is clamped to the table size. */
+void dictWalkBucketRange(dict *d, int table, unsigned long lo, unsigned long hi,
+                         dictScanFunction *fn, void *privdata)
+{
+    dictEntry **tbl = d->ht_table[table];
+    unsigned long size = DICTHT_SIZE(d->ht_size_exp[table]);
+    if (!tbl || lo >= size) return;
+    if (hi > size) hi = size;
+    for (unsigned long i = lo; i < hi; i++) {
+        dictEntry *de = __atomic_load_n(&tbl[i], __ATOMIC_ACQUIRE);
+        while (de) {
+            /* dictEntry and dictEntryNoValue share the 'next' offset; a bare
+             * key has no next. */
+            dictEntry *next = entryIsKey(de) ? NULL : __atomic_load_n(&de->next, __ATOMIC_ACQUIRE);
+            fn(privdata, de, NULL);
+            de = next;
+        }
+    }
+}
+
 /* ------------------------- private functions ------------------------------ */
 
 /* Because we may need to allocate huge memory chunk at once when dict

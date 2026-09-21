@@ -9280,6 +9280,8 @@ int moduleTryAcquireGIL(void) {
 }
 
 void moduleReleaseGIL(void) {
+    /* Hybrid BGSAVE: a module thread's keyspace writes end with the GIL. */
+    snapFunnelClose();
     threadHoldsGIL = 0;
     pthread_mutex_unlock(&moduleGIL);
 }

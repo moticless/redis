@@ -471,7 +471,8 @@ void debugCommand(client *c) {
 "    Hybrid BGSAVE: placement statistics of the keyspace (arena vs class).",
 "SNAP-DRIFT [<dbid>]",
 "    Hybrid BGSAVE: list up to 50 keys whose value placement disagrees with its class.",
-"    Report SNAP_NOFORK/SNAP_FORK placement statistics of a database (hybrid BGSAVE).",
+"SNAP-WINDOW-BUCKETS [<n>]",
+"    Hybrid BGSAVE: get or set the number of buckets per scan-thread window.",
 "DROP-CLUSTER-PACKET-FILTER <packet-type>",
 "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
 "ENABLE-KEYMETA-RUNTIME-REGISTRATION <0|1>",
@@ -723,6 +724,17 @@ NULL
             db = &server.db[dbid];
         }
         snapPlacementDriftReply(c, db, 50);
+    } else if (!strcasecmp(c->argv[1]->ptr,"snap-window-buckets") && (c->argc == 2 || c->argc == 3)) {
+        if (c->argc == 3) {
+            long long n;
+            if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return;
+            if (n < 1 || n > (1LL << 30)) {
+                addReplyError(c, "Out of range");
+                return;
+            }
+            snapSetWindowBuckets((unsigned long)n);
+        }
+        addReplyLongLong(c, (long long)snapGetWindowBuckets());
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         kvobj *kv;
         char *strenc;
