@@ -405,3 +405,53 @@ during saves; load factor drift under the resize lockout for long saves; the
 walker's wait on a main thread inside a long write section (bounded by one
 command). Order of work: standalone single db first, TSan and the harness on
 every step, cluster slots last.
+
+### 11.z.1 Status of the serialize-before-write spike (2026-09-22)
+
+Done on branch `snapshot-hybrid-bgsave` (commits 2e69194bc, f6ee1fcba,
+3da2cd28a; backlog TASK-1.21.1 and 1.21.2):
+
+- Bucket window published by the scan thread, write sections on the main
+  thread (opened by the overlay's first write hook, closed at outermost
+  command end, beforeSleep and module GIL release), seq_cst handshake, chain
+  walk with atomic loads, per-save bucket bitmaps, resize lockout for frozen
+  dicts (cron, `kvstoreExpand`, insert path), `DEBUG SNAP-WINDOW-BUCKETS`.
+- Main-thread emission: the overlay's `prepare` hook places the key's bucket
+  relative to the window; behind or already emitted -> in place; ahead ->
+  emit the whole chain (NOFORK records serialized on the main thread into a
+  locked stage, FORK keys as kvobj header copies), set the bit, in place;
+  inside -> temp dict as before. The scan thread forwards the queue at every
+  window boundary and before END. Adds, deletes, evictions and expiries of
+  unwalked keys are in place, so their memory returns immediately.
+- Verified: unit tests, the whole tcl harness (randomized race, eviction
+  variants, cluster mode, child killed, hard mark, SHUTDOWN), TSan clean for
+  the window layer, callgrind unchanged with the feature off.
+
+Left over, in the order I would do it:
+
+1. TASK-1.21.4: remove `kvBits.save_gen`, the kvBits atomics, the trust
+   counter and their INFO fields; the scan thread still stamps every key it
+   emits (dead work, about one release store per key). Expose bitmap bytes in
+   INFO.
+2. TASK-1.21.3: drain the temp dict per window instead of merging at slot
+   end. Today the temp dict only ever holds keys written while their bucket
+   was inside the window, so the slot-end merge is small; the `hybrid-merge`
+   latency event still exists and the temp/state dicts still exist. In-window
+   deletes clone the key only to tombstone it (rare, wasteful).
+3. Cost trims: `dictKeyBucket()` hashes the key a second time per write
+   during a save (reuse the lookup's hash); `snapSendMsg` does two `write()`s
+   per message (writev); the walker's `snapWalkerQuiesce` spins with
+   `sched_yield` then 20 us sleeps (fine, but an asymmetric fence would make
+   the main-thread side plain stores); `snapKvobjIsOwed()` opens a write
+   section from the hash field-TTL read paths.
+4. Not measured yet (TASK-1.21.2 AC 3-5): used_memory dropping during
+   eviction under a save; behaviour with a stalled child (queue growth is
+   accounted and hard-marked, not exercised by a test); the per-write cost of
+   a main-thread emission in isolation (the benchmark's main-thread CPU
+   seconds are the proxy).
+5. TASK-1.21.6: cluster mode is exercised by the harness's cluster test
+   (the window names the dict, SLOT_INFO comes from the message header) but
+   has no dedicated verification of main-thread emission per slot.
+6. Unchanged from M1: AOF rewrite, diskless sync and `RedisModule_Fork` are
+   refused while the arena is on; atomic slot migration during a save is
+   not guarded.
