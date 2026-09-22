@@ -455,3 +455,57 @@ Left over, in the order I would do it:
 6. Unchanged from M1: AOF rewrite, diskless sync and `RedisModule_Fork` are
    refused while the arena is on; atomic slot migration during a save is
    not guarded.
+
+### 11.z.2 How the scan thread and the main thread agree on which buckets the thread reads
+
+The unit of coordination is a bucket window: a range of consecutive buckets
+`[lo, hi)` of one table of one frozen dict (1024 buckets by default). Three
+pieces of shared state, all lock-free:
+
+1. **The window** (`snap_win`, published by the scan thread). Before reading a
+   window the thread fills the spare of two window slots and publishes its
+   sequence number with a seq_cst store. Sequence 0 or a NULL dict means "no
+   window": nothing is being read.
+2. **The write-section counter** (`snap_funnel_seq`, owned by the main thread).
+   Odd means the main thread is inside a keyspace write section. A section
+   opens at the first overlay write hook of a command (seq_cst increment) and
+   closes when the outermost command returns, at `beforeSleep`, and when a
+   module thread releases the GIL. Links into a frozen dict are never held
+   across a section boundary.
+3. **The per-save bucket bitmaps**, one bit per bucket of every frozen table,
+   allocated at freeze and freed when the slot completes.
+
+**Handshake.** After publishing a new window the thread loads the counter
+(seq_cst). If it is odd it waits until the value changes, then reads the
+window. Because both sides store then load with seq_cst, a section that started
+before the publication is always seen by the thread and waited for, and a
+section that starts after it always sees the new window. The thread gives up
+the wait only when the save is aborted, since the aborting command may itself
+hold the section open while joining the thread. An idle server never stalls
+the thread: no section, no wait.
+
+**Bucket position, decided by the main thread inside a section.** For a key it
+is about to write structurally (add, unlink, replace) it derives the key's
+`(table, bucket)` and compares with the slot state and the window:
+
+| position | condition | action |
+|---|---|---|
+| behind | slot SCANNED/DONE, or same dict and `(table, bucket)` before the window | write in place, nothing to emit |
+| inside | same dict, same table, `lo <= bucket < hi` | clone into the temp dict (never touch the chain) |
+| ahead | slot PENDING, window on another dict, or `(table, bucket)` after the window | if the bucket's bit is clear: serialize its whole chain into the queue and set the bit; then write in place |
+
+**Why it is race-free.** The thread reads chain pointers only inside its
+window, with atomic loads. The main thread writes chains only outside the
+window and only inside a section, which the thread cannot overtake. A bucket's
+bit is set by the main thread only while the bucket is ahead of the window and
+read by the thread only while the bucket is inside it, so the same bit is never
+accessed by both at once (byte-wide atomics cover a window edge inside a byte).
+Value mutations outside the section need no protection: the bucket was emitted
+or walked before they start and the thread never returns to it. The thread
+skips buckets whose bit is set and forwards the main thread's queue at every
+window boundary; before END it publishes the empty window, waits for the open
+section to close, and drains once more, so nothing emitted can be left behind.
+
+Rehashing is paused and expansion forbidden for a frozen dict for the whole
+save (cron, `kvstoreExpand` and the insert path), so bucket indices are stable;
+a dict mid-rehash at freeze keeps both tables and the window names the table.
