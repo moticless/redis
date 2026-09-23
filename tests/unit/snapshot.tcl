@@ -808,6 +808,47 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
+        test {Hybrid BGSAVE harness: keys with module metadata leave the arena, survive writes during the save and reload with their metadata} {
+            r module load [file normalize tests/modules/test_keymeta.so]
+            r debug enable-keymeta-runtime-registration 1
+            r keymeta.register SNPM 1 KEEPONCOPY:KEEPONRENAME:ALLOWIGNORE:RDBLOAD:RDBSAVE
+            r flushall
+            # every small-class encoding: raw and embedded strings, listpack
+            # hash, listpack-ex hash (field TTL), intset
+            r set km:str [string repeat s 200]
+            r set km:embstr short
+            r hset km:hash f1 v1 f2 v2
+            r hset km:hfe f1 v1 f2 v2
+            r hexpire km:hfe 100000 fields 1 f1
+            assert_equal listpackex [r object encoding km:hfe]
+            r sadd km:intset 1 2 3
+            set keys {km:str km:embstr km:hash km:hfe km:intset}
+            foreach k $keys { r keymeta.set SNPM $k "meta-$k" }
+            populate_fillers 2000
+            # module metadata is serialized by the child through module
+            # callbacks: nothing of these values may stay in the arena
+            snap_assert_placement_clean
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 2000
+            r bgsave
+            snap_wait_save_started
+            # write them while owed: the pre-write emission ships them to the child
+            r append km:str more
+            r set km:embstr other
+            r hset km:hash f3 v3
+            r hset km:hfe f3 v3
+            r sadd km:intset 4
+            r keymeta.set SNPM km:hash changed
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            foreach k $keys { assert_equal "meta-$k" [r keymeta.get SNPM $k] }
+            snap_assert_placement_clean
+            r flushall
+        }
+
         test {Hybrid BGSAVE harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
             r flushall
             r himport prepare fieldset a b c d

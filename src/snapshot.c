@@ -248,12 +248,16 @@ static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
 void snapPlaceValueArena(robj *o) {
     if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return;
     if (snapValueIsInline(o->type, o->encoding)) return;
+    /* Module key metadata is serialized through module callbacks, which only
+     * run in the fork child: such a key is SNAP_FORK whatever its size, so
+     * every piece of its value must be readable by the child. */
+    int force_fork = o->iskvobj && getModuleMetaBits(((kvobj *)o)->metabits);
 
     switch (o->encoding) {
     case OBJ_ENCODING_RAW: {
         sds s = o->ptr;
         void *a = sdsAllocPtr(s);
-        int want = snapClassify(o->type, o->encoding, zmalloc_size(a));
+        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(a));
         int in = zmalloc_is_nofork(a);
         if (want == SNAP_NOFORK && !in) o->ptr = snapSdsMove(s, 1);
         else if (want == SNAP_FORK && in) o->ptr = snapSdsMove(s, 0);
@@ -261,7 +265,7 @@ void snapPlaceValueArena(robj *o) {
     }
     case OBJ_ENCODING_LISTPACK: {
         unsigned char *lp = o->ptr;
-        int want = snapClassify(o->type, o->encoding, zmalloc_size(lp));
+        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(lp));
         int in = zmalloc_is_nofork(lp);
         if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(lp, lpBytes(lp), 1);
         else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(lp, lpBytes(lp), 0);
@@ -269,7 +273,7 @@ void snapPlaceValueArena(robj *o) {
     }
     case OBJ_ENCODING_INTSET: {
         intset *is = o->ptr;
-        int want = snapClassify(o->type, o->encoding, zmalloc_size(is));
+        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(is));
         int in = zmalloc_is_nofork(is);
         if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 1);
         else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 0);
@@ -286,6 +290,19 @@ void snapPlaceValueArena(robj *o) {
         listpackEx *lpt = o->ptr;
         int lp_in = zmalloc_is_nofork(lpt->lp);
         int st_in = zmalloc_is_nofork(lpt);
+        if (force_fork) {
+            /* Module metadata: both pieces must leave the arena. Moving the
+             * struct is only legal while its ExpireMeta is not registered in
+             * the db's ebuckets, which holds at every placement call site
+             * (kvobjSet insertion funnel, dbSetValue swap, metadata attach:
+             * the db unregisters before and re-registers after). */
+            if (st_in) {
+                lpt = snapBlobMove(lpt, sizeof(*lpt), 0);
+                o->ptr = lpt;
+            }
+            if (zmalloc_is_nofork(lpt->lp)) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
+            break;
+        }
         if (st_in && !lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 1);
         else if (!st_in && lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
         break;
@@ -501,6 +518,17 @@ void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
 
         int cls = snapKeyClass(kv);
         if (cls == SNAP_NOFORK) st->class_nofork++; else st->class_fork++;
+
+        if (getModuleMetaBits(kv->metabits)) {
+            /* Serialized by the child (module callbacks): nothing of the value
+             * may be in the arena. */
+            if (cls == SNAP_NOFORK && !snapValueIsInline(kv->type, kv->encoding)) st->violations++;
+            if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
+                listpackEx *lpt = kv->ptr;
+                if (zmalloc_is_nofork(lpt) || zmalloc_is_nofork(lpt->lp)) st->violations++;
+            }
+            continue;
+        }
 
         if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
             /* Multi-allocation value: its top-level allocation must be forkable. */
@@ -1115,6 +1143,8 @@ typedef struct snapMsgHdr {
     int32_t slot;
     uint32_t len;        /* payload bytes */
     uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation */
+    uint64_t src_addr;   /* KVOBJ: parent address of the copied allocation, to relocate
+                          * pointers into it (an EMBSTR value points inside its kvobj) */
 } snapMsgHdr;
 
 typedef struct snapDbSizes {
@@ -1200,7 +1230,7 @@ long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; 
 /* ---- Bucket position and main-thread emission (spec 11.z) ---- */
 
 static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
-                       const void *payload, uint32_t len, uint32_t robj_off);
+                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
 static void snapStageFlush(snapSave *sv);
 
 #define SNAP_POS_BEHIND 0   /* the thread already read this bucket */
@@ -1225,13 +1255,14 @@ static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int ta
     return SNAP_POS_INSIDE;
 }
 
-static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds payload, uint32_t robj_off) {
+static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds payload, uint32_t robj_off, uint64_t src_addr) {
     snapQueuedMsg *m = zmalloc(sizeof(*m));
     m->h.type = type;
     m->h.dbid = dbid;
     m->h.slot = slot;
     m->h.len = (uint32_t)sdslen(payload);
     m->h.robj_off = robj_off;
+    m->h.src_addr = src_addr;
     m->payload = payload;
     listAddNodeTail(sv->mq, m);
     atomicIncr(sv->mq_bytes, sdslen(payload));
@@ -1240,7 +1271,7 @@ static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int s
 /* Main thread, mq_lock held: hand the partial BUFFER over as a message. */
 static void snapSaveMainStageFlushLocked(snapSave *sv) {
     if (sdslen(sv->mstage) == 0) return;
-    snapSaveQueuePushLocked(sv, SNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0);
+    snapSaveQueuePushLocked(sv, SNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0, 0);
     sv->mstage = sdsempty();
 }
 
@@ -1260,7 +1291,7 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
                               !zmalloc_is_nofork(kv->ptr));
             sds copy = sdsnewlen(alloc, zmalloc_size(alloc));
             pthread_mutex_lock(&sv->mq_lock);
-            snapSaveQueuePushLocked(sv, SNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc));
+            snapSaveQueuePushLocked(sv, SNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
             pthread_mutex_unlock(&sv->mq_lock);
         } else {
             rio r;
@@ -1306,7 +1337,7 @@ static void snapSaveWindowDone(void *priv) {
     while ((ln = listFirst(ready)) != NULL) {
         snapQueuedMsg *m = listNodeValue(ln);
         if (!snapScanAborted(sv->scan))
-            snapSendMsg(sv, m->h.type, m->h.dbid, m->h.slot, m->payload, m->h.len, m->h.robj_off);
+            snapSendMsg(sv, m->h.type, m->h.dbid, m->h.slot, m->payload, m->h.len, m->h.robj_off, m->h.src_addr);
         atomicDecr(sv->mq_bytes, m->h.len);
         sdsfree(m->payload);
         zfree(m);
@@ -1472,9 +1503,9 @@ static int snapReadAll(int fd, void *p, size_t n) {
 
 /* Scan thread: send one message; a failure (child gone) aborts the scan. */
 static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
-                       const void *payload, uint32_t len, uint32_t robj_off)
+                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr)
 {
-    snapMsgHdr h = { type, dbid, slot, len, robj_off };
+    snapMsgHdr h = { type, dbid, slot, len, robj_off, src_addr };
     if (snapWriteAll(sv->pipe_wr, &h, sizeof(h)) != 0 ||
         (len && snapWriteAll(sv->pipe_wr, payload, len) != 0))
     {
@@ -1488,7 +1519,7 @@ static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
 
 static void snapStageFlush(snapSave *sv) {
     if (sdslen(sv->stage) == 0) return;
-    snapSendMsg(sv, SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot, sv->stage, sdslen(sv->stage), 0);
+    snapSendMsg(sv, SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot, sv->stage, sdslen(sv->stage), 0, 0);
     sdsclear(sv->stage);
 }
 
@@ -1511,7 +1542,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         /* The child resolves kv->ptr in its own memory: it must be forkable. */
         debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
                           !zmalloc_is_nofork(kv->ptr));
-        snapSendMsg(sv, SNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc));
+        snapSendMsg(sv, SNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
         atomicIncr(sv->keys_fork, 1);
         snapKvobjMarkScanned(kv);   /* last touch of kv on this thread */
     } else {
@@ -1559,10 +1590,10 @@ void snapKvobjMarkScanned(kvobj *kv) {
 static void snapSaveThreadDone(void *priv, int aborted) {
     snapSave *sv = priv;
     if (aborted) {
-        snapSendMsg(sv, SNAP_MSG_ABORT, -1, -1, NULL, 0, 0);
+        snapSendMsg(sv, SNAP_MSG_ABORT, -1, -1, NULL, 0, 0, 0);
     } else {
         snapStageFlush(sv);
-        snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0);
+        snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0, 0);
     }
 }
 
@@ -1634,6 +1665,10 @@ static int snapSaveChildWrite(snapSave *sv) {
             if (rioWrite(&rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
         } else if (h.type == SNAP_MSG_KVOBJ) {
             kvobj *kv = (kvobj *)(payload + h.robj_off);
+            /* An embedded string value lives inside the kvobj allocation: its
+             * pointer is the parent's address, relocate it into our copy. */
+            if (kv->encoding == OBJ_ENCODING_EMBSTR)
+                kv->ptr = payload + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
             robj key;
             initStaticStringObject(key, kvobjGetKey(kv));
             size_t before = rdb.processed_bytes;

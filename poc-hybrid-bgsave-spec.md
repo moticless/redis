@@ -456,6 +456,17 @@ Left over, in the order I would do it:
    refused while the arena is on; atomic slot migration during a save is
    not guarded.
 
+Found while comparing with the teammate's POC (2026-09-24), both fixed and
+covered by a harness test with `test_keymeta.so`: (a) placement ignored module
+key metadata, so a small value whose key later received metadata stayed in the
+arena while both emitters routed the key to the child (which serializes module
+metadata through module callbacks); such values now always leave the arena,
+including the listpack-ex struct, and the placement scan reports them as
+violations. (b) An EMBSTR value shipped to the child as a kvobj copy kept its
+parent-side pointer into the copied allocation; KVOBJ messages now carry the
+source address and the child relocates it. Both were unreachable before, since
+the only route of a small value to the child is module metadata.
+
 ### 11.z.2 How the scan thread and the main thread agree on which buckets the thread reads
 
 The unit of coordination is a bucket window: a range of consecutive buckets
