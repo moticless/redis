@@ -509,3 +509,58 @@ section to close, and drains once more, so nothing emitted can be left behind.
 Rehashing is paused and expansion forbidden for a frozen dict for the whole
 save (cron, `kvstoreExpand` and the insert path), so bucket indices are stable;
 a dict mid-rehash at freeze keeps both tables and the window names the table.
+
+### 11.z.3 Comparison with the teammate's forkless-hybrid POC (yinon/forkless-hybrid, 2026-09-23)
+
+Same goal, and the same two tools: a MADV_DONTFORK jemalloc arena for small
+values and a parent thread that serializes them while the fork child writes
+big values and owns the RDB. The split of responsibilities differs:
+
+| | forkless-hybrid (theirs) | snapshot-hybrid-bgsave (ours) |
+|---|---|---|
+| Enumerates the fork-time keys | the child, walking its CoW copy of the dicts; sends `{kvobj*, dbid}` back over a work pipe (256 x 16 B batches) | a parent scan thread, walking the live dicts under a published bucket window |
+| Dict tables, big-key headers | forkable (default arena / arena A): stock-size fork stall, table and header CoW on every write | DONTFORK arena: 0.7 ms stall on 300 MB, no table or header CoW |
+| "Small" | INT/EMBSTR/RAW strings up to 500 KB and listpack(-ex) hashes; small lists, sets, zsets, streams go to the child | any single-allocation encoding up to 4 KB (strings, listpack list/set/zset/hash, intset, listpack-ex) |
+| Write to an unsaved small key | pin: retain by refcount (immutable strings), type Dup copy, or pre-encoded bytes; memory held until the helper reaches the key (evicted keys jump the queue); two budgets, abort when exceeded | serialize the bucket's chain into the queue, then write in place; retention only for buckets inside the window being read |
+| "Already saved" | 2-bit alternating round in the kvobj header (took 2 of the 8 module metadata classes), recovery mode after a failed save | per-save bucket bitmap plus window position; nothing outlives the save |
+| Thread sync | one mutex and condvar; each side publishes the one object it reads; the main thread waits if the helper is reading that object | the main thread never waits; the scan thread waits for the open write section at each window boundary |
+| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | one pipe parent to child, 1 MB; whole 64 KB buffers or header copies; `SELECTDB` only on change |
+| Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
+| Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
+| Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB only; diskless sync and AOF rewrite are M2 |
+| Tests | 15 tcl suites, C unit tests, a python fault-injection harness for the arena | one tcl suite with a randomized race harness, C unit tests, TSan/ASan runs |
+
+Where theirs is ahead: runtime mode switching, replication coverage,
+no resize lockout, O(1) retain-by-refcount instead of main-thread
+serialization, eviction integration (release pins before evicting, evicted
+keys serialized first), memory budgets with reserve-before-allocate
+accounting, richer INFO, test breadth, and the parent publishing the RDB
+only after both sides succeed.
+
+Where ours is ahead: fork stall and metadata CoW (their tables and headers are
+forked, so their stall and small-key CoW should be stock-like; to be measured
+with their binary in `utils/snap-bench`), the main thread never blocks on the
+helper, no child-to-parent-to-child round trip per small key, more small
+types offloaded, no per-record `SELECTDB`, no O(N) normalization after a
+failed save, and the write path serializes instead of retaining.
+
+Ideas to take:
+
+1. **madvise flip as the fallback path.** Our arena is one reservation, so
+   `MADV_DOFORK` on it is a single call. Flipping it for the duration of an
+   AOF rewrite or a diskless sync makes the stock fork paths work unchanged
+   (at stock CoW cost) until the hybrid versions exist; it would also make
+   `bgsave-hybrid` mutable at runtime.
+2. **Eviction integration**: frozen LRU/LFU clock and policy per save (we have
+   it), plus a check of the eviction deficit after freeing snapshot memory.
+3. **Their test scenarios as a checklist**: address reuse after DEL, PFCOUNT
+   in-place RAW mutation, XREADGROUP through read lookups, cap crossing via
+   APPEND/SETRANGE, diskless digest under writes and eviction, cancellation
+   while the helper is blocked, failed publication keeps the old RDB.
+4. **INFO counters** for main-thread time spent in emission and for waits.
+5. **Their benchmark spec and runner** as the shared harness for a three-way
+   comparison (see `tools/forkless-benchmark` on their branch).
+
+Not to take: one `SELECTDB` per record, relay only on EAGAIN through small
+pipes, the 8192-extent registry cap, giving up module metadata classes for
+marks, an O(N) main-thread normalization after failures.
