@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core)
+# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -594,3 +594,101 @@ About 3 instructions per SET, 0.1%; GET within run-to-run noise (the two runs di
 atomic byte store is a plain `mov`, so there was no fence to remove; the win of the removal is the upstream layout and
 one less mechanism, not throughput. The feature-on GET number under callgrind (arena unavailable there) moved from
 +0.9% to +3.2% over feature-off between the two runs, which is the same noise band and not a signal.
+
+
+## Run 9 (2026-09-25): new traffic generator, uniform vs 20% hot set, our hybrid vs the teammate's hybrid vs upstream
+
+Raw: `run9.csv`. Binaries: `up` (0d6266f2d), `hybrid` (41868cb93, plain worktree build, after the arena flip and the
+save_gen removal), `yinon-hybrid` (1204d0970, `--bgsave-mode hybrid --forkless-string-max 4096`). 8 cores, 2 reps per cell
+(6 for our two 50k/uniform cells, see below), medians.
+
+**Traffic changed in this run**, so the big-dataset rows are not comparable with runs 6 to 8. `snapload.py` replaces memtier:
+writes go to a random EXISTING field of a hash (`HSET key f<rand>`) or member of a zset (`ZINCRBY`), over the first `hot`
+fraction of each class's keys (1.0 = uniform over all keys, 0.2 = a 20% hot set). memtier could only write a fixed element,
+so on the big dataset every write hit field `f0` of one of 22 hashes, at most 22 pages, and all configurations showed 1-2 MB
+of copy-on-write regardless of the rate. Now they show what big values really cost under writes.
+
+### Small (300 MB, all values eligible for the small path)
+
+| rate | hot | config | save s | fork ms | extra mem MB | child dirty MB | main cpu s | ping p99 ms | ping max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 2.03 | 5.0 | 2 | 2 | 0.08 | 1.43 | 3.9 |
+| 0 | - | yinon-hybrid | 1.49 | 1.3 | 2 | 1 | 0.07 | 0.61 | 15.4 |
+| 0 | - | hybrid | 1.36 | 0.66 | 1.5 | 1 | 0.06 | 0.72 | 1.9 |
+| 20k | 1.0 | up | 2.18 | 4.2 | 154.5 | 154.5 | 0.60 | 0.31 | 1.7 |
+| 20k | 1.0 | yinon-hybrid | 1.57 | 0.79 | 32.5 | 26 | 0.44 | 0.29 | 13.2 |
+| 20k | 1.0 | hybrid | 1.45 | 0.27 | 3 | 1 | 0.36 | 0.26 | 0.36 |
+| 20k | 0.2 | up | 1.79 | 3.4 | 56.5 | 56.5 | 0.40 | 0.27 | 1.4 |
+| 20k | 0.2 | yinon-hybrid | 1.87 | 0.72 | 34 | 28 | 0.59 | 0.34 | 19.6 |
+| 20k | 0.2 | hybrid | 1.53 | 0.34 | 3 | 1 | 0.37 | 0.31 | 0.66 |
+| 50k | 1.0 | up | 2.13 | 4.0 | 229.5 | 229.5 | 0.73 | 0.35 | 1.3 |
+| 50k | 1.0 | yinon-hybrid | 2.05 | 0.69 | 36.5 | 26.5 | 0.95 | 0.43 | 14.7 |
+| 50k | 1.0 | hybrid (n=6) | 1.77 | 0.30 | 3 | 2 | 0.65 | 0.34 | see caveat |
+| 50k | 0.2 | up | 1.96 | 3.4 | 60 | 60 | 0.63 | 0.28 | 1.2 |
+| 50k | 0.2 | yinon-hybrid | 2.25 | 0.71 | 38 | 29 | 1.00 | 0.43 | 21.4 |
+| 50k | 0.2 | hybrid | 1.70 | 0.32 | 3 | 1.5 | 0.65 | 0.34 | 0.45 |
+
+### Mixed (260 MB, 55% of bytes in 9 KB hashtable hashes)
+
+| rate | hot | config | save s | fork ms | extra mem MB | child dirty MB | main cpu s | ping p99 ms | ping max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 1.69 | 4.8 | 2 | 2 | 0.08 | 0.66 | 3.3 |
+| 0 | - | yinon-hybrid | 1.53 | 4.7 | 2 | 2 | 0.09 | 0.90 | 14.9 |
+| 0 | - | hybrid | 0.92 | 3.3 | 2.5 | 2 | 0.04 | 0.53 | 1.9 |
+| 20k | 1.0 | up | 2.36 | 4.4 | 137 | 137 | 0.71 | 0.69 | 3.5 |
+| 20k | 1.0 | yinon-hybrid | 1.53 | 2.6 | 91 | 87.5 | 0.48 | 0.29 | 10.4 |
+| 20k | 1.0 | hybrid | 1.32 | 1.9 | 47 | 46.5 | 0.39 | 0.28 | 0.48 |
+| 20k | 0.2 | up | 2.71 | 2.9 | 47 | 47 | 0.73 | 0.40 | 1.8 |
+| 20k | 0.2 | yinon-hybrid | 1.63 | 2.5 | 72 | 69 | 0.47 | 0.26 | 8.5 |
+| 20k | 0.2 | hybrid | 1.31 | 1.8 | 28 | 27 | 0.38 | 0.27 | 2.6 |
+| 50k | 1.0 | up | 2.82 | 3.5 | 191.5 | 191.5 | 1.08 | 0.39 | 1.0 |
+| 50k | 1.0 | yinon-hybrid | 2.19 | 2.7 | 143.5 | 138.5 | 1.09 | 0.66 | 15.1 |
+| 50k | 1.0 | hybrid (n=6) | 2.57 | 2.0 | 104 | 103 | 1.13 | 0.63 | see caveat |
+| 50k | 0.2 | up | 2.66 | 3.2 | 47 | 47 | 0.93 | 0.41 | 1.3 |
+| 50k | 0.2 | yinon-hybrid | 1.81 | 2.5 | 85 | 80.5 | 0.88 | 0.34 | 14.3 |
+| 50k | 0.2 | hybrid | 1.32 | 1.9 | 33 | 31.5 | 0.63 | 0.33 | 0.67 |
+
+### Big (260 MB, 10 MB hashes and 300k-member zsets; random existing field/member per write)
+
+| rate | hot | config | save s | fork ms | extra mem MB | main cpu s | ping p99 ms | ping max ms | load ops/s |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 1.59 | 4.7 | 1 | 0.06 | 0.69 | 1.9 | - |
+| 0 | - | yinon-hybrid | 1.58 | 5.5 | 1 | 0.07 | 0.57 | 7.9 | - |
+| 0 | - | hybrid | 1.62 | 5.9 | 0.5 | 0.06 | 0.64 | 5.0 | - |
+| 20k | 1.0 | up | 1.68 | 3.3 | 99.5 | 0.40 | 0.25 | 0.38 | 19998 |
+| 20k | 1.0 | yinon-hybrid | 1.78 | 3.4 | 102 | 0.46 | 0.27 | 8.6 | 19998 |
+| 20k | 1.0 | hybrid | 1.68 | 3.1 | 98.5 | 0.41 | 0.23 | 1.2 | 19997 |
+| 20k | 0.2 | up | 1.85 | 3.1 | 46.5 | 0.43 | 0.31 | 1.7 | 19998 |
+| 20k | 0.2 | yinon-hybrid | 1.96 | 3.2 | 44 | 0.46 | 0.34 | 6.8 | 19997 |
+| 20k | 0.2 | hybrid | 1.66 | 2.8 | 42 | 0.38 | 0.26 | 0.77 | 19997 |
+| 50k | 1.0 | up | 1.77 | 3.2 | 161.5 | 0.53 | 0.32 | 0.88 | 49985 |
+| 50k | 1.0 | yinon-hybrid | 2.78 | 3.7 | 171 | 1.03 | 0.73 | 14.4 | 47067 |
+| 50k | 1.0 | hybrid | 2.35 | 3.6 | 170 | 0.76 | 0.53 | 3.3 | 48954 |
+| 50k | 0.2 | up | 2.44 | 3.0 | 49 | 0.72 | 0.39 | 3.3 | 49398 |
+| 50k | 0.2 | yinon-hybrid | 1.84 | 3.0 | 45 | 0.47 | 0.34 | 9.7 | 49659 |
+| 50k | 0.2 | hybrid | 1.91 | 2.8 | 45 | 0.43 | 0.33 | 1.7 | 49990 |
+
+### Reading the run
+
+- **Big values now show their real cost, and it is the same for everyone that forks**: 100 MB of child copy-on-write at 20k
+  writes/s uniform, 160-170 MB at 50k, 42-49 MB with the 20% hot set (bounded by the hot set's pages). Our hybrid, the
+  teammate's hybrid and stock are within noise of each other here because all three serialize big values from a fork child;
+  the hybrid designs neither help nor hurt on this dataset. This is the number a forkless design trades against its main-thread
+  copies (runs 6 and 8: Valkey forkless 140-170 MB of parent growth plus 65-214 ms PING p99 on the same dataset).
+- **Small and mixed repeat run 7** with the new generator: at 20k uniform ours is 3 MB / 0.27 ms fork / 0.36 ms PING max
+  against 32.5 MB / 0.79 ms / 13.2 ms for the teammate's hybrid and 154.5 MB / 4.2 ms / 1.7 ms for stock. On mixed the
+  big-value CoW remains for all three and is smallest for ours (47 vs 91 vs 137 MB at 20k) because our child finishes sooner.
+- **The 20% hot set changes little for the small path** (3 MB either way for us, 32-38 MB for the teammate's hybrid) and
+  cuts stock and big-value CoW by 2.5-4x, as expected once repeated writes land on already-copied pages. The teammate's
+  hybrid keeps its 7-21 ms PING max in every cell with writes, unchanged from run 7.
+- **Caveat, and the reason two cells have n=6: thermal throttling.** Our two 50k/uniform cells each had one rep where the
+  CPU seconds of the main thread, the scan thread AND the child doubled at once (small: 4.18 s save, PING max 19.8 ms;
+  mixed: 5.24 s, 21.9 ms) while the other rep was normal (1.57 s / 0.36 ms; 2.45 s / 0.8 ms). That signature is a clock drop,
+  not a lock. Re-measuring those cells with frequency sampling confirmed it: package at 85-89 C, cores averaging 1.5-2.6 GHz
+  with dips to 0.76 GHz (max 4.7), and save time tracking the average clock (1.40 s at 2.5 GHz, 2.25 s at 1.65 GHz). Every
+  configuration in this run was affected to an unknown and uneven degree, since they ran back to back for 100 minutes:
+  treat save-time and latency differences under about 25% as noise in this run; memory numbers do not depend on the clock.
+  bench.py now records `cpu_mhz_min`, `cpu_mhz_avg`, `temp_c_start`, `temp_c_max` per cell and has a thermal gate
+  (`--cool-below C`, `COOL=` in run.sh) that waits for the package to cool before each cell. A rerun with the gate, and with
+  configurations interleaved per cell now that datasets load from the RDB cache in 2 s, is the clean way to get medians that
+  are comparable across configurations.

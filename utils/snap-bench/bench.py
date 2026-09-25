@@ -125,15 +125,38 @@ class Server:
         child = sum(ticks(f"/proc/{c}/stat") for c in self.children())
         return main, proc, child
 
+def cpu_mhz(cpus):
+    """Mean current frequency (MHz) of the server's CPUs; 0 if unavailable. Throttling shows up here."""
+    vals = []
+    for c in cpus:
+        v = read_file(f"/sys/devices/system/cpu/cpu{c}/cpufreq/scaling_cur_freq").strip()
+        if v.isdigit(): vals.append(int(v) / 1000)
+    return round(sum(vals) / len(vals)) if vals else 0
+
+def cpu_temp():
+    """Package temperature (C) from the TCPU/x86_pkg_temp thermal zone; 0 if unavailable."""
+    for z in sorted(os.listdir("/sys/class/thermal")) if os.path.isdir("/sys/class/thermal") else []:
+        if read_file(f"/sys/class/thermal/{z}/type").strip() in ("TCPU", "x86_pkg_temp"):
+            v = read_file(f"/sys/class/thermal/{z}/temp").strip()
+            return int(v) // 1000 if v.isdigit() else 0
+    return 0
+
+def parse_cpus(spec):
+    out = []
+    for part in spec.split(","):
+        a, _, b = part.partition("-"); out += list(range(int(a), int(b or a) + 1))
+    return out
+
 class Sampler(threading.Thread):
-    def __init__(self, srv, port, period=0.1):
-        super().__init__(daemon=True); self.srv = srv; self.port = port; self.period = period
+    def __init__(self, srv, port, period=0.1, cpus=()):
+        super().__init__(daemon=True); self.srv = srv; self.port = port; self.period = period; self.cpus = cpus
         self.rows = []; self.stop_ev = threading.Event(); self.child_cpu = 0
     def run(self):
         r = redis.Redis(port=self.port, socket_timeout=2)
         while not self.stop_ev.is_set():
             t = time.time(); st = self.srv.status(); pd, crss = self.srv.child_mem()
-            row = {"t": t, "rss_anon_mb": st.get("RssAnon", 0), "swap_mb": st.get("VmSwap", 0), "child_pd_mb": pd, "child_rss_mb": crss}
+            row = {"t": t, "rss_anon_mb": st.get("RssAnon", 0), "swap_mb": st.get("VmSwap", 0), "child_pd_mb": pd, "child_rss_mb": crss,
+                   "mhz": cpu_mhz(self.cpus), "temp": cpu_temp()}
             try:
                 info = r.info("memory"); row["used_memory_mb"] = info["used_memory"] // 2**20
                 row["blocked"] = r.info("clients").get("blocked_clients", 0)
@@ -211,13 +234,23 @@ def wait_save(r, poll=0.02):
         time.sleep(poll)
 
 # ------------------------------------------------------------------ one cell
+def cool_down(a):
+    """Thermal gate: this laptop throttles (package 85-89 C, cores at 0.8-1.6 GHz of 4.7) after minutes of load and
+    save times then track the clock, not the code. Wait until the package is below --cool-below (0 = off)."""
+    if not a.cool_below: return 0
+    t0 = time.time()
+    while cpu_temp() > a.cool_below and time.time() - t0 < a.cool_wait: time.sleep(1)
+    return round(time.time() - t0)
+
 def run_cell(a, dataset, rate, est_save):
+    cooled = cool_down(a)
     r = redis.Redis(port=a.port, socket_timeout=600)
     pid = r.info("server")["process_id"]; srv = Server(pid)
     classes = scaled(dataset, a.scale)
     mem0 = r.info("memory")["used_memory"]
     row = {"name": a.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "sha": r.info("server").get("redis_git_sha1"),
            "dataset": dataset, "rate": rate, "hot": a.hot, "dbsize": r.dbsize(), "used_mb": mem0 // 2**20,
+           "cooled_s": cooled, "temp_c_start": cpu_temp(),
            "hybrid": int(r.config_get("bgsave-hybrid").get("bgsave-hybrid", "no") == "yes") if "bgsave-hybrid" in str(r.config_get("bgsave-hybrid")) else 0}
     row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
@@ -232,7 +265,7 @@ def run_cell(a, dataset, rate, est_save):
             procs.append(snapload(a.port, cls, cr, secs, out, a.load_cpus, a.hot)); outs[cls[0]] = (out + ".json", cr)
     t_mt = time.time(); time.sleep(a.warm if procs else 0.5)
 
-    sampler = Sampler(srv, a.port); ping = PingProbe(a.port); sampler.start(); ping.start()
+    sampler = Sampler(srv, a.port, cpus=parse_cpus(a.server_cpus)); ping = PingProbe(a.port); sampler.start(); ping.start()
     time.sleep(0.3)
     st0 = srv.status(); cpu0 = srv.cpu_ticks()
     t0 = time.time(); r.bgsave(); t1 = wait_save(r); time.sleep(0.8)
@@ -256,6 +289,9 @@ def run_cell(a, dataset, rate, est_save):
         row["abs_peak_mb"] = max(x["rss_anon_mb"] + x["swap_mb"] + x["child_pd_mb"] for x in rows)
         row["used_mem_growth_mb"] = max(x.get("used_memory_mb", 0) for x in rows) - mem0 // 2**20
         row["blocked_peak"] = max(x.get("blocked", 0) for x in rows)
+        mhz = [x["mhz"] for x in rows if x.get("mhz")]
+        row["cpu_mhz_min"] = min(mhz) if mhz else None; row["cpu_mhz_avg"] = round(statistics.fmean(mhz)) if mhz else None
+        row["temp_c_max"] = max((x.get("temp", 0) for x in rows), default=None)
     ms = [m for t, m in ping.samples if t0 <= t <= t1]
     row.update(ping_p50_ms=pct(ms, 50), ping_p99_ms=pct(ms, 99), ping_max_ms=pct(ms, 100))
     lat = r.execute_command("LATENCY", "HISTORY", "command") or []
@@ -282,7 +318,7 @@ COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "hot", "sha
            "save_sec", "status", "fork_ms", "extra_mem_peak_mb", "parent_growth_peak_mb", "child_pd_peak_mb", "abs_peak_mb", "cow_mb",
            "used_mem_growth_mb", "cpu_main_s", "cpu_threads_s", "cpu_child_s", "ping_p50_ms", "ping_p99_ms", "ping_max_ms",
            "cmd_events_ge20ms", "ops", "load_avg_ms", "load_p99_ms", "load_p999_ms", "load_max_ms", "stall_s", "target_missed",
-           "blocked_peak", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err"]
+           "blocked_peak", "cpu_mhz_min", "cpu_mhz_avg", "temp_c_start", "temp_c_max", "cooled_s", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err"]
 
 def cmd_run(a):
     r = redis.Redis(port=a.port); r.ping()
@@ -310,7 +346,8 @@ def cmd_run(a):
                     row = run_cell(a, ds, rate, est); w.writerow(row); f.flush()
                     print(f"[{a.name}] {ds} r{rate} #{rep}: save {row['save_sec']}s fork {row['fork_ms']}ms extra_mem {row.get('extra_mem_peak_mb')}MB "
                           f"(parent +{row.get('parent_growth_peak_mb')}, child {row.get('child_pd_peak_mb')}) cow {row['cow_mb']}MB "
-                          f"ping p99 {row.get('ping_p99_ms')} max {row.get('ping_max_ms')} load p99 {row.get('load_p99_ms')} max {row.get('load_max_ms')} stall {row.get('stall_s')}", file=sys.stderr)
+                          f"ping p99 {row.get('ping_p99_ms')} max {row.get('ping_max_ms')} load p99 {row.get('load_p99_ms')} max {row.get('load_max_ms')} stall {row.get('stall_s')} "
+                          f"cpu {row.get('cpu_mhz_min')}-{row.get('cpu_mhz_avg')} MHz {row.get('temp_c_max')}C", file=sys.stderr)
                     time.sleep(a.cooldown)
 
 def cmd_report(a):
@@ -341,6 +378,9 @@ def main():
     p.add_argument("--datasets", default="small,mixed,big"); p.add_argument("--rates", default="0,20000"); p.add_argument("--reps", type=int, default=1)
     p.add_argument("--csv", required=True); p.add_argument("--scale", type=float, default=1.0); p.add_argument("--warm", type=float, default=3)
     p.add_argument("--cooldown", type=float, default=3); p.add_argument("--workdir", default="/tmp/snap-bench-runs"); p.add_argument("--load-cpus", default="8-15")
+    p.add_argument("--server-cpus", default="0-7", help="CPUs the server is pinned to (frequency sampling)")
+    p.add_argument("--cool-below", type=int, default=0, help="before each cell wait until the package temperature (C) is below this (0 = off)")
+    p.add_argument("--cool-wait", type=int, default=120, help="max seconds to wait for the thermal gate")
     p.add_argument("--hot", type=float, default=1.0, help="fraction of each class's keys that receive the writes (1.0 = uniform over all keys)")
     p.add_argument("--cache", default="/dev/shm/snap-bench-runs/cache", help="dir of cached dataset RDBs ('' to disable)")
     p.set_defaults(fn=cmd_run)

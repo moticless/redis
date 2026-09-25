@@ -10,6 +10,7 @@ PORT=7600; D=${BENCH_DIR:-/dev/shm/snap-bench-runs}; mkdir -p "$D"   # tmpfs: sa
 SERVER_CPUS=${SERVER_CPUS:-0-7}   # server, its threads and its fork child (affinity is inherited); e.g. SERVER_CPUS=0 for one core
 LOAD_CPUS=${LOAD_CPUS:-8-15}      # snapload.py, bench.py and its probes
 HOT=${HOT:-1.0}                   # fraction of each class's keys the writes hit (bench.py --hot)
+COOL=${COOL:-0}                   # thermal gate: wait before each cell until the package is below this many C (0 = off)
 BASE=${BASE:-/tmp/redis-base/src/redis-server}        # stock 0c1c74706 (M1 baseline)
 UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d (current base)
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
@@ -39,7 +40,7 @@ for cfg in ${CFGS:-base hybrid}; do
     yinon-forkless)  start yinon-forkless "$YINON" --bgsave-mode forkless --forkless-string-max 4096 ;;
   esac || { echo "$cfg: server start failed (see $D/$cfg.log)"; continue; }
   echo "=== $(date +%T) $cfg $($CLI -p $PORT info server | grep -E '^redis_git_sha1|^redis_version|^valkey_version' | tr -d '\r' | tr '\n' ' ')"
-  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --hot "$HOT"
+  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL"
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 2
 done
 echo "=== $(date +%T) DONE -> $CSV"
