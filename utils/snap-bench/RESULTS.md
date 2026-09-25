@@ -576,6 +576,7 @@ Final runs (repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS`, 8 clients):
 | `./runtest --config bgsave-hybrid yes` (final) | 5781 passed, 0 failed, then the cluster harness aborted with "cluster config did not reach a consistent state" while three cluster units ran in parallel; those three units pass alone with the feature on (170 tests). A convergence timeout under load, seen with the feature off too on this laptop in earlier sessions |
 | `./runtest` (feature off, final) | 6267 passed, 0 failed |
 | unit/snapshot, feature on | 41 of 41; unit tests 165 of 165 |
+| **after the save_gen removal (41868cb93): `./runtest` feature off / `./runtest --config bgsave-hybrid yes`** | **6283 passed, 0 failed / 6270 passed, 0 failed, end to end, no cluster-harness timeout this time** |
 
 
 ## Per-key save generation removed (TASK-1.21.4, 2026-09-25, commit 41868cb93)
