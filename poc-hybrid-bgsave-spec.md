@@ -187,6 +187,17 @@ quiescence wait when it sees the abort, since the aborting command may itself ho
 open), kills the child, merges every temp dict and unfreezes. FLUSHALL, FLUSHDB, SWAPDB, SHUTDOWN
 and a killed child take the same path. The previous dump file is untouched.
 
+**Other fork children (fallback).** The arena is one reserved range carrying
+`MADV_DONTFORK`. Any child that is not the hybrid save's (stock RDB save while the
+feature is off, diskless full sync, AOF rewrite, module fork, Lua debugger) needs
+the keyspace mapped, so `redisFork()` first flips the range to `MADV_DOFORK` (one
+madvise, O(VMAs), no key is touched) and the child reaper flips it back once no
+child is left and the feature is on. Such a child sees stock copy-on-write on the
+arena for its lifetime. Mutual exclusion with the hybrid save is the existing
+one-child rule; a `BGSAVE` issued while a fallback child runs is scheduled and
+starts, on the hybrid path, after the flip back. `CONFIG SET bgsave-hybrid` uses
+the same flip and is refused while any child or hybrid save runs.
+
 **What the main thread pays.** One hash and one atomic load per write to a frozen dict, one dict
 lookup in the temp dict, and, for the first write into each not-yet-walked bucket, the
 serialization of that bucket (about 1.3 keys on average at load factor 1). Measured main-thread CPU
@@ -497,9 +508,15 @@ Left over, in the order I would do it:
 5. TASK-1.21.6: cluster mode is exercised by the harness's cluster test
    (the window names the dict, SLOT_INFO comes from the message header) but
    has no dedicated verification of main-thread emission per slot.
-6. Unchanged from M1: AOF rewrite, diskless sync and `RedisModule_Fork` are
-   refused while the arena is on; atomic slot migration during a save is
-   not guarded.
+6. AOF rewrite, diskless sync and `RedisModule_Fork`: no longer refused (TASK-1.22,
+   2026-09-25). `redisFork()` flips the arena's reservation to `MADV_DOFORK` for any
+   non-hybrid child (one madvise; `snapArenaBeforeFork`), the reaper flips it back
+   once no child is left (`snapArenaChildExited`); the fallback child pays stock
+   copy-on-write on the arena. `bgsave-hybrid` is a runtime config on the same
+   mechanism (off = arena forkable, stock save path, no new placement in the arena),
+   refused while any child or hybrid save runs. `INFO snap_nofork_arena_forkable`
+   shows the state. Atomic slot migration during a save is still untested (cluster
+   is TASK-1.21.6).
 
 Found while comparing with the teammate's POC (2026-09-24), both fixed and
 covered by a harness test with `test_keymeta.so`: (a) placement ignored module

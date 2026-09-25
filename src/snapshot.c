@@ -49,24 +49,89 @@ static inline void snapAssertNotChild(void) {
  * knowing about classes. These are the snapshot-facing entry points. */
 void snapArenaInit(void) {
     server.snap_nofork_arena = UINT_MAX;
-    if (!server.bgsave_hybrid) {
-        serverLog(LL_NOTICE, "Hybrid BGSAVE disabled (bgsave-hybrid no): SNAP_NOFORK arena not created.");
-        return;
-    }
 #ifdef SNAP_NOFORK_ARENA_SUPPORTED
     if (!zmalloc_nofork_arena_init()) {
         serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
-                              "range or create the jemalloc arena; hybrid BGSAVE unavailable.");
+                              "range or create the jemalloc arena; hybrid BGSAVE runs without it.");
         return;
     }
     server.snap_nofork_arena = zmalloc_nofork_arena_index();
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of MADV_DONTFORK "
-                         "address space reserved).", server.snap_nofork_arena,
-                         snapArenaVaReserved() >> 30);
+    if (!server.bgsave_hybrid) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
+    serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
+                         "%s).", server.snap_nofork_arena, snapArenaVaReserved() >> 30,
+                         server.bgsave_hybrid ? "MADV_DONTFORK: hybrid BGSAVE on" : "forkable: bgsave-hybrid no");
 #else
     serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator; "
-                         "hybrid BGSAVE disabled.");
+                         "hybrid BGSAVE, if enabled, runs without it.");
 #endif
+}
+
+/* ---- Fork visibility of the arena (see snapshot.h) ---------------------- */
+
+static int snap_arena_fallback = 0;   /* flipped forkable for a non-hybrid child, flip back on reap */
+static int snap_forking_hybrid = 0;   /* set around the hybrid save's own redisFork() */
+
+int snapArenaForkable(void) {
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    return snapArenaAvailable() && zmalloc_nofork_arena_forkable();
+#else
+    return 0;
+#endif
+}
+
+int snapArenaSetForkable(int forkable) {
+#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+    if (!snapArenaAvailable()) return 0;
+    if (!zmalloc_nofork_arena_set_forkable(forkable)) {
+        serverLog(LL_WARNING, "SNAP_NOFORK arena: madvise(%s) failed: %s",
+                  forkable ? "MADV_DOFORK" : "MADV_DONTFORK", strerror(errno));
+        return 0;
+    }
+    return 1;
+#else
+    UNUSED(forkable);
+    return 0;
+#endif
+}
+
+void snapArenaBeforeFork(int purpose) {
+    UNUSED(purpose);
+    if (snap_forking_hybrid || !snapArenaAvailable() || snapArenaForkable()) return;
+    /* A stock child (RDB with the feature off, diskless sync, AOF rewrite,
+     * module or Lua debugger fork) walks the keyspace: it must map the arena. */
+    if (snapArenaSetForkable(1)) {
+        snap_arena_fallback = 1;
+        serverLog(LL_NOTICE, "SNAP_NOFORK arena made forkable for a %s child (stock copy-on-write applies)",
+                  strChildType(purpose));
+    }
+}
+
+void snapArenaChildExited(void) {
+    if (!snap_arena_fallback) return;
+    if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another stock child still runs */
+    snap_arena_fallback = 0;
+    if (server.bgsave_hybrid && snapArenaSetForkable(0))
+        serverLog(LL_NOTICE, "SNAP_NOFORK arena back to MADV_DONTFORK");
+}
+
+int snapHybridConfigApply(const char **err) {
+    if (server.loading) return 1;   /* applied again by the startup path */
+    if (hasActiveChildProcess() || snapSaveInProgress() || ldbPendingChildren()) {
+        *err = "bgsave-hybrid cannot change while a save, rewrite, module fork or debugger child is running";
+        return 0;
+    }
+    if (snapArenaAvailable()) {
+        /* On: children stop mapping the arena; off: they must map it. Values
+         * placed so far stay where they are, the switch itself is O(1). */
+        if (!snapArenaSetForkable(!server.bgsave_hybrid)) {
+            *err = "SNAP_NOFORK arena: madvise failed, see the server log";
+            return 0;
+        }
+        snap_arena_fallback = 0;
+    }
+    serverLog(LL_NOTICE, "Hybrid BGSAVE switched %s at runtime%s", server.bgsave_hybrid ? "on" : "off",
+              snapArenaAvailable() ? "" : " (no SNAP_NOFORK arena on this platform)");
+    return 1;
 }
 
 
@@ -1800,6 +1865,13 @@ static const kvstoreOverlayHooks snap_server_hooks = {
 
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (hasActiveChildProcess()) return C_ERR;
+    if (snapArenaForkable()) {
+        /* Only a Lua debugger child can leave the arena forkable without an
+         * exclusive child: a hybrid child forked now would map the arena and
+         * pay copy-on-write for nothing. Refuse; BGSAVE can be retried. */
+        serverLog(LL_WARNING, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable for a fallback child; refusing to start");
+        return C_ERR;
+    }
     serverAssert(snap_save == NULL);
 
     snapSave *sv = zcalloc(sizeof(*sv));
@@ -1875,7 +1947,9 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     snapScanFreeze(sv->scan);
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
+    snap_forking_hybrid = 1;
     pid_t childpid = redisFork(CHILD_TYPE_RDB);
+    snap_forking_hybrid = 0;
     if (childpid == 0) {
         snapSaveChild(sv);   /* never returns */
     }
@@ -2854,6 +2928,12 @@ int snapshotTest(int argc, char **argv, int flags) {
     test_cond("fork child survives and can use the default allocator", snapTestChildAllocatorAlive() == 1);
     test_cond("fork child faults when writing a SNAP_NOFORK allocation", snapTestChildWriteFaults(p) == 1);
     test_cond("fork child can write a zmalloc allocation", snapTestChildWriteFaults(q) == 0);
+    /* Fork visibility flip (TASK-1.22): one madvise over the reservation. */
+    test_cond("arena is DONTFORK by default", !snapArenaForkable());
+    test_cond("flip: arena made forkable", snapArenaSetForkable(1) && snapArenaForkable());
+    test_cond("flip: fork child can write a SNAP_NOFORK allocation while forkable", snapTestChildWriteFaults(p) == 0);
+    test_cond("flip: arena back to DONTFORK", snapArenaSetForkable(0) && !snapArenaForkable());
+    test_cond("flip: fork child faults again on the same allocation", snapTestChildWriteFaults(p) == 1);
 
     /* Large (>= 2MB, multi-page-run) allocation is also DONTFORK. */
     char *big = snapNoforkAlloc(5 * 1024 * 1024);

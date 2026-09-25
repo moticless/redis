@@ -5355,14 +5355,8 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
 
     if (hasActiveChildProcess()) return C_ERR;
-    if (snapArenaAvailable()) {
-        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
-         * fork child cannot walk the keyspace. Until the hybrid save path is
-         * wired (snapshot.c), refuse rather than crash the child. */
-        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
-                              "operation yet; refusing to fork a stock serializer.");
-        return C_ERR;
-    }
+    /* Hybrid BGSAVE: diskless sync keeps the stock child; redisFork() flips the
+     * SNAP_NOFORK arena forkable for it (see snapArenaBeforeFork()). */
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */

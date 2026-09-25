@@ -375,6 +375,7 @@ unsigned zmalloc_nofork_arena = UINT_MAX;   /* read inline by zmalloc.h fast pat
 static extent_hooks_t *nofork_default_hooks = NULL;
 static extent_hooks_t nofork_hooks;              /* must outlive the arena */
 static __thread int nofork_thread_flags = 0;     /* MALLOCX_ARENA|MALLOCX_TCACHE, 0 = uninit */
+static int nofork_forkable = 0;                  /* 1 while the range is MADV_DOFORK (stock fork fallback) */
 
 /* Carve [aligned, aligned+size) out of the reservation and make it RW. The
  * whole reservation carries VM_DONTCOPY; mprotect splits the VMA but keeps
@@ -483,6 +484,23 @@ int zmalloc_nofork_arena_init(void) {
 }
 
 int zmalloc_nofork_arena_available(void) { return zmalloc_nofork_arena != UINT_MAX; }
+
+/* Flip the whole reserved range between MADV_DONTFORK (children never map it)
+ * and MADV_DOFORK (a stock fork child sees it, at copy-on-write cost). The
+ * flag is per VMA and the range is one reservation split only by mprotect,
+ * so one madvise over [lo, hi) covers every extent, present and future
+ * (alloc/commit never re-apply a flag). Affects forks made after the call
+ * only; running children are unaffected. Returns 1 on success. */
+int zmalloc_nofork_arena_set_forkable(int forkable) {
+    if (zmalloc_nofork_arena == UINT_MAX) return 0;
+    if (nofork_forkable == !!forkable) return 1;
+    if (madvise(zmalloc_nofork_lo, zmalloc_nofork_hi - zmalloc_nofork_lo,
+                forkable ? MADV_DOFORK : MADV_DONTFORK) != 0)
+        return 0;
+    nofork_forkable = !!forkable;
+    return 1;
+}
+int zmalloc_nofork_arena_forkable(void) { return nofork_forkable; }
 unsigned zmalloc_nofork_arena_index(void) { return zmalloc_nofork_arena; }
 
 void zmalloc_nofork_va_stats(size_t *reserved, size_t *used) {

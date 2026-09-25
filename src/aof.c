@@ -3211,14 +3211,8 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    if (snapArenaAvailable()) {
-        /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
-         * fork child cannot walk the keyspace. Until the hybrid save path is
-         * wired (snapshot.c), refuse rather than crash the child. */
-        serverLog(LL_WARNING, "bgsave-hybrid is enabled but the hybrid save path is not available for this "
-                              "operation yet; refusing to fork a stock serializer.");
-        return C_ERR;
-    }
+    /* Hybrid BGSAVE: redisFork() flips the SNAP_NOFORK arena forkable for this
+     * child (stock copy-on-write while it runs), see snapArenaBeforeFork(). */
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
         server.backup_state == BACKUP_STATE_INCREMENTING)
     {

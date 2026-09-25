@@ -31,15 +31,27 @@ struct listpackEx;
 
 /* Create the SNAP_NOFORK arena. Must be called once, in the main thread,
  * before any snapNofork* allocation (initServer does it before creating the
- * db kvstores). Only creates the arena when the startup config
- * `bgsave-hybrid` is enabled: with headers in a DONTFORK arena no fork child
- * can read the keyspace, so the stock fork-based serializers cannot be used
- * and every save must go through the hybrid path. On platforms without
- * jemalloc or MADV_DONTFORK this is a no-op and snapArenaAvailable() is 0. */
+ * db kvstores). The arena is created whenever the platform supports it so
+ * that `bgsave-hybrid` can be switched at runtime; while the feature is off
+ * the arena is left forkable and nothing new is placed in it. On platforms
+ * without jemalloc or MADV_DONTFORK this is a no-op and snapArenaAvailable()
+ * is 0. */
 void snapArenaInit(void);
 
-/* 1 if the DONTFORK arena exists and the hybrid save path may be used. */
+/* 1 if the arena exists (DONTFORK or currently forkable, see below). */
 static inline int snapArenaAvailable(void) { return server.snap_nofork_arena != UINT_MAX; }
+
+/* Fork visibility of the arena. Normally DONTFORK: the hybrid save's child
+ * never maps it. Any other fork (stock RDB save while the feature is off,
+ * diskless sync, AOF rewrite, module fork, Lua debugger) needs the keyspace
+ * in the child, so redisFork() flips the range to DOFORK first
+ * (snapArenaBeforeFork) and the reaper flips it back once no child is left
+ * and the feature is on (snapArenaChildExited). One madvise each way, O(VMAs),
+ * O(1) in keys; the fallback child pays stock copy-on-write. */
+int snapArenaForkable(void);
+int snapArenaSetForkable(int forkable);
+void snapArenaBeforeFork(int purpose);          /* redisFork(), parent, before fork() */
+void snapArenaChildExited(void);                /* after a child of any type was reaped */
 
 /* Reserved / bump-allocated bytes of the arena's address range (0 if unavailable). */
 size_t snapArenaVaReserved(void);
@@ -105,7 +117,9 @@ int snapKeyClass(const robj *o);
  * every keyspace insertion and after unbounded in-place growth of strings.
  * Only the value moves; the header (and thus every pointer to it) stays. */
 void snapPlaceValueArena(robj *o);
-static inline void snapPlaceValue(robj *o) { if (__builtin_expect(snapArenaAvailable(), 0)) snapPlaceValueArena(o); }
+static inline void snapPlaceValue(robj *o) {
+    if (__builtin_expect(snapArenaAvailable() && server.bgsave_hybrid, 0)) snapPlaceValueArena(o);
+}
 
 /* Move a single-allocation value out of the arena if it is there. Must be
  * called before such a buffer is ADOPTED by a multi-allocation structure
@@ -283,10 +297,14 @@ int snapSaveInProgress(void);
 void snapSaveAbort(void);
 /* Called by backgroundSaveDoneHandler() when the RDB child exited. */
 void snapSaveChildDone(int exitcode, int bysignal);
-/* 1 when bgsave-hybrid is on: saves take the hybrid path whether or not the
- * SNAP_NOFORK arena exists (without it the CoW benefit is gone but the
- * mechanics are identical, which is what sanitizer builds exercise). */
+/* 1 when bgsave-hybrid is on (a runtime config): saves take the hybrid path
+ * whether or not the SNAP_NOFORK arena exists (without it the CoW benefit is
+ * gone but the mechanics are identical, which is what sanitizer builds
+ * exercise). Switching is O(1): the arena is flipped forkable when off, and
+ * values allocated meanwhile simply live in the default allocator. */
 static inline int snapHybridEnabled(void) { return server.bgsave_hybrid; }
+/* CONFIG SET bgsave-hybrid apply hook: flips the arena, refuses mid-save. */
+int snapHybridConfigApply(const char **err);
 
 /* 1 if 'kv' is a fork-instant original the running save has not taken yet:
  * its bucket is ahead of the scan thread and not emitted by the main thread,

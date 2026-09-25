@@ -1007,3 +1007,171 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
         }
     }
 }
+
+# ---------------------------------------------------------------------------
+# Arena fork visibility (TASK-1.22): stock fork children (AOF rewrite, diskless
+# sync, module fork) map the SNAP_NOFORK arena while they run, the hybrid child
+# never does, and bgsave-hybrid is a runtime switch.
+# ---------------------------------------------------------------------------
+set ::snap_fork_module [file normalize tests/modules/fork.so]
+
+proc snap_wait_forkable {want} {
+    if {![snap_arena_available]} return
+    wait_for_condition 100 20 {[s snap_nofork_arena_forkable] == $want} else {
+        fail "arena forkable flag did not become $want"
+    }
+}
+
+start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+    r module load $::snap_fork_module
+
+    proc snap_fallback_dataset {} {
+        r flushall
+        populate 3000 k: 40
+        r hset h f1 v1 f2 v2
+        r sadd s a b c
+        r rpush l 1 2 3
+        r zadd z 1 a 2 b
+        r set big [string repeat x 20000]
+    }
+
+    test {Arena fork visibility: INFO exposes it and it is DONTFORK while the feature is on} {
+        assert_match {*snap_nofork_arena_forkable:*} [r info memory]
+        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+    }
+
+    test {BGREWRITEAOF with bgsave-hybrid on: the arena is forkable for the child, DONTFORK after, the AOF reloads} {
+        snap_fallback_dataset
+        set digest [debug_digest]
+        r config set rdb-key-save-delay 300
+        r config set appendonly yes   ;# starts the rewrite
+        if {[snap_arena_available]} {
+            wait_for_condition 100 20 {[s snap_nofork_arena_forkable] == 1} else { fail "arena not forkable for the AOF child" }
+        }
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
+        assert_equal ok [s aof_last_bgrewrite_status]
+        snap_wait_forkable 0
+        r debug loadaof
+        assert_equal $digest [debug_digest]
+        r config set appendonly no
+    }
+
+    test {Diskless full sync with bgsave-hybrid on: the child maps the arena and the replica matches the master} {
+        snap_fallback_dataset
+        set digest [debug_digest]
+        start_server {overrides {bgsave-hybrid yes}} {
+            r replicaof [srv -1 host] [srv -1 port]
+            wait_for_condition 100 100 {
+                [s master_link_status] eq {up}
+            } else { fail "replication not established" }
+            wait_for_condition 50 100 {
+                [r dbsize] == [[srv -1 client] dbsize]
+            } else { fail "replica did not receive all keys" }
+            assert_equal $digest [debug_digest]
+            assert {[count_log_message -1 "Starting BGSAVE for SYNC with target: replicas sockets"] >= 1}
+            r replicaof no one
+        }
+        snap_wait_forkable 0
+    }
+
+    test {Module fork with bgsave-hybrid on: the child runs and exits with its code} {
+        r fork.create 3 100000
+        wait_for_condition 20 100 {
+            [r fork.exitcode] != -1
+        } else { fail "fork didn't terminate" }
+        assert_equal 3 [r fork.exitcode]
+        snap_wait_forkable 0
+    }
+
+    test {Mutual exclusion: a hybrid save keeps the arena DONTFORK, a rewrite asked meanwhile is scheduled and runs after} {
+        snap_fallback_dataset
+        r config set rdb-key-save-delay 1000
+        r bgsave
+        snap_wait_save_started
+        assert_match {*scheduled*} [r bgrewriteaof]
+        assert_equal 1 [s aof_rewrite_scheduled]
+        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        r config set rdb-key-save-delay 0
+        snap_wait_bgsave_done
+        assert_equal ok [s rdb_last_bgsave_status]
+        wait_for_condition 200 50 {
+            [s aof_rewrite_scheduled] == 0 && [s aof_rewrite_in_progress] == 0
+        } else { fail "scheduled rewrite did not run" }
+        assert_equal ok [s aof_last_bgrewrite_status]
+        snap_wait_forkable 0
+    }
+
+    test {Mutual exclusion: BGSAVE during a fallback child is scheduled, the arena stays forkable until that child exits} {
+        snap_fallback_dataset
+        r config set rdb-key-save-delay 1000
+        r bgrewriteaof
+        wait_for_condition 100 20 {[s aof_rewrite_in_progress] == 1} else { fail "rewrite did not start" }
+        if {[snap_arena_available]} { assert_equal 1 [s snap_nofork_arena_forkable] }
+        set gen [s snap_gen]
+        assert_match {*scheduled*} [r bgsave schedule]
+        assert_equal 0 [s snap_save_in_progress]
+        if {[snap_arena_available]} { assert_equal 1 [s snap_nofork_arena_forkable] }
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
+        wait_for_condition 200 50 {
+            [s snap_gen] != $gen && [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
+        } else { fail "scheduled save did not run" }
+        assert_equal ok [s rdb_last_bgsave_status]   ;# snap_gen moved: the scheduled save took the hybrid path
+        snap_wait_forkable 0
+    }
+
+    test {CONFIG SET bgsave-hybrid is refused while a save runs} {
+        r config set rdb-key-save-delay 1000
+        r bgsave
+        snap_wait_save_started
+        assert_error {*cannot change*} {r config set bgsave-hybrid no}
+        assert_equal yes [lindex [r config get bgsave-hybrid] 1]
+        r config set rdb-key-save-delay 0
+        snap_wait_bgsave_done
+    }
+
+    test {Runtime switch: off takes the stock save path with a forkable arena, on is hybrid again, both reload} {
+        snap_fallback_dataset
+        set digest [debug_digest]
+        r config set bgsave-hybrid no
+        snap_wait_forkable 1
+        set gen [s snap_gen]
+        r bgsave
+        waitForBgsave r
+        assert_equal ok [s rdb_last_bgsave_status]
+        assert_equal $gen [s snap_gen]              ;# stock path, no hybrid generation
+        assert_equal 0 [s snap_save_in_progress]
+        r debug reload
+        assert_equal $digest [debug_digest]
+        populate 500 off: 40                        ;# allocated outside the arena while off
+        set digest2 [debug_digest]
+        r config set bgsave-hybrid yes
+        snap_wait_forkable 0
+        r bgsave
+        snap_wait_bgsave_done
+        assert_equal ok [s rdb_last_bgsave_status]
+        assert {[s snap_gen] != $gen}
+        r debug reload
+        assert_equal $digest2 [debug_digest]
+        snap_assert_placement_clean
+    }
+
+    test {Runtime switch: the arena is forkable from startup when the feature starts off} {
+        start_server {overrides {bgsave-hybrid no save ""}} {
+            if {[snap_arena_available]} {
+                assert_equal 1 [s snap_nofork_arena_forkable]
+                r config set bgsave-hybrid yes
+                assert_equal 0 [s snap_nofork_arena_forkable]
+            }
+            populate 100 k: 40
+            set d [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            r debug reload
+            assert_equal $d [debug_digest]
+        }
+    }
+
+    r module unload fork
+}
