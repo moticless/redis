@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@moti.cohen@redis.com'
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-21 21:40'
+updated_date: '2026-09-25 04:52'
 labels:
   - bgsave
   - testing
@@ -46,4 +46,8 @@ Closes the spike on standalone. Run the full randomized race harness (CI, evicti
 2026-09-22: benchmark run 6 done (RESULTS.md, results.csv ts 2026-09-22): four configs (upstream 0d6266f2d, hybrid 3da2cd28a, valkey-fork, valkey-forkless from ~/git/valkey unstable 06d35aca6), small/mixed/big/big-grow x 0/20k/50k writes/s x 2 reps. Not run: the overlay-only hybrid (033f94bbf) as a third redis column (run 5 numbers stand in), the --accurate 100-iteration stress, ASan, the full stock suite. tcl unit/snapshot passes on the test build. TSan on 3da2cd28a: one report, snap_main_emitting read by the scan thread through rdb.c:1747 (fixed by making it thread-local, rerun pending).
 
 2026-09-22: TSan clean on fa21935d0 after the two emission fixes (thread-local snap_main_emitting; rdb.c delay check reads server.rdb_key_save_delay only on the main thread outside emission). Verdict so far: the new scheme should replace the overlay: same correctness (harness), worst PING 0.3-0.7 ms instead of 13-31 ms, parent growth 2 MB instead of 4.5-17 MB, save time and main-thread CPU unchanged. Regressions found: none in the matrix; the hard-mark test now trips on queued bytes rather than retained clones (peak accounting extended). Still to do for this task: ASan, --accurate 100 iterations, full stock suite, STRING microbench and callgrind with the feature on.
+
+2026-09-25 run 7 (utils/snap-bench/RESULTS.md, run7.csv, commit 5780b349a): head to head with the teammate's forkless-hybrid POC (yinon-fork / yinon-hybrid / yinon-forkless configs added to run.sh in 293e26ae2) plus upstream. Small at 50k writes/s: our hybrid extra memory 3 MB, fork 0.5 ms, PING max 0.33 ms; teammate hybrid 35 MB / 1.0 ms / 9 ms; stock 220 MB / 4.5 ms / 2.6 ms. Save time ours 1.3 s vs 1.5 s theirs vs 1.9 s stock. Forkless on big values: 140 MB parent growth, PING p99 65 ms.
+
+Bug found by run 7 and fixed in 20aa93d06: snapKvobjIsOwed/prepare checked the emitted bit only for the ahead position; a window move inside a write section made an emitted bucket look owed (DEBUG_ASSERTIONS crash at db.c:618 at 50k writes/s, needless clone in plain builds). New helper snapBucketOwed, unit test, spec 11.z.2. Also found: the repository binary used in run 6 was a -DDEBUG_ASSERTIONS build while every other benchmark binary was plain; run 7 hybrid rows use a plain worktree build (/tmp/redis-hyb). Rerun of the microbench (feature-on SET/GET) with a plain build is still owed.
 <!-- SECTION:NOTES:END -->
