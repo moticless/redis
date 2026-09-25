@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey)
+# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -272,3 +272,130 @@ on small, 220 vs 254 MB on big), so its save time is for slightly less data.
   small/mixed under traffic plus 1.4-1.7 s on its background thread.
 - **Correctness of the hybrid run.** All 24 hybrid saves reported `ok`; the
   reload equivalence is covered by the tcl harness, not by this tool.
+
+
+## Run 7 (2026-09-25): head to head with the teammate's forkless-hybrid POC
+
+Raw: `run7.csv`. Same host, same flags and datasets as run 6, medians of 2 reps, [min-max].
+
+| config | binary | save path |
+|---|---|---|
+| up | upstream unstable 0d6266f2d, plain build | stock fork |
+| hybrid | this branch 20aa93d06, plain build (`/tmp/redis-hyb` worktree), `--bgsave-hybrid yes` | our hybrid: scan thread serializes arena values, child serializes big values |
+| yinon-fork | `yinon/forkless-hybrid` 1204d0970 (on dce0c76d4, 15 commits behind our base), plain build, `--bgsave-mode fork` | stock fork of the teammate's tree |
+| yinon-hybrid | same binary, `--bgsave-mode hybrid --forkless-string-max 4096` | child walks its CoW dict and serializes big values, parent helper thread serializes retained small values |
+| yinon-forkless | same binary, `--bgsave-mode forkless --forkless-string-max 4096` | no child: main thread cuts the snapshot and copies, helper serializes |
+
+Parity: the small-value cap is 4096 B on both POCs. Retained-memory budgets are at each POC's default (ours 256 MB hard mark,
+theirs unlimited); neither budget was hit (`snap_hard_mark_aborts=0`, `forkless_limit_aborts=0` in every row). The teammate's
+config leaves keyspace and kvobj headers in forkable memory; ours keeps them in the no-fork arena.
+
+### Small (300 MB: 1.2 M strings x 100 B, 200 k listpack hashes), all values eligible for the small path on both POCs
+
+| rate | config | save s | fork ms | extra mem peak MB | parent / child MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load max ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 1.80 | 3.3 | 2 | 0 / 2 | 0.06 | 0 | 1.72 | 0.57 | 1.8 | - |
+| 0 | yinon-fork | 1.50 | 6.3 | 1 | 0 / 1 | 0.07 | 0 | 1.43 | 0.66 | 3.0 | - |
+| 0 | yinon-hybrid | 1.35 | 1.2 | 1.5 | 0.5 / 1 | 0.07 | 1.31 | 0.52 | 0.51 | 9.4 | - |
+| 0 | yinon-forkless | 1.68 | 0 | 0.5 | 0.5 / 0 | 1.58 | 1.67 | 0 | 0.38 | 10.7 | - |
+| 0 | hybrid | 1.33 | 0.66 | 1 | 0 / 1 | 0.05 | 1.25 | 0.20 | 0.75 | 1.2 | - |
+| 20k | up | 1.75 | 4.2 | 135 | 0 / 135 | 0.56 | 0 | 1.68 | 0.42 | 2.8 | 4.8 |
+| 20k | yinon-fork | 1.57 | 3.8 | 150 | 0 / 150 | 0.59 | 0 | 1.45 | 0.38 | 1.6 | 3.1 |
+| 20k | yinon-hybrid | 1.50 | 1.1 | 32.5 | 6.5 / 26 | 0.58 | 1.46 | 0.55 | 0.38 | 12.3 | 5.8 |
+| 20k | yinon-forkless | 1.54 | 0 | 0.5 | 0.5 / 0 | 1.73 | 1.51 | 0 | 0.30 | 9.8 | 8.7 |
+| 20k | hybrid | 1.35 | 0.65 | 3 | 2 / 1 | 0.51 | 1.29 | 0.22 | 0.34 | 0.6 | 3.2 |
+| 50k | up | 1.88 | 4.5 | 220 | 0 / 220 | 1.34 | 0 | 1.80 | 0.53 | 2.6 | 7.9 |
+| 50k | yinon-fork | 1.64 | 5.3 | 232 | 0 / 232 | 0.98 | 0 | 1.53 | 0.45 | 3.0 | 5.8 |
+| 50k | yinon-hybrid | 1.47 | 1.0 | 34.5 | 8.5 / 26 | 0.96 | 1.40 | 0.55 | 0.36 | 9.2 | 7.2 |
+| 50k | yinon-forkless | 1.90 | 0 | 1 | 1 / 0 | 2.15 | 1.62 | 0 | 0.37 | 9.2 | 11.9 |
+| 50k | hybrid | 1.31 | 0.52 | 3 | 2 / 1 | 0.79 | 1.25 | 0.21 | 0.28 | 0.33 | 4.1 |
+
+### Mixed (260 MB: 45% of bytes in small values, 55% in 16 k hashtable hashes of about 9 KB)
+
+| rate | config | save s | fork ms | extra mem peak MB | parent / child MB | rdb_last_cow MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load max ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 2.53 [1.71-3.35] | 4.6 | 2 | 0 / 2 | 2 | 0.10 | 0 | 2.42 | 1.49 | 3.4 | - |
+| 0 | yinon-fork | 1.62 | 5.6 | 1.5 | 0 / 1.5 | 1.5 | 0.07 | 0 | 1.51 | 0.48 | 5.0 | - |
+| 0 | yinon-hybrid | 1.34 | 4.0 | 2.5 | 0.5 / 2 | 2 | 0.08 | 0.61 | 1.10 | 1.22 | 13.4 | - |
+| 0 | yinon-forkless | 1.59 | 0 | 0 | 0 / 0 | 0 | 1.27 | 1.59 | 0 | 0.48 | 4.0 | - |
+| 0 | hybrid | 1.12 | 2.6 | 1 | 0 / 1 | 1 | 0.06 | 0.82 | 0.78 | 0.52 | 2.0 | - |
+| 20k | up | 1.75 | 4.0 | 102 | 0 / 102 | 104 | 0.59 | 0 | 1.66 | 0.37 | 2.0 | 4.5 |
+| 20k | yinon-fork | 1.69 | 4.3 | 124 | 0.5 / 123.5 | 109.5 | 0.61 | 0 | 1.58 | 0.33 | 3.6 | 3.4 |
+| 20k | yinon-hybrid | 1.36 | 2.4 | 76.5 | 3.5 / 73 | 66.5 | 0.56 | 0.65 | 1.19 | 0.36 | 8.8 | 7.0 |
+| 20k | yinon-forkless | 1.49 | 0 | 2 | 2 / 0 | 0 | 1.45 | 1.45 | 0 | 0.30 | 7.2 | 7.2 |
+| 20k | hybrid | 1.11 | 1.7 | 34.5 | 1.5 / 33 | 35 | 0.51 | 0.90 | 0.88 | 0.35 | 2.3 | 3.3 |
+| 50k | up | 1.79 | 3.3 | 141.5 | 0 / 141.5 | 142 | 1.07 | 0 | 1.72 | 0.33 | 1.5 | 6.7 |
+| 50k | yinon-fork | 1.79 | 4.0 | 166.5 | 0 / 166.5 | 151 | 1.03 | 0 | 1.71 | 0.37 | 0.7 | 4.7 |
+| 50k | yinon-hybrid | 1.29 | 2.8 | 103 | 4.5 / 98.5 | 94 | 0.86 | 0.67 | 1.12 | 0.40 | 7.9 | 7.6 |
+| 50k | yinon-forkless | 1.75 | 0 | 8 | 8 / 0 | 0 | 1.84 | 1.52 | 0 | 0.39 | 5.9 | 5.4 |
+| 50k | hybrid | 1.37 | 2.0 | 58 | 2 / 56 | 56 | 0.86 | 0.89 | 0.87 | 0.32 | 2.0 | 4.9 |
+
+### Big (260 MB: 22 hashtable hashes of about 10 MB, 2 zsets), nothing eligible for the small path
+
+| rate | config | save s | fork ms | extra mem peak MB | parent / child MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load max ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 1.77 | 4.4 | 1 | 0 / 1 | 0.05 | 0 | 1.64 | 0.57 | 2.4 | - |
+| 0 | yinon-fork | 1.52 | 3.7 | 1 | 0 / 1 | 0.06 | 0 | 1.40 | 0.57 | 2.5 | - |
+| 0 | yinon-hybrid | 1.45 | 3.6 | 1 | 0 / 1 | 0.07 | 0 | 1.36 | 0.57 | 5.4 | - |
+| 0 | yinon-forkless | 1.29 | 0 | 146.5 | 146.5 / 0 | 0.52 | 1.31 | 0 | 64.9 | 87.3 | - |
+| 0 | hybrid | 1.47 | 4.5 | 1 | 0 / 1 | 0.04 | 0 | 1.38 | 0.50 | 1.8 | - |
+| 20k | up | 1.55 | 3.9 | 2 | 0 / 2 | 0.49 | 0 | 1.44 | 0.36 | 0.5 | 4.5 |
+| 20k | yinon-fork | 1.51 | 3.4 | 2 | 0 / 2 | 0.50 | 0 | 1.44 | 0.37 | 1.2 | 3.8 |
+| 20k | yinon-hybrid | 1.60 | 3.4 | 2.5 | 0 / 2.5 | 0.54 | 0 | 1.49 | 0.40 | 9.7 | 12.1 |
+| 20k | yinon-forkless | 1.31 | 0 | 146.5 | 146.5 / 0 | 0.89 | 1.30 | 0 | 64.3 | 159.5 | 170.5 |
+| 20k | hybrid | 1.55 | 3.3 | 2 | 0 / 2 | 0.48 | 0 | 1.48 | 0.37 | 1.7 | 3.7 |
+| 50k | up | 1.51 | 3.7 | 1 | 0 / 1 | 0.77 | 0 | 1.41 | 0.35 | 3.4 | 3.9 |
+| 50k | yinon-fork | 1.53 | 3.7 | 2 | 0 / 2 | 0.82 | 0 | 1.43 | 0.33 | 0.6 | 4.1 |
+| 50k | yinon-hybrid | 1.54 | 3.0 | 2 | 0 / 2 | 0.78 | 0 | 1.45 | 0.36 | 5.1 | 8.8 |
+| 50k | yinon-forkless | 1.31 | 0 | 140.5 | 140.5 / 0 | 1.06 | 1.34 | 0 | 67.7 | 190.8 | 228.9 |
+| 50k | hybrid | 1.46 | 4.0 | 2 | 0 / 2 | 0.73 | 0.01 | 1.39 | 0.37 | 2.5 | 4.2 |
+
+### Reading the run
+
+- **Small, under writes: both hybrids remove most of the fork's cost; ours removes the rest.** Stock CoW is 135-232 MB at 20-50k
+  writes/s. The teammate's hybrid brings it to 32-35 MB, of which 26 MB is the child's copy-on-write of the dict and kvobj headers
+  it walks (they stay in forkable memory), plus 6-8 MB of retained values in the parent. Ours is 3 MB (2 MB of temp-dict clones,
+  1 MB in the child). Fork stall: 1.0-1.2 ms theirs, 0.5-0.7 ms ours, 3.3-6.3 ms for the two stock forks.
+- **Worst-case latency during the save is the largest difference.** The teammate's hybrid has a PING max of 9-13 ms in every
+  small and mixed cell and 5-10 ms on big; forkless 9-11 ms on small. Ours is 0.3-1.2 ms on small and 2.0-2.5 ms on mixed and big,
+  i.e. the fork itself. We did not profile their spike; candidates are the per-save arena madvise flip and the snapshot cut on the
+  main thread. Their p99 is fine (0.3-0.5 ms), so it is a few events per save, not a steady cost.
+- **Main-thread CPU.** Ours matches stock in every cell (0.05 / 0.5 / 0.8 s idle / 20k / 50k on small), because the serialization
+  runs on the scan thread and the main thread only clones inside the window. The teammate's hybrid also matches stock; their
+  forkless mode moves the whole small-value copy to the main thread (1.6 s idle, 2.2 s at 50k, three times stock).
+- **Save time.** Ours is the fastest on small and mixed (1.1-1.4 s), because two threads serialize (scan thread the arena values,
+  child the big ones) and the scan thread's serialization is not slowed by CoW. Theirs is 1.3-1.5 s; the two stock forks 1.5-1.9 s.
+  On big, everything is the child's work and all fork-based configs are within noise (1.45-1.6 s); forkless is faster (1.3 s) but
+  pays for it below.
+- **Forkless on big values is not usable as measured**: 140-147 MB of parent growth (full copies of the 10 MB hashes being
+  written), PING p99 of 65 ms and PING max of 87-190 ms, load max of 170-230 ms. The same configuration on small/mixed is the
+  best memory number of the run (0-8 MB) with p99 in line with the others. This matches the Valkey forkless result of run 6.
+- **Mixed: the big-value CoW remains for both hybrids and is smaller for ours.** Extra memory at 50k: stock 142-167 MB,
+  teammate 103 MB, ours 58 MB. Both children copy the pages of 9 KB hashes as they are written; ours finishes sooner (0.87 s child
+  CPU versus 1.12 s), so fewer writes land while it runs.
+- **The two stock baselines agree.** `up` and `yinon-fork` are within noise of each other in every cell except idle mixed, where one
+  `up` rep took 3.35 s (the other 1.71 s; a laptop scheduling artifact, not reproduced elsewhere).
+
+### What the run found in our code
+
+The first pass of `hybrid` used the repository binary, which was built with `-DDEBUG_ASSERTIONS` (unlike every other binary
+in the run; run 6's hybrid rows had the same handicap). At small / 50k it hit `db.c:618`: the debug check
+`snapDebugAssertNotFrozenOriginal` reported a frozen chain as owed. Root cause: within one write section the prepare hook saw
+a bucket ahead, emitted it and set its bit; the scan thread then published the next window over that bucket and waited for the
+section to close; the check re-read the position, found the bucket inside the window and consulted the bit only for the ahead
+position. In a plain build the same path only caused an unnecessary clone. Fixed in 20aa93d06 (`snapBucketOwed`: behind or
+emitted is never owed; unit test reproduces the window move inside a section; spec 11.z.2). The 4 hybrid rows of the first pass
+were dropped and the config rerun with a plain build of the fixed commit about 35 minutes after the other configs.
+
+Harness note: `snap_save_main_keys` / `snap_save_main_buckets` are live counters of the running save and read 0 once it is
+done, so the `impl_stats` column carries no main-thread emission count for our rows; `snap_last_save_retained_peak` does
+carry (4.4-10.9 MB on small at 20-50k, 0.6-2 MB on mixed, 0 on big).
+
+### Caveats specific to this run
+
+- The teammate's tree is 15 commits behind our base; compare each hybrid to the stock fork of its own tree (`yinon-hybrid` vs
+  `yinon-fork`, `hybrid` vs `up`) before comparing the hybrids to each other.
+- One laptop, 2 reps, medians; differences under about 10% in save time and 1 ms in latency are noise here.
+- `--forkless-string-max 4096` puts the teammate's cap at our default; their default is 500 KB. Their retained budget is
+  unlimited, ours 256 MB; neither triggered.
+- The hybrid rows were measured later than the other four configs (same boot, same idle machine).
