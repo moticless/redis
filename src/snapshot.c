@@ -56,6 +56,7 @@ void snapArenaInit(void) {
         return;
     }
     server.snap_nofork_arena = zmalloc_nofork_arena_index();
+    zmalloc_nofork_set_active(server.bgsave_hybrid);       /* new headers, tables and values go there only when on */
     if (!server.bgsave_hybrid) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
     serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
                          "%s).", server.snap_nofork_arena, snapArenaVaReserved() >> 30,
@@ -127,6 +128,7 @@ int snapHybridConfigApply(const char **err) {
             *err = "SNAP_NOFORK arena: madvise failed, see the server log";
             return 0;
         }
+        zmalloc_nofork_set_active(server.bgsave_hybrid);
         snap_arena_fallback = 0;
     }
     serverLog(LL_NOTICE, "Hybrid BGSAVE switched %s at runtime%s", server.bgsave_hybrid ? "on" : "off",

@@ -120,7 +120,7 @@ int snapKeyClass(const robj *o);
  * Only the value moves; the header (and thus every pointer to it) stays. */
 void snapPlaceValueArena(robj *o);
 static inline void snapPlaceValue(robj *o) {
-    if (__builtin_expect(snapArenaAvailable() && server.bgsave_hybrid, 0)) snapPlaceValueArena(o);
+    if (__builtin_expect(zmalloc_nofork_enabled(), 0)) snapPlaceValueArena(o);
 }
 
 /* Move a single-allocation value out of the arena if it is there. Must be

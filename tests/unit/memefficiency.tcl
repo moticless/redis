@@ -109,13 +109,26 @@ run_solo {defrag} {
         }
     }
 
+    # bgsave-hybrid yes puts the keyspace in its own jemalloc arena, so keys no
+    # longer share slabs with scripts, pubsub channels, argv or field-expiry
+    # structures and the fragmentation some tests below manufacture by
+    # interleaving keys with them cannot arise (the ratio stays near 1.0).
+    # Those tests run with the feature switched off at runtime (values
+    # allocated afterwards live in the default arena); tests that fragment the
+    # keyspace itself run with it on, which is the interesting case.
+    proc defrag_hybrid_arena {mode} {
+        if {$::defrag_hybrid_started eq "yes"} { r config set bgsave-hybrid [expr {$mode eq "on" ? "yes" : "no"}] }
+    }
+
     proc test_active_defrag {type} {
+        set ::defrag_hybrid_started [lindex [r config get bgsave-hybrid] 1]
 
     # note: Disabling lookahead because it changes the number and order of allocations which interferes with defrag and causes tests to fail
     r config set lookahead 1
 
     if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
         test "Active defrag main dictionary: $type" {
+            defrag_hybrid_arena on
             r config set hz 100
             r config set activedefrag no
             r config set active-defrag-threshold-lower 5
@@ -202,6 +215,7 @@ run_solo {defrag} {
             # if defrag is supported, test AOF loading too
             if {[r config get activedefrag] eq "activedefrag yes" && $type eq "standalone"} {
             test "Active defrag - AOF loading" {
+            defrag_hybrid_arena on
                 # reset stats and load the AOF file
                 r config resetstat
                 r config set key-load-delay -25 ;# sleep on average 1/25 usec
@@ -252,6 +266,7 @@ run_solo {defrag} {
 
         test "Active defrag eval scripts: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r script flush sync
             r config set hz 100
             r config set activedefrag no
@@ -356,6 +371,7 @@ run_solo {defrag} {
 
         test "Active defrag big keys: $type" {
             r flushdb
+            defrag_hybrid_arena on
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -506,6 +522,7 @@ run_solo {defrag} {
 
         test "Active defrag pubsub: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -615,6 +632,7 @@ run_solo {defrag} {
 
         test "Active defrag IDMP streams: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -732,6 +750,7 @@ run_solo {defrag} {
         foreach {eb_container fields n} {eblist 16 3000 ebrax 30 1600 large_ebrax 500 100} {
         test "Active Defrag HFE with $eb_container: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -825,6 +844,7 @@ run_solo {defrag} {
 
         test "Active defrag for argv retained by the main thread from IO thread: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -944,6 +964,7 @@ run_solo {defrag} {
         if {$type eq "standalone"} { ;# skip in cluster mode
         test "Active defrag big list: $type" {
             r flushdb
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -1045,6 +1066,7 @@ run_solo {defrag} {
         } {1}
 
         test "Active defrag edge case: $type" {
+            defrag_hybrid_arena on
             # there was an edge case in defrag where all the slabs of a certain bin are exact the same
             # % utilization, with the exception of the current slab from which new allocations are made
             # if the current slab is lower in utilization the defragger would have ended up in stagnation,
@@ -1150,6 +1172,7 @@ run_solo {defrag} {
         $type eq "standalone"} { ;# skip in cluster mode and non-jemalloc
         test "Active defrag arrays: $type" {
             r flushdb
+            defrag_hybrid_arena on
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -1236,6 +1259,7 @@ run_solo {defrag} {
         } {1}
 
         test "Active defrag check-cache: skip path when below threshold: $type" {
+            defrag_hybrid_arena on
             # threshold-lower=99 and ignore-bytes=1gb guarantee the cached
             # value is below both skip conditions every tick, so defrag
             # never engages and the cache is consumed each cron tick.
@@ -1267,6 +1291,7 @@ run_solo {defrag} {
         # byte-identical afterwards (debug digest) and the keys still resolve.
         test "Active defrag template-encoded hashes: $type" {
             r flushall
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -1349,6 +1374,7 @@ run_solo {defrag} {
         # the surviving templates and the hashes stay intact.
         test "Active defrag hash template registry: $type" {
             r flushall
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100
@@ -1458,6 +1484,7 @@ run_solo {defrag} {
         # template.
         test "Active defrag resumes a wide template across cycles: $type" {
             r flushall
+            defrag_hybrid_arena off
             r config set hz 100
             r config set activedefrag no
             wait_for_defrag_stop 500 100

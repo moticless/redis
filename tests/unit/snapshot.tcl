@@ -1151,11 +1151,15 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         set digest2 [debug_digest]
         r config set bgsave-hybrid yes
         snap_wait_forkable 0
+        # keys created while the feature was off keep their stock placement
+        # (header outside the arena) until rewritten: expected drift, not a
+        # violation, and the hybrid save below must handle them.
+        if {[snap_arena_available]} { assert {[dict get [snap_placement] headers_outside] > 0} }
         r bgsave
         snap_wait_bgsave_done
         assert_equal ok [s rdb_last_bgsave_status]
         assert {[s snap_gen] != $gen}
-        r debug reload
+        r debug reload                              ;# re-creates every key: placement is clean again
         assert_equal $digest2 [debug_digest]
         snap_assert_placement_clean
     }

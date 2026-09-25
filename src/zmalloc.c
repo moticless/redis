@@ -372,6 +372,7 @@ char *zmalloc_nofork_lo = NULL;
 char *zmalloc_nofork_hi = NULL;
 static char *nofork_bump = NULL;                 /* atomic bump pointer inside [lo,hi) */
 unsigned zmalloc_nofork_arena = UINT_MAX;   /* read inline by zmalloc.h fast paths */
+int zmalloc_nofork_active = 0;              /* placement gate, see zmalloc.h */
 static extent_hooks_t *nofork_default_hooks = NULL;
 static extent_hooks_t nofork_hooks;              /* must outlive the arena */
 static __thread int nofork_thread_flags = 0;     /* MALLOCX_ARENA|MALLOCX_TCACHE, 0 = uninit */
@@ -484,6 +485,7 @@ int zmalloc_nofork_arena_init(void) {
 }
 
 int zmalloc_nofork_arena_available(void) { return zmalloc_nofork_arena != UINT_MAX; }
+void zmalloc_nofork_set_active(int active) { zmalloc_nofork_active = (zmalloc_nofork_arena != UINT_MAX) && active; }
 
 /* Flip the whole reserved range between MADV_DONTFORK (children never map it)
  * and MADV_DOFORK (a stock fork child sees it, at copy-on-write cost). The
@@ -564,7 +566,7 @@ void zfree_nofork_size(void *ptr, size_t size) {
 }
 
 void *ztrycalloc_nofork(size_t size) {
-    if (zmalloc_nofork_arena == UINT_MAX) return ztrycalloc(size);
+    if (!zmalloc_nofork_enabled()) return ztrycalloc(size);
     if (size >= SIZE_MAX/2) return NULL;
     void *ptr = mallocx(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
     if (ptr) update_zmalloc_stat_alloc(zmalloc_size(ptr));
@@ -1399,6 +1401,7 @@ void set_jemalloc_bg_thread(int enable) {
     ((void)(enable));
 }
 
+void zmalloc_nofork_set_active(int active) { (void)active; }
 void zmalloc_nofork_tcache_flush(void) { }
 
 int jemalloc_purge(void) {
