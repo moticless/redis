@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid; run 10 = the same on a c7i.4xlarge with interleaved configurations)
+# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid; run 10 = the same on a c7i.4xlarge with interleaved configurations; run 11 = mixed, our hybrid vs Valkey forkless on the c7i.4xlarge)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -809,3 +809,51 @@ min(backlog size, stream bytes during the save); 50 MB/s x 2 s = 100 MB, the siz
 active clients' reply buffers and reply lists. Both are single allocation sites (`replBufBlock`, `c->buf`/`clientReplyBlock`),
 never read by any fork child, and `zfree` is already range-aware, so moving them into the arena is cheap; it should be done
 against a measurement with a heavy replication stream first.
+
+
+## Run 11 (2026-09-26): mixed dataset, our hybrid vs Valkey forkless vs Valkey fork, c7i.4xlarge
+
+Raw: `run11.csv`. Same host and layout as run 10 (server on 4 physical cores with both threads, load on the other 4, tmpfs).
+Binaries: `hybrid` 41868cb93 (plain), `valkey-forkless` and `valkey-fork` from Valkey unstable 06d35aca6 built on the instance
+(`--forkless-infrastructure-enabled yes --bgsave-default-method forkless` for the forkless rows). Interleaved per cell, 2 reps.
+Mixed = 800k strings x 50 B, 200k 1-element lists, 200k 1-element sets, 16k hashtable hashes of 64 x 96 B (about 9 KB); 260 MB;
+writes hit a random existing field of the hashes, same-size overwrites elsewhere.
+
+| rate | keys | config | save s | fork ms | extra mem MB | main cpu s | threads cpu s | PING p99 ms | PING max ms | load p99 ms | load max ms | load ops/s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| idle | - | valkey-fork | 2.18 | 3.3 | 1 | 0.04 | 0 | 0.65 | 2.4 | - | - | - |
+| idle | - | valkey-forkless | 2.57 | 0 | 1 | 0.60 | 2.2 | 1.11 | 1.2 | - | - | - |
+| idle | - | hybrid | 1.40 | 2.2 | 2 | 0.03 | 1.1 | 0.61 | 1.2 | - | - | - |
+| 20k | uniform | valkey-fork | 2.21 | 4.8 | 141 | 0.63 | 0 | 0.59 | 3.8 | 0.64 | 5.7 | 19998 |
+| 20k | uniform | valkey-forkless | 3.14 | 0 | 1.5 | 1.07 | 2.6 | 0.98 | 1.1 | 1.74 | 12.4 | 19633 |
+| 20k | uniform | hybrid | 1.41 | 2.4 | 52.5 | 0.49 | 1.1 | 0.61 | 1.2 | 0.63 | 3.7 | 19998 |
+| 20k | 20% hot | valkey-fork | 2.17 | 4.1 | 100.5 | 0.59 | 0 | 0.60 | 1.5 | 0.62 | 4.8 | 19997 |
+| 20k | 20% hot | valkey-forkless | 2.99 | 0 | 1 | 1.09 | 2.5 | 0.96 | 1.1 | 1.14 | 12.2 | 19898 |
+| 20k | 20% hot | hybrid | 1.32 | 2.3 | 29 | 0.44 | 1.1 | 0.69 | 2.0 | 0.64 | 3.6 | 19998 |
+| 50k | uniform | valkey-fork | 2.31 | 5.0 | 201 | 1.22 | 0 | 0.47 | 2.3 | 0.29 | 6.6 | 49995 |
+| 50k | uniform | valkey-forkless | 3.10 | 0 | 1.5 | 1.84 | 2.7 | 1.06 | 1.2 | 1.51 | 17.1 | 48876 |
+| 50k | uniform | hybrid | 2.15 | 2.8 | 104.5 | 1.21 | 1.2 | 0.39 | 2.8 | 0.30 | 4.9 | 49993 |
+| 50k | 20% hot | valkey-fork | 2.21 | 4.7 | 131 | 1.12 | 0 | 0.39 | 2.9 | 0.31 | 6.2 | 49995 |
+| 50k | 20% hot | valkey-forkless | 2.99 | 0 | 2 | 1.90 | 2.6 | 0.68 | 1.0 | 0.56 | 16.4 | 49784 |
+| 50k | 20% hot | hybrid | 1.36 | 2.3 | 34.5 | 0.85 | 1.1 | 0.41 | 2.0 | 0.37 | 4.2 | 49994 |
+
+### Reading the run
+
+- **Memory: forkless wins outright on this dataset.** 1-2 MB of extra memory in every cell against 29-105 MB for us and
+  100-201 MB for Valkey's fork. The reason is the value sizes: the biggest value here is a 9 KB hash, which Valkey copies on the
+  main thread before it is written for a few microseconds, so nothing is ever forked and nothing is copied on write. Our 29-105 MB
+  is the child's copy-on-write on exactly those hashes, the class we send to the child.
+- **Everything the main thread does, forkless pays for on the main thread.** Its main-thread CPU is 0.6 s with no traffic at all
+  (the snapshot cut and the value copies of the walk) and 1.07-1.9 s under writes, 1.5-2.2x ours, and its save takes 2.6-3.1 s
+  against our 1.3-2.2 s and Valkey fork's 2.2-2.3 s. Command latency shows the same thing: load p99 1.1-1.7 ms against our
+  0.3-0.6 ms, load max 12-17 ms against our 3.6-4.9 ms, PING p99 about 1.0 ms against 0.4-0.7 ms for the two fork-based
+  designs, and at 50k writes/s it is the only configuration that misses the offered rate (48.9k of 50k).
+- **PING max is where forkless looks good here (1.0-1.2 ms)**: no fork, so no fork stall. Ours is 1.2-2.8 ms, which is the
+  fork of the page tables for the 16k hashes. On the big dataset in runs 6 and 8 the same forkless design showed 65-214 ms PING
+  p99 because 10 MB values are copied on the main thread; the copy cost is proportional to value size and this dataset's values
+  are small enough to hide it.
+- **The trade in one line for mixed data**: forkless buys about 50-100 MB of peak memory per save on a 260 MB dataset for a
+  permanent 1.5-2x main-thread cost during saves, 3x command latency p99, 3-4x command latency max and 40% longer saves. Our
+  design keeps the command path at stock and pays copy-on-write only for values above the small-value cap; where that cap sits
+  (4 KB today) is the lever that trades between the two, since 9 KB hashes serialized on the scan thread would take the 29-105 MB
+  away at the cost of more scan-thread work.
