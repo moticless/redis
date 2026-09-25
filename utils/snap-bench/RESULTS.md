@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC)
+# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -399,3 +399,99 @@ carry (4.4-10.9 MB on small at 20-50k, 0.6-2 MB on mixed, 0 on big).
 - `--forkless-string-max 4096` puts the teammate's cap at our default; their default is 500 KB. Their retained budget is
   unlimited, ours 256 MB; neither triggered.
 - The hybrid rows were measured later than the other four configs (same boot, same idle machine).
+
+
+## Run 8 (2026-09-25): run 7 repeated with the server confined to one CPU
+
+Raw: `run8-cpu1.csv`. Same binaries, flags, datasets and rates as run 7; the only change is `SERVER_CPUS=0` in `run.sh`:
+the server, its threads (our scan thread, the teammate's helper) and its fork child all inherit the affinity to CPU 0 (a P-core;
+its SMT sibling CPU 1 is idle). memtier and the probes stay on CPUs 8-15. This is the shape of the teammate's `cpu1` profile
+(his spec uses a one-CPU cgroup). Medians of 2 reps, [min-max] where it matters.
+
+### Small (300 MB, all small values)
+
+| rate | config | save s | fork ms | extra mem peak MB | parent / child MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load ops/s | load max ms | stall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 1.56 | 5.4 | 2 | 0 / 2 | 0.06 | 0 | 1.47 | 1.33 | 3.6 | - | - | - |
+| 0 | yinon-fork | 1.60 | 6.5 | 1 | 0 / 1 | 0.06 | 0 | 1.47 | 1.81 | 6.0 | - | - | - |
+| 0 | yinon-hybrid | 1.75 | 0.8 | 2 | 1 / 1 | 0.06 | 1.22 | 0.41 | 0.77 | 10.9 | - | - | - |
+| 0 | yinon-forkless | 2.71 [2.43-2.99] | 0 | 1 | 1 / 0 | 1.26 | 1.46 | 0 | 0.83 | 8.4 | - | - | - |
+| 0 | hybrid | 1.42 | 0.47 | 1 | 1 / 0 | 0.05 | 1.19 | 0.12 | 1.01 | 2.1 | - | - | - |
+| 20k | up | 1.89 | 4.0 | 142.5 | 0 / 142.5 | 0.55 | 0 | 1.51 | 3.28 | 3.6 | 19697 | 5.4 | 0 |
+| 20k | yinon-fork | 1.90 | 4.7 | 164 | 0 / 164 | 0.61 | 0 | 1.46 | 4.03 | 5.4 | 19696 | 5.3 | 0 |
+| 20k | yinon-hybrid | 2.06 | 1.0 | 32 | 7 / 25 | 0.59 | 1.26 | 0.41 | 2.87 | 9.1 | 19699 | 5.4 | 0 |
+| 20k | yinon-forkless | 4.36 [2.78-5.94] | 0 | 1 | 1 / 0 | 2.48 | 2.05 | 0 | 1.32 | 10.9 | 19665 | 12.3 | 0 |
+| 20k | hybrid | 1.56 | 0.6 | 2.5 | 1.5 / 1 | 0.48 | 1.15 | 0.12 | 2.83 | 3.7 | 19695 | 5.6 | 0 |
+| 50k | up | 2.38 | 4.9 | 236.5 | 0 / 236.5 | 1.10 | 0 | 1.50 | 4.67 | 6.2 | 49182 | 6.4 | 0 |
+| 50k | yinon-fork | 2.46 | 4.4 | 261 | 0 / 261 | 1.20 | 0 | 1.51 | 5.44 | 9.4 | 49131 | 12.1 | 0 |
+| 50k | yinon-hybrid | 2.63 | 0.8 | 39 | 12.5 / 26.5 | 1.18 | 1.30 | 0.40 | 4.61 | 11.9 | 49148 | 14.9 | 0 |
+| 50k | yinon-forkless | 12.14 | 0 | 1 | 1 / 0 | 7.72 | 4.36 | 0 | 2.44 | 14.9 | 36913 (target missed) | 8.2 | 12 |
+| 50k | hybrid | 1.94 | 0.32 | 3 | 2 / 1 | 0.92 | 1.14 | 0.12 | 3.95 | 7.4 | 49127 | 11.7 | 0 |
+
+### Mixed (260 MB, 55% of bytes in 9 KB hashtable hashes)
+
+| rate | config | save s | fork ms | extra mem peak MB | parent / child MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load ops/s | load max ms | stall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 1.62 | 4.9 | 2 | 0 / 2 | 0.05 | 0 | 1.53 | 1.28 | 4.4 | - | - | - |
+| 0 | yinon-fork | 1.61 | 5.6 | 1 | 0 / 1 | 0.06 | 0 | 1.51 | 2.08 | 3.5 | - | - | - |
+| 0 | yinon-hybrid | 1.78 | 4.1 | 2 | 1 / 4 | 0.06 | 0.57 | 1.09 | 1.92 | 13.2 | - | - | - |
+| 0 | yinon-forkless | 4.26 | 0 | 4.5 | 4.5 / 0 | 1.86 | 2.39 | 0 | 1.28 | 11.6 | - | - | - |
+| 0 | hybrid | 1.68 | 2.2 | 2 | 1 / 1 | 0.06 | 0.81 | 0.77 | 2.98 | 3.3 | - | - | - |
+| 20k | up | 1.96 | 3.2 | 112 | 0 / 112 | 0.59 | 0 | 1.57 | 2.91 | 3.8 | 19685 | 4.6 | 0 |
+| 20k | yinon-fork | 2.08 | 3.8 | 135 | 0 / 135 | 0.65 | 0 | 1.59 | 3.13 | 6.8 | 19674 | 7.1 | 0 |
+| 20k | yinon-hybrid | 2.10 | 2.7 | 91 | 3.5 / 87.5 | 0.63 | 0.58 | 1.07 | 3.54 | 7.3 | 19681 | 11.0 | 0 |
+| 20k | yinon-forkless | 5.43 | 0 | 3 | 3 / 0 | 3.09 | 2.52 | 0 | 4.33 | 11.1 | 19575 | 12.6 | 0.5 |
+| 20k | hybrid | 1.91 | 2.2 | 49.5 | 1.5 / 48 | 0.57 | 0.77 | 0.74 | 4.53 | 5.2 | 19682 | 7.5 | 0 |
+| 50k | up | 2.38 | 4.2 | 149.5 | 0 / 149.5 | 1.08 | 0 | 1.55 | 3.78 | 6.8 | 49247 | 7.1 | 0 |
+| 50k | yinon-fork | 2.53 | 3.0 | 172.5 | 0 / 172.5 | 1.15 | 0 | 1.60 | 3.84 | 8.9 | 49230 | 12.8 | 0 |
+| 50k | yinon-hybrid | 2.49 | 2.5 | 113 | 5 / 108 | 1.10 | 0.59 | 1.04 | 6.08 | 8.4 | 49238 | 10.7 | 0 |
+| 50k | yinon-forkless | 13.76 | 0 | 25.5 | 25.5 / 0 | 8.98 | 4.72 | 0 | 2.15 | 16.4 | 39613 (target missed) | 13.7 | 12.5 |
+| 50k | hybrid | 2.45 | 1.6 | 65 | 2.5 / 63 | 1.12 | 0.78 | 0.79 | 5.23 | 8.8 | 49225 | 10.1 | 0 |
+
+### Big (260 MB, 10 MB hashes)
+
+| rate | config | save s | fork ms | extra mem peak MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | load ops/s | load max ms | stall s |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 1.52 | 5.4 | 1 | 0.06 | 0 | 1.39 | 1.64 | 5.2 | - | - | - |
+| 0 | yinon-fork | 1.57 | 4.5 | 1 | 0.05 | 0 | 1.47 | 2.47 | 5.2 | - | - | - |
+| 0 | yinon-hybrid | 1.56 | 4.8 | 1 | 0.07 | 0 | 1.45 | 2.94 | 11.6 | - | - | - |
+| 0 | yinon-forkless | 3.05 | 0 | 143 | 0.85 | 2.20 | 0 | 213.8 | 312.4 | - | - | - |
+| 0 | hybrid | 1.51 | 4.8 | 1 | 0.05 | 0 | 1.38 | 1.96 | 3.2 | - | - | - |
+| 20k | up | 1.72 | 3.7 | 1.5 | 0.49 | 0 | 1.42 | 2.75 | 3.5 | 19661 | 4.7 | 0 |
+| 20k | yinon-fork | 1.69 | 3.6 | 1.5 | 0.48 | 0 | 1.39 | 3.07 | 4.8 | 19657 | 7.0 | 0 |
+| 20k | yinon-hybrid | 1.70 | 3.5 | 1.5 | 0.51 | 0 | 1.38 | 3.31 | 7.0 | 19661 | 8.1 | 0 |
+| 20k | yinon-forkless | 3.31 | 0 | 147.5 | 1.33 | 2.16 | 0 | 207.1 | 657.3 | 17701 (target missed) | 661.5 | 1 |
+| 20k | hybrid | 1.84 | 3.3 | 1.5 | 0.49 | 0 | 1.50 | 2.93 | 3.9 | 19660 | 5.1 | 0 |
+| 50k | up | 2.04 | 3.0 | 1 | 0.85 | 0 | 1.45 | 4.67 | 8.1 | 49263 | 9.2 | 0 |
+| 50k | yinon-fork | 2.05 | 3.8 | 1 | 0.85 | 0 | 1.41 | 4.43 | 7.4 | 49265 | 7.7 | 0 |
+| 50k | yinon-hybrid | 2.08 | 3.3 | 1 | 0.89 | 0 | 1.44 | 4.61 | 6.8 | 49286 | 7.2 | 0 |
+| 50k | yinon-forkless | 2.11 | 0 | 170 | 1.10 | 1.29 | 0 | 135.7 | 456.9 | 45989 (target missed) | 486.4 | 1 |
+| 50k | hybrid | 2.01 | 3.0 | 2 | 0.82 | 0 | 1.40 | 4.14 | 8.1 | 49266 | 11.5 | 0 |
+
+### Reading the run
+
+- **On one core every fork-based configuration pays the same latency price: the child competes with the main thread.** PING p99
+  during the save goes from 0.3-0.5 ms (run 7) to 3-5 ms at 50k writes/s for stock and for both hybrids alike. Our extra thread
+  costs nothing on top: at small/50k our p99 (3.95 ms) is below stock (4.67) and the teammate's hybrid (4.61), and total CPU for
+  the save is lower (0.92 main + 1.14 scan + 0.12 child = 2.2 s, versus 1.1 + 1.5 = 2.6 s stock, whose child also pays the kernel's
+  copy-on-write work). Serializing from a thread instead of a CoW child is cheaper CPU-wise, not just memory-wise.
+- **Save time.** Ours is still the fastest on small (1.42 / 1.56 / 1.94 s idle / 20k / 50k against 1.56 / 1.89 / 2.38 stock and
+  1.75 / 2.06 / 2.63 for the teammate's hybrid, whose helper thread now slows the save instead of speeding it up). On mixed and
+  big all fork-based configs are within noise of each other; the single core is the bottleneck for everyone.
+- **Memory is unchanged from run 7**, as expected: ours 3 MB, teammate's hybrid 32-39 MB, stock 143-261 MB on small at 20-50k.
+- **Worst-case latency.** Ours: 2.1-7.4 ms on small, 3.3-8.8 on mixed, 3.2-8.1 on big, the same band as stock (3.6-6.2 / 3.8-6.8 /
+  3.5-8.1). The teammate's hybrid keeps its 7-13 ms PING max in the small and mixed cells and 7-12 on big. The load's max
+  latency at 50k is 10-15 ms for every fork-based config, single-core scheduling noise dominates it.
+- **Forkless does not survive one core.** The main thread owns the copy and the cut: saves take 2.7-4.4 s idle, 12-14 s at 50k
+  writes/s on small and mixed, with the offered load unmet (37-40k of 50k ops/s achieved, 12 s of stall). On big it is what run
+  7 showed, worse: PING p99 136-214 ms, PING max 312-657 ms, load max 486-661 ms. This is the same shape as the Valkey forkless
+  result of run 6 and is the strongest argument in these runs for keeping a child for big values.
+- Note on the counters: the teammate's `forkless_*` INFO fields are lifetime maxima / cumulative (e.g. `forkless_retained_peak`
+  stays at its earlier high-water mark, `forkless_copied_values` grows across saves), ours are per last save; do not compare
+  them cell by cell.
+
+### Caveats specific to this run
+
+- One P-core with its SMT sibling idle is a generous "one CPU": a one-CPU cgroup on a busy host would be tighter. The relative
+  picture (fork child versus threads versus main thread all sharing one core) is what the run tests.
+- Same 2-rep laptop caveats as run 7; the teammate's forkless idle/20k small cells vary 2.4-5.9 s between reps.
