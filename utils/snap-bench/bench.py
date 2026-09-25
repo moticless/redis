@@ -7,7 +7,7 @@ per dataset shape. One row per (config, dataset, write rate) in a CSV.
   bench.py report out.csv          # markdown tables
 
 The server must already be running on --port (see run.sh, which starts the two
-binaries with identical flags, pinned to their own cores). Needs memtier_benchmark,
+binaries with identical flags, pinned to their own cores). Needs
 python redis, same host (reads /proc/<pid>).
 
 Datasets (each <= ~400 MB at scale 1.0):
@@ -15,39 +15,43 @@ Datasets (each <= ~400 MB at scale 1.0):
   mixed   800 k strings 50 B + 200 k 1-elem lists + 200 k 1-elem sets
           + 16 k hashtable hashes (64 fields x 96 B, ~9 KB)               ~55% of bytes in 2% big keys
   big     22 hashes x 100 k fields x 64 B (~10 MB) + 2 zsets x 300 k     only SNAP_FORK
-  big-grow  same data; traffic inserts random fields/members instead of overwriting f0
+  big-grow  same data; traffic inserts random new fields/members instead of overwriting existing ones
 
-Traffic = memtier same-size in-place writes spread over the dataset's classes in
-proportion to the bytes each class occupies, started 3 s before BGSAVE and kept
-past its end, plus a 5 ms PING probe. Sampled every 100 ms during the save:
+Traffic = snapload.py (asyncio, raw RESP, rate limited) same-size writes spread
+over the dataset's classes in proportion to the bytes each class occupies, keys
+uniform over the first --hot fraction of each class (default 1.0 = all keys),
+random EXISTING field/member for hashes and zsets, started 3 s before BGSAVE and
+kept past its end, plus a 5 ms PING probe (the latency instrument; load latency is
+per pipelined batch). A populated dataset is cached as an RDB under --cache and
+loaded with DEBUG RELOAD NOSAVE on later runs (same bytes for every binary). Sampled every 100 ms during the save:
 server RssAnon/VmSwap growth, child Private_Dirty, used_memory, blocked clients.
 """
-import argparse, csv, json, multiprocessing as mp, os, random, statistics, string, subprocess, sys, threading, time
+import argparse, csv, json, multiprocessing as mp, os, random, shutil, statistics, string, subprocess, sys, threading, time
 import redis
 
 ALPHA = (string.ascii_letters + string.digits).encode()
 def rnd_bytes(rnd, n): return bytes(rnd.choices(ALPHA, k=n))
 
-# (prefix, count, kind, params, memtier command, data size)
+# (prefix, count, kind, params, write mode, write data size)
 DATASETS = {
     "small": [
-        ("s:",  1_200_000, "string", {"size": 100},                   "SET __key__ __data__",     100),
-        ("h:",    200_000, "hash",   {"fields": 10, "size": 40},      "HSET __key__ f0 __data__", 40),
+        ("s:",  1_200_000, "string", {"size": 100},                   "overwrite", 100),
+        ("h:",    200_000, "hash",   {"fields": 10, "size": 40},      "overwrite", 40),
     ],
     "mixed": [
-        ("s:",    800_000, "string", {"size": 50},                    "SET __key__ __data__",     50),
-        ("l:",    200_000, "list",   {"size": 50},                    "LSET __key__ 0 __data__",  50),
-        ("st:",   200_000, "set",    {"size": 8},                     "SADD __key__ __data__",    8),
-        ("bh:",    16_000, "hash",   {"fields": 64, "size": 96},      "HSET __key__ f0 __data__", 96),
+        ("s:",    800_000, "string", {"size": 50},                    "overwrite", 50),
+        ("l:",    200_000, "list",   {"size": 50},                    "overwrite", 50),
+        ("st:",   200_000, "set",    {"size": 8},                     "grow",      8),
+        ("bh:",    16_000, "hash",   {"fields": 64, "size": 96},      "overwrite", 96),
     ],
     "big": [
-        ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "HSET __key__ f0 __data__", 64),
-        ("bz:",         2, "zset",   {"members": 300_000},            "ZADD __key__ 1 0",         8),
+        ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "overwrite", 64),
+        ("bz:",         2, "zset",   {"members": 300_000},            "overwrite", 8),
     ],
     # same data, but the traffic inserts new fields/members (random names) into the big items
     "big-grow": [
-        ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "HSET __key__ __data__ v",  24),
-        ("bz:",         2, "zset",   {"members": 300_000},            "ZADD __key__ 1 __data__",  16),
+        ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "grow",      24),
+        ("bz:",         2, "zset",   {"members": 300_000},            "grow",      16),
     ],
 }
 
@@ -154,26 +158,24 @@ def pct(xs, p):
     xs = sorted(xs); k = min(len(xs) - 1, int(round(p / 100 * (len(xs) - 1)))); return round(xs[k], 3)
 
 # ------------------------------------------------------------------ load
-def memtier(port, cls, rate, secs, out_prefix, cpus):
-    prefix, count, _, _, cmd, dsize = cls
-    conns = max(2, min(8, round(8 * rate / 30000))); threads = min(4, conns); clients = max(1, conns // threads)
-    per_conn = max(1, rate // (threads * clients))
-    c = ["taskset", "-c", cpus, "memtier_benchmark", "-s", "127.0.0.1", "-p", str(port), "--protocol", "redis", "-t", str(threads), "-c", str(clients),
-         "--test-time", str(secs), "--rate-limiting", str(per_conn), f"--command={cmd}", "--command-key-pattern=R",
-         "--key-prefix", prefix, "--key-minimum", "1", "--key-maximum", str(count), "-d", str(dsize), "-R",
-         "--hide-histogram", "--print-percentiles", "50,99,99.9,100", f"--json-out-file={out_prefix}.json", "--distinct-client-seed"]
+SNAPLOAD = os.path.join(os.path.dirname(os.path.abspath(__file__)), "snapload.py")
+
+def snapload(port, cls, rate, secs, out_prefix, cpus, hot):
+    prefix, count, kind, params, mode, dsize = cls
+    conns = max(2, min(8, round(8 * rate / 30000)))
+    c = ["taskset", "-c", cpus, sys.executable, SNAPLOAD, "--port", str(port), "--seconds", str(secs), "--rate", str(rate),
+         "--kind", kind, "--prefix", prefix, "--count", str(count), "--fields", str(params.get("fields", 1)),
+         "--members", str(params.get("members", 1)), "--size", str(dsize), "--mode", mode, "--hot", str(hot),
+         "--conns", str(conns), "--pipeline", "16", "--out", out_prefix + ".json"]
     return subprocess.Popen(c, stdout=open(out_prefix + ".out", "w"), stderr=subprocess.STDOUT)
 
-def parse_memtier(path):
+def parse_load(path):
     try:
-        d = json.load(open(path))["ALL STATS"]["Totals"]
-        pc = {x["Percentile"]: x["Latency"] for x in d.get("Percentile Latencies", {}).get("Totals", [])} if isinstance(d.get("Percentile Latencies"), dict) else {}
-        # memtier >= 1.4 stores percentiles per-command; fall back to the flat keys
-        pl = d.get("Percentile Latencies", {}) if isinstance(d.get("Percentile Latencies"), dict) else {}
-        out = {"ops_per_sec": d.get("Ops/sec"), "avg_ms": (d.get("Accumulated Latency") or 0) / max(1, d.get("Count") or 1) / 1000,
-               "p50.00": pl.get("p50.00"), "p99.00": pl.get("p99.00"), "p99.90": pl.get("p99.90"), "p100.00": pl.get("p100.0") or d.get("Max Latency")}
-        ts = d.get("Time-Serie", {})
-        return out, ts
+        d = json.load(open(path))
+        out = {"ops_per_sec": d.get("ops_per_sec"), "avg_ms": d.get("avg_ms"), "p50.00": d.get("p50.00"), "p99.00": d.get("p99.00"),
+               "p99.90": d.get("p99.90"), "p100.00": d.get("p100.00")}
+        if d.get("errors"): out["err"] = "; ".join(d["errors"])
+        return out, d.get("ts", {})
     except (OSError, KeyError, json.JSONDecodeError, TypeError) as e:
         return {"err": str(e)}, {}
 
@@ -215,7 +217,7 @@ def run_cell(a, dataset, rate, est_save):
     classes = scaled(dataset, a.scale)
     mem0 = r.info("memory")["used_memory"]
     row = {"name": a.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "sha": r.info("server").get("redis_git_sha1"),
-           "dataset": dataset, "rate": rate, "dbsize": r.dbsize(), "used_mb": mem0 // 2**20,
+           "dataset": dataset, "rate": rate, "hot": a.hot, "dbsize": r.dbsize(), "used_mb": mem0 // 2**20,
            "hybrid": int(r.config_get("bgsave-hybrid").get("bgsave-hybrid", "no") == "yes") if "bgsave-hybrid" in str(r.config_get("bgsave-hybrid")) else 0}
     row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
@@ -226,8 +228,8 @@ def run_cell(a, dataset, rate, est_save):
         row["shares"] = " ".join(f"{c[0]}{w/tot:.2f}" for c, w in zip(classes, weights))
         wd = os.path.join(a.workdir, f"{a.name}-{dataset}-r{rate}"); os.makedirs(wd, exist_ok=True)
         for cls, wgt in zip(classes, weights):
-            cr = max(100, round(rate * wgt / tot)); out = os.path.join(wd, "memtier-" + cls[0].strip(":"))
-            procs.append(memtier(a.port, cls, cr, secs, out, a.load_cpus)); outs[cls[0]] = (out + ".json", cr)
+            cr = max(100, round(rate * wgt / tot)); out = os.path.join(wd, "load-" + cls[0].strip(":"))
+            procs.append(snapload(a.port, cls, cr, secs, out, a.load_cpus, a.hot)); outs[cls[0]] = (out + ".json", cr)
     t_mt = time.time(); time.sleep(a.warm if procs else 0.5)
 
     sampler = Sampler(srv, a.port); ping = PingProbe(a.port); sampler.start(); ping.start()
@@ -266,7 +268,7 @@ def run_cell(a, dataset, rate, est_save):
     for p in procs: p.wait(timeout=secs + 60)
     ops = p99 = p999 = mx = stall = 0; missed = False; avg = []
     for prefix, (path, cr) in outs.items():
-        m, ts = parse_memtier(path)
+        m, ts = parse_load(path)
         if "err" in m: row["load_err"] = m["err"]; continue
         ops += m.get("ops_per_sec") or 0; avg.append(m.get("avg_ms") or 0)
         p99 = max(p99, m.get("p99.00") or 0); p999 = max(p999, m.get("p99.90") or 0); mx = max(mx, m.get("p100.00") or 0)
@@ -276,7 +278,7 @@ def run_cell(a, dataset, rate, est_save):
         row.update(ops=round(ops), load_avg_ms=round(statistics.fmean(avg), 3) if avg else None, load_p99_ms=p99, load_p999_ms=p999, load_max_ms=mx, stall_s=stall, target_missed=missed)
     return row
 
-COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "shares", "dbsize", "used_mb", "rss_base_mb",
+COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "hot", "shares", "dbsize", "used_mb", "rss_base_mb",
            "save_sec", "status", "fork_ms", "extra_mem_peak_mb", "parent_growth_peak_mb", "child_pd_peak_mb", "abs_peak_mb", "cow_mb",
            "used_mem_growth_mb", "cpu_main_s", "cpu_threads_s", "cpu_child_s", "ping_p50_ms", "ping_p99_ms", "ping_max_ms",
            "cmd_events_ge20ms", "ops", "load_avg_ms", "load_p99_ms", "load_p999_ms", "load_max_ms", "stall_s", "target_missed",
@@ -289,10 +291,17 @@ def cmd_run(a):
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         if new: w.writeheader()
         for ds in a.datasets.split(","):
-            secs = populate(a.port, ds, a.scale)
+            cache = os.path.join(a.cache, f"{ds}-s{a.scale}-seed42.rdb") if a.cache else None
+            dump = os.path.join(r.config_get("dir")["dir"], r.config_get("dbfilename")["dbfilename"])
+            if cache and os.path.exists(cache):
+                t0 = time.time(); shutil.copyfile(cache, dump); r.execute_command("DEBUG", "RELOAD", "NOSAVE"); secs = time.time() - t0; how = "loaded from cache"
+            else:
+                secs = populate(a.port, ds, a.scale); how = "populated"
             mb = r.info("memory")["used_memory"] // 2**20
-            print(f"[{a.name}] {ds}: {r.dbsize()} keys, {mb} MB, populated in {secs:.0f}s", file=sys.stderr)
+            print(f"[{a.name}] {ds}: {r.dbsize()} keys, {mb} MB, {how} in {secs:.0f}s", file=sys.stderr)
             t0 = time.time(); r.bgsave(); wait_save(r); est = time.time() - t0; time.sleep(2)   # untimed warm-up save
+            if cache and not os.path.exists(cache) and os.path.exists(dump):
+                os.makedirs(a.cache, exist_ok=True); shutil.copyfile(dump, cache)
             for rate in [int(x) for x in a.rates.split(",")]:
                 for rep in range(a.reps):
                     row = run_cell(a, ds, rate, est); w.writerow(row); f.flush()
@@ -307,7 +316,7 @@ def cmd_report(a):
         try: return float(x)
         except (TypeError, ValueError): return None
     groups = {}
-    for r in rows: groups.setdefault((r["dataset"], r["rate"], r["name"]), []).append(r)
+    for r in rows: groups.setdefault((r["dataset"], r["rate"], r.get("hot", "1.0"), r["name"]), []).append(r)
     def agg(g, k):
         xs = [num(r.get(k)) for r in g]; xs = [x for x in xs if x is not None]
         if not xs: return "-"
@@ -316,11 +325,11 @@ def cmd_report(a):
             ("child_pd_peak_mb", "child dirty MB"), ("abs_peak_mb", "abs peak MB"), ("cow_mb", "rdb_last_cow MB"),
             ("cpu_main_s", "main cpu s"), ("cpu_threads_s", "threads cpu s"), ("cpu_child_s", "child cpu s"),
             ("ping_p99_ms", "ping p99 ms"), ("ping_max_ms", "ping max ms"), ("ops", "load ops/s"), ("load_p99_ms", "load p99 ms"), ("load_max_ms", "load max ms"), ("stall_s", "stall s")]
-    print("| dataset | rate | config | n | " + " | ".join(c[1] for c in cols) + " |")
-    print("|" + "---|" * (4 + len(cols)))
-    for key in sorted(groups, key=lambda k: (k[0], int(k[1]), k[2])):
+    print("| dataset | rate | hot | config | n | " + " | ".join(c[1] for c in cols) + " |")
+    print("|" + "---|" * (5 + len(cols)))
+    for key in sorted(groups, key=lambda k: (k[0], int(k[1]), k[2], k[3])):
         g = groups[key]
-        print(f"| {key[0]} | {key[1]} | {key[2]} | {len(g)} | " + " | ".join(agg(g, c[0]) for c in cols) + " |")
+        print(f"| {key[0]} | {key[1]} | {key[2]} | {key[3]} | {len(g)} | " + " | ".join(agg(g, c[0]) for c in cols) + " |")
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -329,6 +338,8 @@ def main():
     p.add_argument("--datasets", default="small,mixed,big"); p.add_argument("--rates", default="0,20000"); p.add_argument("--reps", type=int, default=1)
     p.add_argument("--csv", required=True); p.add_argument("--scale", type=float, default=1.0); p.add_argument("--warm", type=float, default=3)
     p.add_argument("--cooldown", type=float, default=3); p.add_argument("--workdir", default="/tmp/snap-bench-runs"); p.add_argument("--load-cpus", default="8-15")
+    p.add_argument("--hot", type=float, default=1.0, help="fraction of each class's keys that receive the writes (1.0 = uniform over all keys)")
+    p.add_argument("--cache", default="/dev/shm/snap-bench-runs/cache", help="dir of cached dataset RDBs ('' to disable)")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("report"); p.add_argument("csv"); p.set_defaults(fn=cmd_report)
     a = ap.parse_args(); a.fn(a)
