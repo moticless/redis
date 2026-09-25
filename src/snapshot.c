@@ -1346,6 +1346,22 @@ static void snapSaveWindowDone(void *priv) {
     listRelease(ready);
 }
 
+/* Inside a write section: is the frozen chain of bucket (table, idx) of dict
+ * d of slot (s, didx) still owed to the snapshot, i.e. neither read by the
+ * thread already nor emitted by the main thread? Only an owed chain must not
+ * be written in place. *pos receives the bucket's position.
+ *
+ * The emitted bit is checked whatever the position: one section may see the
+ * bucket ahead, emit it and set the bit, while the thread publishes the next
+ * window over that bucket and then waits for the section to close. A later
+ * look in the same section sees the bucket inside the window, but the thread
+ * will skip it (snapScanWalkDict reads the bit), so it is not owed. */
+static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos) {
+    *pos = snapBucketPosition(ctx, s, didx, d, table, idx);
+    if (*pos == SNAP_POS_BEHIND) return 0;
+    return !snapScanBucketEmitted(ctx, s, didx, table, idx);
+}
+
 /* Overlay 'prepare' hook (privdata = redisDb *): may the frozen chain of
  * 'key' be written in place? Emits the bucket first when the thread has not
  * reached it. */
@@ -1353,18 +1369,17 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
     redisDb *db = privdata;
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
-    int table;
+    int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    int pos = snapBucketPosition(sv->scan, db->id, didx, d, table, idx);
-    if (pos == SNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
-    if (pos == SNAP_POS_AHEAD && !snapScanBucketEmitted(sv->scan, db->id, didx, table, idx)) {
-        snapSaveEmitBucket(sv, db->id, didx, d, table, idx);
-        snapScanMarkBucketEmitted(sv->scan, db->id, didx, table, idx);
-    } else {
+    if (!snapBucketOwed(sv->scan, db->id, didx, d, table, idx, &pos)) {
         sv->inplace_writes++;
         server.stat_snap_inplace_writes++;
+        return KVSTORE_OV_INPLACE;
     }
+    if (pos == SNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
+    snapSaveEmitBucket(sv, db->id, didx, d, table, idx);
+    snapScanMarkBucketEmitted(sv->scan, db->id, didx, table, idx);
     return KVSTORE_OV_INPLACE;
 }
 
@@ -1379,12 +1394,10 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     dict *d = kvstoreGetDict(db->keys, slot);
     if (!d) return 0;
     snapFunnelOpen();   /* the window must hold still while we look */
-    int table;
+    int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    int pos = snapBucketPosition(sv->scan, db->id, slot, d, table, idx);
-    if (pos == SNAP_POS_BEHIND) return 0;
-    if (pos == SNAP_POS_AHEAD && snapScanBucketEmitted(sv->scan, db->id, slot, table, idx)) return 0;
+    if (!snapBucketOwed(sv->scan, db->id, slot, d, table, idx, &pos)) return 0;
     /* Ahead and not emitted, or being read: the frozen entry itself is owed,
      * a temp-dict clone of it is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
@@ -2393,6 +2406,36 @@ static void snapScanTests(int accurate) {
                   skipped_ok && others_ok && bad == 0 && dispatched == total_keys - st->inserted[1][0]);
         test_cond("bitmap: freed when the slots completed", snapScanBitmapBytes(ctx) == 0);
     }
+    snapScanRelease(ctx);
+
+    /* ---- Owed: a bucket emitted ahead of the window stays not-owed once the
+     * window moves over it (the thread skips it by its bit). Simulates one
+     * write section spanning a window publish, with no thread running. ---- */
+    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    snapScanFreeze(ctx);
+    {
+        dict *d = kvstoreGetDict(stores[0], 3);   /* populated (see the window test) */
+        unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
+        int pos, p_ahead, p_after, p_other, p_behind;
+        test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
+        snapSlotSetState(ctx, 0, 3, SNAP_SLOT_SCANNING);
+        snapWindowPublish(d, 0, 0, mid);            /* the thread reads [0, mid) */
+        snapFunnelOpen();                           /* a command opens its write section */
+        int owed_ahead = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos); p_ahead = pos;
+        snapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
+        snapWindowPublish(d, 0, mid, size);         /* the thread moves on; it would quiesce now */
+        int owed_after = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos); p_after = pos;
+        int owed_other = snapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos); p_other = pos;
+        int owed_behind = snapBucketOwed(ctx, 0, 3, d, 0, 0, &pos); p_behind = pos;
+        snapFunnelClose();
+        snapWindowPublish(NULL, 0, 0, 0);
+        test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == SNAP_POS_AHEAD);
+        test_cond("owed: the same bucket, emitted, is not owed after the window moved over it", !owed_after && p_after == SNAP_POS_INSIDE);
+        test_cond("owed: an unemitted bucket inside the window is owed", owed_other && p_other == SNAP_POS_INSIDE);
+        test_cond("owed: a bucket behind the window is not owed", !owed_behind && p_behind == SNAP_POS_BEHIND);
+    }
+    snapScanAbort(ctx);   /* frozen, never started: unfreezes */
     snapScanRelease(ctx);
 
     /* ---- Empty stores ---- */

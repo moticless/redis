@@ -502,8 +502,17 @@ is about to write structurally (add, unlink, replace) it derives the key's
 | position | condition | action |
 |---|---|---|
 | behind | slot SCANNED/DONE, or same dict and `(table, bucket)` before the window | write in place, nothing to emit |
-| inside | same dict, same table, `lo <= bucket < hi` | clone into the temp dict (never touch the chain) |
+| inside | same dict, same table, `lo <= bucket < hi` | if the bucket's bit is set: write in place (see below); else clone into the temp dict (never touch the chain) |
 | ahead | slot PENDING, window on another dict, or `(table, bucket)` after the window | if the bucket's bit is clear: serialize its whole chain into the queue and set the bit; then write in place |
+
+The bit is consulted whatever the position (`snapBucketOwed`): within one
+section the first look may find a bucket ahead and emit it, then the thread
+publishes the next window over that bucket and waits for the section to close;
+a second look in the same section (another key of the chain, or the debug
+check in `dbSetValue`) finds it inside. The thread will skip it by its bit, so
+it is not owed and may be written in place. Run 7 of the benchmark hit exactly
+this in a `DEBUG_ASSERTIONS` build at 50k writes/s (`db.c:618`), which is how
+the position-only check was found (2026-09-25).
 
 **Why it is race-free.** The thread reads chain pointers only inside its
 window, with atomic loads. The main thread writes chains only outside the
