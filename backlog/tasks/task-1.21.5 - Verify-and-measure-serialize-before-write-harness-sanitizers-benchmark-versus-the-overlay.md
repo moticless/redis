@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@moti.cohen@redis.com'
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-25 04:52'
+updated_date: '2026-09-25 05:37'
 labels:
   - bgsave
   - testing
@@ -50,4 +50,6 @@ Closes the spike on standalone. Run the full randomized race harness (CI, evicti
 2026-09-25 run 7 (utils/snap-bench/RESULTS.md, run7.csv, commit 5780b349a): head to head with the teammate's forkless-hybrid POC (yinon-fork / yinon-hybrid / yinon-forkless configs added to run.sh in 293e26ae2) plus upstream. Small at 50k writes/s: our hybrid extra memory 3 MB, fork 0.5 ms, PING max 0.33 ms; teammate hybrid 35 MB / 1.0 ms / 9 ms; stock 220 MB / 4.5 ms / 2.6 ms. Save time ours 1.3 s vs 1.5 s theirs vs 1.9 s stock. Forkless on big values: 140 MB parent growth, PING p99 65 ms.
 
 Bug found by run 7 and fixed in 20aa93d06: snapKvobjIsOwed/prepare checked the emitted bit only for the ahead position; a window move inside a write section made an emitted bucket look owed (DEBUG_ASSERTIONS crash at db.c:618 at 50k writes/s, needless clone in plain builds). New helper snapBucketOwed, unit test, spec 11.z.2. Also found: the repository binary used in run 6 was a -DDEBUG_ASSERTIONS build while every other benchmark binary was plain; run 7 hybrid rows use a plain worktree build (/tmp/redis-hyb). Rerun of the microbench (feature-on SET/GET) with a plain build is still owed.
+
+2026-09-25 run 8 (run8-cpu1.csv, RESULTS.md 'Run 8'): run 7 matrix with SERVER_CPUS=0 (server + scan/helper threads + fork child on one CPU; run.sh knob added in e270b171e). All fork-based configs converge to PING p99 3-5 ms at 50k writes/s (child competes for the core); ours is at or below stock and the teammate's hybrid in every small cell with less total CPU (2.2 s vs 2.6 s stock at small/50k), fastest save on small (1.94 s vs 2.38 stock vs 2.63 teammate hybrid), memory unchanged (3 MB vs 236 MB vs 39 MB). Forkless collapses on one core: 12-14 s saves at 50k with the load target missed and 12 s of stall; on big values PING p99 136-214 ms, max up to 657 ms.
 <!-- SECTION:NOTES:END -->
