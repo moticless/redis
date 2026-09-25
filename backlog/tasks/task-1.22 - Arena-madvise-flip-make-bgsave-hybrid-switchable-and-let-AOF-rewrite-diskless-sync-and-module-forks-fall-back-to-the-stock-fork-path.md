@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-24 06:21'
+updated_date: '2026-09-25 08:31'
 labels:
   - bgsave
   - persistence
@@ -33,3 +34,9 @@ Idea taken from the teammate's forkless-hybrid POC (spec 11.z.3, item 1). The SN
 - [ ] #4 INFO reports whether the arena is currently DONTFORK
 - [ ] #5 The fork child of a fallback operation observes stock-like CoW (documented in RESULTS.md with one measurement)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-09-25: the full stock suite cannot run with --config bgsave-hybrid yes until this task lands: with the arena on, AOF rewrite, replica full sync and module forks are refused (aof.c/rdb.c/module.c guards), so untagged tests that turn AOF on abort the whole runtest and every replica-based test fails (RESULTS.md 'Verification pass' has the partial run: 1433 ok, 5 expected failures). Acceptance for this task should include: full ./runtest --config bgsave-hybrid yes passes unmodified.
+<!-- SECTION:NOTES:END -->

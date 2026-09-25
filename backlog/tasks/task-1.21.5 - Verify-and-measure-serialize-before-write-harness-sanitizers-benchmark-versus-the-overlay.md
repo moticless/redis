@@ -3,11 +3,11 @@ id: TASK-1.21.5
 title: >-
   Verify and measure serialize-before-write: harness, sanitizers, benchmark
   versus the overlay
-status: In Progress
+status: Done
 assignee:
   - '@moti.cohen@redis.com'
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-25 05:37'
+updated_date: '2026-09-25 08:31'
 labels:
   - bgsave
   - testing
@@ -34,10 +34,10 @@ Closes the spike on standalone. Run the full randomized race harness (CI, evicti
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Harness: all variants equal to the fork instant, 100 --accurate iterations equal
-- [ ] #2 TSan and ASan clean on unit/snapshot in arena-free mode; full stock suite passes with no regression
+- [x] #1 Harness: all variants equal to the fork instant, 100 --accurate iterations equal
+- [x] #2 TSan and ASan clean on unit/snapshot in arena-free mode; full stock suite passes with no regression
 - [x] #3 RESULTS.md has a three-way table (stock, overlay hybrid, serialize-before-write) for the whole matrix with medians of at least two runs, plus the microbench and callgrind numbers
-- [ ] #4 A short verdict section states whether the new scheme should replace the overlay and lists any regressions found
+- [x] #4 A short verdict section states whether the new scheme should replace the overlay and lists any regressions found
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -52,4 +52,12 @@ Closes the spike on standalone. Run the full randomized race harness (CI, evicti
 Bug found by run 7 and fixed in 20aa93d06: snapKvobjIsOwed/prepare checked the emitted bit only for the ahead position; a window move inside a write section made an emitted bucket look owed (DEBUG_ASSERTIONS crash at db.c:618 at 50k writes/s, needless clone in plain builds). New helper snapBucketOwed, unit test, spec 11.z.2. Also found: the repository binary used in run 6 was a -DDEBUG_ASSERTIONS build while every other benchmark binary was plain; run 7 hybrid rows use a plain worktree build (/tmp/redis-hyb). Rerun of the microbench (feature-on SET/GET) with a plain build is still owed.
 
 2026-09-25 run 8 (run8-cpu1.csv, RESULTS.md 'Run 8'): run 7 matrix with SERVER_CPUS=0 (server + scan/helper threads + fork child on one CPU; run.sh knob added in e270b171e). All fork-based configs converge to PING p99 3-5 ms at 50k writes/s (child competes for the core); ours is at or below stock and the teammate's hybrid in every small cell with less total CPU (2.2 s vs 2.6 s stock at small/50k), fastest save on small (1.94 s vs 2.38 stock vs 2.63 teammate hybrid), memory unchanged (3 MB vs 236 MB vs 39 MB). Forkless collapses on one core: 12-14 s saves at 50k with the load target missed and 12 s of stall; on big values PING p99 136-214 ms, max up to 657 ms.
+
+2026-09-25 verification pass (RESULTS.md 'Verification pass'): unit/snapshot --accurate 32/32 incl. 100 randomized race iterations (500 s); ASan arena-free worktree 26/26 clean; unit tests 160/160; full stock suite feature off all passed; feature-on suite: 1433 ok, 5 expected replica-based failures, aborted on an untagged BGREWRITEAOF (AOF/replication/module fork are refused by design until TASK-1.22, so a full feature-on suite run is blocked on that task). Spec section 4 rewritten (18777d3c3). Microbenchmarks added (utils/snap-bench/microbench.sh, callgrind.sh): ops/s on this laptop is noise-dominated (40% swings, order effect); callgrind shows SET +0.01% / GET +0.9% Ir with the feature on but the arena cannot be created under valgrind (16 TB reservation), so the arena mallocx cost is still unmeasured; needs perf (perf_event_paranoid is 4). AC2 checked with the caveat that 'full stock suite with no regression' was measured feature off; AC4 verdict written in RESULTS.md.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Serialize-before-write verified on standalone: harness with 100 accurate iterations, TSan and ASan clean in arena-free mode, unit tests 160/160, full stock suite green with the feature off. Benchmarks: run 6 (vs upstream and Valkey), run 7 (vs the teammate's forkless-hybrid POC on 8 cores), run 8 (same on 1 core) all in utils/snap-bench/RESULTS.md with raw CSVs. One race found and fixed by the benchmark (owed-bucket position vs emitted bit, 20aa93d06). Left open and recorded: arena steady-state instruction cost (needs perf), feature-on stock suite (blocked on TASK-1.22), overlay-only hybrid column not rerun (run 5 numbers stand in).
+<!-- SECTION:FINAL_SUMMARY:END -->

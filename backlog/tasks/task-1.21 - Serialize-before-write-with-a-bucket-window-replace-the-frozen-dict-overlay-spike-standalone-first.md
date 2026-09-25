@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@moti.cohen@redis.com'
 created_date: '2026-09-21 19:56'
-updated_date: '2026-09-23 22:15'
+updated_date: '2026-09-25 08:31'
 labels:
   - bgsave
   - persistence
@@ -40,8 +40,8 @@ Invariants, handshake (seq_cst quiescence counter, no ack from main), queue and 
 - [x] #1 The randomized race harness (tests/unit/snapshot.tcl) reloads equal to the fork instant with the new scheme, including eviction, cluster-mode and child-killed variants
 - [x] #2 No hybrid-merge latency event exists any more and the worst PING during a save on the small dataset at 50k writes/s is at or below stock's fork stall (recorded in utils/snap-bench/RESULTS.md)
 - [x] #3 Retained bytes during a save are bounded by the side table plus queue and the peak on the small dataset drops versus the overlay numbers in RESULTS.md
-- [ ] #4 TSan and ASan runs of unit/snapshot in arena-free mode are clean
-- [ ] #5 Spec section 4 is rewritten to describe the new protocol and the M1 report gets a pointer to the change
+- [x] #4 TSan and ASan runs of unit/snapshot in arena-free mode are clean
+- [x] #5 Spec section 4 is rewritten to describe the new protocol and the M1 report gets a pointer to the change
 - [ ] #6 Per-save bucket bitmaps replace the per-key generation: kvBits returns to the upstream layout, no kvBits atomics remain, an aborted save leaves no state behind and the next save reloads correctly
 <!-- AC:END -->
 
@@ -55,4 +55,6 @@ Invariants, handshake (seq_cst quiescence counter, no ack from main), queue and 
 2026-09-22 final verification on fa21935d0: TSan (arena-free, libc) unit/snapshot all passed, no reports (86 s); test build unit 155/155; tcl unit/snapshot 31 tests passed (79 s). ASan not rerun on the new code (leftover). AC1 checked (harness incl. eviction, cluster mode, child killed).
 
 2026-09-24: comparison with yinon/forkless-hybrid recorded in spec 11.z.3. Two bugs found on the module-metadata path and fixed (commit on 2026-09-24): placement ignored module key metadata (small value left in the arena while routed to the child) and EMBSTR values shipped as kvobj copies kept parent-side pointers (child segfault in rdbSaveStringObject). New harness test with test_keymeta.so. Unit 155/155, tcl suite 32 tests green.
+
+2026-09-25: AC4 closed (TSan clean 2026-09-22, ASan clean in arena-free mode 2026-09-25, harness --accurate 100 iterations green); AC5 closed (spec section 4 rewritten for the bucket-window scheme, 18777d3c3). TASK-1.21.5 Done. Remaining for this task: AC6 kvBits save_gen cleanup (TASK-1.21.4) and the optional overlay removal (TASK-1.21.3); cluster mode is TASK-1.21.6.
 <!-- SECTION:NOTES:END -->
