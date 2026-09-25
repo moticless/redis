@@ -117,36 +117,81 @@ int snapEncodingIsNoforkClass(int type, int encoding) {
   temporary dict, then merges at slot-scan-complete.
 
 ## 4. The per-slot scan protocol (the concurrency model — this is the crux, get it exact)
-A monotonic scan cursor tracks, for every slot, one of: `PENDING`, `SCANNING` (owned by a bg thread),
-`DONE`. Transitions are published so the main thread can read a slot's state cheaply.
 
-**Invariant: while a slot is `SCANNING`, its hash table, the kvobj headers it references and the
-fork-instant SNAP_NOFORK values are immutable.** The background thread only reads them. All
-main-thread changes go to a per-slot **temp dict** (a normal dict, main-thread-only), never to the
-scanned hash table:
+Rewritten 2026-09-25 to describe the serialize-before-write scheme that replaced the frozen-dict
+overlay (design and rationale in §11.z; the sync argument in §11.z.2). The original overlay text is
+kept in §11.y for history.
 
-- `dictPauseRehashing` the slot's dict for the `SCANNING` window (so bucket layout is stable).
-- The bg thread `dictScan`s the slot, classifying each entry and dispatching it (SNAP_FORK -> kvobj
-  copy, SNAP_NOFORK -> serialize into the staging buffer). It touches nothing else.
-- The main thread, for a key whose slot is `PENDING` or `SCANNING` (i.e. still owed to the snapshot),
-  on the FIRST modification of that key during the save: **clone** — allocate a new kvobj (always
-  SNAP_NOFORK) and, if the value changes, a new value in the arena matching its new class; apply the
-  change to the clone; insert the clone into the temp dict; LEAVE the fork-instant original in place
-  in the scanned dict. Subsequent modifications of the same key act on the clone in the temp dict in
-  place. Presence in the temp dict is the "already captured" marker.
-- **Delete of an owed key:** put a tombstone in the temp dict; leave the original in the scanned dict
-  so the bg still serializes it (it existed at fork).
-- **Add of a new key to an owed slot:** insert into the temp dict only (never the scanned dict); it is
-  post-fork and must NOT be serialized.
-- **Reads during a save:** consult the temp dict first (covers modified/added/deleted keys), else the
-  scanned dict. Because the scanned dict is immutable while `SCANNING`, concurrent reads by the main
-  thread and the bg thread are safe with no lock beyond the rehash pause.
-- **Slot-scan-complete:** the bg thread signals done; the **main thread** then merges the temp dict
-  into the real dict (apply clones/tombstones/adds) and frees the fork-instant originals it replaced.
-  Freeing a header or SNAP_NOFORK value is CoW-free (DONTFORK: the fork never mapped it). After merge
-  the slot is `DONE`.
-- For a key whose slot is already `DONE`, modifications act in place normally — no clone, no temp
-  dict. So the capture burden shrinks as the save advances.
+**States.** Every frozen dict (one per db in standalone, one per slot in cluster) is in one of
+`PENDING` (the scan thread has not reached it), `SCANNING` (being read), `SCANNED` (fully dispatched,
+waiting for the main-thread merge) or `DONE` (merged, dict unfrozen). The scan thread advances the
+state, the main thread reads it with an atomic load.
+
+**Freeze.** At save start, on the main thread and before the fork: pause rehashing and forbid
+auto-resize on every non-empty dict (`dictExpandIfNeeded` / `dictShrinkIfNeeded` return `DICT_ERR`
+while paused, `kvstoreExpand` skips paused dicts), allocate one bucket bitmap per table of every
+frozen dict, and install the overlay hooks. The bucket layout of a frozen dict is therefore fixed
+for the whole save; the chains are not.
+
+**The window.** The scan thread reads a dict one window of `W` consecutive buckets at a time
+(`SNAP_WINDOW_BUCKETS_DEFAULT` = 1024, settable only through `DEBUG SNAP-WINDOW-BUCKETS n` for tests; no config option yet). Before reading
+a window it publishes `(dict, table, lo, hi)` into a double buffer guarded by a seq_cst sequence
+number, then **quiesces**: if a main-thread write section is open it waits until that section
+closes (§11.z.2). Only then does it walk the buckets of the window, with atomic loads of the chain
+pointers, skipping every bucket whose bitmap bit is set, and dispatches each entry (SNAP_FORK ->
+kvobj copy message for the child; SNAP_NOFORK -> serialized on this thread into its staging buffer).
+At the end of each window it forwards what the main thread queued (below). When the dict is done it
+publishes `SCANNED`; when every dict is done it publishes the empty window, quiesces once more,
+drains the queue a last time and sends END.
+
+**Write sections.** The main thread opens a section at the first write hook of a command on a
+frozen dict (`snapFunnelOpen`, seq_cst) and closes it when the outermost command ends
+(`afterCommandEx` at nesting 0, `beforeSleep`, `moduleReleaseGIL`). Inside a section the window
+cannot move past it, so a position computed in the section stays valid until it closes. The scan
+thread never blocks the main thread; the main thread blocks the scan thread only for the length
+of one command.
+
+**Position and action.** Every write to a key of a frozen dict is preceded by the overlay's
+`prepare` hook, which hashes the key to its `(table, bucket)` and, inside the section, classifies
+it against the state and the window (`snapBucketOwed`):
+
+| position | condition | action |
+|---|---|---|
+| behind | dict `SCANNED`/`DONE`, or same dict and `(table, bucket)` before the window | write in place (nothing is owed) |
+| emitted | the bucket's bit is set, whatever the position | write in place (the thread skips the bucket) |
+| inside | same dict, same table, `lo <= bucket < hi`, bit clear | never touch the chain: clone the key into the per-dict temp dict on first touch and apply the write there; deletes leave a tombstone, adds land in the temp dict |
+| ahead | dict `PENDING`, window on another dict or table, or `(table, bucket)` after the window, bit clear | **emit first**: serialize the whole fork-instant chain of the bucket on the main thread (SNAP_NOFORK records into a mutex-guarded stage, SNAP_FORK keys as kvobj copies) into the main->thread queue, set the bit, then write in place |
+
+The bit is set only by the main thread and only while the bucket is outside the window; it is read
+by the scan thread only while the bucket is inside; the same bucket is never read by both at once.
+Value mutations outside the write hook (in-place `APPEND`, `HSET` on a listpack, `INCR`) need no
+protection: their bucket was emitted or walked before the command ran, and the thread never returns
+to a bucket. Keys with module metadata, module-type values and everything larger than
+`save-small-max-bytes` are SNAP_FORK and serialized by the child from the kvobj copy (§5).
+
+**Reads during a save** consult the temp dict first (clones, adds, tombstones), then the frozen dict.
+Only keys written while their bucket was inside the window live in the temp dict, so it is tiny:
+run 7 measured 0.6-11 MB of retained clones at 20-50k writes/s on a 300 MB dataset, against 5-17 MB
+for the overlay scheme and 135-232 MB of child copy-on-write for a stock fork.
+
+**Merge.** When the thread publishes `SCANNED` for a dict, the main thread (from the event loop,
+`snapScanHandleCompletions`) applies the temp dict to the real dict, frees the fork-instant
+originals it replaced (SNAP_NOFORK memory: DONTFORK, so the free is CoW-free), resumes rehashing
+and auto-resize, frees the bitmap and marks the dict `DONE`. From then on writes to it are stock
+writes.
+
+**Backpressure and abort.** The main thread's queue is bounded only by the hard mark: `snapSaveCron`
+aborts the save when retained clones plus queued bytes exceed `bgsave-hybrid-max-retained-bytes`
+(default 256 MB, 0 = unlimited). Abort marks the context, joins the thread (which gives up its
+quiescence wait when it sees the abort, since the aborting command may itself hold the section
+open), kills the child, merges every temp dict and unfreezes. FLUSHALL, FLUSHDB, SWAPDB, SHUTDOWN
+and a killed child take the same path. The previous dump file is untouched.
+
+**What the main thread pays.** One hash and one atomic load per write to a frozen dict, one dict
+lookup in the temp dict, and, for the first write into each not-yet-walked bucket, the
+serialization of that bucket (about 1.3 keys on average at load factor 1). Measured main-thread CPU
+during a save equals stock in every cell of runs 7 and 8; worst PING during a save is the fork stall
+(0.3-0.7 ms), not the scheme.
 
 ## 5. SNAP_FORK keys
 The **value** of a SNAP_FORK key is served entirely by the fork's CoW snapshot; the main thread mutates
