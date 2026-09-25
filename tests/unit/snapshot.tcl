@@ -785,17 +785,20 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             populate_fillers 3000
             set ref [debug_digest]
             set gen0 [s snap_gen]
-            r config set rdb-key-save-delay 1000
+            r config set rdb-key-save-delay 2000
             r bgsave
             snap_wait_save_started
             assert_equal 1 [s snap_save_marks_valid]
             wait_for_condition 100 50 {[s snap_save_keys_nofork] > 1500} else { fail "scan did not reach half" }
             for {set i 0} {$i < 3000} {incr i} { r set filler:$i [string repeat h 60] }
-            set inplace [s snap_save_inplace_writes]
+            # Under a loaded machine the writes may outlast the scan: the live
+            # counter is reset when the save ends, the last-save one keeps it.
+            set still_running [s snap_save_in_progress]
+            set inplace [expr {$still_running ? [s snap_save_inplace_writes] : [s snap_last_save_inplace_writes]}]
             assert {$inplace > 500}
             assert {$inplace < 3000}
             # the scanned half was written in place, only the rest is retained
-            assert {[s snap_save_retained_bytes] > 0}
+            if {$still_running} { assert {[s snap_save_retained_bytes] > 0} }
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]

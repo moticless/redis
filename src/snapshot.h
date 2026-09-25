@@ -45,9 +45,11 @@ static inline int snapArenaAvailable(void) { return server.snap_nofork_arena != 
  * never maps it. Any other fork (stock RDB save while the feature is off,
  * diskless sync, AOF rewrite, module fork, Lua debugger) needs the keyspace
  * in the child, so redisFork() flips the range to DOFORK first
- * (snapArenaBeforeFork) and the reaper flips it back once no child is left
- * and the feature is on (snapArenaChildExited). One madvise each way, O(VMAs),
- * O(1) in keys; the fallback child pays stock copy-on-write. */
+ * (snapArenaBeforeFork) and resetChildState() flips it back once no child is
+ * left and the feature is on (snapArenaChildExited; also on the debugger
+ * child reap path). One madvise each way, O(VMAs), O(1) in keys; the fallback
+ * child pays stock copy-on-write. A hybrid save started while a debugger
+ * child keeps the arena forkable simply maps it in its child. */
 int snapArenaForkable(void);
 int snapArenaSetForkable(int forkable);
 void snapArenaBeforeFork(int purpose);          /* redisFork(), parent, before fork() */

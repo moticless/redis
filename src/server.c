@@ -865,6 +865,10 @@ void resetChildState(void) {
     server.stat_current_save_keys_total = 0;
     updateDictResizePolicy();
     closeChildInfoPipe();
+    /* Reaped or killed (killRDBChild/killAppendOnlyChild/TerminateModuleForkChild
+     * come here without checkChildrenDone): the SNAP_NOFORK arena may go back
+     * to DONTFORK now that no exclusive child is left. */
+    snapArenaChildExited();
     moduleFireServerEvent(REDISMODULE_EVENT_FORK_CHILD,
                           REDISMODULE_SUBEVENT_FORK_CHILD_DIED,
                           NULL);
@@ -1473,8 +1477,7 @@ void checkChildrenDone(void) {
                 exit(1);
             }
             if (!bysignal && exitcode == 0) receiveChildInfo();
-            resetChildState();
-            snapArenaChildExited();
+            resetChildState();   /* flips the SNAP_NOFORK arena back if needed */
         } else {
             if (!ldbRemoveChild(pid)) {
                 serverLog(LL_WARNING,

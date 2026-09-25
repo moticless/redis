@@ -1866,11 +1866,10 @@ static const kvstoreOverlayHooks snap_server_hooks = {
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (hasActiveChildProcess()) return C_ERR;
     if (snapArenaForkable()) {
-        /* Only a Lua debugger child can leave the arena forkable without an
-         * exclusive child: a hybrid child forked now would map the arena and
-         * pay copy-on-write for nothing. Refuse; BGSAVE can be retried. */
-        serverLog(LL_WARNING, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable for a fallback child; refusing to start");
-        return C_ERR;
+        /* Only a Lua debugger session can leave the arena forkable with no
+         * exclusive child around. The hybrid child never touches the arena, so
+         * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
+        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
     }
     serverAssert(snap_save == NULL);
 

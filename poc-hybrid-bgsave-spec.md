@@ -191,11 +191,13 @@ and a killed child take the same path. The previous dump file is untouched.
 `MADV_DONTFORK`. Any child that is not the hybrid save's (stock RDB save while the
 feature is off, diskless full sync, AOF rewrite, module fork, Lua debugger) needs
 the keyspace mapped, so `redisFork()` first flips the range to `MADV_DOFORK` (one
-madvise, O(VMAs), no key is touched) and the child reaper flips it back once no
-child is left and the feature is on. Such a child sees stock copy-on-write on the
+madvise, O(VMAs), no key is touched) and `resetChildState()` flips it back once
+no child is left and the feature is on (reaped or killed children alike). Such a child sees stock copy-on-write on the
 arena for its lifetime. Mutual exclusion with the hybrid save is the existing
 one-child rule; a `BGSAVE` issued while a fallback child runs is scheduled and
-starts, on the hybrid path, after the flip back. `CONFIG SET bgsave-hybrid` uses
+starts, on the hybrid path, after the flip back. A Lua debugger child is not
+exclusive: a hybrid save started during a debug session maps the arena in its
+child (copy-on-write on it for that save only, still correct). `CONFIG SET bgsave-hybrid` uses
 the same flip and is refused while any child or hybrid save runs.
 
 **What the main thread pays.** One hash and one atomic load per write to a frozen dict, one dict
