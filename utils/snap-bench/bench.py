@@ -290,9 +290,12 @@ def cmd_run(a):
     with open(a.csv, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
         if new: w.writeheader()
+        dump = os.path.join(r.config_get("dir")["dir"], r.config_get("dbfilename")["dbfilename"])
+        # The cache is keyed by the RDB format version this binary writes (an
+        # older tree cannot load a newer format): learn it from an empty SAVE.
+        r.flushall(); r.save(); rdbver = open(dump, "rb").read(9)[5:9].decode()
         for ds in a.datasets.split(","):
-            cache = os.path.join(a.cache, f"{ds}-s{a.scale}-seed42.rdb") if a.cache else None
-            dump = os.path.join(r.config_get("dir")["dir"], r.config_get("dbfilename")["dbfilename"])
+            cache = os.path.join(a.cache, f"{ds}-s{a.scale}-seed42-rdb{rdbver}.rdb") if a.cache else None
             if cache and os.path.exists(cache):
                 t0 = time.time(); shutil.copyfile(cache, dump); r.execute_command("DEBUG", "RELOAD", "NOSAVE"); secs = time.time() - t0; how = "loaded from cache"
             else:
