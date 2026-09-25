@@ -187,6 +187,21 @@ def class_weights(r, classes):
         w.append(sum(mem) / len(mem) * count)
     return w
 
+def save_mode(r):
+    """Which save path this build uses: ours (bgsave-hybrid), the teammate POC (bgsave_mode) or valkey (bgsave-default-method)."""
+    cfg = r.config_get("bgsave-hybrid")
+    if "bgsave-hybrid" in cfg: return "hybrid" if cfg["bgsave-hybrid"] == "yes" else "fork"
+    p = r.info("persistence")
+    if "bgsave_mode" in p: return p["bgsave_mode"]                      # teammate POC: fork | hybrid | forkless
+    cfg = r.config_get("bgsave-default-method")
+    if "bgsave-default-method" in cfg: return "valkey-" + cfg["bgsave-default-method"]
+    return "fork"
+
+IMPL_STATS = ["snap_last_save_retained_peak", "snap_hard_mark_aborts", "snap_save_main_keys",
+              "forkless_retained_peak", "forkless_snapshot_peak", "forkless_limit_aborts", "forkless_copied_values",
+              "forkless_retained_strings", "forkless_priority_keys", "forkless_copy_usec", "forkless_reader_wait_usec",
+              "rdb_last_bgsave_type"]
+
 def wait_save(r, poll=0.02):
     while True:
         p = r.info("persistence")
@@ -202,6 +217,7 @@ def run_cell(a, dataset, rate, est_save):
     row = {"name": a.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "sha": r.info("server").get("redis_git_sha1"),
            "dataset": dataset, "rate": rate, "dbsize": r.dbsize(), "used_mb": mem0 // 2**20,
            "hybrid": int(r.config_get("bgsave-hybrid").get("bgsave-hybrid", "no") == "yes") if "bgsave-hybrid" in str(r.config_get("bgsave-hybrid")) else 0}
+    row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
     secs = int(a.warm + est_save * 1.6 + 8)
     procs, outs = [], {}
@@ -226,7 +242,8 @@ def run_cell(a, dataset, rate, est_save):
                cpu_threads_s=round(((cpu1[1] - cpu0[1]) - (cpu1[0] - cpu0[0])) / tick, 2),
                cpu_child_s=round(sampler.child_cpu / tick, 2),
                snap_retained_peak_mb=round(p1.get("snap_last_save_retained_peak", 0) / 2**20, 1) if "snap_last_save_retained_peak" in p1 else None,
-               snap_hard_mark_aborts=p1.get("snap_hard_mark_aborts"))
+               snap_hard_mark_aborts=p1.get("snap_hard_mark_aborts"),
+               impl_stats=" ".join(f"{k}={p1[k]}" for k in IMPL_STATS if k in p1))
     base = st0.get("RssAnon", 0) + st0.get("VmSwap", 0)
     rows = [x for x in sampler.rows if t0 - 0.2 <= x["t"] <= t1 + 0.5]
     if rows:
@@ -259,11 +276,11 @@ def run_cell(a, dataset, rate, est_save):
         row.update(ops=round(ops), load_avg_ms=round(statistics.fmean(avg), 3) if avg else None, load_p99_ms=p99, load_p999_ms=p999, load_max_ms=mx, stall_s=stall, target_missed=missed)
     return row
 
-COLUMNS = ["name", "ts", "sha", "hybrid", "dataset", "rate", "shares", "dbsize", "used_mb", "rss_base_mb",
+COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "shares", "dbsize", "used_mb", "rss_base_mb",
            "save_sec", "status", "fork_ms", "extra_mem_peak_mb", "parent_growth_peak_mb", "child_pd_peak_mb", "abs_peak_mb", "cow_mb",
            "used_mem_growth_mb", "cpu_main_s", "cpu_threads_s", "cpu_child_s", "ping_p50_ms", "ping_p99_ms", "ping_max_ms",
            "cmd_events_ge20ms", "ops", "load_avg_ms", "load_p99_ms", "load_p999_ms", "load_max_ms", "stall_s", "target_missed",
-           "blocked_peak", "snap_retained_peak_mb", "snap_hard_mark_aborts", "latency_events", "load_err"]
+           "blocked_peak", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err"]
 
 def cmd_run(a):
     r = redis.Redis(port=a.port); r.ping()
