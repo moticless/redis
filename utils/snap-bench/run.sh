@@ -16,7 +16,7 @@ UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
 VALKEY=${VALKEY:-/tmp/valkey-bench/src/valkey-server} # valkey unstable (fork and forkless saves)
 YINON=${YINON:-/home/moti/git/tmp/redis-yinon/src/redis-server} # teammate POC 1204d0970 (bgsave-mode fork|hybrid|forkless)
-CLI=/home/moti/git/redis-bgsave/src/redis-cli
+CLI=${CLI:-$(dirname "$HYB")/redis-cli}                 # any redis-cli
 
 start() {  # start <name> <binary> [flags...]
   local name=$1 bin=$2; shift 2
