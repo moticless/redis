@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid)
+# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid; run 10 = the same on a c7i.4xlarge with interleaved configurations)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -692,3 +692,97 @@ of copy-on-write regardless of the rate. Now they show what big values really co
   (`--cool-below C`, `COOL=` in run.sh) that waits for the package to cool before each cell. A rerun with the gate, and with
   configurations interleaved per cell now that datasets load from the RDB cache in 2 s, is the clean way to get medians that
   are comparable across configurations.
+
+
+## Run 10 (2026-09-25/26): run 9 on AWS, configurations interleaved per cell
+
+Raw: `run10.csv`. Host: EC2 **c7i.4xlarge** (Xeon Platinum 8488C, 8 cores / 16 vCPUs, 30 GB, Ubuntu 24.04, kernel
+6.8.0-1021-aws, no cpufreq exposed), server on 4 physical cores with both threads (vCPUs 0-3,8-11), load generator on the other
+4 (4-7,12-15), dumps and dataset cache on tmpfs. Same binaries as run 9 (upstream 0d6266f2d, hybrid 41868cb93, teammate
+1204d0970), plain builds on the instance. `run-interleaved.sh`: for every (dataset, rate, rep) each binary is started, loads
+the dataset from the RDB cache, runs one cell and stops, so the three configurations see the same machine state. 2 reps per
+cell; rep-to-rep spread is tight everywhere (our save times agree within 0.1 s in 17 of 18 cells), the opposite of run 9.
+
+The run was interrupted three times by the FinOps NoTag-NoRun policy (FINOPS-416): the instance had no `owner`/`team` tags
+and was stopped 12-22 minutes after each boot. Cells are self-contained and the CSV was trimmed to complete cells before each
+resume, so the interruptions cost time, not data.
+
+### Small (300 MB, all values eligible for the small path)
+
+| rate | hot | config | save s | fork ms | extra mem MB | child dirty MB | main cpu s | ping p99 ms | ping max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 2.55 | 4.9 | 1.5 | 3.5 | 0.06 | 0.62 | 3.9 |
+| 0 | - | yinon-hybrid | 2.34 | 0.84 | 1.5 | 1 | 0.05 | 0.64 | 9.8 |
+| 0 | - | hybrid | 2.27 | 0.40 | 1 | 1 | 0.04 | 0.65 | 0.79 |
+| 20k | 1.0 | up | 2.51 | 4.4 | 172 | 172 | 0.62 | 0.69 | 3.2 |
+| 20k | 1.0 | yinon-hybrid | 2.45 | 0.98 | 35 | 28 | 0.66 | 0.65 | 7.5 |
+| 20k | 1.0 | hybrid | 2.23 | 0.41 | 3 | 1 | 0.58 | 0.70 | 0.89 |
+| 20k | 0.2 | up | 2.72 | 3.5 | 165.5 | 165.5 | 0.66 | 0.64 | 0.82 |
+| 20k | 0.2 | yinon-hybrid | 2.60 | 0.99 | 35 | 28 | 0.69 | 0.65 | 8.8 |
+| 20k | 0.2 | hybrid | 2.33 | 0.41 | 3 | 1 | 0.61 | 0.65 | 0.77 |
+| 50k | 1.0 | up | 2.56 | 5.2 | 243 | 243 | 1.30 | 0.41 | 4.6 |
+| 50k | 1.0 | yinon-hybrid | 2.42 | 0.99 | 41 | 28 | 1.44 | 0.51 | 11.5 |
+| 50k | 1.0 | hybrid | 2.12 | 0.40 | 3 | 1 | 1.19 | 0.49 | 0.63 |
+| 50k | 0.2 | up | 2.65 | 3.6 | 223 | 223 | 1.35 | 0.41 | 2.3 |
+| 50k | 0.2 | yinon-hybrid | 2.57 | 0.98 | 40 | 28 | 1.54 | 0.56 | 10.6 |
+| 50k | 0.2 | hybrid | 2.30 | 0.40 | 3 | 1 | 1.29 | 0.39 | 0.53 |
+
+### Mixed (260 MB, 55% of bytes in 9 KB hashtable hashes)
+
+| rate | hot | config | save s | fork ms | extra mem MB | child dirty MB | main cpu s | ping p99 ms | ping max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 2.30 | 3.5 | 1.5 | 1.5 | 0.05 | 0.63 | 3.6 |
+| 0 | - | yinon-hybrid | 1.87 | 3.1 | 2 | 1.5 | 0.06 | 0.62 | 9.2 |
+| 0 | - | hybrid | 1.11 | 2.0 | 1 | 1 | 0.03 | 0.66 | 0.83 |
+| 20k | 1.0 | up | 2.26 | 4.6 | 143.5 | 143.5 | 0.62 | 0.67 | 2.9 |
+| 20k | 1.0 | yinon-hybrid | 1.83 | 4.0 | 108 | 105 | 0.62 | 0.68 | 10.4 |
+| 20k | 1.0 | hybrid | 1.42 | 2.7 | 53 | 51 | 0.50 | 0.63 | 1.6 |
+| 20k | 0.2 | up | 2.47 | 4.1 | 104.5 | 104.5 | 0.70 | 0.67 | 3.9 |
+| 20k | 0.2 | yinon-hybrid | 1.98 | 3.4 | 75.5 | 71.5 | 0.66 | 0.65 | 7.7 |
+| 20k | 0.2 | hybrid | 1.36 | 2.3 | 29.5 | 28 | 0.47 | 0.67 | 0.99 |
+| 50k | 1.0 | up | 2.31 | 5.2 | 196 | 196 | 1.17 | 0.45 | 2.6 |
+| 50k | 1.0 | yinon-hybrid | 1.92 | 4.0 | 152.5 | 147.5 | 1.17 | 0.48 | 7.0 |
+| 50k | 1.0 | hybrid | 1.86 | 3.0 | 99 | 96 | 1.04 | 0.48 | 2.2 |
+| 50k | 0.2 | up | 2.25 | 2.8 | 88 | 88 | 1.11 | 0.35 | 0.52 |
+| 50k | 0.2 | yinon-hybrid | 1.91 | 2.6 | 75 | 70.5 | 0.98 | 0.59 | 6.3 |
+| 50k | 0.2 | hybrid | 1.30 | 1.5 | 34 | 32 | 0.78 | 0.50 | 0.61 |
+
+### Big (260 MB, 10 MB hashes and 300k-member zsets; random existing field/member per write)
+
+| rate | hot | config | save s | fork ms | extra mem MB | main cpu s | ping p99 ms | ping max ms |
+|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 1.99 | 3.9 | 1 | 0.03 | 0.65 | 3.6 |
+| 0 | - | yinon-hybrid | 2.00 | 3.3 | 1 | 0.05 | 0.62 | 7.7 |
+| 0 | - | hybrid | 1.97 | 3.7 | 1 | 0.05 | 0.63 | 2.8 |
+| 20k | 1.0 | up | 2.09 | 2.9 | 115.5 | 0.64 | 0.67 | 0.82 |
+| 20k | 1.0 | yinon-hybrid | 2.25 | 3.0 | 120 | 0.70 | 0.75 | 5.6 |
+| 20k | 1.0 | hybrid | 2.34 | 2.7 | 121.5 | 0.65 | 0.73 | 2.7 |
+| 20k | 0.2 | up | 1.88 | 2.8 | 43 | 0.49 | 0.66 | 2.1 |
+| 20k | 0.2 | yinon-hybrid | 1.98 | 3.1 | 44 | 0.54 | 0.65 | 4.8 |
+| 20k | 0.2 | hybrid | 2.02 | 3.1 | 44 | 0.53 | 0.63 | 2.2 |
+| 50k | 1.0 | up | 2.23 | 3.4 | 174 | 1.31 | 0.43 | 2.9 |
+| 50k | 1.0 | yinon-hybrid | 2.14 | 3.8 | 172 | 1.29 | 0.41 | 5.3 |
+| 50k | 1.0 | hybrid | 2.16 | 3.5 | 172.5 | 1.29 | 0.40 | 2.9 |
+| 50k | 0.2 | up | 1.96 | 2.8 | 45 | 1.09 | 0.37 | 2.0 |
+| 50k | 0.2 | yinon-hybrid | 1.97 | 2.8 | 45 | 1.14 | 0.46 | 6.0 |
+| 50k | 0.2 | hybrid | 1.92 | 3.0 | 45 | 1.07 | 0.40 | 1.5 |
+
+### Reading the run
+
+- **This is the clean version of run 9.** No thermal drift, no order effect, rep spreads of a few percent. The conclusions
+  of runs 7 and 9 hold on a server CPU: on the small path our hybrid saves in 2.1-2.4 s against 2.3-2.6 s for the teammate's
+  hybrid and 2.5-2.7 s for stock, with a 0.4 ms fork (his 1.0, stock 3.5-5.2), 3 MB of extra memory (his 35-41, stock 165-243)
+  and a PING max of 0.5-0.9 ms (his 7.5-11.5, stock 0.8-4.6).
+- **Mixed is where the two hybrids differ most**: 53 MB vs 108 MB extra memory at 20k uniform (stock 143.5), 99 vs 152.5 at
+  50k (stock 196), and save time 1.1-1.9 s vs 1.8-2.0 s vs 2.3 s. Both children copy the pages of the 9 KB hashes as they are
+  written; ours finishes sooner and keeps the headers and small values out of the child.
+- **Big is a wash for everything that forks**, as it must be: 116-123 MB at 20k uniform, 172-175 MB at 50k, 43-45 MB with the
+  hot set, for all three. The only difference on this dataset is the teammate's PING max of 4.8-7.7 ms against 1.5-2.9 ms for
+  ours and 0.8-3.6 ms for stock.
+- **The 20% hot set** behaves as in run 9: it cuts stock and big-value copy-on-write by 2-4x and changes nothing for our
+  small path.
+- **PING p99 is 0.4-0.7 ms for every configuration here**, higher than the 0.25-0.35 ms the laptop showed: the probe runs
+  from Python on the load cores and a virtualized network stack adds its share. It is the same for all three, so it does not
+  affect the comparison; PING max does, and it separates the three designs clearly.
+- Main-thread CPU during the save is at or below stock in every small and mixed cell for ours; the teammate's hybrid is
+  5-15% above stock at 50k on small (its parent-side helper handshake).
