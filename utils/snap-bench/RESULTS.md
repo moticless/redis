@@ -786,3 +786,26 @@ resume, so the interruptions cost time, not data.
   affect the comparison; PING max does, and it separates the three designs clearly.
 - Main-thread CPU during the save is at or below stock in every small and mixed cell for ours; the teammate's hybrid is
   5-15% above stock at 50k on small (its parent-side helper handshake).
+
+
+## Copy-on-write sources other than big values (2026-09-26, `cow-sources.py`)
+
+Mixed dataset (260 MB), write traffic at 20k/s on the small classes only (strings, lists, sets; the 9 KB hashes untouched), so
+every dirtied page in the child is a parent mechanism other than big-value CoW. Laptop, plain build 41868cb93, one save per
+variant, measured 3 s into the traffic.
+
+| variant | our hybrid: child dirty MB | stock: child dirty MB | INFO memory during the save |
+|---|---|---|---|
+| base (4 pipelined clients) | 3 | 95 | clients 2 KB |
+| + replica (diskless sync, 1 MB backlog churning) | 3 | 97 | slaves 37 KB, backlog 1 MB |
+| + AOF (appendfsync everysec) | 3 | 97 | aof_buf 3 KB |
+| + 64 pipelined clients | 3 | 92 | clients 2 KB |
+
+The 3 MB floor is the same as an idle save's 1-3 MB and is mostly the child's own working set (rio buffer, stack, allocator
+metadata), not parent pages. Adding a replica, AOF or 64 clients moved nothing at this rate: the reply buffer is 16 KB per
+client and reused in place, the default backlog is 1 MB, the AOF buffer a few KB. On this workload there is nothing left to
+mark DONTFORK. Where it can matter in production: a churning replication backlog under a heavy write stream (CoW bounded by
+min(backlog size, stream bytes during the save); 50 MB/s x 2 s = 100 MB, the size of the big-value CoW), and thousands of
+active clients' reply buffers and reply lists. Both are single allocation sites (`replBufBlock`, `c->buf`/`clientReplyBlock`),
+never read by any fork child, and `zfree` is already range-aware, so moving them into the arena is cheap; it should be done
+against a measurement with a heavy replication stream first.
