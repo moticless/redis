@@ -3,11 +3,11 @@ id: TASK-1.21
 title: >-
   Serialize-before-write with a bucket window: replace the frozen-dict overlay
   (spike, standalone first)
-status: In Progress
+status: Done
 assignee:
   - '@moti.cohen@redis.com'
 created_date: '2026-09-21 19:56'
-updated_date: '2026-09-25 08:31'
+updated_date: '2026-09-25 14:23'
 labels:
   - bgsave
   - persistence
@@ -42,7 +42,7 @@ Invariants, handshake (seq_cst quiescence counter, no ack from main), queue and 
 - [x] #3 Retained bytes during a save are bounded by the side table plus queue and the peak on the small dataset drops versus the overlay numbers in RESULTS.md
 - [x] #4 TSan and ASan runs of unit/snapshot in arena-free mode are clean
 - [x] #5 Spec section 4 is rewritten to describe the new protocol and the M1 report gets a pointer to the change
-- [ ] #6 Per-save bucket bitmaps replace the per-key generation: kvBits returns to the upstream layout, no kvBits atomics remain, an aborted save leaves no state behind and the next save reloads correctly
+- [x] #6 Per-save bucket bitmaps replace the per-key generation: kvBits returns to the upstream layout, no kvBits atomics remain, an aborted save leaves no state behind and the next save reloads correctly
 <!-- AC:END -->
 
 ## Implementation Notes
@@ -57,4 +57,12 @@ Invariants, handshake (seq_cst quiescence counter, no ack from main), queue and 
 2026-09-24: comparison with yinon/forkless-hybrid recorded in spec 11.z.3. Two bugs found on the module-metadata path and fixed (commit on 2026-09-24): placement ignored module key metadata (small value left in the arena while routed to the child) and EMBSTR values shipped as kvobj copies kept parent-side pointers (child segfault in rdbSaveStringObject). New harness test with test_keymeta.so. Unit 155/155, tcl suite 32 tests green.
 
 2026-09-25: AC4 closed (TSan clean 2026-09-22, ASan clean in arena-free mode 2026-09-25, harness --accurate 100 iterations green); AC5 closed (spec section 4 rewritten for the bucket-window scheme, 18777d3c3). TASK-1.21.5 Done. Remaining for this task: AC6 kvBits save_gen cleanup (TASK-1.21.4) and the optional overlay removal (TASK-1.21.3); cluster mode is TASK-1.21.6.
+
+2026-09-25: AC6 closed with TASK-1.21.4 (kvBits upstream layout, no atomics). All six acceptance criteria met; the spike is complete on standalone. Left as independent tasks: TASK-1.21.3 (optional overlay removal), TASK-1.21.6 (cluster mode), TASK-1.24 (FLUSHDB/SWAPDB detach).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Serialize-before-write with a bucket window replaced the frozen-dict overlay on standalone: scan thread publishes bucket windows, main thread emits ahead buckets and clones only inside the window, per-save bucket bitmaps as the only snapshot state, write sections for the handshake. Verified by the randomized harness (100 accurate iterations), TSan, ASan, the stock suite feature off and (after TASK-1.22) feature on; benchmarked in runs 6 to 8 against upstream, Valkey forkless and the teammate's forkless-hybrid POC. kvBits returned to the upstream layout.
+<!-- SECTION:FINAL_SUMMARY:END -->

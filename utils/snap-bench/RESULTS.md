@@ -576,3 +576,20 @@ Final runs (repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS`, 8 clients):
 | `./runtest --config bgsave-hybrid yes` (final) | 5781 passed, 0 failed, then the cluster harness aborted with "cluster config did not reach a consistent state" while three cluster units ran in parallel; those three units pass alone with the feature on (170 tests). A convergence timeout under load, seen with the feature off too on this laptop in earlier sessions |
 | `./runtest` (feature off, final) | 6267 passed, 0 failed |
 | unit/snapshot, feature on | 41 of 41; unit tests 165 of 165 |
+
+
+## Per-key save generation removed (TASK-1.21.4, 2026-09-25, commit 41868cb93)
+
+Suspicion: the byte-wide atomic on the kvobj byte (one relaxed store per kvobj creation, a release store per key on
+the scan thread) costs SET/GET something. Measured with `callgrind.sh` on plain builds, feature off, instructions
+inside `processCommand` per command:
+
+| build | SET Ir/cmd | GET Ir/cmd |
+|---|---|---|
+| 20aa93d06 (generation, atomics) | 2952.8 | 1861.8 |
+| 41868cb93 (upstream kvBits, plain field access) | 2949.9 | 1872.0 |
+
+About 3 instructions per SET, 0.1%; GET within run-to-run noise (the two runs differ in dict layout). On x86 a relaxed
+atomic byte store is a plain `mov`, so there was no fence to remove; the win of the removal is the upstream layout and
+one less mechanism, not throughput. The feature-on GET number under callgrind (arena unavailable there) moved from
++0.9% to +3.2% over feature-off between the two runs, which is the same noise band and not a signal.
