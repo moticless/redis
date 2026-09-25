@@ -668,3 +668,95 @@ Ideas to take:
 Not to take: one `SELECTDB` per record, relay only on EAGAIN through small
 pipes, the 8192-extent registry cap, giving up module metadata classes for
 marks, an O(N) main-thread normalization after failures.
+
+### 11.z.4 Modules under a hybrid save: what runs where, and the contract (2026-09-26)
+
+Precedent: Valkey's `VALKEYMODULE_OPTIONS_HANDLE_FORKLESS` (valkeymodule.h, an
+opt-in bit; `moduleAllModulesHandleForkless()` in module.c; `resolveBgsaveType()`
+in rdb.c falls back to a fork save with a warning when any loaded module lacks
+it). Valkey needs it for two reasons: its forkless save changes main-thread
+semantics (`VM_OpenKey` in WRITE mode may return NULL while a key is write-locked)
+and its save callbacks may run off the main thread. Neither applies here, so our
+contract is narrower, but the child side is stricter than stock.
+
+**What runs where.**
+
+- Module code never runs on the scan thread. `OBJ_MODULE` values and every key
+  carrying module key metadata are SNAP_FORK (`snapPlaceValueArena`,
+  `snapKeyClass`): the fork child serializes them through the type's `rdb_save`
+  and the metadata save callbacks, from the kvobj header copy it receives over
+  the channel (`snapSaveChildWrite` -> `rdbSaveKeyValuePair`), exactly as the
+  stock child does. `aux_save`/`aux_save2` run in the child from
+  `rdbSaveRioHeader`. Persistence events fire as in stock: `RDB_START` in the
+  child (`startSaving`), `ENDED`/`FAILED` in the parent; `FORK_CHILD` events from
+  `redisFork`.
+- Module allocations (`RM_Alloc` and friends, `RedisModuleString`s, module dicts)
+  are default-arena `zmalloc`: forkable, mapped in the child. Only kvobj headers,
+  the keyspace and expires dict tables and entries, and small values live in the
+  `MADV_DONTFORK` arena (the `*_nofork` allocators, reachable from object.c,
+  dict.c and kvstore.c only). A module cannot allocate there.
+- The one difference from stock: **the hybrid child has no keyspace.** Dict
+  tables, kvobj headers other than the copy handed to the save callback, and
+  small values are unmapped in the child. Dereferencing them is a SIGSEGV: the
+  child dies, the save is reported as "terminated by signal 11" and the parent
+  is unaffected, but persistence silently stops working until someone reads the
+  log. In the stock child the same code reads a stale but valid copy.
+
+**Contract for a module to be compatible with `bgsave-hybrid yes`.**
+
+1. Save-side callbacks (`rdb_save`, `aux_save`, `aux_save2`, key-metadata save,
+   and any server-event handler that may run in a child: `PERSISTENCE`
+   `RDB_START`, `FORK_CHILD_BORN`) must not touch the keyspace: no `RM_OpenKey`,
+   `RM_KeyExists`, `RM_Scan`, `RM_ScanKey`, `RM_Call`, `RM_DbSize`,
+   `RM_RandomKey`, `RM_GetExpire`, `RM_ListPush`... on any key. Allowed: the
+   value passed to the callback, module-owned memory, and the IO context
+   (`RM_SaveString*`, `RM_GetKeyNameFromIO`, `RM_GetDbIdFromIO`,
+   `RM_GetContextFromIO` for `RM_Log`). The key name in the IO context points
+   into the header copy and is valid for the callback only, as in stock.
+2. Module-owned state must not keep pointers into Redis-owned key memory and
+   dereference them in a save callback: a `char *` from `RM_StringDMA` or a
+   `RedisModuleKey *`. Both are already invalid past the command by the API
+   contract; the difference is that in the hybrid child they fault.
+3. Main-thread rules are the existing API rules, restated because the funnel
+   relies on them: mutate a key only through a handle opened with
+   `REDISMODULE_WRITE` (the write lookup emits or clones the owed bucket, so a
+   later in-place write through the `RM_StringDMA` pointer, `RM_StringTruncate`,
+   `RM_SetExpire`, list/zset/hash/stream APIs and `RM_ModuleTypeReplaceValue` is
+   covered: "value mutations outside the section need no protection"), and from
+   a module thread only under the GIL (the write section closes in
+   `moduleReleaseGIL`). Gap on our side: `RM_SetLRU`/`RM_SetLFU` do not check the
+   mode, so on a READ handle they write `kv->lru` while the scan thread may read
+   it for the IDLE/FREQ opcode; either value is a valid clock, so the effect is a
+   racy idle time in the RDB, not corruption. To be closed by requiring WRITE
+   (or by cloning as P29 of the audit says).
+4. Behaviour a module can observe on the main thread during a hybrid save:
+   `RM_ResetDataset` (`emptyData`) aborts the save and kills the child (stock:
+   the child finishes the pre-flush dataset); `RM_Call` of FLUSHDB or SWAPDB
+   aborts it too (TASK-1.24 will detach the frozen kvstore instead). `RM_Fork`
+   during a save is refused by `redisFork`'s child exclusivity as in stock;
+   outside a save it works and the arena is flipped forkable for that child
+   (§11.z.1 item 6). `REDISMODULE_CTX_FLAGS_ACTIVE_CHILD` is set for the whole
+   hybrid save, so `lookupKey` keeps skipping LRU/LFU updates as in stock.
+5. Cost, not a restriction: a key with module key metadata is SNAP_FORK whatever
+   its value size, so it pays stock copy-on-write and does not benefit from the
+   arena. Module values themselves are big-value class by definition.
+
+**Enforcement (to implement, backlog TASK-1.25).** Follow Valkey: an opt-in
+module option `REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE` (`1<<4`,
+`_REDISMODULE_OPTIONS_FLAGS_NEXT` -> `1<<5`) meaning "my save callbacks obey
+items 1 and 2". `snapSaveBackground` consults `moduleAllModulesHandleHybridBgsave()`:
+if any loaded module lacks the bit, the save falls back to the stock fork path
+(the §11.z.1 item 6 flip makes this free) with one `LL_WARNING` per offending
+module at load time and an INFO field naming it (`snap_hybrid_blocked_by:<name>`),
+so the fallback is never silent. Every module must opt in, as in Valkey, rather
+than only modules with data types: server-event handlers run in the child too,
+and the rule is easier to state and to check. `MODULE LOAD` during a hybrid save
+stays allowed (its `OnLoad` runs on the main thread through the funnel; the
+running child was forked before it). Defence in depth in the child: when
+`server.in_fork_child` is a hybrid save child, the keyspace APIs of item 1
+return NULL/`REDISMODULE_ERR` (`RM_Call`: an error reply) and log once, so a
+violation by an opted-in module fails the save with a message instead of a
+SIGSEGV. The test modules that register types or aux callbacks set the bit, and
+one test module violates item 1 on purpose to check both the fallback (bit not
+set) and the guard (bit set). With the bit missing, `tests/modules` under
+`--config bgsave-hybrid yes` would otherwise silently run the stock path.
