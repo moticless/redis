@@ -549,3 +549,30 @@ With the feature on, `redisFork()` flips the arena forkable for the AOF child (o
 
 The fallback child pays the same copy-on-write as stock, as designed: the flip only restores stock behaviour for that child.
 Nothing about the hybrid save path is involved in this measurement.
+
+
+## Full stock suite with the feature on (TASK-1.22, 2026-09-25, commits f6f680f87 .. 4031dbf4b)
+
+Before the arena fork-visibility flip the feature-on suite could not run end to end (AOF rewrite, diskless sync and module
+forks were refused). After it, `./runtest --config bgsave-hybrid yes --clients 8` on the DEBUG_ASSERTIONS build found, in
+order, and each was fixed the same day:
+
+| finding | cause | fix |
+|---|---|---|
+| bare `ERR` from BGSAVE after a killed AOF child (moduleapi/rdbloadsave) | killed children reach `resetChildState()` without `checkChildrenDone()`, so the arena stayed forkable and the hybrid save refused to start | flip-back moved into `resetChildState()`; the refusal removed (a debugger child may leave the arena forkable, the hybrid child then just maps it) |
+| `keyModified` assertion under XACKDEL during a full sync (integration/replication) | XACK/XACKDEL mutate the stream through a read lookup; safe for SNAP_FORK containers (the child serializes its CoW image) but the debug check did not know | `snapKvobjIsFrozenOriginal` exempts stream, module, hashtable, skiplist and quicklist values; audit addendum |
+| `current_save_keys_processed` stayed 0 during a hybrid save (integration/rdb) | the child only sees SNAP_FORK keys | INFO reports the scan thread's and the main thread's dispatched keys |
+| active defrag could not bring `allocator_frag_ratio` under 1.1 (unit/memefficiency, 12.5 of 12.9 MB of frag in the arena, 325 M key misses) | the arena's explicit tcache is only GC'd by its own allocations; idle keyspace or a defrag pass (tcache bypassed) pins slabs | `serverCron` flushes the arena tcache once a second |
+| defrag recipes never reached their fragmentation precondition (11 tests) | they interleave keys with scripts, channels, argv or field-expiry structures in the same slabs; with the keyspace in its own arena that cannot fragment anything | those tests switch the feature off for their duration (runtime switch); keyspace-fragmenting ones run with it on |
+| feature-off servers had headers and dict tables in the arena since the arena is created at startup | only value placement followed the flag | one gate, `zmalloc_nofork_active`, for every arena entry point |
+| two stock tests assume stock semantics | `DEBUG LOADAOF` during a save aborts a hybrid save (the scan thread reads the dicts being freed); writes to small values create no CoW in the child | integration/aof-multi-part in-progress assertion stock-only; integration/rdb 'Test child sending info' skipped with the feature on |
+
+Final runs (repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS`, 8 clients):
+
+| suite | result |
+|---|---|
+| `./runtest --config bgsave-hybrid yes` (run 7 of the day, before the defrag fixes) | 6246 passed, 21 failed, all in unit/memefficiency (the two defrag findings above) |
+| unit/memefficiency alone, feature on, after the fixes | 28 of 28 defrag tests pass (standalone and cluster) |
+| `./runtest --config bgsave-hybrid yes` (final) | 5781 passed, 0 failed, then the cluster harness aborted with "cluster config did not reach a consistent state" while three cluster units ran in parallel; those three units pass alone with the feature on (170 tests). A convergence timeout under load, seen with the feature off too on this laptop in earlier sessions |
+| `./runtest` (feature off, final) | 6267 passed, 0 failed |
+| unit/snapshot, feature on | 41 of 41; unit tests 165 of 165 |
