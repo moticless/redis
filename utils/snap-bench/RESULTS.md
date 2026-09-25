@@ -495,3 +495,42 @@ its SMT sibling CPU 1 is idle). memtier and the probes stay on CPUs 8-15. This i
 - One P-core with its SMT sibling idle is a generous "one CPU": a one-CPU cgroup on a busy host would be tighter. The relative
   picture (fork child versus threads versus main thread all sharing one core) is what the run tests.
 - Same 2-rep laptop caveats as run 7; the teammate's forkless idle/20k small cells vary 2.4-5.9 s between reps.
+
+
+## Verification pass (2026-09-25, commit 20aa93d06 and later)
+
+Run after the owed-bucket fix, to close TASK-1.21.5 on standalone.
+
+| check | build | result |
+|---|---|---|
+| `./runtest --single unit/snapshot --accurate` (randomized writers race the save, 100 iterations, plus eviction lru/lfu, module metadata, templated hashes, FLUSHALL, hard mark, killed child, SHUTDOWN, cluster-mode harness) | repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS` | 32/32 passed; the 100-iteration race took 500 s, every iteration byte-identical to the fork instant |
+| `./runtest --single unit/snapshot` | `SANITIZER=address MALLOC=libc` worktree (arena-free mode) | 26/26 passed, no sanitizer report |
+| `./src/redis-server test snapshot` | repo build | 160/160 (5 new checks for the window move inside a section) |
+| full stock suite with `--config bgsave-hybrid yes`, minus AOF / replication / cluster / fork-dependent units | repo build | 1433 tests passed; 5 failed, all replica-based (MASTERAUTH x2, bind-source-addr, pubsubshard setup, maxmemory slave buffers): with the arena on, a replica full sync is refused by design until TASK-1.22; the run then aborted on an untagged BGREWRITEAOF (same refusal). The feature-on suite is not runnable end to end before TASK-1.22 |
+| full stock suite, feature off (default config), `./runtest --clients 8` | repo build | all passed (6265 tests), no regression from the window layer being compiled in |
+
+### Steady-state cost with no save running (feature on vs off, same plain binary 20aa93d06)
+
+Two tools were added under this directory. `microbench.sh` measures redis-benchmark ops/s (pinned, 2 M ops, pipeline 16);
+`callgrind.sh` counts instructions inside `processCommand` for 200 k SET and 200 k GET under callgrind.
+
+- **ops/s on this laptop is too noisy to resolve a few percent.** Alternating on/off/on/off with 5 runs each gave SET
+  1.13 M / 0.76 M / 0.76 M / 0.88 M ops/s and GET 1.28 M / 0.97 M / 1.15 M / 1.27 M: the first mode measured is the fastest
+  whatever it is, and run-to-run spread within one mode is up to 40% (powersave governor, thermal state after an hour of
+  benchmarks). No conclusion about the feature can be drawn from this; the earlier "SET -4..-6%" figure came from the same kind
+  of measurement on the debug build and should be treated as unmeasured.
+- **Instruction counts: SET +0.01%, GET +0.9% with the feature on, but without the arena.** Under valgrind the server cannot
+  reserve the 16 TB DONTFORK range, the arena reports unavailable and values stay in the default allocator, so this measures the
+  feature's code path (write sections, overlay checks, placement decisions) and not the arena `mallocx`. It is the number that
+  matters for a build with the feature compiled in but the arena unavailable (any non-Linux or non-jemalloc build).
+- **The arena's own cost is still unmeasured on a quiet machine.** `perf stat -e instructions` on the server pid would give it in
+  one run but needs `kernel.perf_event_paranoid <= 1` (it is 4 here) or root.
+
+### Verdict for TASK-1.21.5
+
+The serialize-before-write scheme replaces the frozen-dict overlay: same correctness on every harness variant including 100
+accurate iterations, TSan (2026-09-22) and ASan clean in arena-free mode, the stock suite unchanged with the feature off, and
+on the benchmark it beats the overlay, stock, Valkey forkless and the teammate's hybrid on worst-case latency and extra memory
+while matching or beating them on save time and main-thread CPU on 8 cores and on 1 core. Regressions found and fixed during
+the pass: the owed-bucket position race (20aa93d06). Open: the arena's steady-state cost is unmeasured on a quiet machine; the
+feature-on stock suite needs TASK-1.22 before it can run end to end.
