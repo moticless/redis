@@ -3,10 +3,10 @@ id: TASK-1.17
 title: >-
   Measure hybrid BGSAVE against stock BGSAVE: CoW/RSS, main-thread CPU, fork
   stall, wall-time
-status: To Do
+status: In Progress
 assignee: []
 created_date: '2026-09-20 17:22'
-updated_date: '2026-09-20 18:28'
+updated_date: '2026-09-25 21:09'
 labels:
   - bgsave
   - persistence
@@ -34,11 +34,17 @@ Scope: a reproducible benchmark script (dataset generators, workload drivers, co
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A reproducible benchmark script and dataset/workload definitions are checked in with instructions to run them
+- [x] #1 A reproducible benchmark script and dataset/workload definitions are checked in with instructions to run them
 - [ ] #2 Peak RSS and CoW bytes during a save are recorded for stock and hybrid under the write-heavy mix, the key-churn mix and the EXPIRE-heavy SNAP_FORK mix, on a SNAP_NOFORK-heavy dataset and a mixed dataset
-- [ ] #3 Parent main-thread CPU during the save is recorded for stock and hybrid, and hybrid is shown to move the keyspace walk off the main thread
-- [ ] #4 fork() stall (latest_fork_usec) is recorded for stock and hybrid at the same dataset size
+- [x] #3 Parent main-thread CPU during the save is recorded for stock and hybrid, and hybrid is shown to move the keyspace walk off the main thread
+- [x] #4 fork() stall (latest_fork_usec) is recorded for stock and hybrid at the same dataset size
 - [ ] #5 Save wall-time is recorded for stock, hybrid with 1 thread, and hybrid with N threads
 - [ ] #6 Steady-state (no save running) command latency, throughput and object create/free cost are compared between the hybrid build with the switch on and stock, to quantify placement, class-aware free and lookup-resolution overhead
-- [ ] #7 All results, the hardware description and the exact commands are recorded in a checked-in measurements document
+- [x] #7 All results, the hardware description and the exact commands are recorded in a checked-in measurements document
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-09-26 status from the snap-bench work (utils/snap-bench: bench.py, snapload.py, run.sh, run-interleaved.sh, RESULTS.md runs 4-10). Done: AC1 reproducible scripts + datasets + commands checked in; AC3 main-thread CPU recorded per cell, hybrid at or below stock while the scan thread carries the walk (threads cpu column); AC4 fork stall recorded (0.4 ms hybrid vs 3.5-5.2 ms stock on 300 MB); AC7 hardware and commands in RESULTS.md (laptop i7-1260P runs 4-9, EC2 c7i.4xlarge run 10). Partially done: AC2 peak RSS/CoW recorded for the write-heavy mix on small (SNAP_NOFORK-heavy), mixed and big datasets, uniform and 20% hot set; NOT yet the key-churn (add/delete) mix nor the EXPIRE-heavy SNAP_FORK mix. AC5 wall-time recorded for stock and hybrid with 1 scan thread; N threads is TASK-1.11 (not started). AC6 steady state: callgrind Ir feature on/off (+0.01% SET, +0.9% GET, arena not measurable under valgrind), ops/s on the laptop is noise-dominated; the arena's mallocx cost per op is still unmeasured (needs perf, or the EC2 host). Datasets are 260-300 MB, not the multi-GB the description asks for.
+<!-- SECTION:NOTES:END -->
