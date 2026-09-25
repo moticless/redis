@@ -534,3 +534,18 @@ on the benchmark it beats the overlay, stock, Valkey forkless and the teammate's
 while matching or beating them on save time and main-thread CPU on 8 cores and on 1 core. Regressions found and fixed during
 the pass: the owed-bucket position race (20aa93d06). Open: the arena's steady-state cost is unmeasured on a quiet machine; the
 feature-on stock suite needs TASK-1.22 before it can run end to end.
+
+
+## Fallback child copy-on-write (TASK-1.22 AC5, 2026-09-25, commit f6f680f87, plain build)
+
+`utils/snap-bench/aof-cow.sh`: 1.2 M keys x 100 B (196 MB), memtier same-size overwrites at 20k/s, BGREWRITEAOF issued 2 s in.
+With the feature on, `redisFork()` flips the arena forkable for the AOF child (one flip logged) and back afterwards
+(`snap_nofork_arena_forkable` 0 when done).
+
+| bgsave-hybrid | rewrite s | aof_last_cow_size | latest_fork_usec |
+|---|---|---|---|
+| on (arena flipped forkable for the child) | 0.98 | 18.3 MB | 3.3 ms |
+| off (values in the default allocator) | 0.98 | 19.1 MB | 3.6 ms |
+
+The fallback child pays the same copy-on-write as stock, as designed: the flip only restores stock behaviour for that child.
+Nothing about the hybrid save path is involved in this measurement.
