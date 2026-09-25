@@ -262,6 +262,12 @@ set page_size [exec getconf PAGESIZE]
 if {$system_name eq {linux} && $page_size == 4096} {
 
 start_server {overrides {save ""}} {
+    # Hybrid BGSAVE (bgsave-hybrid yes): small values are not mapped in the
+    # child, so writes during the save create no copy-on-write and this test's
+    # premise does not hold; progress reporting is covered by unit/snapshot.
+    if {[lindex [r config get bgsave-hybrid] 1] eq "yes"} {
+        test {Test child sending info (skipped: bgsave-hybrid yes, no CoW by design)} { } {}
+    } else {
     test {Test child sending info} {
         # make sure that rdb_last_cow_size and current_cow_size are zero (the test using new server),
         # so that the comparisons during the test will be valid
@@ -373,6 +379,7 @@ start_server {overrides {save ""}} {
             assert_morethan_equal $final_cow $cow_size
         }
     }
+    } ;# bgsave-hybrid
 }
 } ;# system_name
 

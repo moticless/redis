@@ -1469,7 +1469,21 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     return l && dictGetKV(*l) == kv;
 }
 
-int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) { return snapKvobjIsOwed(db, kv); }
+/* Debug-build check at the write funnels. A SNAP_FORK value whose top-level
+ * pointer never moves (stream, hashtable, skiplist, quicklist, module type)
+ * may be mutated in place even while owed: the child serializes its own
+ * copy-on-write image from the fork instant, and the header copy taken later
+ * still points at the same object (only its LRU field may be a little stale).
+ * XACK/XACKDEL reach such values through a read lookup (write-path audit,
+ * streams row), which is why this exemption exists. Single-allocation values
+ * (raw strings, listpacks, intsets) may move on write and stay checked. */
+int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
+    if (kv->type == OBJ_STREAM || kv->type == OBJ_MODULE ||
+        kv->encoding == OBJ_ENCODING_HT || kv->encoding == OBJ_ENCODING_SKIPLIST ||
+        kv->encoding == OBJ_ENCODING_QUICKLIST)
+        return 0;
+    return snapKvobjIsOwed(db, kv);
+}
 
 void snapSaveSetKeySaveDelay(int usec) {
     if (snap_save) atomicSet(snap_save->key_save_delay, usec);

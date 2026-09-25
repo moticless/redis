@@ -6841,11 +6841,17 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
         long long snap_keys_nofork = 0, snap_keys_fork = 0, snap_bytes_sent = 0;
         snapSaveProgress(&snap_slots_total, &snap_slots_done, &snap_keys_nofork, &snap_keys_fork, &snap_bytes_sent);
         if (sections++) info = sdscat(info,"\r\n");
+        /* Hybrid BGSAVE: the child only sees SNAP_FORK keys; progress is what
+         * the scan thread and the main thread have dispatched so far. */
+        size_t save_keys_processed = server.stat_current_save_keys_processed;
+        if (snapSaveInProgress())
+            save_keys_processed = (size_t)(snap_keys_nofork + snap_keys_fork + snapSaveMainKeys());
         double fork_perc = 0;
         if (server.stat_module_progress) {
             fork_perc = server.stat_module_progress * 100;
         } else if (server.stat_current_save_keys_total) {
-            fork_perc = ((double)server.stat_current_save_keys_processed / server.stat_current_save_keys_total) * 100;
+            fork_perc = ((double)save_keys_processed / server.stat_current_save_keys_total) * 100;
+            if (fork_perc > 100) fork_perc = 100;
         }
         int aof_bio_fsync_status;
         atomicGet(server.aof_bio_fsync_status,aof_bio_fsync_status);
@@ -6858,7 +6864,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "current_cow_size_age:%lu\r\n", (server.stat_current_cow_updated ?
                                              (unsigned long) elapsedMs(server.stat_current_cow_updated) / 1000 : 0),
             "current_fork_perc:%.2f\r\n", fork_perc,
-            "current_save_keys_processed:%zu\r\n", server.stat_current_save_keys_processed,
+            "current_save_keys_processed:%zu\r\n", save_keys_processed,
             "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
             "rdb_changes_since_last_save:%lld\r\n", server.dirty,
             "rdb_bgsave_in_progress:%d\r\n", server.child_type == CHILD_TYPE_RDB,

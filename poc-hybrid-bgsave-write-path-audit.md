@@ -407,3 +407,18 @@ Blockers still open: eviction during a save only tombstones (no memory reclaimed
 | Arena-free mode | single-allocation values are always copied on clone (the scan thread classifies by reading the allocation) |
 | Write lookup on a frozen slot, key already scanned (kvBits.save_gen == current) | `kvstoreDictFindLink` returns the frozen entry: in-place write, no clone (`snapOverlayKeyScanned`) |
 | Delete of an already-scanned frozen key | tombstone via a header-only clone that owns the value (`snapOverlayCloneKey` with the scanned check) |
+
+
+## Addendum 2026-09-25: read-lookup mutations of SNAP_FORK containers
+
+XACK and XACKDEL reach the stream through `lookupKeyRead` and mutate the PEL in place; the
+funnel (overlay `prepare`) is not involved. This is safe for SNAP_FORK values whose top-level
+pointer never moves (stream, hashtable, skiplist, quicklist, module type): the child serializes
+its own copy-on-write image from the fork instant, and the header copy taken later still points
+at the same object. The debug check `snapKvobjIsFrozenOriginal` exempts these encodings for that
+reason (found by the full suite with `bgsave-hybrid yes`: `keyModified` asserted under XACKDEL
+during a full sync). Single-allocation SNAP_FORK values (raw strings, listpacks, intsets above
+the cap) may move on write and must keep going through a write lookup; the audit rows above
+hold for them. `keyModified` -> `updateLRM` still writes the header's LRU field of such an owed
+stream while the scan thread may be copying the header: LRU only, benign (a slightly stale idle
+time in the RDB), TSan will report it if a test exercises it.

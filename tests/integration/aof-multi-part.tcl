@@ -1062,7 +1062,12 @@ tags {"external:skip"} {
             assert_equal 0 [r exists k2]
 
             set total_forks [s total_forks]
-            assert_equal [s rdb_bgsave_in_progress] 1
+            # Hybrid BGSAVE (bgsave-hybrid yes) aborts the running save when the
+            # keyspace is emptied (DEBUG LOADAOF here): its scan thread reads the
+            # frozen dicts that emptyData frees. Stock keeps the child alive.
+            if {[lindex [r config get bgsave-hybrid] 1] ne "yes"} {
+                assert_equal [s rdb_bgsave_in_progress] 1
+            }
             r config set rdb-key-save-delay 0
             catch {exec kill -9 [get_child_pid 0]}
             wait_for_condition 1000 10 {
