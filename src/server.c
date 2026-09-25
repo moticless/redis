@@ -1791,6 +1791,11 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * clear the AOF error in case of success to make the DB writable again,
      * however to try every second is enough in case of 'hz' is set to
      * a higher frequency. */
+    /* SNAP_NOFORK arena: return this thread's cached regions to the bins, so
+     * an idle keyspace or an active-defrag pass (tcache bypassed) does not
+     * leave slabs pinned by the explicit tcache (see zmalloc.c). */
+    run_with_period(1000) zmalloc_nofork_tcache_flush();
+
     run_with_period(1000) {
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
             server.aof_last_write_status == C_ERR) 

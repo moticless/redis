@@ -163,6 +163,7 @@ int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unava
 int zmalloc_nofork_arena_available(void);
 int zmalloc_nofork_arena_set_forkable(int forkable); /* MADV_DOFORK (1) / MADV_DONTFORK (0) on the range; 1 on success */
 int zmalloc_nofork_arena_forkable(void);             /* 1 while a fork child would map the arena */
+void zmalloc_nofork_tcache_flush(void);              /* return this thread's cached arena regions to the bins */
 unsigned zmalloc_nofork_arena_index(void);           /* UINT_MAX if unavailable */
 /* The arena entry points: with no arena they ARE the default allocators (one
  * predictable branch, inlined), so a server with bgsave-hybrid off pays nothing. */

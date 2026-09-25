@@ -519,6 +519,15 @@ Left over, in the order I would do it:
    refused while any child or hybrid save runs. `INFO snap_nofork_arena_forkable`
    shows the state. Atomic slot migration during a save is still untested (cluster
    is TASK-1.21.6).
+7. Active defrag and the arena (2026-09-25, found by the full suite with `bgsave-hybrid
+   yes`): the arena's explicit per-thread tcache only receives jemalloc GC events through
+   its own allocations. With an idle keyspace, or during an active-defrag pass (which
+   bypasses tcaches), its cached regions pinned their slabs indefinitely and defrag could
+   not bring `allocator_frag_ratio` down (12.5 MB of the 12.9 MB it could not remove were
+   arena slabs, 325 M key misses). Fix: `serverCron` flushes the arena tcache once a
+   second (`zmalloc_nofork_tcache_flush`), in addition to the flush `jemalloc_purge`
+   already did on FLUSHALL/lazyfree/MEMORY PURGE. All 21 defrag tests then pass with the
+   feature on.
 
 Found while comparing with the teammate's POC (2026-09-24), both fixed and
 covered by a harness test with `test_keymeta.so`: (a) placement ignored module
