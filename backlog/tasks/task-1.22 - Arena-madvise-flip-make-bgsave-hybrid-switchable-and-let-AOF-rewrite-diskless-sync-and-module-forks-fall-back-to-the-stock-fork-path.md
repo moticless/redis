@@ -6,7 +6,7 @@ title: >-
 status: Done
 assignee: []
 created_date: '2026-09-24 06:21'
-updated_date: '2026-09-25 11:00'
+updated_date: '2026-09-25 14:55'
 labels:
   - bgsave
   - persistence
@@ -55,6 +55,8 @@ Idea taken from the teammate's forkless-hybrid POC (spec 11.z.3, item 1). The SN
 2026-09-25 implemented in f6f680f87 (+ a13927129 for the AC5 measurement). zmalloc_nofork_arena_set_forkable() = one madvise(MADV_DOFORK/DONTFORK) over the reserved range; redisFork() calls snapArenaBeforeFork() for every non-hybrid child (RDB stock/diskless, AOF, MODULE, LDB), checkChildrenDone/ldb reap call snapArenaChildExited(); the hybrid save marks its own fork and refuses to start while the arena is forkable. Refusals removed from rewriteAppendOnlyFileBackground, rdbSaveToSlavesSockets, RM_Fork. bgsave-hybrid MODIFIABLE (snapHybridConfigApply: refused while a child/hybrid save/LDB child runs; arena created at startup whenever supported, left forkable when off; snapPlaceValue follows the flag). INFO memory snap_nofork_arena_forkable. Tests: unit 165/165 (flip test with the fork-fault probe), tcl unit/snapshot 41/41 incl. 9 new tests (BGREWRITEAOF + DEBUG LOADAOF digest, diskless sync digest, module fork exit code, mutual exclusion both ways, CONFIG SET refused mid-save, runtime off/on with reloads, forkable from startup when off). AC5: aof-cow.sh, BGREWRITEAOF under 20k writes/s on 196 MB: CoW 18.3 MB with the flip vs 19.1 MB feature off (stock-like). Spec section 4 fallback paragraph and 11.z.1 item 6 updated. Full stock suite with --config bgsave-hybrid yes (no exclusions) running now; result to follow.
 
 2026-09-25 follow-ups found by running the full stock suite with bgsave-hybrid yes end to end (all fixed, commits cda316cc1, 2b3e61d64, 57adbd12f, 4031dbf4b): flip-back moved into resetChildState() (killed children); refusal-while-forkable removed; snapKvobjIsFrozenOriginal exempts stable-pointer SNAP_FORK containers (XACK/XACKDEL via read lookup); INFO current_save_keys_processed covers the hybrid scan; arena tcache flushed once a second from serverCron (active defrag could not reclaim arena slabs); one runtime gate zmalloc_nofork_active for every arena allocation (feature-off layout is stock again); memefficiency defrag recipes that interleave keys with other structures run with the feature switched off; integration/rdb child-info test skipped and aof-multi-part in-progress assertion stock-only with the feature on. Final: feature-on suite 5781 ok / 0 failed until a cluster-harness convergence timeout under 8 clients (the three in-flight cluster units pass alone, 170 tests); feature-off suite 6267 ok; unit/snapshot 41/41; unit tests 165/165. RESULTS.md has the table.
+
+2026-09-25 late: on 41868cb93 (after the save_gen removal) the full stock suite passed end to end both ways: feature off 6283/6283, feature on (--config bgsave-hybrid yes, 8 clients) 6270/6270, no cluster-harness timeout this time. The acceptance note 'full ./runtest --config bgsave-hybrid yes passes unmodified' is met (two stock tests carry feature-aware guards, documented in RESULTS.md).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
