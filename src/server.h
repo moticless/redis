@@ -2587,8 +2587,7 @@ struct redisServer {
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
     int bgsave_hybrid;              /* Hybrid BGSAVE: SNAP_NOFORK arena + background scan (snapshot.c). Runtime switch. */
-    int snap_gen;                   /* Hybrid BGSAVE: generation of the current/last save (3 bits, kvBits.save_gen). */
-    int snap_gen_since_success;     /* Hybrid saves started since the last one that completed (marks valid while < 7). */
+    long long stat_snap_saves;      /* Hybrid saves started (INFO snap_saves). */
     long long stat_snap_inplace_writes;  /* Writes to already-scanned keys served in place (no clone). */
     size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
     size_t bgsave_hybrid_max_retained_bytes; /* Hybrid save aborts when the overlay retains more than this (0 = no limit). */

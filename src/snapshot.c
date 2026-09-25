@@ -400,15 +400,8 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
     char *alloc = kvobjGetAllocPtr(orig);
     size_t size = zmalloc_size(alloc);
     char *nalloc = snapNoforkAlloc(size);
-    /* The kvBits byte may be receiving the scan thread's generation mark right
-     * now (this original is being cloned because it is still owed, and the
-     * thread may be finishing it): copy that byte through the atomic and the
-     * rest around it. */
-    size_t bits_off = (char *)kvobjBits(orig) - alloc;
-    memcpy(nalloc, alloc, bits_off);
-    memcpy(nalloc + bits_off + 1, alloc + bits_off + 1, size - bits_off - 1);
+    memcpy(nalloc, alloc, size);
     kvobj *kv = (kvobj *)(nalloc + ((char *)orig - alloc));
-    kvobjBitsSet(kv, kvobjBitsGet(orig));
     if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
         kv->ptr = (char *)kv->ptr + (nalloc - alloc);
     kv->refcount = 1;
@@ -707,7 +700,6 @@ struct snapScanCtx {
 static __thread int snap_on_scan_thread = 0;
 static __thread int snap_scan_maxmemory_policy = 0;
 static __thread int snap_scan_rdb_compression = 0;
-static __thread int snap_scan_gen = 0;
 int snapOnScanThread(void) { return snap_on_scan_thread; }
 int snapScanMaxmemoryPolicy(void) { return snap_scan_maxmemory_policy; }
 int snapScanRdbCompression(void) { return snap_scan_rdb_compression; }
@@ -1239,8 +1231,6 @@ typedef struct snapSave {
     size_t retained_peak;
     redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
     int maxmemory_policy, rdb_compression;   /* config frozen at start for the scan thread */
-    int gen;                   /* this save's generation (kvBits.save_gen) */
-    int marks_valid;           /* generation marks may be trusted (see snapshot.h) */
     long long inplace_writes;  /* writes served in place on scanned keys (main thread) */
     /* Scan-thread staging buffer (single thread in M1). */
     sds stage;
@@ -1272,19 +1262,15 @@ static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 static size_t snap_last_retained_peak = 0;
 static long long snap_last_inplace_writes = 0;
 
-int snapSaveMarksValid(void) { return snap_save && !snap_save->aborted && snap_save->marks_valid; }
 long long snapSaveInplaceWrites(void) { return snap_save ? snap_save->inplace_writes : 0; }
 long long snapSaveLastInplaceWrites(void) { return snap_last_inplace_writes; }
 
-/* Main thread: has the running save's scan thread finished reading 'kv'? */
-int snapKvobjScanned(const kvobj *kv) {
-    if (!snap_save || snap_save->aborted || !snap_save->marks_valid) return 0;
-    return kvobjBitsGetAcquire(kv).save_gen == (unsigned)snap_save->gen;
-}
 
 int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
 size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
+size_t snapSaveBitmapBytes(void) { return snap_save ? snapScanBitmapBytes(snap_save->scan) : 0; }
+
 size_t snapSaveQueuedBytes(void) {
     if (!snap_save) return 0;
     size_t n;
@@ -1638,7 +1624,6 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
                           !zmalloc_is_nofork(kv->ptr));
         snapSendMsg(sv, SNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
         atomicIncr(sv->keys_fork, 1);
-        snapKvobjMarkScanned(kv);   /* last touch of kv on this thread */
     } else {
         rio r;
         rioInitWithBuffer(&r, sv->stage);
@@ -1657,7 +1642,6 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         }
         sv->stage = r.io.buffer.ptr;
         atomicIncr(sv->keys_nofork, 1);
-        snapKvobjMarkScanned(kv);   /* last touch of kv on this thread */
         if (sdslen(sv->stage) >= SNAP_STAGE_BYTES) snapStageFlush(sv);
     }
 }
@@ -1667,18 +1651,8 @@ static void snapSaveThreadInit(void *priv) {
     snapSave *sv = priv;
     snap_scan_maxmemory_policy = sv->maxmemory_policy;
     snap_scan_rdb_compression = sv->rdb_compression;
-    snap_scan_gen = sv->gen;
 }
 
-/* Scan thread, the LAST thing done with a key: publish that this save has
- * read it. Single writer of the byte during a save (the main thread never
- * writes a frozen original it has not seen marked), so a plain read-modify-
- * release-store is enough. */
-void snapKvobjMarkScanned(kvobj *kv) {
-    kvBits b = kvobjBitsGet(kv);
-    b.save_gen = snap_scan_gen;
-    kvobjBitsSetRelease(kv, b);
-}
 
 /* Scan thread: after the last slot (or on abort). */
 static void snapSaveThreadDone(void *priv, int aborted) {
@@ -1937,15 +1911,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
     sv->maxmemory_policy = server.maxmemory_policy;
     sv->rdb_compression = server.rdb_compression;
-    /* Generation marks: bump before the freeze so no live key carries this
-     * save's value yet. Untrusted after too many saves without a completion. */
-    server.snap_gen = (server.snap_gen + 1) & KVBITS_GEN_MASK;
-    sv->gen = server.snap_gen;
-    sv->marks_valid = server.snap_gen_since_success < SNAP_GEN_MAX_SINCE_SUCCESS;
-    server.snap_gen_since_success++;
-    if (!sv->marks_valid)
-        serverLog(LL_NOTICE, "Hybrid BGSAVE: %d saves since the last completed one, scan marks not trusted for this save",
-                  server.snap_gen_since_success - 1);
+    server.stat_snap_saves++;
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     snapScanSetOverlay(sv->scan, &snap_server_hooks, sv->privs);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
@@ -2020,10 +1986,6 @@ void snapSaveChildDone(int exitcode, int bysignal) {
         server.lastbgsave_status = C_ERR;
         server.stat_rdb_consecutive_failures++;
     }
-    /* A save that scanned every slot stamped every key with its generation:
-     * the marks are consistent again whatever earlier aborts left behind. */
-    if (!bysignal && exitcode == 0 && !sv->aborted && !sv->failed && snapScanIsFinished(sv->scan))
-        server.snap_gen_since_success = 0;
     snap_last_retained_peak = sv->retained_peak;
     snap_last_inplace_writes = sv->inplace_writes;
     snap_save = NULL;
@@ -2898,8 +2860,7 @@ static void snapOverlayTests(int abort_variant) {
 int snapshotTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     {
-        kvBitsWord w; w.byte = 0; w.bits.save_gen = 7;
-        test_cond("kvBits: save_gen occupies bits 3-5 of the byte (atomic mask contract)", w.byte == 0x38);
+        union { uint8_t byte; kvBits bits; } w;
         w.byte = 0; w.bits.key_sds_type = 3; w.bits.no_evict = 1;
         test_cond("kvBits: key_sds_type and no_evict occupy bits 0-2", w.byte == 0x07);
     }

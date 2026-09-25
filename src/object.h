@@ -127,34 +127,13 @@ typedef struct __attribute__ ((__packed__)) kvBits {
      * Keys are never longer than 4GB, so SDS_TYPE_64 is not needed. */
     unsigned key_sds_type : 2;
     unsigned no_evict : 1;    /* Protected from maxmemory eviction. */
-    unsigned save_gen : 3;    /* Hybrid BGSAVE: generation of the save whose scan
-                               * thread serialized this key (snapshot.h). */
-    unsigned unused : 2;       /* Free bits. Available for future use. */
+    unsigned unused : 5;       /* Free bits. Available for future use. */
 } kvBits;
-#define KVBITS_GEN_MASK 7
 
 /* Returns the kvBits that follow the robj. Valid only if kv->iskvobj is set.
  * Note that a plain robj has no such byte allocated after it. */
 static inline kvBits *kvobjBits(const kvobj *kv) {
     return (kvBits *) (void *) (kv + 1);
-}
-
-/* The hybrid BGSAVE scan thread writes save_gen into this byte while the main
- * thread reads it, so the byte is always accessed as a whole through atomics.
- * The relaxed load compiles to a plain byte load. The release/acquire pair is
- * how the scan thread publishes "I am done reading this key". */
-typedef union { uint8_t byte; kvBits bits; } kvBitsWord;
-static inline kvBits kvobjBitsGet(const kvobj *kv) {
-    kvBitsWord w; w.byte = __atomic_load_n((const uint8_t *)(kv + 1), __ATOMIC_RELAXED); return w.bits;
-}
-static inline kvBits kvobjBitsGetAcquire(const kvobj *kv) {
-    kvBitsWord w; w.byte = __atomic_load_n((const uint8_t *)(kv + 1), __ATOMIC_ACQUIRE); return w.bits;
-}
-static inline void kvobjBitsSet(kvobj *kv, kvBits bits) {
-    kvBitsWord w; w.bits = bits; __atomic_store_n((uint8_t *)(kv + 1), w.byte, __ATOMIC_RELAXED);
-}
-static inline void kvobjBitsSetRelease(kvobj *kv, kvBits bits) {
-    kvBitsWord w; w.bits = bits; __atomic_store_n((uint8_t *)(kv + 1), w.byte, __ATOMIC_RELEASE);
 }
 
 kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits);

@@ -533,6 +533,12 @@ Left over, in the order I would do it:
    scripts, channels, argv or field-expiry structures in the same slabs: with the keyspace
    in its own arena that cannot fragment anything (a real property of the design), so those
    tests run with the feature switched off at runtime.
+8. Per-key generation removed (TASK-1.21.4, 2026-09-25): `kvBits` is back to the upstream
+   layout (2 bits sds type, no_evict, 5 unused) with plain field access; no byte-wide
+   atomics remain on the kvobj creation path, `snapKvobjScanned/MarkScanned`, `snap_gen`,
+   `snap_gen_since_success` and `snap_save_marks_valid` are gone. The per-save bucket
+   bitmap is the only "already in the snapshot" state (INFO `snap_save_bitmap_bytes`
+   while a save runs, 0 otherwise); `snap_saves` counts hybrid saves started.
 
 Found while comparing with the teammate's POC (2026-09-24), both fixed and
 covered by a harness test with `test_keymeta.so`: (a) placement ignored module

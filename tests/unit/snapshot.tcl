@@ -784,11 +784,10 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r flushall
             populate_fillers 3000
             set ref [debug_digest]
-            set gen0 [s snap_gen]
+            set saves0 [s snap_saves]
             r config set rdb-key-save-delay 2000
             r bgsave
             snap_wait_save_started
-            assert_equal 1 [s snap_save_marks_valid]
             wait_for_condition 100 50 {[s snap_save_keys_nofork] > 1500} else { fail "scan did not reach half" }
             for {set i 0} {$i < 3000} {incr i} { r set filler:$i [string repeat h 60] }
             # Under a loaded machine the writes may outlast the scan: the live
@@ -802,8 +801,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            assert_equal 0 [s snap_gen_since_success]
-            assert {[s snap_gen] != $gen0}
+            assert_equal [expr {$saves0 + 1}] [s snap_saves]
             assert {[s snap_last_save_inplace_writes] >= $inplace}
             assert_equal [string repeat h 60] [r get filler:0]
             r debug reload nosave
@@ -977,6 +975,43 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {$hy_dexp * 2 < $st_dexp}
         }
 
+        test {Hybrid BGSAVE harness: the bucket bitmaps exist only while a save runs} {
+            snap_populate_race 0 0
+            assert_equal 0 [s snap_save_bitmap_bytes]
+            r config set rdb-key-save-delay 1000
+            r bgsave
+            snap_wait_save_started
+            assert {[s snap_save_bitmap_bytes] > 0}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal 0 [s snap_save_bitmap_bytes]
+        }
+
+        test {Hybrid BGSAVE harness: ten saves aborted by a killed child, then one that completes, reload equal} {
+            snap_populate_race 0 1
+            for {set k 0} {$k < 10} {incr k} {
+                r config set rdb-key-save-delay 400
+                r bgsave
+                snap_wait_save_started
+                exec kill -9 [get_child_pid 0]
+                for {set n 0} {$n < 50} {incr n} { snap_random_op 0 1 }
+                snap_wait_bgsave_done
+                assert_equal err [s rdb_last_bgsave_status]
+                assert_equal 0 [s snap_save_bitmap_bytes]
+            }
+            r config set rdb-key-save-delay 0
+            after 600
+            wait_for_condition 50 100 {[r dbsize] == [llength [r keys *]]} else { fail "expired keys linger" }
+            set ref [debug_digest]
+            set refkeys [snap_key_digests]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            if {[debug_digest] ne $ref} { snap_fail_with_diff $refkeys [snap_key_digests] "save after ten aborted saves differs from the live keyspace" }
+            snap_assert_placement_clean
+        }
+
         test {Hybrid BGSAVE harness: SHUTDOWN NOSAVE during a save exits cleanly} {
             start_server {overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
                 set pid [srv 0 pid]
@@ -1111,16 +1146,16 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r bgrewriteaof
         wait_for_condition 100 20 {[s aof_rewrite_in_progress] == 1} else { fail "rewrite did not start" }
         if {[snap_arena_available]} { assert_equal 1 [s snap_nofork_arena_forkable] }
-        set gen [s snap_gen]
+        set saves [s snap_saves]
         assert_match {*scheduled*} [r bgsave schedule]
         assert_equal 0 [s snap_save_in_progress]
         if {[snap_arena_available]} { assert_equal 1 [s snap_nofork_arena_forkable] }
         r config set rdb-key-save-delay 0
         waitForBgrewriteaof r
         wait_for_condition 200 50 {
-            [s snap_gen] != $gen && [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
+            [s snap_saves] == $saves + 1 && [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
         } else { fail "scheduled save did not run" }
-        assert_equal ok [s rdb_last_bgsave_status]   ;# snap_gen moved: the scheduled save took the hybrid path
+        assert_equal ok [s rdb_last_bgsave_status]   ;# snap_saves moved: the scheduled save took the hybrid path
         snap_wait_forkable 0
     }
 
@@ -1139,11 +1174,11 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         set digest [debug_digest]
         r config set bgsave-hybrid no
         snap_wait_forkable 1
-        set gen [s snap_gen]
+        set saves [s snap_saves]
         r bgsave
         waitForBgsave r
         assert_equal ok [s rdb_last_bgsave_status]
-        assert_equal $gen [s snap_gen]              ;# stock path, no hybrid generation
+        assert_equal $saves [s snap_saves]          ;# stock path, not a hybrid save
         assert_equal 0 [s snap_save_in_progress]
         r debug reload
         assert_equal $digest [debug_digest]
@@ -1158,7 +1193,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r bgsave
         snap_wait_bgsave_done
         assert_equal ok [s rdb_last_bgsave_status]
-        assert {[s snap_gen] != $gen}
+        assert_equal [expr {$saves + 1}] [s snap_saves]
         r debug reload                              ;# re-creates every key: placement is clean again
         assert_equal $digest2 [debug_digest]
         snap_assert_placement_clean

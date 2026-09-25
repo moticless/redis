@@ -688,11 +688,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         val->lru = old->lru;
         
         kvNew = kvobjSet(key->ptr, val, newKeyMetaBits);
-        {
-            kvBits b = kvobjBitsGet(kvNew);
-            b.no_evict = kvobjBitsGet(old).no_evict;
-            kvobjBitsSet(kvNew, b);
-        }
+        kvobjBits(kvNew)->no_evict = kvobjBits(old)->no_evict;
         kvstoreDictSetAtLink(db->keys, slot, kvNew, &link, 0);
 
         /* if expiry replace the old value at its location in the expire space. */

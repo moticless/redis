@@ -321,17 +321,6 @@ int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
  * the rdb-key-save-delay there: it is meant to slow the scan thread). */
 int snapMainEmitting(void);
 
-/* Scan generation (kvBits.save_gen, 3 bits). Every hybrid save bumps
- * server.snap_gen; the scan thread stamps each key it finished reading with
- * it (release store), so the main thread can tell an already-scanned frozen
- * original (acquire load, gen == current) from one still owed. Marks are only
- * trusted while fewer than 7 saves ran without one completing: a completed
- * save stamps every key, an aborted one leaves a mix, and after 7 aborts the
- * 8th generation would alias a stale mark. */
-#define SNAP_GEN_MAX_SINCE_SUCCESS 7
-int snapKvobjScanned(const kvobj *kv);           /* main thread */
-void snapKvobjMarkScanned(kvobj *kv);            /* scan thread */
-int snapSaveMarksValid(void);
 long long snapSaveInplaceWrites(void);
 long long snapSaveLastInplaceWrites(void);
 #define snapDebugAssertNotFrozenOriginal(db, kv) \
@@ -353,6 +342,7 @@ size_t snapSaveLastRetainedPeak(void);
 /* Main-thread emission (spec 11.z): bytes queued for the scan thread to
  * forward to the child, buckets and keys the main thread emitted itself. */
 size_t snapSaveQueuedBytes(void);
+size_t snapSaveBitmapBytes(void);   /* bucket bitmaps of the running save, 0 when none runs */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);
 
