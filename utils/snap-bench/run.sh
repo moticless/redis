@@ -7,6 +7,8 @@
 cd "$(dirname "$0")"
 CSV=${1:-res.csv}; RATES=${2:-0,20000}; DATASETS=${3:-small,mixed,big}; SCALE=${4:-1.0}; REPS=${5:-1}
 PORT=7600; D=${BENCH_DIR:-/dev/shm/snap-bench-runs}; mkdir -p "$D"   # tmpfs: save time must not measure disk writeback
+SERVER_CPUS=${SERVER_CPUS:-0-7}   # server, its threads and its fork child (affinity is inherited); e.g. SERVER_CPUS=0 for one core
+LOAD_CPUS=${LOAD_CPUS:-8-15}      # memtier, bench.py and its probes
 BASE=${BASE:-/tmp/redis-base/src/redis-server}        # stock 0c1c74706 (M1 baseline)
 UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d (current base)
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
@@ -16,7 +18,7 @@ CLI=/home/moti/git/redis-bgsave/src/redis-cli
 
 start() {  # start <name> <binary> [flags...]
   local name=$1 bin=$2; shift 2
-  taskset -c 0-7 "$bin" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --activedefrag no --disable-thp yes \
+  taskset -c "$SERVER_CPUS" "$bin" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --activedefrag no --disable-thp yes \
     --io-threads 1 --latency-monitor-threshold 5 --jemalloc-bg-thread yes --daemonize yes --enable-debug-command yes \
     --dir "$D" --dbfilename "$name.rdb" --logfile "$D/$name.log" "$@" || return 1
   for i in $(seq 1 50); do $CLI -p $PORT ping 2>/dev/null | grep -q PONG && return 0; sleep 0.2; done
@@ -36,7 +38,7 @@ for cfg in ${CFGS:-base hybrid}; do
     yinon-forkless)  start yinon-forkless "$YINON" --bgsave-mode forkless --forkless-string-max 4096 ;;
   esac || { echo "$cfg: server start failed (see $D/$cfg.log)"; continue; }
   echo "=== $(date +%T) $cfg $($CLI -p $PORT info server | grep -E '^redis_git_sha1|^redis_version|^valkey_version' | tr -d '\r' | tr '\n' ' ')"
-  taskset -c 8-15 python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS"
+  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS"
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 2
 done
 echo "=== $(date +%T) DONE -> $CSV"
