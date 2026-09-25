@@ -515,8 +515,10 @@ Left over, in the order I would do it:
    non-hybrid child (one madvise; `snapArenaBeforeFork`), the reaper flips it back
    once no child is left (`snapArenaChildExited`); the fallback child pays stock
    copy-on-write on the arena. `bgsave-hybrid` is a runtime config on the same
-   mechanism (off = arena forkable, stock save path, no new placement in the arena),
-   refused while any child or hybrid save runs. `INFO snap_nofork_arena_forkable`
+   mechanism (off = arena forkable, stock save path, and `zmalloc_nofork_active` = 0 so
+   every arena entry point is a plain `zmalloc`: headers, dict tables and values allocated
+   while off have the stock layout; blocks already in the arena stay there and are freed
+   by address), refused while any child or hybrid save runs. `INFO snap_nofork_arena_forkable`
    shows the state. Atomic slot migration during a save is still untested (cluster
    is TASK-1.21.6).
 7. Active defrag and the arena (2026-09-25, found by the full suite with `bgsave-hybrid
@@ -527,7 +529,10 @@ Left over, in the order I would do it:
    arena slabs, 325 M key misses). Fix: `serverCron` flushes the arena tcache once a
    second (`zmalloc_nofork_tcache_flush`), in addition to the flush `jemalloc_purge`
    already did on FLUSHALL/lazyfree/MEMORY PURGE. All 21 defrag tests then pass with the
-   feature on.
+   feature on. Eleven of them manufacture fragmentation by interleaving keys with
+   scripts, channels, argv or field-expiry structures in the same slabs: with the keyspace
+   in its own arena that cannot fragment anything (a real property of the design), so those
+   tests run with the feature switched off at runtime.
 
 Found while comparing with the teammate's POC (2026-09-24), both fixed and
 covered by a harness test with `test_keymeta.so`: (a) placement ignored module
