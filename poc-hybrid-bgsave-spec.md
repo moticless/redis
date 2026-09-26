@@ -688,8 +688,12 @@ contract is narrower, but the child side is stricter than stock.
   the channel (`snapSaveChildWrite` -> `rdbSaveKeyValuePair`), exactly as the
   stock child does. `aux_save`/`aux_save2` run in the child from
   `rdbSaveRioHeader`. Persistence events fire as in stock: `RDB_START` in the
-  child (`startSaving`), `ENDED`/`FAILED` in the parent; `FORK_CHILD` events from
-  `redisFork`.
+  child (`startSaving`) and so are `ENDED`/`FAILED` (`stopSaving` runs in the
+  child too); `FORK_CHILD_BORN`/`DIED` fire in the parent only (`redisFork`,
+  `receiveChildInfo`). Module timers, keyspace notifications and module threads
+  do not exist in the child: fork copies only the calling thread and the child
+  never runs the event loop. `pthread_atfork` child handlers of linked libraries
+  do run there (libuv, Rust `rand`: they reset locks and counters, no keyspace).
 - Module allocations (`RM_Alloc` and friends, `RedisModuleString`s, module dicts)
   are default-arena `zmalloc`: forkable, mapped in the child. Only kvobj headers,
   the keyspace and expires dict tables and entries, and small values live in the
@@ -705,8 +709,8 @@ contract is narrower, but the child side is stricter than stock.
 **Contract for a module to be compatible with `bgsave-hybrid yes`.**
 
 1. Save-side callbacks (`rdb_save`, `aux_save`, `aux_save2`, key-metadata save,
-   and any server-event handler that may run in a child: `PERSISTENCE`
-   `RDB_START`, `FORK_CHILD_BORN`) must not touch the keyspace: no `RM_OpenKey`,
+   and a `PERSISTENCE` event handler, which runs in the child for
+   `RDB_START`/`ENDED`/`FAILED`) must not touch the keyspace: no `RM_OpenKey`,
    `RM_KeyExists`, `RM_Scan`, `RM_ScanKey`, `RM_Call`, `RM_DbSize`,
    `RM_RandomKey`, `RM_GetExpire`, `RM_ListPush`... on any key. Allowed: the
    value passed to the callback, module-owned memory, and the IO context
@@ -760,3 +764,39 @@ SIGSEGV. The test modules that register types or aux callbacks set the bit, and
 one test module violates item 1 on purpose to check both the fallback (bit not
 set) and the guard (bit set). With the bit missing, `tests/modules` under
 `--config bgsave-hybrid yes` would otherwise silently run the stock path.
+
+**Audit of RedisJSON and RediSearch against the contract (2026-09-26, trees
+~/git/RedisJSON e1c8194 and ~/git/RediSearch c14cf7ffb).** Both satisfy items 1
+to 3 as they are; only the opt-in bit would be missing. RedisJSON: one save-side
+callback, `rdb_save` (redis_json/src/redisjson.rs), encodes the value it is
+given; no aux save, no persistence or fork-child event handlers; writes go
+through WRITE handles (`set_value`); no `SetLRU/SetLFU/StringDMA/ResetDataset`.
+RediSearch: `Indexes_RdbSave/Indexes_RdbSave2` (aux, BEFORE_RDB) walk the
+module-owned spec dictionary and serialize fields, schema rule, stopwords,
+synonyms, aliases and the disk spec; `SpellCheckDictAuxSave(2)` and
+`TrieType_RdbSave` serialize module-owned tries; `GenericType_DummyRdbSave`
+aborts by design. `RedisModule_GetContextFlags` on the IO context is the only
+server call. Every `RedisModule_OpenKey/Call/Scan` in the tree is in indexing,
+query, notification and suggestion code (spec.c: `IndexSpec_TimedOutProc`,
+`Indexes_ScanAndReindexTask`; module.c, document_*.c, suggest.c, redis_index.c,
+rlookup.c, notifications.c), none reachable from a save callback. The fork GC
+(`fork_gc.c`, `RedisModule_Fork`) reads inverted indexes in its own child; with
+the arena flip it behaves as under stock. Method: grep of the keyspace APIs per
+file intersected with the save-path call tree; the leaf serializers
+(field_spec, rules, stopwords, synonym_map, hiddenstring, search disk) contain
+no keyspace calls.
+
+Neither RedisJSON nor RediSearch subscribes to `PERSISTENCE`; RediSearch's
+subscriptions (ModuleChange, FlushDB, Loading, Shutdown, Sharding, Config,
+ClusterSlotMigration, ReplBackup, ReplicationRoleChanged) and its timers (GC
+scheduling, index timeout `IndexSpec_TimedOutProc` which does open keys,
+topology refresh, trimming) fire only from the parent's event loop. Its fork GC
+child calls only `ThreadSafeContextLock/Unlock`, `ExitFromChild` and
+`KillForkChild` besides reading inverted indexes.
+
+Side finding, not module related: a crash inside the hybrid child runs
+`logServerInfo` -> `genRedisInfoString`, whose Keyspace section reads
+`kvstoreSize(server.db[j].keys)` from the unmapped arena and faults again; the
+re-entry guard in `sigsegvHandler` then prints the reduced report, so a child
+crash log is truncated but produced. Skipping the keyspace section when
+`server.in_fork_child` is a hybrid child would keep the full report.
