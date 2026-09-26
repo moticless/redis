@@ -44,8 +44,9 @@ DATASETS = {
         ("st:",   200_000, "set",    {"size": 8},                     "grow",      8),
         ("bh:",    16_000, "hash",   {"fields": 64, "size": 96},      "overwrite", 96),
     ],
-    "big": [
-        ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "overwrite", 64),
+    "big": [   # run 12+: one class of 1M-field hashes (about 100 MB each) beside the 10 MB ones; runs 4-11 had 22 x 100k-field hashes only
+        ("hh:",         1, "hash",   {"fields": 1_000_000, "size": 64}, "overwrite", 64),
+        ("bh:",        12, "hash",   {"fields": 100_000, "size": 64}, "overwrite", 64),
         ("bz:",         2, "zset",   {"members": 300_000},            "overwrite", 8),
     ],
     # same data, but the traffic inserts new fields/members (random names) into the big items

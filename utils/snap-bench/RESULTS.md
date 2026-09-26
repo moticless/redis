@@ -857,3 +857,92 @@ writes hit a random existing field of the hashes, same-size overwrites elsewhere
   design keeps the command path at stock and pays copy-on-write only for values above the small-value cap; where that cap sits
   (4 KB today) is the lever that trades between the two, since 9 KB hashes serialized on the scan thread would take the 29-105 MB
   away at the cost of more scan-thread work.
+
+
+## Run 12 (2026-09-26): 4 GB datasets, our hybrid vs upstream vs Valkey forkless, c7i.4xlarge
+
+Raw: `run12.csv`, driver `run4g.sh` (per-dataset scale, tmpfs remounted to 24 GB, a watcher deleting the dump files of
+configurations not running so three 3 GB dumps plus two caches fit). Host: a fresh c7i.4xlarge (i-00fe113633e1d929e, 30 GB),
+server on vCPUs 0-3,8-11, load on 4-7,12-15, dumps and dataset cache on tmpfs. Binaries built on the instance: `up` = upstream
+0d6266f2d, `hybrid` = 54b7d4f0c (`--bgsave-hybrid yes`, cap 4 KB), `valkey-forkless` = Valkey unstable 06d35aca6
+(`--forkless-infrastructure-enabled yes --bgsave-default-method forkless`). Interleaved per cell, 2 reps, every save `ok`, no
+hard-mark aborts. Scales: small 13.5 (18.9 M keys, 4.1 GB), mixed 16 (19.5 M keys, 4.0 GB), big 16 (240 keys, 3.9 GB).
+**The big dataset changed for this run**: it now has a class of 1M-field hashes (16 x about 100 MB) beside 192 x 100k-field
+hashes (10 MB) and 32 zsets of 300k; runs 4-11 had 22 x 100k-field hashes only. Columns: `peak` = parent RssAnon + child
+Private_Dirty (the memory the machine must have), `extra` = peak minus the parent's RSS before the save, `wavg/wp99/wmax` =
+load-generator latency per pipelined batch, `ops` = achieved writes/s against the offered rate. Medians of 2 reps; ranges where
+the reps differ materially.
+
+### Small (4.1 GB, 18.9 M keys: 100-byte strings and 10-field listpack hashes)
+
+| rate | hot | config | save s | fork ms | peak MB | extra MB | main cpu s | threads cpu s | ping max ms | ops | wavg ms | wp99 ms | wmax ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 33.8 | 34.4 | 4109 | 2 | 0.46 | 0 | 31.3 | - | - | - | - |
+| 0 | - | hybrid | 31.3 | 1.6 | 4030 | 2 | 0.41 | 31.0 | 1.8 | - | - | - | - |
+| 0 | - | valkey-forkless | 36.1 | 0 | 3911 | 0.5 | 10.7 | 35.2 | 1.7 | - | - | - | - |
+| 20k | 1.0 | up | 35.1 | 33.6 | 6408 | 2380 | 7.7 | 0 | 30.0 | 19994 | 0.218 | 0.60 | 34.5 |
+| 20k | 1.0 | hybrid | 31.5 | 1.6 | 4036 | 8 | 6.9 | 31.2 | 1.0 | 19999 | 0.220 | 0.63 | 2.5 |
+| 20k | 1.0 | valkey-forkless | 46.0 | 0 | 3904 | 9 | 17.2 | 41.3 | 1.7 | 19980 | 0.302 | 3.41 | 7.0 |
+| 50k | 1.0 | up | 35.6 | 38.0 | 7334 | 3306 | 13.9 | 0 | 36.1 | 49982 | 0.109 | 0.45 | 39.5 |
+| 50k | 1.0 | hybrid | 29.3 | 1.6 | 4036 | 7.5 | 11.8 | 29.1 | 1.4 | 49998 | 0.134 | 0.49 | 3.1 |
+| 50k | 1.0 | valkey-forkless | 41.9 | 0 | 3916 | 20.5 | 25.6 | 40.9 | 2.7 | 49999 | 0.202 | 1.25 | 4.5 |
+| 50k | 0.2 | up | 35.3 | 40.2 | 6910 | 2882 | 14.5 | 0 | 38.4 | 49980 | 0.095 | 0.33 | 41.3 |
+| 50k | 0.2 | hybrid | 29.7 | 1.6 | 4036 | 8 | 12.8 | 29.5 | 1.2 | 49999 | 0.118 | 0.31 | 3.6 |
+| 50k | 0.2 | valkey-forkless | 41.0 | 0 | 3906 | 11.5 | 23.5 | 39.7 | 2.6 | 49999 | 0.183 | 1.12 | 4.9 |
+
+### Mixed (4.0 GB, 19.5 M keys: 45% of bytes in small values, 55% in 256k hashtable hashes of about 9 KB)
+
+| rate | hot | config | save s | fork ms | peak MB | extra MB | main cpu s | threads cpu s | ping max ms | ops | wavg ms | wp99 ms | wmax ms |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 36.9 | 36.7 | 3979 | 2.5 | 0.52 | 0 | 35.8 | - | - | - | - |
+| 0 | - | hybrid | 18.7 | 16.6 | 3909 | 2 | 0.27 | 18.5 | 17.0 | - | - | - | - |
+| 0 | - | valkey-forkless | 40.3 | 0 | 3900 | 1 | 11.0 | 37.7 | 1.6 | - | - | - | - |
+| 20k | 1.0 | up | 36.0 | 38.4 | 6223 | 2324 | 8.4 | 0 | 37.5 | 19995 | 0.205 | 0.63 | 39.1 |
+| 20k | 1.0 | hybrid | 23.3 | 18.7 | 4772 | 852 | 5.8 | 19.1 | 16.6 | 20000 | 0.194 | 0.65 | 20.1 |
+| 20k | 1.0 | valkey-forkless | 44.1 | 0 | 3828 | 7 | 15.8 | 39.2 | 1.7 | 18970 (missed) | 0.346 | 7.1 | 13.7 |
+| 50k | 1.0 | up | 37.4 | 41.9 | 7058 | 3148 | 14.8 | 0 | 38.8 | 49981 | 0.088 | 0.50 | 43.6 |
+| 50k | 1.0 | hybrid | 31.3 | 17.9 | 5492 | 1576 | 14.3 | 18.7 | 15.5 | 49995 | 0.085 | 0.40 | 20.9 |
+| 50k | 1.0 | valkey-forkless | 44.4 | 0 | 3861 | 15.5 | 23.6 | 40.4 | 1.9 | 46490 (missed) | 0.322 | 12.6 | 17.6 |
+| 50k | 0.2 | up | 36.0 | 42.8 | 5899 | 1988 | 14.8 | 0 | 40.6 | 49982 | 0.079 | 0.32 | 44.5 |
+| 50k | 0.2 | hybrid | 21.8 | 18.7 | 4416 | 506 | 9.6 | 18.8 | 16.9 | 49996 | 0.082 | 0.33 | 20.8 |
+| 50k | 0.2 | valkey-forkless | 45.3 | 0 | 3827 | 14 | 26.3 | 42.1 | 1.25 | 49203 | 0.166 | 0.91 | 16.9 |
+
+### Big (3.9 GB, 240 keys: 16 hashes of 1M fields (about 100 MB), 192 hashes of 100k fields (10 MB), 32 zsets of 300k)
+
+| rate | hot | config | save s | fork ms | peak MB | extra MB | main cpu s | threads cpu s | ping max ms | ops | wavg ms | wp99 ms | wmax ms | stall s | blocked clients |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 30.2 | 24-39 | 3890 | 1 | 0.43 | 0 | 1.1-35.6 | - | - | - | - | - | 0 |
+| 0 | - | hybrid | 31.2 | 24-33 | 3800 | 1.5 | 0.45 | 0 | 24-29 | - | - | - | - | - | 0 |
+| 0 | - | valkey-forkless | 31.8 | 0 | 3639 | 1 | 0.68 | 31.7 | 1.2 | - | - | - | - | - | 0 |
+| 20k | 1.0 | up | 32.5 | 31-35 | 5628 | 1830 | 7.5 | 0 | 28.9 | 19995 | 0.224 | 0.70 | 33.7 | 0 | 0 |
+| 20k | 1.0 | hybrid | 31.3 | 26-28 | 5586 | 1787 | 7.2 | 0 | 25.8 | 19997 | 0.223 | 0.71 | 28.4 | 0 | 0 |
+| 20k | 1.0 | valkey-forkless | 32.9 | 0 | 3606 | 1 | 1.1 | 32.8 | 1.4 | 9689 (48%) | 0.94 | 0.65 | 25672-29442 | 9-10 | 7 |
+| 50k | 1.0 | up | 33.2 | 26-34 | 6546 | 2748 | 11.9 | 0 | 29.7 | 49986 | 0.133 | 0.56 | 31.1 | 0 | 0 |
+| 50k | 1.0 | hybrid | 33.7 | 26-28 | 6557 | 2759 | 12.0 | 0 | 26.7 | 49989 | 0.150 | 0.61 | 28.8 | 0 | 0 |
+| 50k | 1.0 | valkey-forkless | 33.4 | 0 | 3606 | 1 | 1.3 | 33.4 | 0.9 | 24723 (49%) | 0.81 | 0.68 | 30136-32759 | 10-11 | 14 |
+| 50k | 0.2 | up | 32.0 | 33-34 | 4398 | 599 | 9.5 | 0 | 30.4 | 49984 | 0.142 | 0.65 | 34.8 | 0 | 0 |
+| 50k | 0.2 | hybrid | 32.5 | 25-26 | 4398 | 599 | 9.8 | 0 | 22.3 | 49990 | 0.143 | 0.63 | 27.0 | 0 | 0 |
+| 50k | 0.2 | valkey-forkless | 33.8 | 0 | 3607 | 2 | 5.9 | 33.8 | 1.2 | 35355 (71%) | 0.31 | 0.47 | 19708-20518 | 6-8 | 14 |
+
+### Reading the run
+
+- **The 300 MB conclusions hold at 4 GB and the absolute numbers are now operator-sized.** Small: upstream needs 7.3 GB of
+  memory to save a 4 GB dataset at 50k writes/s (3.3 GB of copy-on-write, over 80% of the data), a 34-40 ms fork stall that
+  lands on PING max and write max alike; ours saves 6 s faster with 8 MB extra, a 1.6 ms stall and a 3 ms write max.
+  Forkless keeps memory at 9-20 MB but its save is 40-50% longer than ours, its main thread burns 17-26 CPU-seconds against
+  7-13, and write p99 is 2-5x (3.4 ms at 20k). Nobody misses the offered rate on small.
+- **Mixed is where the cap costs us, now in gigabytes.** The 256k 9 KB hashes are forkable: 2.3 GB of page tables give a
+  17-19 ms stall (upstream 37-43) and their copy-on-write is 0.5-1.6 GB (upstream 2.0-3.1). Forkless stays at 7-16 MB but
+  misses the offered rate at 20k (94.9%) and 50k uniform (93%), with write p99 of 7-13 ms against 0.4-0.65 for the two
+  fork-based designs and 42-45 s saves against our 22-31. Our save is the shortest in every mixed cell because the scan thread
+  and the child overlap; idle it is half of upstream (18.7 vs 36.9 s).
+- **Big is fork parity for us and a failure mode for forkless.** Upstream and hybrid agree within noise on every column
+  (1.8 GB and 2.7 GB of copy-on-write at 20k and 50k, 0.6 GB with the hot set, 25-35 ms stalls). Forkless with 1M-field
+  hashes: a write to a hash under serialization waits until the whole 100 MB hash is written, so the load generator saw
+  20-33 s maximum write latency, 6-11 s of stalled seconds per save, 7-14 clients blocked at the peak, and delivered
+  48%, 49% and 71% of the offered rate at 20k, 50k uniform and 50k hot. Its p99 stays at 0.5-0.7 ms because the blocked
+  writes are few; they are just very long.
+- **Base RSS differs between binaries for the same data** (small: up 4186 loaded fresh / 4028 from cache, hybrid 4028, Valkey
+  3926): compare `extra` across configurations and `peak` within one.
+- The scan thread's CPU (`threads cpu s`) equals the save duration on small and mixed: it serializes for the whole save, on a
+  core the fork child would otherwise use. Forkless's background thread does the same for longer.
