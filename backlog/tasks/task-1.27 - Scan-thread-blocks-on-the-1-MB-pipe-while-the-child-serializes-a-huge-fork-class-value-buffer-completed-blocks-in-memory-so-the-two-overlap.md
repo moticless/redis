@@ -29,7 +29,9 @@ Options, in order of preference:
 2. Alternatively a reader thread in the child that drains the pipe into a memory queue while the main child thread serializes, so the pipe never fills. Costs a thread and a copy in the child; the parent side stays as is.
 3. Larger pipe (F_SETPIPE_SZ, up to /proc/sys/fs/pipe-max-size, 1 MB default cap without privileges) is a partial fix only.
 
-Measure with mixed1m (run 13 recipe) before/after: target is save time close to max(scan time, child time) = about 40 s -> the child's 40 s alone is the floor here, so the win shows when the child's share is smaller than the scan's (e.g. mixed1m with fewer hashes, or the small dataset with a few huge hashes added). Also record snap_save_queued_bytes peak.
+Evidence from the CSVs (idle cells): run 12 mixed, hybrid: scan thread 18.2 s CPU, child 17.6 s CPU, save 18.4 s = max of the two (full overlap). Run 13 mixed1m, hybrid: scan thread 19.9 s, child 23.3 s, save 41.7 s = their sum (no overlap); upstream's single child needs 40.5 s CPU for the same data. So the child is not the floor on mixed1m: with the two overlapping, the save should take about 24 s instead of 42.
+
+Measure with mixed1m (run 13 recipe) before/after: target is save time within 10% of max(scan CPU, child CPU), about 24 s. Also record the snap_save_queued_bytes peak.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
