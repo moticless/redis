@@ -49,6 +49,17 @@ DATASETS = {
         ("bh:",        12, "hash",   {"fields": 100_000, "size": 64}, "overwrite", 64),
         ("bz:",         2, "zset",   {"members": 300_000},            "overwrite", 8),
     ],
+    # run 13: the big component is 1M-field hashes (about 90 MB each, hashtable); counts scale with --scale (int(c*scale))
+    "mixed1m": [
+        ("s:",    800_000, "string", {"size": 50},                      "overwrite", 50),
+        ("l:",    200_000, "list",   {"size": 50},                      "overwrite", 50),
+        ("st:",   200_000, "set",    {"size": 8},                       "grow",      8),
+        ("hh:",       1.5, "hash",   {"fields": 1_000_000, "size": 64}, "overwrite", 64),
+    ],
+    "big1m": [
+        ("hh:",      2.25, "hash",   {"fields": 1_000_000, "size": 64}, "overwrite", 64),
+        ("bz:",         2, "zset",   {"members": 300_000},              "overwrite", 8),
+    ],
     # same data, but the traffic inserts new fields/members (random names) into the big items
     "big-grow": [
         ("bh:",        22, "hash",   {"fields": 100_000, "size": 64}, "grow",      24),
