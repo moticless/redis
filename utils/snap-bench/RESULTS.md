@@ -1024,3 +1024,50 @@ log before the connection dropped, small idle: yinon-hybrid save 30.3 s, fork 9.
 147.9 ms** (ours in run 12: 31.3 s, 1.6 ms, 2 MB, 0.60 ms, 1.8 ms; his PING max at 300 MB in run 10 was 7.5-11.5 ms, so the
 parent-side helper handshake appears to scale with the dataset). One cell, no conclusion. Rerun with the recipe above on a new
 host; copy the CSV off the host after every dataset.
+
+
+## Run 15 (2026-09-27): single core, mixed at 4 GB, our hybrid vs upstream vs Valkey forkless
+
+Raw: `run15.csv`, driver `run15.sh`. Fresh c7i.4xlarge (i-003628ddea3294b66, same layout as runs 12-13). The only change from
+run 12: `SERVER_CPUS=0`, so the server, its scan thread, its fork child and Valkey's background thread all run on vCPU 0 with
+its SMT sibling vCPU 8 idle; load generator on vCPUs 4-7,12-15. Mixed dataset at scale 16 (19.5 M keys, 3.9 GB, 256k hashtable
+hashes of 9 KB). Binaries: `up` 0d6266f2d, `hybrid` 9e21ef6c3 (src as 54b7d4f0c), `valkey-forkless` 06d35aca6. 2 reps,
+interleaved per cell, every save `ok`, no hard-mark aborts. Values as rep a / rep b.
+
+| rate | hot | config | save s | fork ms | peak MB | extra MB | main cpu s | threads cpu s | child cpu s | ping p99 ms | ping max ms | ops | wavg ms | wp99 ms | wmax ms | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | - | up | 38.0 / 41.5 | 41 / 32 | 4064 / 3910 | 4 / 1 | 0.35 | 0 | 37.6 / 41.0 | 1.70 / 1.63 | 37.5 / 33.4 | - | - | - | - | - | 0 |
+| 0 | - | hybrid | 42.6 / 41.4 | 17 / 19 | 3919 / 3906 | 2 / 1 | 0.34 | 23.0 / 23.1 | 19.2 / 17.9 | 3.37 / 3.04 | 14.9 / 16.4 | - | - | - | - | - | 0 |
+| 0 | - | valkey-forkless | 48.1 / 50.9 | 0 | 3943 / 3830 | 1 | 10.8 / 11.0 | 36.4 / 39.1 | 0 | 3.83 / 3.78 | 5.0 / 4.8 | - | - | - | - | - | 0 |
+| 20k | 1.0 | up | 50.3 / 53.2 | 35 / 59 | 6601 / 6640 | 2680 / 2735 | 7.2 / 7.6 | 0 | 43.1 / 45.6 | 3.29 / 3.36 | 31.8 / 58.0 | 19996 / 19990 | 0.23 / 0.24 | 3.04 / 3.15 | 35.8 / 60.4 | 0 | 0 |
+| 20k | 1.0 | hybrid | 47.7 / 49.3 | 30 / 32 | 5207 / 5241 | 1306 / 1328 | 6.9 / 7.2 | 21.8 / 22.9 | 19.0 / 19.2 | 4.17 / 3.99 | 28.4 / 31.0 | 19996 | 0.33 | 3.98 / 3.96 | 31.8 / 32.7 | 0 | 0 |
+| 20k | 1.0 | valkey-forkless | 56.6 / 59.3 | 0 | 3837 / 3853 | 8 | 16.5 / 16.9 | 37.5 / 39.5 | 0 | 2.41 | 3.5 / 3.7 | 17663 / 17548 (88%) | 0.74 / 0.79 | 11.8 / 12.3 | 24.3 / 24.1 | 32 / 33 | 7 |
+| 50k | 1.0 | up | 61.8 / 63.9 | 46 / 64 | 7234 / 7222 | 3309 / 3313 | 19.6 / 20.2 | 0 | 42.5 / 43.9 | 3.72 / 3.68 | 43.1 / 64.1 | 49979 / 49971 | 0.32 / 0.30 | 3.76 / 3.72 | 47.9 / 65.7 | 0 | 0 |
+| 50k | 1.0 | hybrid | 65.7 / 60.8 | 27 / 33 | 5702 / 5690 | 1777 / 1769 | 24.3 / 19.8 | 21.2 / 21.0 | 20.5 / 20.0 | 3.41 / 3.55 | 25.2 / 33.2 | 49989 / 49983 | 0.23 | 3.19 / 3.14 | 29.2 / 35.0 | 0 | 0 |
+| 50k | 1.0 | valkey-forkless | 64.2 / 62.5 | 0 | 3870 / 3838 | 25 | 22.6 / 22.1 | 40.2 / 39.0 | 0 | 2.87 / 2.92 | 158 / 162 | 44001 / 44261 (88%) | 1.04 / 1.02 | 18.5 / 18.2 | 162 / 165 | 32 / 35 | 12 |
+| 50k | 0.2 | up | 63.8 / 61.1 | 66 / 43 | 5980 / 5973 | 2063 / 2060 | 19.6 / 18.9 | 0 | 44.4 / 42.4 | 3.76 / 3.72 | 63.8 / 43.7 | 49968 / 49981 | 0.32 / 0.31 | 3.73 / 3.72 | 67.9 / 45.9 | 0 | 0 |
+| 50k | 0.2 | hybrid | 55.3 / 56.6 | 19 / 23 | 4445 / 4425 | 532 | 14.1 / 14.5 | 22.5 / 22.6 | 18.9 / 19.7 | 4.53 / 4.74 | 17.9 / 20.8 | 49995 / 49989 | 0.51 / 0.52 | 4.58 / 4.73 | 20.9 / 25.8 | 0 | 0 |
+| 50k | 0.2 | valkey-forkless | 66.2 / 66.2 | 0 | 3844 / 3828 | 15 | 24.9 / 24.9 | 39.7 / 39.7 | 0 | 2.63 / 2.65 | 3.8 / 4.8 | 48664 / 48635 (97%) | 0.66 / 0.67 | 6.91 / 7.17 | 27.8 / 25.1 | 6 | 12 |
+
+### Reading the run
+
+- **On one core the hybrid's parallelism is gone, and so is its save-time win on mixed.** Scan thread (21-23 s CPU) and child
+  (18-20 s) take turns on the core, so idle saves take 42 s against upstream's 38-41 (four cores: 18.7 vs 36.9). Under traffic
+  the two are within noise of each other (48-49 vs 50-53 s at 20k, 56 vs 61-64 with the hot set, 61-66 vs 62-64 at 50k).
+- **Memory and stall are unchanged by the core count**, as they must be: 1.3 GB vs 2.7 GB (20k), 1.8 vs 3.3 GB (50k), 0.5 vs
+  2.1 GB (hot) of copy-on-write; stalls 17-33 ms vs 32-66 ms (upstream's 59-66 ms outliers are one-core scheduling: the parent
+  waits to be rescheduled after fork). Peak memory to save 3.9 GB at 50k: upstream 7.2 GB, hybrid 5.7, forkless 3.9.
+- **Command latency on one core: the hybrid costs about 1 ms at p99 when the main thread is light, and nothing when it is
+  busy.** Idle: PING p99 3.0-3.4 ms vs 1.6-1.7 for upstream (two workers instead of one share the core with the main thread).
+  20k: write p99 3.96-3.98 vs 3.04-3.15. 50k uniform: the order flips, 3.14-3.19 vs 3.72-3.76, and PING p99 3.4-3.5 vs 3.7;
+  upstream's child copying 3.3 GB of pages now takes more of the core than our scan thread. 50k hot: 4.6-4.7 vs 3.7 (our
+  child has little to copy and the scan thread's 22 s dominate). Write max follows the fork stall for both: ours 21-35 ms,
+  upstream 36-68 ms. Run 8 at 300 MB showed the same shape (3.95 vs 4.67 ms at 50k).
+- **Forkless does not survive one core at 4 GB either.** It misses the offered rate at 20k (88%) and 50k uniform (88%), with
+  32-35 s of stalled seconds per 57-64 s save, 7-12 clients blocked at the peak, write p99 12-18 ms and a 162-165 ms worst
+  write and PING max at 50k; with the hot set it delivers 97% with 6 stalled seconds and a 7 ms write p99. Its main thread
+  spends 16.5-25 CPU-seconds per save against 7-24 for ours and upstream's, and its saves are the longest in every cell but
+  one. Memory stays at 8-25 MB, as on four cores. Its PING p99 (2.4-2.9 ms) is the lowest under traffic because blocked
+  writers do not count against PING; the write columns show where the time went.
+- Caveat: one P-core with its SMT sibling idle is a generous "one CPU"; a one-vCPU cgroup on a busy host is tighter. The
+  relative picture is what this run tests.
