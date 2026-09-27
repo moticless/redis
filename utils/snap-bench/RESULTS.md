@@ -1012,3 +1012,15 @@ rep a / rep b.
   the retained-bytes mark) rather than blocking on the pipe, or give the child a reader thread. Filed as TASK-1.27.
 - Forkless's idle save on mixed1m is 25% longer than either fork-based one (50.7 s) and its main thread spends 11-25
   CPU-seconds per save against our 0.6-17.
+
+
+## Run 14 (2026-09-27, lost): our hybrid vs the teammate's hybrid on the 4 GB datasets
+
+Started 00:12 UTC on the run 12/13 host (i-00fe113633e1d929e) with `run14.sh`: `hybrid` (54b7d4f0c) vs `yinon-hybrid`
+(1204d0970, `--bgsave-mode hybrid --forkless-string-max 4096`), datasets small (13.5), mixed, mixed1m, big1m (16), rates
+0/20k/50k uniform and 50k on the 20% hot set, two passes of one rep each, interleaved per cell. The instance powered off on its
+own shutdown timer at 03:58 UTC and was then no longer available, so `~/run14.csv` was never fetched. The one cell seen in the
+log before the connection dropped, small idle: yinon-hybrid save 30.3 s, fork 9.3 ms, extra 4 MB, PING p99 0.58 ms, **PING max
+147.9 ms** (ours in run 12: 31.3 s, 1.6 ms, 2 MB, 0.60 ms, 1.8 ms; his PING max at 300 MB in run 10 was 7.5-11.5 ms, so the
+parent-side helper handshake appears to scale with the dataset). One cell, no conclusion. Rerun with the recipe above on a new
+host; copy the CSV off the host after every dataset.
