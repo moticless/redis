@@ -2547,9 +2547,11 @@ static void snapPlacementTests(void) {
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("arena blocks freed with zfree_with_size() never come back from zmalloc()", leaked == 0);
         zfree(a);
-        void *nt = zmalloc_nofork_no_tcache(300);
+#if defined(SNAP_NOFORK_ARENA_SUPPORTED) && defined(HAVE_DEFRAG)
+        void *nt = zmalloc_nofork_no_tcache(300);   /* the no-tcache entry points exist only with the arena and defrag */
         test_cond("zmalloc_nofork_no_tcache() allocates in the arena", zmalloc_is_nofork(nt));
         zfree_no_tcache(nt);
+#endif
     }
 
     /* sds growth through the sds API keeps the arena. */
