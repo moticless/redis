@@ -62,8 +62,8 @@ void snapArenaInit(void) {
                          "%s).", server.snap_nofork_arena, snapArenaVaReserved() >> 30,
                          server.bgsave_hybrid ? "MADV_DONTFORK: hybrid BGSAVE on" : "forkable: bgsave-hybrid no");
 #else
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator; "
-                         "hybrid BGSAVE, if enabled, runs without it.");
+    serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
+                         "with jemalloc); hybrid BGSAVE, if enabled, runs without it.");
 #endif
 }
 

@@ -126,11 +126,6 @@ typedef struct dictType {
     /* Ensures that the entire hash table is rehashed at once if set. */
     unsigned int force_full_rehash:1;
 
-    /* Allocate the dict struct, bucket arrays and entry nodes in the
-     * SNAP_NOFORK arena (hybrid BGSAVE, keyspace dicts only). Frees need no
-     * special handling: the generic zfree/zrealloc are arena-aware. */
-    unsigned int nofork_alloc:1;
-    
     /* Callback to extract key from stored-key object. When set, the dict can
      * store keys in one format (e.g., a structure) but look them up using a
      * different format, extracted from the stored-key. (e.g., sds or integer). 
@@ -159,6 +154,13 @@ typedef struct dictType {
      *   value-side payload, or NULL. */
     void *(*prefetchEntryKey)(const dictEntry *de);
     void *(*prefetchEntryValue)(const dictEntry *de);
+
+    /* Allocate the dict struct, bucket arrays and entry nodes in the
+     * SNAP_NOFORK arena (hybrid BGSAVE, keyspace dicts only). Frees need no
+     * special handling: the generic zfree/zrealloc are arena-aware. Kept
+     * last so that positional dictType initializers in upstream code (e.g.
+     * t_stream.c) keep their meaning. */
+    unsigned int nofork_alloc:1;
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))

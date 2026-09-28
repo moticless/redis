@@ -314,7 +314,9 @@ surfaced, not worked around.
 ### 11.x Additions after the sibling-branch comparison (2026-09-21)
 
 - The hybrid path is gated by `bgsave-hybrid` alone. Without the SNAP_NOFORK
-  arena (non-Linux, libc allocator, sanitizer builds) keys are classified by
+  arena (non-Linux, libc allocator, sanitizer builds, and 32-bit builds: the
+  arena is a 64 GB to 16 TB address-space reservation, so `HAVE_NOFORK_ARENA`
+  requires a 64-bit pointer size, 2026-09-28) keys are classified by
   encoding and size, single-allocation values are always copied on clone, and
   the mechanics are identical; TSan and ASan run the whole path this way.
 - `bgsave-hybrid-max-retained-bytes` bounds the memory the overlay keeps alive

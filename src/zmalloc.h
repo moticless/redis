@@ -149,7 +149,14 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
  * allocated in the arena stays there across realloc and is never recycled
  * through a default-arena thread cache. New allocations go to the arena only
  * through the explicit zmalloc_nofork*() entry points. */
-#if defined(USE_JEMALLOC) && defined(__linux__)
+/* 64-bit Linux with jemalloc only. The arena is a single reservation of 64 GB
+ * to 16 TB of address space (noforkReserve); a 32-bit process has 4 GB in
+ * total, so neither the reservation nor the size ladder makes sense there and
+ * the shifts would not even compile. Without the arena the hybrid save runs
+ * in its arena-free mode (classification by encoding and size, values copied
+ * on clone), which the sanitizer builds exercise. */
+#include <stdint.h>
+#if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
 #define HAVE_NOFORK_ARENA 1
 extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
 extern char *zmalloc_nofork_hi;
@@ -209,6 +216,8 @@ static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *u
 #define zmalloc_nofork_usable(size, usable) zmalloc_usable(size, usable)
 #define ztrycalloc_nofork(size) ztrycalloc(size)
 static inline int zmalloc_nofork_enabled(void) { return 0; }
+void zmalloc_nofork_set_active(int active);   /* no-op stubs in zmalloc.c: nothing to gate, no arena tcache to flush */
+void zmalloc_nofork_tcache_flush(void);
 #endif
 
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))
