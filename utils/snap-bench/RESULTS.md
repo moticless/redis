@@ -1071,3 +1071,106 @@ interleaved per cell, every save `ok`, no hard-mark aborts. Values as rep a / re
   writers do not count against PING; the write columns show where the time went.
 - Caveat: one P-core with its SMT sibling idle is a generous "one CPU"; a one-vCPU cgroup on a busy host is tighter. The
   relative picture is what this run tests.
+
+
+## Run 16 (2026-09-29/30): the scan thread's outbound queue (TASK-1.27), before/after on our own branch, c7i.4xlarge
+
+Raw: `run16.csv`, drivers `run16.sh` (pass 1: `hybrid-before` = 444feb8d4 vs `hybrid` = first queue version, interleaved),
+`run16b.sh` (pass 2: `hybrid2` = zero-copy staging), `run16c.sh` (pass 3: `hybrid3` = exact allocation, the committed
+version 16fda179b), `run16d.sh` (pass 4: `hybrid-before` vs `hybrid3` interleaved, 3 reps, on the cells where pass 3
+differed from before by more than a few percent). Fresh c7i.4xlarge at 54.219.8.216, same layout as runs 12-15 (server on
+vCPUs 0-3,8-11, load on 4-7,12-15, dumps and dataset cache on a 24 GB tmpfs). Datasets: mixed1m at scale 16 (run 13's
+recipe), small 13.5 and mixed 16 (run 12's). All saves `ok`, no hard-mark aborts. New columns: `used_mem +MB` is the peak
+growth of `used_memory` during the save, `queued peak MB` is `snap_last_save_queued_peak` (added in this task).
+
+**What changed between the versions.** Before: the scan thread wrote the pipe with blocking `write()`, so while the child
+serialized one 90 MB hash the 1 MB pipe filled and the scan stalled. v1: every message is copied into an owned buffer and
+queued; the pipe write end is non-blocking; past `bgsave-hybrid-max-retained-bytes` the thread waits. v2: the staging
+buffer is handed to the queue without a copy and drained buffers return to a pool (v1 cost 11% scan CPU on small). v3:
+exact allocations, pool for staging-sized buffers only, queue bytes are allocation sizes (v2 let 170-byte KVOBJ messages
+pin 160 KB pooled buffers and let greedy sds doubling make each 64 KB buffer a 160 KB allocation: `used_memory` grew by
+5-20 GB during mixed saves while RSS grew 0.6 GB; maxmemory would have seen it).
+
+**Cell ordering caveat.** The first cell of every dataset in every pass runs right after a fresh populate (the cache is
+deleted per dataset) and is 30-40% slower for every binary (mixed1m idle 32 s vs 24 s from cache, mixed idle 27 vs 19),
+with the child's wall time far above its CPU time. Compare from-cache cells; the from-populate cells are the first value
+in each pair below where a pass has two reps.
+
+### mixed1m
+
+| rate | config | save s | main cpu s | scan cpu s | child cpu s | extra MB | parent +MB | CoW MB | used_mem +MB | queued peak MB | wp99 ms | wmax ms | ops |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | before | 38.1 / 38.3 | 0.5 / 0.5 | 18.7 / 17.4 | 21.0 / 22.4 | 4 / 1 | 1 / 0 | 4 / 1 | 6 / 5 | - / - | - / - | - / - | - / - |
+| 0 | queue v1 (copy) | 27.3 / 21.4 | 0.4 / 0.2 | 18.5 / 19.2 | 24.6 / 20.7 | 301 / 278 | 268 / 225 | 33 / 53 | 324 / 299 | - / - | - / - | - / - | - / - |
+| 0 | queue v2 (zero-copy) | 32.6 / 23.8 | 0.5 / 0.3 | 18.6 / 17.2 | 20.3 / 22.2 | 241 / 277 | 233 / 248 | 8 / 29 | 551 / 644 | 220 / 256 | - / - | - / - | - / - |
+| 0 | queue v3 (exact alloc) | 32.2 / 24.6 | 0.5 / 0.3 | 18.7 / 18.6 | 20.4 / 23.7 | 250 / 246 | 237 / 231 | 13 / 16 | 262 / 260 | 256 / 256 | - / - | - / - | - / - |
+| 20000 | before | 40.9 / 41.9 | 9.3 / 10.2 | 18.2 / 18.6 | 24.0 / 24.6 | 1241 / 1256 | 23 / 23 | 1236 / 1251 | 35 / 36 | - / - | 0.57 / 0.55 | 14.8 / 16.0 | 20000 / 19999 |
+| 20000 | queue v1 (copy) | 37.0 / 37.3 | 7.9 / 8.4 | 19.4 / 18.1 | 23.5 / 24.6 | 1176 / 1181 | 283 / 283 | 1173 / 1178 | 325 / 327 | - / - | 0.55 / 0.56 | 16.4 / 15.8 | 19999 / 20000 |
+| 20000 | queue v2 (zero-copy) | 34.0 / 35.2 | 8.4 / 8.0 | 18.8 / 17.2 | 20.9 / 23.5 | 1120 / 1150 | 289 / 293 | 1120 / 1143 | 1206 / 1207 | 274 / 277 | 0.56 / 0.56 | 16.0 / 15.1 | 19999 / 20000 |
+| 20000 | queue v3 (exact alloc) | 36.0 / 39.0 | 8.3 / 9.0 | 17.0 / 18.3 | 22.4 / 24.2 | 1163 / 1217 | 141 / 161 | 1182 / 1207 | 282 / 283 | 280 / 281 | 0.57 / 0.57 | 15.6 / 15.5 | 19999 / 19999 |
+
+### small
+
+| rate | config | save s | main cpu s | scan cpu s | child cpu s | extra MB | parent +MB | CoW MB | used_mem +MB | queued peak MB | wp99 ms | wmax ms | ops |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | before | 29.3 | 0.4 | 29.1 | 3.0 | 5 | 1 | 4 | 6 | - | - | - | - |
+| 0 | queue v1 (copy) | 32.5 | 0.4 | 32.3 | 3.0 | 2 | 1 | 1 | 4 | - | - | - | - |
+| 0 | queue v2 (zero-copy) | 31.2 | 0.4 | 31.0 | 3.0 | 1 | 0 | 1 | 6 | 0 | - | - | - |
+| 0 | queue v3 (exact alloc) | 29.6 | 0.4 | 29.3 | 2.9 | 4 | 0 | 4 | 6 | 0 | - | - | - |
+| 20000 | before | 28.9 / 31.3 / 31.5 / 31.1 | 6.3 / 7.0 / 6.9 / 6.8 | 28.7 / 31.1 / 31.4 / 30.9 | 3.3 / 3.3 / 3.3 / 3.3 | 8 / 17 / 8 / 8 | 7 / 8 / 7 / 7 | 1 / 9 / 1 / 1 | 4 / 6 / 4 / 4 | - / - / - / - | 0.54 / 0.56 / 0.54 / 0.54 | 2.2 / 4.3 / 2.7 / 2.6 | 20000 / 19999 / 20000 / 20000 |
+| 20000 | queue v1 (copy) | 30.9 | 6.8 | 30.7 | 3.3 | 8 | 7 | 1 | 4 | - | 0.53 | 2.1 | 19999 |
+| 20000 | queue v2 (zero-copy) | 30.2 | 6.3 | 30.0 | 3.3 | 8 | 7 | 1 | 4 | 96 | 0.58 | 2.6 | 20000 |
+| 20000 | queue v3 (exact alloc) | 30.9 / 31.1 / 30.5 / 30.1 | 6.8 / 6.7 / 6.8 / 6.7 | 30.7 / 30.9 / 30.3 / 30.0 | 3.1 / 3.1 / 3.1 / 3.0 | 8 / 8 / 8 / 8 | 7 / 7 / 7 / 7 | 1 / 1 / 1 / 1 | 4 / 4 / 4 / 4 | 98 / 99 / 97 / 96 | 0.53 / 0.57 / 0.53 / 0.53 | 2.8 / 2.6 / 2.7 / 2.4 | 19999 / 19999 / 20000 / 20000 |
+| 50000 | before | 29.3 | 13.0 | 29.1 | 3.0 | 7 | 6 | 1 | 4 | - | 0.31 | 3.0 | 49999 |
+| 50000 | queue v1 (copy) | 29.1 | 9.4 | 29.0 | 3.2 | 7 | 6 | 1 | 4 | - | 0.62 | 3.0 | 49998 |
+| 50000 | queue v2 (zero-copy) | 28.3 | 12.5 | 28.1 | 3.1 | 8 | 7 | 1 | 4 | 219 | 0.36 | 4.1 | 49999 |
+| 50000 | queue v3 (exact alloc) | 29.6 | 13.2 | 29.4 | 2.9 | 8 | 7 | 1 | 4 | 229 | 0.35 | 3.3 | 49999 |
+
+### mixed
+
+| rate | config | save s | main cpu s | scan cpu s | child cpu s | extra MB | parent +MB | CoW MB | used_mem +MB | queued peak MB | wp99 ms | wmax ms | ops |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | before | 26.8 | 0.4 | 19.6 | 16.1 | 5 | 1 | 4 | 6 | - | - | - | - |
+| 0 | queue v1 (copy) | 18.8 | 0.3 | 18.6 | 18.0 | 3 | 1 | 2 | 4 | - | - | - | - |
+| 0 | queue v2 (zero-copy) | 27.0 | 0.4 | 20.2 | 16.2 | 694 | 624 | 70 | 20763 | 208 | - | - | - |
+| 0 | queue v3 (exact alloc) | 27.0 | 0.4 | 20.1 | 16.1 | 39 | 29 | 10 | 262 | 256 | - | - | - |
+| 20000 | before | 21.8 / 21.2 / 23.1 / 23.1 | 6.1 / 5.7 / 5.9 / 6.3 | 18.1 / 18.4 / 20.0 / 19.9 | 18.5 / 16.3 / 18.6 / 18.6 | 814 / 791 / 847 / 847 | 7 / 8 / 6 / 7 | 809 / 784 / 843 / 842 | 4 / 6 / 5 / 4 | - / - / - / - | 0.57 / 0.59 / 0.55 / 0.56 | 18.2 / 17.3 / 18.4 / 18.4 | 20000 / 20000 / 19999 / 20000 |
+| 20000 | queue v1 (copy) | 19.8 | 5.5 | 19.6 | 18.2 | 838 | 160 | 757 | 147 | - | 0.56 | 18.4 | 19999 |
+| 20000 | queue v2 (zero-copy) | 19.5 | 5.2 | 19.3 | 17.4 | 929 | 403 | 747 | 5235 | 110 | 0.55 | 18.2 | 19999 |
+| 20000 | queue v3 (exact alloc) | 21.2 / 21.8 / 22.5 / 20.6 | 5.6 / 5.9 / 6.2 / 5.6 | 18.2 / 19.8 / 20.1 / 18.1 | 18.1 / 17.5 / 18.2 / 17.3 | 800 / 817 / 835 / 783 | 79 / 72 / 74 / 76 | 792 / 810 / 828 / 777 | 261 / 261 / 261 / 261 | 264 / 263 / 264 / 264 | 0.55 / 0.56 / 0.56 / 0.55 | 18.6 / 19.1 / 19.2 / 18.8 | 20000 / 19999 / 19999 / 20000 |
+| 50000 | before | 28.5 / 31.9 / 30.9 / 30.9 | 12.8 / 14.5 / 14.1 / 14.2 | 17.1 / 19.2 / 19.3 / 19.3 | 17.9 / 19.2 / 18.1 / 18.3 | 1533 / 1589 / 1571 / 1571 | 17 / 18 / 17 / 17 | 1527 / 1581 / 1565 / 1564 | 15 / 17 / 16 / 15 | - / - / - / - | 0.34 / 0.33 / 0.28 / 0.33 | 19.8 / 19.6 / 19.8 / 23.4 | 49996 / 49996 / 49997 / 49992 |
+| 50000 | queue v1 (copy) | 20.2 | 8.5 | 19.2 | 18.1 | 1564 | 352 | 1339 | 289 | - | 0.57 | 19.6 | 49996 |
+| 50000 | queue v2 (zero-copy) | 20.4 | 9.7 | 19.9 | 17.8 | 1773 | 620 | 1363 | 7930 | 276 | 0.36 | 20.2 | 49996 |
+| 50000 | queue v3 (exact alloc) | 29.9 / 28.3 / 26.9 / 27.9 | 13.6 / 13.0 / 12.4 / 12.7 | 20.2 / 19.7 / 18.0 / 18.8 | 19.1 / 18.2 / 18.1 / 18.6 | 1557 / 1532 / 1505 / 1528 | 97 / 96 / 96 / 98 | 1549 / 1525 / 1497 / 1517 | 262 / 262 / 262 / 262 | 285 / 284 / 283 / 284 | 0.36 / 0.36 / 0.32 / 0.35 | 20.2 / 20.2 / 19.8 / 19.9 | 49995 / 49996 / 49996 / 49996 |
+
+### Pass 4: the noisy cells repeated, before vs v3 interleaved, 3 reps
+
+| dataset | rate | config | save s | main cpu s | scan cpu s | child cpu s | parent +MB | CoW MB |
+|---|---|---|---|---|---|---|---|---|
+| mixed | 20k | before | 21.3 / 23.1 / 23.1 | 5.7 / 5.9 / 6.3 | 18.4 / 20.0 / 19.9 | 16.3 / 18.6 / 18.6 | 8 / 6 / 7 | 784 / 843 / 842 |
+| mixed | 20k | queue v3 | 21.8 / 22.5 / 20.6 | 5.9 / 6.2 / 5.6 | 19.8 / 20.1 / 18.1 | 17.5 / 18.2 / 17.3 | 72 / 74 / 76 | 810 / 828 / 777 |
+| mixed | 50k | before | 31.9 / 30.9 / 30.9 | 14.5 / 14.1 / 14.2 | 19.2 / 19.3 / 19.3 | 19.2 / 18.2 / 18.3 | 18 / 17 / 17 | 1581 / 1565 / 1564 |
+| mixed | 50k | queue v3 | 28.3 / 26.9 / 27.9 | 13.0 / 12.4 / 12.7 | 19.7 / 18.0 / 18.8 | 18.2 / 18.1 / 18.6 | 96 / 96 / 98 | 1525 / 1497 / 1517 |
+| small | 20k | before | 31.3 / 31.5 / 31.1 | 7.0 / 6.9 / 6.8 | 31.1 / 31.4 / 30.9 | 3.3 / 3.3 / 3.3 | 8 / 7 / 7 | 9 / 1 / 1 |
+| small | 20k | queue v3 | 31.1 / 30.5 / 30.1 | 6.7 / 6.8 / 6.7 | 30.9 / 30.3 / 30.0 | 3.2 / 3.1 / 3.0 | 7 / 7 / 7 | 1 / 1 / 1 |
+
+### Reading the run
+
+- **mixed1m idle: the save now tracks the child.** Before, 38.1 / 38.3 s = scan (17-19 s CPU) + child (21-22 s CPU) in
+  series. With the queue, from-cache cells: v1 21.4 s against a 20.7 s child, v2 23.8 against 22.2, v3 24.6 against 23.7,
+  i.e. within 3-7% of the slower half. The from-populate cells (27.3 / 32.6 / 32.2 s) are the caveat above, not the queue.
+- **mixed1m at 20k writes/s: a smaller gain, 41-42 s -> 36-39 s (v3), 34-35 (v2).** The child's CPU is unchanged at
+  21-24 s but its wall time is not: the queue sits at its bound most of the save (queued peak 280 MB = the 256 MiB bound
+  plus the main-thread queue), so the scan thread is throttled to the child's pace, and the child is waiting on something
+  for 10-15 s that it does not wait on at idle. Not investigated here; the same signature appears in the from-populate
+  cells at idle. A larger bound would show whether the gap closes.
+- **The cost is the queue's memory.** Parent RSS grows by the bound while the child is behind: 231-293 MB on mixed1m
+  (before: 0-23 MB), 72-98 MB on mixed under writes (before: 6-18), nothing on small (the child is never behind there).
+  `used_memory` grows by the same amount once v3's accounting is in place (262 MB on mixed1m against a 256 MB queued peak;
+  v2 showed 551-1207 MB there and 5-20 GB on mixed). It is released at the end of the save. Copy-on-write is 3-6% lower
+  because the save is shorter.
+- **No regression on small and mixed (pass 4, 3 interleaved reps).** mixed 20k 21.3-23.1 vs 20.6-22.5 s, small 20k
+  31.1-31.5 vs 30.1-31.1 s, main-thread CPU within 0.3 s; mixed 50k is 10% faster (30.9-31.9 -> 26.9-28.3 s) with 1.5 s
+  less main-thread CPU, because the shorter save emits fewer buckets. The single-rep differences of passes 1-3 (small 20k
+  +7%, mixed 50k v3 29.9 vs 28.5) were noise: the same cells spread 21.3-23.1 and 30.9-31.9 for the unchanged binary.
+- **Write latency is unchanged** (wp99 0.55-0.57 ms at 20k on both, wmax 15-16 ms on mixed1m from the fork stall).

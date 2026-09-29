@@ -226,6 +226,19 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   at `fork()` and SNAP_FORK values are forkable.
 - The fork is the single writer and merge point and owns SELECTDB tracking (§3), so multiple bg threads
   may feed it concurrently; the fork serializes writes.
+- **Outbound queue in front of the pipe (TASK-1.27, 2026-09-29).** The child reads one message at a
+  time and does not touch the pipe while it serializes a fork-class value, so with a blocking
+  `write()` the scan thread stalled behind every big value (mixed1m: save = scan + child instead of
+  max, run 13). The scan thread now owns a queue of complete messages and writes the pipe
+  non-blockingly after every enqueue (partial writes keep an offset into the head message); the
+  staging buffer reserves its header up front and is handed to the queue without a copy, and
+  drained buffers return to a small pool. Past `bgsave-hybrid-max-retained-bytes` (frozen at save
+  start) the thread waits for the child with `poll()` instead of growing; it never aborts for that.
+  The main-thread hard mark still counts only what the main thread retains and queues, so the
+  worst-case save memory is up to twice the configured value. `snap_save_queued_bytes` covers both
+  queues; `snap_last_save_queued_peak` is their peak over the last save. Cost: the queue is memory
+  the save holds while the child is behind, up to the bound (250 MB at the default on mixed1m,
+  where before the change the save held about 1 MB).
 - Diskless full sync: the fork writes the replica socket instead of a file. AOF rewrite: same scan,
   AOF encoders.
 
@@ -630,7 +643,7 @@ big values and owns the RDB. The split of responsibilities differs:
 | Write to an unsaved small key | pin: retain by refcount (immutable strings), type Dup copy, or pre-encoded bytes; memory held until the helper reaches the key (evicted keys jump the queue); two budgets, abort when exceeded | serialize the bucket's chain into the queue, then write in place; retention only for buckets inside the window being read |
 | "Already saved" | 2-bit alternating round in the kvobj header (took 2 of the 8 module metadata classes), recovery mode after a failed save | per-save bucket bitmap plus window position; nothing outlives the save |
 | Thread sync | one mutex and condvar; each side publishes the one object it reads; the main thread waits if the helper is reading that object | the main thread never waits; the scan thread waits for the open write section at each window boundary |
-| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | one pipe parent to child, 1 MB; whole 64 KB buffers or header copies; `SELECTDB` only on change |
+| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | one pipe parent to child, 1 MB, fed from a bounded in-memory queue on the scan thread (non-blocking writes); whole 64 KB buffers or header copies; `SELECTDB` only on change |
 | Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
 | Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
 | Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB only; diskless sync and AOF rewrite are M2 |

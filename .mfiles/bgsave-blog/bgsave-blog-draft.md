@@ -327,7 +327,14 @@ yet.
 Two things happen here. On big1m, where every byte is fork-class, the hybrid and stock are the
 same save on every column, as designed: nothing eligible, nothing gained, nothing lost, no mode
 to switch. On mixed1m the hybrid again pays copy-on-write for the hashes alone, half of stock's,
-with half the stall.
+with half the stall. Its save time in this table is not the hybrid's floor: the scan thread finished
+its half in 20 s and then waited for the child, because a child inside a 90 MB hash does not read
+the pipe. A later change let the scan thread queue its output in memory, bounded by the same
+retained-bytes limit, and in a before/after run on the same host the idle mixed1m save went from
+38 s to 22-25 s, within a few percent of the child alone, at the price of up to 256 MB of parent
+memory while the child is behind. Under writes the gain is smaller, 41 s to 36-39 s, for a reason
+still open: the child's wall time exceeds its CPU time. The tables above keep the numbers as
+measured against stock and forkless on the same day.
 
 And forkless meets the value it cannot serialize atomically. A write that lands on the hash
 being saved waits until the whole 90 MB hash is written: 22 to 34 seconds at worst, up to 16
@@ -406,10 +413,12 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   thresholds that feed it are untuned; the mixed dataset is the experiment.
 - **The scan thread** costs about one CPU-second per 260 MB save, on a core the fork child would
   otherwise have used.
-- **Save time does not yet always benefit from the two workers.** With a few huge fork-class
-  values, the child's serialization of one value holds the pipe and the scan thread waits on it,
-  so on mixed1m the save took 41 s where the two halves overlapped would take about 24. The fix is
-  a bounded in-memory queue in front of the pipe, filed, not built.
+- **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in
+  front of the pipe: on mixed1m the idle save went from 38 s (scan plus child in series) to 22-25 s
+  (the child alone). The queue is memory the save holds while the child is behind, up to the
+  retained-bytes limit, 256 MB by default, released at the end; and under writes the gain is
+  smaller, 41 s to 36-39 s, because the child's wall time exceeds its CPU time there, which is not
+  yet understood.
 
 ## 10. Conclusion
 
