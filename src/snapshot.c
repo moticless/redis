@@ -652,6 +652,7 @@ void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
 #include "ae.h"
 #include "eventnotifier.h"
 #include <pthread.h>
+#include <poll.h>
 
 struct snapScanCtx {
     kvstore **stores;               /* One per db (db->keys). */
@@ -1247,6 +1248,16 @@ typedef struct snapSave {
     sds mscratch;                       /* main thread only: one record at a time */
     redisAtomic size_t mq_bytes;        /* payload bytes queued and not yet sent */
     long long main_buckets, main_keys;  /* main thread only */
+    /* Outbound queue (TASK-1.27): every message the scan thread produces or
+     * forwards waits here for the pipe, which is written non-blockingly, so a
+     * child busy inside one huge fork-class value does not stall the scan.
+     * Owned by the scan thread; oq_bytes and queued_peak are read by INFO. */
+    list *oq;                           /* sds: header followed by payload */
+    list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
+    size_t oq_head_off;                 /* bytes of the head message already written */
+    size_t oq_limit;                    /* bgsave-hybrid-max-retained-bytes at save start, 0 = none */
+    redisAtomic size_t oq_bytes;        /* bytes queued and not yet written to the pipe */
+    redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
 } snapSave;
 
 typedef struct snapQueuedMsg {
@@ -1260,6 +1271,7 @@ int snapMainEmitting(void) { return snap_main_emitting; }
 
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 static size_t snap_last_retained_peak = 0;
+static size_t snap_last_queued_peak = 0;
 static long long snap_last_inplace_writes = 0;
 
 long long snapSaveInplaceWrites(void) { return snap_save ? snap_save->inplace_writes : 0; }
@@ -1273,10 +1285,12 @@ size_t snapSaveBitmapBytes(void) { return snap_save ? snapScanBitmapBytes(snap_s
 
 size_t snapSaveQueuedBytes(void) {
     if (!snap_save) return 0;
-    size_t n;
+    size_t n, o;
     atomicGet(snap_save->mq_bytes, n);
-    return n;
+    atomicGet(snap_save->oq_bytes, o);
+    return n + o;
 }
+size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
 long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
 long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; }
 
@@ -1523,9 +1537,12 @@ void snapSaveCron(void) {
     snapSave *sv = snap_save;
     size_t queued;
     atomicGet(sv->mq_bytes, queued);
-    /* The peak reported by INFO covers both kinds of save-time memory: the
-     * overlay's retained originals and records queued for the child. */
-    if (sv->retained_bytes + queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + queued;
+    /* The peak reported by INFO covers every kind of save-time memory: the
+     * overlay's retained originals and the records queued for the child on
+     * both threads. The abort below counts only what the main thread holds:
+     * the scan thread's queue waits for the child instead of growing. */
+    size_t all_queued = snapSaveQueuedBytes();
+    if (sv->retained_bytes + all_queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + all_queued;
     if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
         if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
             sv->hard_mark_hit = 1;
@@ -1552,20 +1569,6 @@ void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofor
     atomicGet(snap_save->bytes_sent, *bytes_sent);
 }
 
-static int snapWriteAll(int fd, const void *p, size_t n) {
-    const char *c = p;
-    while (n) {
-        ssize_t w = write(fd, c, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        c += w;
-        n -= w;
-    }
-    return 0;
-}
-
 static int snapReadAll(int fd, void *p, size_t n) {
     char *c = p;
     while (n) {
@@ -1581,26 +1584,137 @@ static int snapReadAll(int fd, void *p, size_t n) {
     return 0;
 }
 
-/* Scan thread: send one message; a failure (child gone) aborts the scan. */
+/* ---- Outbound queue to the child (scan thread only) ---- */
+
+#define SNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
+#define SNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
+#define SNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
+
+static void snapOutRecycle(snapSave *sv, sds m);
+#define SNAP_OUT_POOL_MAX 16   /* buffers kept for reuse; each is about one staging buffer */
+
+/* Scan thread: a message buffer with room for 'need' bytes, recycled when
+ * possible so the 64 KB staging buffers are not allocated (and faulted in)
+ * afresh for every message. */
+static sds snapOutTake(snapSave *sv, size_t need) {
+    sds m;
+    listNode *ln = listFirst(sv->oq_pool);
+    if (ln) {
+        m = listNodeValue(ln);
+        listDelNode(sv->oq_pool, ln);
+    } else {
+        m = sdsempty();
+    }
+    return sdsMakeRoomFor(m, need);
+}
+
+static void snapOutRecycle(snapSave *sv, sds m) {
+    if (listLength(sv->oq_pool) < SNAP_OUT_POOL_MAX && sdsalloc(m) <= 4 * SNAP_STAGE_BYTES) {
+        sdsclear(m);
+        listAddNodeTail(sv->oq_pool, m);
+    } else {
+        sdsfree(m);
+    }
+}
+
+/* Scan thread: write queued messages to the (non-blocking) pipe. Returns -1
+ * when the pipe is broken (child gone) or a BOUND wait saw an abort. */
+static int snapOutDrain(snapSave *sv, int mode, size_t target) {
+    listNode *ln;
+    while ((ln = listFirst(sv->oq)) != NULL) {
+        sds m = listNodeValue(ln);
+        size_t len = sdslen(m);
+        ssize_t w = write(sv->pipe_wr, m + sv->oq_head_off, len - sv->oq_head_off);
+        if (w < 0) {
+            if (errno == EINTR) continue;
+            if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
+            if (mode == SNAP_DRAIN_TRY) return 0;
+            if (mode == SNAP_DRAIN_BOUND) {
+                size_t q;
+                atomicGet(sv->oq_bytes, q);
+                if (q <= target) return 0;
+                if (snapScanAborted(sv->scan)) return -1;
+            }
+            struct pollfd pfd = { .fd = sv->pipe_wr, .events = POLLOUT, .revents = 0 };
+            int r = poll(&pfd, 1, 100);
+            if (r < 0 && errno != EINTR) return -1;
+            if (r > 0 && (pfd.revents & (POLLERR | POLLHUP)) && !(pfd.revents & POLLOUT)) return -1;
+            continue;
+        }
+        sv->oq_head_off += w;
+        atomicDecr(sv->oq_bytes, (size_t)w);
+        if (sv->oq_head_off == len) {
+            listDelNode(sv->oq, ln);
+            snapOutRecycle(sv, m);
+            sv->oq_head_off = 0;
+        }
+    }
+    return 0;
+}
+
+static void snapOutClear(snapSave *sv) {
+    listNode *ln;
+    while ((ln = listFirst(sv->oq)) != NULL) {
+        sdsfree(listNodeValue(ln));
+        listDelNode(sv->oq, ln);
+    }
+    sv->oq_head_off = 0;
+    atomicSet(sv->oq_bytes, 0);
+}
+
+/* Scan thread: queue a complete message (header + payload in 'm', owned by
+ * the queue from here on) and push the pipe. Past the bound the thread waits
+ * for the child rather than growing further; it never aborts for that (the
+ * main-thread hard mark covers what the main thread retains and queues). A
+ * broken pipe (child gone) aborts the scan. */
+static int snapOutEnqueue(snapSave *sv, sds m) {
+    size_t n = sdslen(m);
+    listAddNodeTail(sv->oq, m);
+    size_t q, mqb, peak;
+    atomicIncrGet(sv->oq_bytes, q, n);
+    atomicGet(sv->mq_bytes, mqb);
+    atomicGet(sv->queued_peak, peak);
+    if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
+    atomicIncr(sv->msgs_sent, 1);
+    atomicIncr(sv->bytes_sent, (long long)n);
+    int rc = snapOutDrain(sv, SNAP_DRAIN_TRY, 0);
+    if (rc == 0 && sv->oq_limit) {
+        atomicGet(sv->oq_bytes, q);
+        if (q > sv->oq_limit) rc = snapOutDrain(sv, SNAP_DRAIN_BOUND, sv->oq_limit);
+    }
+    if (rc != 0) {
+        snapScanRequestAbort(sv->scan);
+        return -1;
+    }
+    return 0;
+}
+
+/* Scan thread: one message from a header and a payload it does not own. */
 static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
                        const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr)
 {
     snapMsgHdr h = { type, dbid, slot, len, robj_off, src_addr };
-    if (snapWriteAll(sv->pipe_wr, &h, sizeof(h)) != 0 ||
-        (len && snapWriteAll(sv->pipe_wr, payload, len) != 0))
-    {
-        snapScanRequestAbort(sv->scan);
-        return -1;
-    }
-    atomicIncr(sv->msgs_sent, 1);
-    atomicIncr(sv->bytes_sent, (long long)(sizeof(h) + len));
-    return 0;
+    sds m = snapOutTake(sv, sizeof(h) + len);
+    m = sdscatlen(m, &h, sizeof(h));
+    if (len) m = sdscatlen(m, payload, len);
+    return snapOutEnqueue(sv, m);
+}
+
+/* The staging buffer is a BUFFER message in the making: its first
+ * sizeof(snapMsgHdr) bytes are reserved for the header, the records follow, and
+ * the flush hands the whole buffer to the queue without a copy. */
+static void snapStageReset(snapSave *sv) {
+    sv->stage = snapOutTake(sv, sizeof(snapMsgHdr) + SNAP_STAGE_BYTES);
+    sdsIncrLen(sv->stage, sizeof(snapMsgHdr));
 }
 
 static void snapStageFlush(snapSave *sv) {
-    if (sdslen(sv->stage) == 0) return;
-    snapSendMsg(sv, SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot, sv->stage, sdslen(sv->stage), 0, 0);
-    sdsclear(sv->stage);
+    if (sdslen(sv->stage) <= sizeof(snapMsgHdr)) return;
+    snapMsgHdr h = { SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot,
+                     (uint32_t)(sdslen(sv->stage) - sizeof(snapMsgHdr)), 0, 0 };
+    memcpy(sv->stage, &h, sizeof(h));
+    snapOutEnqueue(sv, sv->stage);
+    snapStageReset(sv);
 }
 
 /* Scan thread: one fork-instant key. Read-only on the keyspace. */
@@ -1642,7 +1756,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         }
         sv->stage = r.io.buffer.ptr;
         atomicIncr(sv->keys_nofork, 1);
-        if (sdslen(sv->stage) >= SNAP_STAGE_BYTES) snapStageFlush(sv);
+        if (sdslen(sv->stage) >= SNAP_STAGE_BYTES + sizeof(snapMsgHdr)) snapStageFlush(sv);
     }
 }
 
@@ -1658,10 +1772,16 @@ static void snapSaveThreadInit(void *priv) {
 static void snapSaveThreadDone(void *priv, int aborted) {
     snapSave *sv = priv;
     if (aborted) {
+        /* Whatever is still queued is moot; the child must see ABORT (or die
+         * first, which breaks the pipe and ends the wait). */
+        snapOutClear(sv);
         snapSendMsg(sv, SNAP_MSG_ABORT, -1, -1, NULL, 0, 0, 0);
+        snapOutDrain(sv, SNAP_DRAIN_ALL, 0);
     } else {
         snapStageFlush(sv);
-        snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0, 0);
+        if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0, 0) == 0 &&
+            snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0)
+            snapScanRequestAbort(sv->scan);
     }
 }
 
@@ -1819,6 +1939,18 @@ static void snapSaveFree(snapSave *sv) {
     if (sv->ae_registered)
         aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
     if (sv->scan) snapScanRelease(sv->scan);
+    if (sv->oq) {
+        snapOutClear(sv);
+        listRelease(sv->oq);
+    }
+    if (sv->oq_pool) {
+        listNode *ln;
+        while ((ln = listFirst(sv->oq_pool)) != NULL) {
+            sdsfree(listNodeValue(ln));
+            listDelNode(sv->oq_pool, ln);
+        }
+        listRelease(sv->oq_pool);
+    }
     if (sv->pipe_wr != -1) close(sv->pipe_wr);
     if (sv->pipe_rd != -1) close(sv->pipe_rd);
     if (sv->sizes) {
@@ -1901,7 +2033,18 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
 #ifdef F_SETPIPE_SZ
     fcntl(sv->pipe_wr, F_SETPIPE_SZ, 1 << 20);   /* best effort: deeper back-pressure buffer */
 #endif
-    sv->stage = sdsempty();
+    /* The scan thread writes the pipe non-blockingly and keeps what does not
+     * fit in its own queue (bounded by the retained-bytes mark). The child's
+     * read end stays blocking. */
+    if (fcntl(sv->pipe_wr, F_SETFL, fcntl(sv->pipe_wr, F_GETFL) | O_NONBLOCK) == -1) {
+        serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+        snapSaveFree(sv);
+        return C_ERR;
+    }
+    sv->oq = listCreate();
+    sv->oq_pool = listCreate();
+    sv->oq_limit = server.bgsave_hybrid_max_retained_bytes;
+    snapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
     sv->mq = listCreate();
@@ -1987,6 +2130,7 @@ void snapSaveChildDone(int exitcode, int bysignal) {
         server.stat_rdb_consecutive_failures++;
     }
     snap_last_retained_peak = sv->retained_peak;
+    atomicGet(sv->queued_peak, snap_last_queued_peak);
     snap_last_inplace_writes = sv->inplace_writes;
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions (merges), joins, unregisters */

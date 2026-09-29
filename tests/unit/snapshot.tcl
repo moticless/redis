@@ -922,6 +922,87 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal $ref [debug_digest]
         }
 
+        test {Hybrid BGSAVE harness: a stalled child fills the scan thread's queue up to the bound, the thread waits, the save completes} {
+            r flushall
+            # rdb compression would shrink the repeated values to a few bytes
+            # each; the point is volume: 100k records of about 75 bytes, 7 MB
+            r config set rdbcompression no
+            set rd [redis_deferring_client]
+            for {set i 0} {$i < 100000} {incr i} { $rd set q:$i [string repeat q 60] }
+            for {set i 0} {$i < 100000} {incr i} { $rd read }
+            $rd close
+            set ref [debug_digest]
+            # 256 KB bound; the pipe itself holds 1 MB before the queue grows
+            r config set bgsave-hybrid-max-retained-bytes 262144
+            r config set rdb-key-save-delay 20
+            set aborts0 [s snap_hard_mark_aborts]
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            exec kill -STOP $child
+            # Observe while the child is stopped, assert after it is continued:
+            # a failed assertion must never leave the child stopped (the next
+            # test's abort could not reach it).
+            set reached 0
+            for {set n 0} {$n < 200 && !$reached} {incr n} {
+                after 50
+                if {[s snap_save_queued_bytes] >= 262144} { set reached 1 }
+            }
+            # the scan thread now waits for the child instead of growing the queue
+            set max_queued 0; set pings 0; set still_running 1
+            for {set n 0} {$n < 10} {incr n} {
+                after 50
+                set q [s snap_save_queued_bytes]
+                if {$q > $max_queued} { set max_queued $q }
+                if {[s snap_save_in_progress] != 1} { set still_running 0 }
+                if {[r ping] eq "PONG"} { incr pings }
+            }
+            set aborts1 [s snap_hard_mark_aborts]
+            exec kill -CONT $child
+            r config set rdb-key-save-delay 0
+            assert_equal 1 $reached
+            assert {$max_queued <= 262144 + 2 * 65536 + 1024}
+            assert_equal 1 $still_running
+            assert_equal 10 $pings
+            assert_equal $aborts0 $aborts1
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert {[s snap_last_save_queued_peak] >= 262144}
+            assert_equal 0 [s snap_save_queued_bytes]
+            r config set bgsave-hybrid-max-retained-bytes 256mb
+            r config set rdbcompression yes
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+        }
+
+        test {Hybrid BGSAVE harness: the queue absorbs scan output while the child serializes big fork-class values} {
+            r flushall
+            r config set rdbcompression no
+            set rd [redis_deferring_client]
+            for {set i 0} {$i < 400000} {incr i} { $rd set a:$i [string repeat a 100] }
+            for {set i 0} {$i < 400000} {incr i} { $rd read }
+            for {set h 0} {$h < 4} {incr h} {
+                for {set i 0} {$i < 300000} {incr i 1000} {
+                    set args {}
+                    for {set j $i} {$j < $i + 1000} {incr j} { lappend args f$j [string repeat v 40] }
+                    $rd hset bigh:$h {*}$args
+                }
+            }
+            for {set h 0} {$h < 4} {incr h} { for {set i 0} {$i < 300000} {incr i 1000} { $rd read } }
+            $rd close
+            assert_equal hashtable [r object encoding bigh:0]
+            set ref [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            # more than the 1 MB pipe was pending at some point: the scan thread ran ahead of the child
+            assert {[s snap_last_save_queued_peak] > 1048576}
+            assert_equal 0 [s snap_save_queued_bytes]
+            r config set rdbcompression yes
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+        }
+
         test {Hybrid BGSAVE harness: child killed mid-save, the parent recovers and the next save works} {
             snap_populate_race 0 1
             r config set rdb-key-save-delay 400

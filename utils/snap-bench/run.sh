@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start each binary with identical flags (pinned to cores 0-7), run bench.py (snapload.py traffic), stop it.
 #   run.sh <csv> [rates] [datasets] [scale] [reps]
-# CFGS env: space-separated subset of "base up hybrid valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
+# CFGS env: space-separated subset of "base up hybrid hybrid-before hybrid2 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
 # Parity: small-value cap pinned to 4096 B on both POCs (ours save-small-max-bytes, theirs forkless-string-max);
 # retained-memory budgets left at each POC's default (ours 256 MB hard mark, theirs unlimited) and recorded in the CSV.
 cd "$(dirname "$0")"
@@ -14,6 +14,8 @@ COOL=${COOL:-0}                   # thermal gate: wait before each cell until th
 BASE=${BASE:-/tmp/redis-base/src/redis-server}        # stock 0c1c74706 (M1 baseline)
 UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d (current base)
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
+HYB_BEFORE=${HYB_BEFORE:-/tmp/redis-hyb-before/src/redis-server}   # our branch before the change under test (A/B runs)
+HYB2=${HYB2:-/tmp/redis-hyb2/src/redis-server}                     # a second build of our branch (A/B/C runs)
 VALKEY=${VALKEY:-/tmp/valkey-bench/src/valkey-server} # valkey unstable (fork and forkless saves)
 YINON=${YINON:-/home/moti/git/tmp/redis-yinon/src/redis-server} # teammate POC 1204d0970 (bgsave-mode fork|hybrid|forkless)
 CLI=${CLI:-$(dirname "$HYB")/redis-cli}                 # any redis-cli
@@ -33,6 +35,8 @@ for cfg in ${CFGS:-base hybrid}; do
     base)            start base "$BASE" ;;
     up)              start up "$UP" ;;
     hybrid)          start hybrid "$HYB" --bgsave-hybrid yes ;;
+    hybrid-before)   start hybrid-before "$HYB_BEFORE" --bgsave-hybrid yes ;;
+    hybrid2)         start hybrid2 "$HYB2" --bgsave-hybrid yes ;;
     valkey-fork)     start valkey-fork "$VALKEY" ;;
     valkey-forkless) start valkey-forkless "$VALKEY" --forkless-infrastructure-enabled yes --bgsave-default-method forkless ;;
     yinon-fork)      start yinon-fork "$YINON" --bgsave-mode fork ;;

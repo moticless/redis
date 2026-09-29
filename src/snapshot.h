@@ -341,7 +341,8 @@ size_t snapSaveRetainedBytes(void);
 size_t snapSaveLastRetainedPeak(void);
 /* Main-thread emission (spec 11.z): bytes queued for the scan thread to
  * forward to the child, buckets and keys the main thread emitted itself. */
-size_t snapSaveQueuedBytes(void);
+size_t snapSaveQueuedBytes(void);        /* main-thread queue plus the scan thread's outbound queue */
+size_t snapSaveLastQueuedPeak(void);     /* peak of the two queues over the last save */
 size_t snapSaveBitmapBytes(void);   /* bucket bitmaps of the running save, 0 when none runs */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);

@@ -234,7 +234,7 @@ def save_mode(r):
     if "bgsave-default-method" in cfg: return "valkey-" + cfg["bgsave-default-method"]
     return "fork"
 
-IMPL_STATS = ["snap_last_save_retained_peak", "snap_hard_mark_aborts", "snap_save_main_keys",
+IMPL_STATS = ["snap_last_save_retained_peak", "snap_last_save_queued_peak", "snap_hard_mark_aborts", "snap_save_main_keys",
               "forkless_retained_peak", "forkless_snapshot_peak", "forkless_limit_aborts", "forkless_copied_values",
               "forkless_retained_strings", "forkless_priority_keys", "forkless_copy_usec", "forkless_reader_wait_usec",
               "rdb_last_bgsave_type"]
