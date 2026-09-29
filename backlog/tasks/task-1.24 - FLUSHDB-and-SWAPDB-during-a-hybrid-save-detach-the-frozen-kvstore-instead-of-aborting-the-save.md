@@ -6,12 +6,17 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-25 14:14'
+updated_date: '2026-09-29 18:53'
 labels:
   - bgsave
   - persistence
   - db
 milestone: m-3
 dependencies: []
+references:
+  - >-
+    ~/git/dragonfly src/server/snapshot.cc (db_array_ intrusive_ptr copy of the
+    table array), src/server/db_slice.cc FlushDbIndexes
 documentation:
   - poc-hybrid-bgsave-spec.md
   - utils/snap-bench/RESULTS.md
@@ -36,3 +41,9 @@ Do better than both: on FLUSHDB during a save, swap in a fresh empty kvstore for
 - [ ] #4 The stock aof-multi-part in-progress assertion adapted in 2b3e61d64 is restored for the FLUSHDB/SWAPDB cases it can cover
 - [ ] #5 Spec section 4 and 11.z.1 describe the detach semantics
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-09-29 precedent: Dragonfly's SliceSnapshot holds its own refcounted copy of the DbTable array; FLUSHALL/FLUSHDB swaps fresh tables into the slice, the snapshot keeps serializing the old, now-frozen tables, and their memory is freed when the snapshot ends. New keys in the new tables carry versions above the cut so the pre-update hook skips them. This is the 'detach the frozen kvstore' design of this task, proven in production; the main difference for us is that the scan thread's window and the funnel must be told the frozen kvstore is no longer the live one (no more emissions for it, all its buckets belong to the scan thread).
+<!-- SECTION:NOTES:END -->
