@@ -1256,7 +1256,7 @@ typedef struct snapSave {
     list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
     size_t oq_head_off;                 /* bytes of the head message already written */
     size_t oq_limit;                    /* bgsave-hybrid-max-retained-bytes at save start, 0 = none */
-    redisAtomic size_t oq_bytes;        /* bytes queued and not yet written to the pipe */
+    redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for the pipe */
     redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
 } snapSave;
 
@@ -1591,25 +1591,29 @@ static int snapReadAll(int fd, void *p, size_t n) {
 #define SNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
 
 static void snapOutRecycle(snapSave *sv, sds m);
-#define SNAP_OUT_POOL_MAX 16   /* buffers kept for reuse; each is about one staging buffer */
+#define SNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
+#define SNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
 
-/* Scan thread: a message buffer with room for 'need' bytes, recycled when
- * possible so the 64 KB staging buffers are not allocated (and faulted in)
- * afresh for every message. */
+/* Scan thread: a message buffer with room for 'need' bytes. Allocation is
+ * exact (no greedy doubling: these bytes are what the queue holds against the
+ * bound and what used_memory reports) and the pool serves staging-sized
+ * requests only, so a small KVOBJ or END message never pins a 64 KB buffer
+ * in the queue with a few bytes in it. */
 static sds snapOutTake(snapSave *sv, size_t need) {
-    sds m;
-    listNode *ln = listFirst(sv->oq_pool);
-    if (ln) {
-        m = listNodeValue(ln);
+    listNode *ln;
+    if (need >= SNAP_STAGE_BYTES && (ln = listFirst(sv->oq_pool)) != NULL) {
+        sds m = listNodeValue(ln);
         listDelNode(sv->oq_pool, ln);
-    } else {
-        m = sdsempty();
+        return sdsMakeRoomForNonGreedy(m, need);
     }
-    return sdsMakeRoomFor(m, need);
+    return sdsMakeRoomForNonGreedy(sdsempty(), need);
 }
 
+/* Scan thread: a drained message goes back to the pool when it is a staging
+ * buffer, is freed otherwise. */
 static void snapOutRecycle(snapSave *sv, sds m) {
-    if (listLength(sv->oq_pool) < SNAP_OUT_POOL_MAX && sdsalloc(m) <= 4 * SNAP_STAGE_BYTES) {
+    size_t a = sdsalloc(m);
+    if (a >= SNAP_STAGE_BYTES && a <= 4 * SNAP_STAGE_BYTES && listLength(sv->oq_pool) < SNAP_OUT_POOL_MAX) {
         sdsclear(m);
         listAddNodeTail(sv->oq_pool, m);
     } else {
@@ -1642,8 +1646,8 @@ static int snapOutDrain(snapSave *sv, int mode, size_t target) {
             continue;
         }
         sv->oq_head_off += w;
-        atomicDecr(sv->oq_bytes, (size_t)w);
         if (sv->oq_head_off == len) {
+            atomicDecr(sv->oq_bytes, sdsAllocSize(m));
             listDelNode(sv->oq, ln);
             snapOutRecycle(sv, m);
             sv->oq_head_off = 0;
@@ -1671,7 +1675,7 @@ static int snapOutEnqueue(snapSave *sv, sds m) {
     size_t n = sdslen(m);
     listAddNodeTail(sv->oq, m);
     size_t q, mqb, peak;
-    atomicIncrGet(sv->oq_bytes, q, n);
+    atomicIncrGet(sv->oq_bytes, q, sdsAllocSize(m));   /* what the queue really holds */
     atomicGet(sv->mq_bytes, mqb);
     atomicGet(sv->queued_peak, peak);
     if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
@@ -1704,7 +1708,7 @@ static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
  * sizeof(snapMsgHdr) bytes are reserved for the header, the records follow, and
  * the flush hands the whole buffer to the queue without a copy. */
 static void snapStageReset(snapSave *sv) {
-    sv->stage = snapOutTake(sv, sizeof(snapMsgHdr) + SNAP_STAGE_BYTES);
+    sv->stage = snapOutTake(sv, sizeof(snapMsgHdr) + SNAP_STAGE_BYTES + SNAP_STAGE_SLACK);
     sdsIncrLen(sv->stage, sizeof(snapMsgHdr));
 }
 
@@ -1756,7 +1760,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         }
         sv->stage = r.io.buffer.ptr;
         atomicIncr(sv->keys_nofork, 1);
-        if (sdslen(sv->stage) >= SNAP_STAGE_BYTES + sizeof(snapMsgHdr)) snapStageFlush(sv);
+        if (sdslen(sv->stage) + SNAP_STAGE_SLACK > sdsalloc(sv->stage)) snapStageFlush(sv);
     }
 }
 

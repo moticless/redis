@@ -930,8 +930,18 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             set rd [redis_deferring_client]
             for {set i 0} {$i < 100000} {incr i} { $rd set q:$i [string repeat q 60] }
             for {set i 0} {$i < 100000} {incr i} { $rd read }
+            # a few thousand hashtable hashes: their small KVOBJ messages must
+            # not each pin a whole staging buffer in the queue
+            for {set h 0} {$h < 3000} {incr h} {
+                set args {}
+                for {set j 0} {$j < 64} {incr j} { lappend args f$j [string repeat v 96] }
+                $rd hset qh:$h {*}$args
+            }
+            for {set h 0} {$h < 3000} {incr h} { $rd read }
             $rd close
+            assert_equal hashtable [r object encoding qh:0]
             set ref [debug_digest]
+            set used0 [s used_memory]
             # 256 KB bound; the pipe itself holds 1 MB before the queue grows
             r config set bgsave-hybrid-max-retained-bytes 262144
             r config set rdb-key-save-delay 20
@@ -949,11 +959,13 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
                 if {[s snap_save_queued_bytes] >= 262144} { set reached 1 }
             }
             # the scan thread now waits for the child instead of growing the queue
-            set max_queued 0; set pings 0; set still_running 1
+            set max_queued 0; set pings 0; set still_running 1; set max_used 0
             for {set n 0} {$n < 10} {incr n} {
                 after 50
                 set q [s snap_save_queued_bytes]
                 if {$q > $max_queued} { set max_queued $q }
+                set u [s used_memory]
+                if {$u > $max_used} { set max_used $u }
                 if {[s snap_save_in_progress] != 1} { set still_running 0 }
                 if {[r ping] eq "PONG"} { incr pings }
             }
@@ -961,7 +973,10 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             exec kill -CONT $child
             r config set rdb-key-save-delay 0
             assert_equal 1 $reached
-            assert {$max_queued <= 262144 + 2 * 65536 + 1024}
+            assert {$max_queued <= 262144 + 2 * 81920}
+            # what the save allocates while stalled: the queue at its bound plus
+            # the pooled staging buffers, not hundreds of MB of pinned buffers
+            assert {$max_used - $used0 < 8 * 1024 * 1024}
             assert_equal 1 $still_running
             assert_equal 10 $pings
             assert_equal $aborts0 $aborts1
