@@ -71,6 +71,21 @@ void snapArenaInit(void) {
 
 static int snap_arena_fallback = 0;   /* flipped forkable for a non-hybrid child, flip back on reap */
 static int snap_forking_hybrid = 0;   /* set around the hybrid save's own redisFork() */
+static int snap_in_hybrid_child = 0;  /* this process is the hybrid save child: no keyspace mapped */
+int snapInHybridChild(void) { return snap_in_hybrid_child; }
+
+/* Main thread: a hybrid save was requested but a loaded module has not
+ * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE; the stock child runs
+ * instead. Logged when the blocking module changes, not on every save. */
+void snapHybridFallbackLog(void) {
+    static sds last = NULL;
+    const char *who = moduleHybridBgsaveBlockedBy();
+    if (last && !strcmp(last, who)) return;
+    sdsfree(last);
+    last = sdsnew(who);
+    serverLog(LL_WARNING, "Hybrid BGSAVE: falling back to the fork child, module '%s' has not declared "
+                          "REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE", who);
+}
 
 int snapArenaForkable(void) {
 #ifdef SNAP_NOFORK_ARENA_SUPPORTED
@@ -1959,6 +1974,7 @@ werr:
 
 static void snapSaveChild(snapSave *sv) {
     rio sock;
+    snap_in_hybrid_child = 1;
     close(sv->pipe_wr);
     if (sv->to_sockets) {
         if (sv->rdb_channel) {

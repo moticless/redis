@@ -120,6 +120,7 @@ void keyMetaTransition(kvobj *kvOld, kvobj *kvNew);
 
 /* return 0 if failed to create. Otherwise return handle (between 1 and 7) */
 KeyMetaClassId keyMetaClassCreate(struct RedisModule *ctx, const char *metaname, int metaver, KeyMetaClassConf *conf);
+int keyMetaClassModuleHasAny(struct RedisModule *module);
 /* Destroy (release) a previously created class. Return 1 on success, 0 on failure. */
 int keyMetaClassRelease(KeyMetaClassId class_id);
 

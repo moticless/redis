@@ -294,6 +294,8 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
  * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);   /* diskless full sync through the hybrid child */
+int snapInHybridChild(void);      /* 1 in the hybrid save child (no keyspace mapped) */
+void snapHybridFallbackLog(void); /* a module without the opt-in sends the save to the stock child */
 int snapSaveInProgress(void);
 /* Stop the scan thread and merge every slot (main thread). Safe to call when
  * no hybrid save is running. Does not touch the child (see killRDBChild). */

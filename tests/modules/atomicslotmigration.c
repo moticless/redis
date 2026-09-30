@@ -611,6 +611,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_Init(ctx, "asm", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
+    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE);
 
     if (RedisModule_CreateCommand(ctx, "asm.cluster_can_access_keys_in_slot", testClusterCanAccessKeysInSlot, "", 0, 0, 0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;

@@ -725,6 +725,14 @@ void keyMetaTransition(kvobj *kvOld, kvobj *kvNew) {
  * 
  * context - In case of a module, pass the module pointer. Otherwise NULL.
  */
+/* Does 'module' own any key metadata class in use? (hybrid BGSAVE: such a
+ * module has save callbacks that run in the child.) */
+int keyMetaClassModuleHasAny(RedisModule *module) {
+    for (int i = 0; i < KEY_META_ID_MAX; i++)
+        if (keyMetaClass[i].state == CLASS_STATE_INUSE && keyMetaClass[i].entity.module == module) return 1;
+    return 0;
+}
+
 KeyMetaClassId keyMetaClassCreate(RedisModule *context, const char *name,
                                   int metaver, KeyMetaClassConf *conf) {
     if (!conf) return 0;

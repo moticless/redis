@@ -2584,7 +2584,16 @@ void RM_Yield(RedisModuleCtx *ctx, int flags, const char *busy_reply) {
  * By default, Redis will not fire key-space notifications that happened inside
  * a key-space notification callback. This flag allows to change this behavior
  * and fire nested key-space notifications. Notice: if enabled, the module
- * should protected itself from infinite recursion. */
+ * should protected itself from infinite recursion.
+ *
+ * REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE:
+ * Declare that the module's save-side callbacks (rdb_save, aux_save,
+ * aux_save2, key metadata save, PERSISTENCE and FORK_CHILD event handlers)
+ * never touch the keyspace: they serialize only the value they are given,
+ * module-owned memory and the IO context. A hybrid BGSAVE runs them in a child
+ * that has no keyspace mapped; a module that registers a data type, aux
+ * callbacks or such an event handler without this flag makes hybrid saves fall
+ * back to the stock fork child while it is loaded. */
 void RM_SetModuleOptions(RedisModuleCtx *ctx, int options) {
     ctx->module->options = options;
 }
@@ -4156,7 +4165,10 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
  * REDISMODULE_OPEN_KEY_NOTOUCH, then checking if NULL was returned and, if not,
  * calling RM_CloseKey on the opened key.
  */
+static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit);
+
 int RM_KeyExists(RedisModuleCtx *ctx, robj *keyname) {
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_KeyExists", 1u << 0)) return 0;
     kvobj *kv = lookupKeyReadWithFlags(ctx->client->db, keyname, LOOKUP_NOTOUCH);
     return (kv != NULL);
 }
@@ -4207,6 +4219,7 @@ RedisModuleKey *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
     RedisModuleKey *kp;
     kvobj *kv;
     int flags = 0;
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_OpenKey", 1u << 1)) return NULL;
     flags |= (mode & REDISMODULE_OPEN_KEY_NOTOUCH? LOOKUP_NOTOUCH: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NONOTIFY? LOOKUP_NONOTIFY: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NOSTATS? LOOKUP_NOSTATS: 0);
@@ -4341,6 +4354,7 @@ int RM_UnlinkKey(RedisModuleKey *key) {
  * If no TTL is associated with the key or if the key is empty,
  * REDISMODULE_NO_EXPIRE is returned. */
 mstime_t RM_GetExpire(RedisModuleKey *key) {
+    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, "RedisModule_GetExpire", 1u << 2)) return REDISMODULE_NO_EXPIRE;
     mstime_t expire = kvobjGetExpire(key->kv);
     if (expire == -1 || key->kv == NULL)
         return REDISMODULE_NO_EXPIRE;
@@ -4677,11 +4691,13 @@ void RM_ResetDataset(int restart_aof, int async) {
 
 /* Returns the number of keys in the current db. */
 unsigned long long RM_DbSize(RedisModuleCtx *ctx) {
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_DbSize", 1u << 3)) return 0;
     return dbSize(ctx->client->db);
 }
 
 /* Returns a name of a random key, or NULL if current db is empty. */
 RedisModuleString *RM_RandomKey(RedisModuleCtx *ctx) {
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_RandomKey", 1u << 4)) return NULL;
     robj *key = dbRandomKey(ctx->client->db);
     autoMemoryAdd(ctx,REDISMODULE_AM_STRING,key);
     return key;
@@ -6924,6 +6940,16 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
     if (ctx->module) ctx->module->in_call++;
 
+    /* Hybrid BGSAVE child: no keyspace to run commands against. */
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_Call", 1u << 7)) {
+        errno = EPERM;
+        if (error_as_call_replies) {
+            sds msg = sdsnew("the hybrid BGSAVE child has no keyspace; save callbacks must not call commands");
+            reply = callReplyCreateError(msg, ctx);
+        }
+        goto cleanup;
+    }
+
     /* Attach the user of the context or client.
      * Internal connections always run with the unrestricted user. */
     user *user = NULL;
@@ -7729,6 +7755,70 @@ int moduleAllModulesHandleReplAsyncLoad(void) {
         }
     }
     dictResetIterator(&di);
+    return 1;
+}
+
+/* Hybrid BGSAVE (bgsave-hybrid): does this module have callbacks that the
+ * save child runs? Data types (rdb_save, aux_save), key metadata classes
+ * (their save callback) and PERSISTENCE / FORK_CHILD event handlers. */
+static int moduleHasSaveCallbacks(struct RedisModule *module) {
+    if (listLength(module->types)) return 1;
+    if (keyMetaClassModuleHasAny(module)) return 1;
+    listIter li;
+    listNode *ln;
+    listRewind(RedisModule_EventListeners, &li);
+    while ((ln = listNext(&li))) {
+        RedisModuleEventListener *el = ln->value;
+        if (el->module == module &&
+            (el->event.id == REDISMODULE_EVENT_PERSISTENCE || el->event.id == REDISMODULE_EVENT_FORK_CHILD))
+            return 1;
+    }
+    return 0;
+}
+
+/* The first loaded module with save callbacks that did not declare
+ * REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE, or NULL when every module is fine
+ * (or has nothing that runs in the save child). */
+static struct RedisModule *moduleHybridBgsaveBlocker(void) {
+    dictIterator di;
+    dictEntry *de;
+    struct RedisModule *found = NULL;
+    dictInitIterator(&di, modules);
+    while ((de = dictNext(&di)) != NULL) {
+        struct RedisModule *module = dictGetVal(de);
+        if (!(module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) && moduleHasSaveCallbacks(module)) {
+            found = module;
+            break;
+        }
+    }
+    dictResetIterator(&di);
+    return found;
+}
+
+/* Returns 1 when a hybrid BGSAVE may run with the loaded modules, 0 when it
+ * must fall back to the stock fork child. */
+int moduleAllModulesHandleHybridBgsave(void) {
+    return moduleHybridBgsaveBlocker() == NULL;
+}
+
+/* Name of the module blocking hybrid saves, "" when none (INFO persistence). */
+const char *moduleHybridBgsaveBlockedBy(void) {
+    struct RedisModule *m = moduleHybridBgsaveBlocker();
+    return m ? m->name : "";
+}
+
+/* Hybrid BGSAVE child: the keyspace is not mapped there, so a module save
+ * callback that reaches for it is refused instead of faulting. Logged once
+ * per API per child. Returns 1 when the caller must refuse. */
+static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit) {
+    static unsigned logged = 0;
+    if (!snapInHybridChild()) return 0;
+    if (!(logged & bit)) {
+        logged |= bit;
+        serverLog(LL_WARNING, "Module %s called %s inside the hybrid BGSAVE child, which has no keyspace: refused. "
+                              "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE).",
+                  module ? module->name : "?", api);
+    }
     return 1;
 }
 
@@ -12298,6 +12388,11 @@ void RM_ScanCursorDestroy(RedisModuleScanCursor *cursor) {
  * memory, so it may make sense to just operate on the current key when
  * possible during the iteration, given that this is safe. */
 int RM_Scan(RedisModuleCtx *ctx, RedisModuleScanCursor *cursor, RedisModuleScanCB fn, void *privdata) {
+    if (moduleHybridChildGuard(ctx->module, "RedisModule_Scan", 1u << 5)) {
+        cursor->done = 1;
+        errno = EPERM;
+        return 0;
+    }
     if (cursor->done) {
         errno = ENOENT;
         return 0;
@@ -12403,6 +12498,11 @@ static void moduleScanKeyCallback(void *privdata, const dictEntry *de, dictEntry
 int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleScanKeyCB fn, void *privdata) {
     if (key == NULL || key->kv == NULL) {
         errno = EINVAL;
+        return 0;
+    }
+    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, "RedisModule_ScanKey", 1u << 6)) {
+        cursor->done = 1;
+        errno = EPERM;
         return 0;
     }
     dict *ht = NULL;
@@ -13765,6 +13865,10 @@ int moduleOnLoad(int (*onload)(void *, void **, int), const char *path, void *ha
         ACLRecomputeCommandBitsFromCommandRulesAllUsers();
     }
     if (path) serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
+    if (server.bgsave_hybrid && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) &&
+        moduleHasSaveCallbacks(ctx.module))
+        serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE: "
+                              "hybrid BGSAVE falls back to the fork child while it is loaded", ctx.module->name);
     ctx.module->onload = 0;
 
     int post_load_err = 0;
@@ -15118,11 +15222,30 @@ size_t moduleCount(void) {
  * ## Key eviction API
  * -------------------------------------------------------------------------- */
 
+/* RM_SetLRU / RM_SetLFU write the kvobj header, which the hybrid BGSAVE scan
+ * thread reads for the IDLE / FREQ opcodes while the key is owed to it. A
+ * handle opened with REDISMODULE_WRITE already went through the write funnel
+ * at open time; a READ handle (the documented way to set the idle time
+ * without touching it first, READ|NOTOUCH) is handed over here: the write
+ * lookup emits or clones the owed bucket, and the pointer is refreshed since
+ * a clone replaces the frozen original. Returns 0 when there is no key. */
+static int moduleKeyPrepareLruWrite(RedisModuleKey *key) {
+    if (!key->kv) return 0;
+    if (key->mode & REDISMODULE_WRITE) return 1;
+    if (snapKvobjIsOwed(key->db, key->kv)) {
+        kvobj *kv = lookupKeyWriteWithFlags(key->db, key->key,
+            LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
+        if (!kv) return 0;
+        key->kv = kv;
+    }
+    return 1;
+}
+
 /* Set the key last access time for LRU based eviction. not relevant if the
  * servers's maxmemory policy is LFU based. Value is idle time in milliseconds.
  * returns REDISMODULE_OK if the LRU was updated, REDISMODULE_ERR otherwise. */
 int RM_SetLRU(RedisModuleKey *key, mstime_t lru_idle) {
-    if (!key->kv)
+    if (!moduleKeyPrepareLruWrite(key))
         return REDISMODULE_ERR;
     if (objectSetLRUOrLFU(key->kv, -1, lru_idle, lru_idle>=0 ? LRU_CLOCK() : 0, 1))
         return REDISMODULE_OK;
@@ -15149,7 +15272,7 @@ int RM_GetLRU(RedisModuleKey *key, mstime_t *lru_idle) {
  * the access frequencyonly (must be <= 255).
  * returns REDISMODULE_OK if the LFU was updated, REDISMODULE_ERR otherwise. */
 int RM_SetLFU(RedisModuleKey *key, long long lfu_freq) {
-    if (!key->kv)
+    if (!moduleKeyPrepareLruWrite(key))
         return REDISMODULE_ERR;
     if (objectSetLRUOrLFU(key->kv, lfu_freq, -1, 0, 1))
         return REDISMODULE_OK;

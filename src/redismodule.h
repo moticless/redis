@@ -344,10 +344,22 @@ typedef uint64_t RedisModuleTimerID;
  * If enabled, the module is responsible to break endless loop. */
 #define REDISMODULE_OPTIONS_ALLOW_NESTED_KEYSPACE_NOTIFICATIONS    (1<<3)
 
+/* Declare that the module's save-side callbacks (rdb_save, aux_save, aux_save2,
+ * key metadata save, PERSISTENCE and FORK_CHILD server-event handlers) never
+ * touch the keyspace: no RedisModule_OpenKey, KeyExists, Scan, ScanKey, Call,
+ * DbSize, RandomKey or GetExpire on any key, only the value they are given,
+ * module-owned memory and the IO context. A hybrid BGSAVE (bgsave-hybrid yes)
+ * saves the module's data in a child process that has no keyspace mapped;
+ * while a module that registers a data type, aux callbacks or such an event
+ * handler is loaded without this flag, hybrid saves fall back to the stock
+ * fork child (INFO snap_hybrid_blocked_by names it). In the hybrid child those
+ * APIs refuse (NULL / 0 / error) and log instead of faulting. */
+#define REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE    (1<<4)
+
 /* Next option flag, must be updated when adding new module flags above!
  * This flag should not be used directly by the module.
  * Use RedisModule_GetModuleOptionsAll instead. */
-#define _REDISMODULE_OPTIONS_FLAGS_NEXT (1<<4)
+#define _REDISMODULE_OPTIONS_FLAGS_NEXT (1<<5)
 
 /* Definitions for RedisModule_SetCommandInfo. */
 

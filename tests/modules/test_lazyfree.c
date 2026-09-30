@@ -165,6 +165,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_Init(ctx,"lazyfreetest",1,REDISMODULE_APIVER_1)
         == REDISMODULE_ERR) return REDISMODULE_ERR;
+    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE);
 
     /* We only allow our module to be loaded when the redis core version is greater than the version of my module */
     if (RedisModule_GetTypeMethodVersion() < REDISMODULE_TYPE_METHOD_VERSION) {

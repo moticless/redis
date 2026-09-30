@@ -734,7 +734,11 @@ contract is narrower, but the child side is stricter than stock.
    value passed to the callback, module-owned memory, and the IO context
    (`RM_SaveString*`, `RM_GetKeyNameFromIO`, `RM_GetDbIdFromIO`,
    `RM_GetContextFromIO` for `RM_Log`). The key name in the IO context points
-   into the header copy and is valid for the callback only, as in stock.
+   into the header copy and is valid for the callback only, as in stock. (The
+   IO context has no client, so `RM_OpenKey` through it dereferences NULL in
+   the stock child as well; a module that reaches the keyspace from a save
+   callback does so through a detached thread-safe context, which is what the
+   test module does.)
 2. Module-owned state must not keep pointers into Redis-owned key memory and
    dereference them in a save callback: a `char *` from `RM_StringDMA` or a
    `RedisModuleKey *`. Both are already invalid past the command by the API
@@ -746,11 +750,13 @@ contract is narrower, but the child side is stricter than stock.
    `RM_SetExpire`, list/zset/hash/stream APIs and `RM_ModuleTypeReplaceValue` is
    covered: "value mutations outside the section need no protection"), and from
    a module thread only under the GIL (the write section closes in
-   `moduleReleaseGIL`). Gap on our side: `RM_SetLRU`/`RM_SetLFU` do not check the
-   mode, so on a READ handle they write `kv->lru` while the scan thread may read
-   it for the IDLE/FREQ opcode; either value is a valid clock, so the effect is a
-   racy idle time in the RDB, not corruption. To be closed by requiring WRITE
-   (or by cloning as P29 of the audit says).
+   `moduleReleaseGIL`). Gap on our side, closed by TASK-1.25: `RM_SetLRU` /
+   `RM_SetLFU` are allowed on a READ handle (the stock test module uses
+   READ|NOTOUCH so that the open does not touch the idle time first), and
+   wrote `kv->lru` while the scan thread may read it for the IDLE/FREQ opcode.
+   They now hand an owed key to the write funnel first (a write lookup, which
+   emits or clones the bucket and refreshes the handle's pointer), the same
+   thing a WRITE handle does at open time.
 4. Behaviour a module can observe on the main thread during a hybrid save:
    `RM_ResetDataset` (`emptyData`) aborts the save and kills the child (stock:
    the child finishes the pre-flush dataset); `RM_Call` of FLUSHDB or SWAPDB
@@ -763,25 +769,32 @@ contract is narrower, but the child side is stricter than stock.
    its value size, so it pays stock copy-on-write and does not benefit from the
    arena. Module values themselves are big-value class by definition.
 
-**Enforcement (to implement, backlog TASK-1.25).** Follow Valkey: an opt-in
+**Enforcement (implemented, TASK-1.25, 2026-09-30).** Following Valkey: an opt-in
 module option `REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE` (`1<<4`,
-`_REDISMODULE_OPTIONS_FLAGS_NEXT` -> `1<<5`) meaning "my save callbacks obey
-items 1 and 2". `snapSaveBackground` consults `moduleAllModulesHandleHybridBgsave()`:
-if any loaded module lacks the bit, the save falls back to the stock fork path
-(the §11.z.1 item 6 flip makes this free) with one `LL_WARNING` per offending
-module at load time and an INFO field naming it (`snap_hybrid_blocked_by:<name>`),
-so the fallback is never silent. Every module must opt in, as in Valkey, rather
-than only modules with data types: server-event handlers run in the child too,
-and the rule is easier to state and to check. `MODULE LOAD` during a hybrid save
-stays allowed (its `OnLoad` runs on the main thread through the funnel; the
-running child was forked before it). Defence in depth in the child: when
-`server.in_fork_child` is a hybrid save child, the keyspace APIs of item 1
-return NULL/`REDISMODULE_ERR` (`RM_Call`: an error reply) and log once, so a
-violation by an opted-in module fails the save with a message instead of a
-SIGSEGV. The test modules that register types or aux callbacks set the bit, and
-one test module violates item 1 on purpose to check both the fallback (bit not
-set) and the guard (bit set). With the bit missing, `tests/modules` under
-`--config bgsave-hybrid yes` would otherwise silently run the stock path.
+`_REDISMODULE_OPTIONS_FLAGS_NEXT` -> `1<<5`) meaning "my save-side callbacks obey
+items 1 and 2". A module is *relevant* when it registers a data type, a key
+metadata class, or a PERSISTENCE / FORK_CHILD server-event handler: those are
+the callbacks the save child runs. A relevant module without the bit blocks the
+hybrid path: `rdbSaveBackground` and `startBgsaveForReplication` consult
+`moduleAllModulesHandleHybridBgsave()` and take the stock fork child instead
+(the §11.z.1 item 6 flip makes this free), with `LL_WARNING` at module load
+(when `bgsave-hybrid` is on) and again when the blocking module changes at save
+time, and INFO persistence `snap_hybrid_blocked_by:<name>` naming it, so the
+fallback is never silent. Modules with none of those callbacks need no
+declaration (nothing of theirs runs in the child). The bundled vector-sets
+module and the test modules with data types, metadata classes or persistence
+handlers declare the bit. `MODULE LOAD` during a hybrid save stays allowed.
+Defence in depth in the child (`snapInHybridChild()`): `RM_OpenKey` returns
+NULL, `RM_KeyExists`/`RM_DbSize` 0, `RM_RandomKey` NULL, `RM_Scan`/`RM_ScanKey`
+0 with `EPERM`, `RM_GetExpire` no-expire, `RM_Call` NULL with `EPERM` (or an
+error reply with the `E` flag), each logged once per API per child, so a
+violation by an opted-in module produces a message and a save that continues
+with the module's own data instead of a SIGSEGV. `RM_SetLRU`/`RM_SetLFU` on
+a READ handle go through the write funnel (item 3's gap; requiring WRITE was
+the plan, but it breaks the stock `misc.c` module tests and any module that
+sets idle time through READ|NOTOUCH). Test module
+`tests/modules/hybridviolate.c` breaks item 1 on purpose to cover both the
+fallback and the guards, and exercises SetLRU/SetLFU on an owed key.
 
 **Audit of RedisJSON and RediSearch against the contract (2026-09-26, trees
 ~/git/RedisJSON e1c8194 and ~/git/RediSearch c14cf7ffb).** Both satisfy items 1

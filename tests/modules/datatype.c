@@ -270,7 +270,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     if (RedisModule_CreateCommand(ctx,"block.create.datatype.outside.onload", createDataTypeBlockCheck, "write", 0, 0, 0) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
 
-    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_IO_ERRORS);
+    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE | REDISMODULE_OPTIONS_HANDLE_IO_ERRORS);
 
     RedisModuleTypeMethods datatype_methods = {
         .version = REDISMODULE_TYPE_METHOD_VERSION,

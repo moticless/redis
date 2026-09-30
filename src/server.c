@@ -6888,6 +6888,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
             "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
             "snap_saves:%lld\r\n", server.stat_snap_saves,
+            "snap_hybrid_blocked_by:%s\r\n", moduleHybridBgsaveBlockedBy(),
             "snap_save_inplace_writes:%lld\r\n", snapSaveInplaceWrites(),
             "snap_last_save_inplace_writes:%lld\r\n", snapSaveLastInplaceWrites(),
             "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes,

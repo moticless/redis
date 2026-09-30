@@ -2270,8 +2270,11 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
      * fork child cannot walk the keyspace; the snapshot.c path scans on a
      * parent thread and streams to the child. Functions-only saves have no
      * keyspace content and keep the stock path. */
-    if (snapHybridEnabled() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA))
-        return snapSaveBackground(req, filename, rsi, rdbflags);
+    if (snapHybridEnabled() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
+        if (moduleAllModulesHandleHybridBgsave())
+            return snapSaveBackground(req, filename, rsi, rdbflags);
+        snapHybridFallbackLog();   /* a module's save callbacks need the keyspace: stock child */
+    }
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;

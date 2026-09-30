@@ -195,7 +195,10 @@ API need no new code.
 
 The one new rule: the child has no keyspace, so a save callback that opens another key faults
 instead of reading a stale copy. Save callbacks must serialize only the value they are given and
-module-owned memory. We audited RedisJSON and RediSearch against this: both comply as they are.
+module-owned memory. A module with a data type, key metadata or a persistence hook declares that it
+obeys with one option bit, `REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE`; until it does, saves take the
+stock fork path and INFO names the module. In the child the keyspace APIs refuse and log rather
+than fault. We audited RedisJSON and RediSearch against the rule: both comply as they are.
 
 The forkless contract asks more. The author must certify that `rdb_save` is thread-safe, and
 every open of a key the command did not declare needs a new branch for a NULL handle. Both are
@@ -434,9 +437,11 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
 - **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
 - **FLUSHDB, SWAPDB and DEBUG RELOAD** during a hybrid save abort it, as in Valkey's forkless
   save; detaching the frozen keyspace instead is designed, not built.
-- **The module opt-in flag** is specified, not implemented; the per-type opt-in to the
-  small-value class (section 5) is a design sketch only. The 4 KB cap and the encoding
-  thresholds that feed it are untuned; the mixed dataset is the experiment.
+- **The module opt-in flag** is implemented (fallback to the fork child, INFO naming the
+  module, child-side guards); the bundled modules have not declared it yet, so a server
+  loading JSON or Search saves through the stock child until they are rebuilt. The per-type
+  opt-in to the small-value class (section 5) is a design sketch only. The 4 KB cap and the
+  encoding thresholds that feed it are untuned; the mixed dataset is the experiment.
 - **The scan thread** costs about one CPU-second per 260 MB save, on a core the fork child would
   otherwise have used.
 - **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in

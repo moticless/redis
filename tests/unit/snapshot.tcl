@@ -1299,6 +1299,87 @@ foreach rdb_channel {yes no} {
     }
 }
 
+# ---- Module contract: REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE (TASK-1.25) ----
+
+set ::snap_violate_module [file normalize tests/modules/hybridviolate.so]
+
+start_server {tags {"snapshot modules external:skip"} overrides {bgsave-hybrid yes save "" appendonly no}} {
+    test {Hybrid BGSAVE modules: the bundled modules do not block the hybrid path} {
+        assert_equal {} [s snap_hybrid_blocked_by]
+    }
+
+    test {Hybrid BGSAVE modules: a module with a data type and no opt-in is named and sends saves to the fork child} {
+        set loglines [count_log_lines 0]
+        r module load $::snap_violate_module
+        assert_equal hybridviolate [s snap_hybrid_blocked_by]
+        wait_for_log_messages 0 {"*has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE*"} $loglines 50 10
+        r flushall
+        r hv.set hv:1 hello
+        r set hv:probe 1
+        populate 2000 k: 40
+        set saves0 [s snap_saves]
+        set loglines [count_log_lines 0]
+        r bgsave
+        waitForBgsave r
+        assert_equal ok [s rdb_last_bgsave_status]
+        assert_equal $saves0 [s snap_saves]
+        wait_for_log_messages 0 {"*falling back to the fork child, module 'hybridviolate'*"} $loglines 50 10
+        # the stock child has the keyspace: the callback's probes succeeded there
+        wait_for_log_messages 0 {"*hv_save: OpenKey=key Call=reply*"} $loglines 50 10
+        if {[snap_arena_available]} { snap_wait_forkable 0 }
+        r debug reload nosave
+        assert_equal hello [r hv.get hv:1]
+    }
+
+    test {Hybrid BGSAVE modules: once opted in the hybrid path runs and the child refuses keyspace calls} {
+        r hv.optin 1
+        assert_equal {} [s snap_hybrid_blocked_by]
+        set saves0 [s snap_saves]
+        set loglines [count_log_lines 0]
+        r bgsave
+        snap_wait_bgsave_done
+        assert_equal ok [s rdb_last_bgsave_status]
+        assert_equal [expr {$saves0 + 1}] [s snap_saves]
+        wait_for_log_messages 0 {"*called RedisModule_OpenKey inside the hybrid BGSAVE child*"} $loglines 50 10
+        wait_for_log_messages 0 {"*called RedisModule_Call inside the hybrid BGSAVE child*"} $loglines 50 10
+        wait_for_log_messages 0 {"*hv_save: OpenKey=NULL Call=NULL*"} $loglines 50 10
+        r debug reload nosave
+        assert_equal hello [r hv.get hv:1]
+        assert_equal 2002 [r dbsize]
+    }
+
+    test {Hybrid BGSAVE modules: withdrawing the opt-in blocks the hybrid path again} {
+        r hv.optin 0
+        assert_equal hybridviolate [s snap_hybrid_blocked_by]
+        r hv.optin 1
+        assert_equal {} [s snap_hybrid_blocked_by]
+    }
+
+    test {Hybrid BGSAVE modules: RM_SetLRU and RM_SetLFU on a READ handle go through the write funnel during a save} {
+        r flushall
+        r set plain v
+        populate 3000 k: 40
+        set digest [debug_digest]
+        r config set rdb-key-save-delay 2000
+        r bgsave
+        snap_wait_save_started
+        # [SetLRU read, SetLRU write, SetLFU read, SetLFU write] under the LRU
+        # policy: both handles succeed, the READ one after the funnel emitted or
+        # cloned the owed key (a WRITE handle did that at open time)
+        r config set maxmemory-policy allkeys-lru
+        assert_equal {1 1 0 0} [r hv.setlru plain]
+        assert {[r object idletime plain] >= 1}
+        r config set maxmemory-policy allkeys-lfu
+        assert_equal {0 0 1 1} [r hv.setlru plain]
+        r config set maxmemory-policy noeviction
+        r config set rdb-key-save-delay 0
+        snap_wait_bgsave_done
+        assert_equal ok [s rdb_last_bgsave_status]
+        r debug reload nosave
+        assert_equal $digest [debug_digest]
+    }
+}
+
 start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0}} {
     r module load $::snap_fork_module
 

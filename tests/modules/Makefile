@@ -55,6 +55,7 @@ TEST_MODULES = \
     scan.so \
     datatype.so \
     datatype2.so \
+    hybridviolate.so \
     auth.so \
     keyspace_events.so \
     blockedclient.so \
