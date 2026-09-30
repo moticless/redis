@@ -1229,3 +1229,78 @@ every save `ok`. Values as rep a / rep b.
 - **Write latency on the hybrid is stock's**: p99 0.40-0.57 ms against 0.42-0.61 (stock) and 1.4-1.5 (forkless); the
   worst write is the fork stall, 16-17 ms against 30-32.
 
+## Run 18 (2026-09-30): diskless full sync to a fresh replica, upstream vs hybrid vs Valkey, c7i.4xlarge
+
+Raw: `run18.csv`, drivers `run18.sh` (three configurations, interleaved per cell) and `run18b.sh` (Valkey's forkless full
+sync from PR 4797, appended afterwards as an experimental fourth configuration; see the addendum). Same host and layout as
+runs 16-17. The primary runs on vCPUs 0-3,8-11 with the dataset loaded from the RDB cache; for every cell bench.py starts a
+fresh replica of the same binary on the load CPUs (4-7,12-15) with `--repl-diskless-load on-empty-db`, so it loads the
+stream directly and writes no file, points it at the primary and measures until the replica reports its link up. `sync s`
+is that time; `transfer` (the primary's child finishing) equalled it in every cell. `up` = 0d6266f2d with its default
+rdb-channel sync (the child writes the replica's second connection, the main channel streams the backlog, the replica
+buffers it: `replica buf MB` is `replica_full_sync_buffer_peak`), `hybrid` = c5183cd4b (the hybrid child on the same
+rdb-channel connection), `valkey-fork` = 06d35aca6 with its default single-channel diskless sync (the replication stream
+waits in the primary's replica output buffer: `primary COB MB` is `mem_clients_slaves`). A replica that loads disklessly
+asks Redis for an uncompressed RDB (`REPLCONF rdb-no-compress 1`), which both Redis binaries honour; Valkey has no such
+request and compresses, which is most of its extra time. 2 reps, values as rep a / rep b.
+### mixed1m
+
+| rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | Redis fork (rdb-channel) | 16.3 / 16.2 | 40 / 28 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.3 / 0.2 | 0.0 / 0.0 | 14.2 / 14.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid | 16.6 / 16.4 | 14 / 14 | 123 / 124 | 79 / 107 | 44 / 30 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 8.9 / 8.9 | 6.4 / 6.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey fork | 34.0 / 39.2 | 41 / 28 | 2 / 1 | 1 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 4.4 / 4.8 | 0.0 / 0.0 | 34.0 / 39.2 | - / - | - / - | - / - | 1 / 1 |
+| 20000 | Redis fork (rdb-channel) | 17.3 / 16.7 | 29 / 29 | 1436 / 1398 | 2 / 2 | 1435 / 1396 | 0 / 0 | 33 / 32 | 4.3 / 4.2 | 0.0 / -0.0 | 14.4 / 14.4 | 19998 / 19998 | 0.52 / 0.54 | 29.4 / 30.0 | 1 / 1 |
+| 20000 | hybrid | 17.2 / 17.5 | 14 / 15 | 799 / 806 | 129 / 124 | 692 / 713 | 0 / 0 | 33 / 33 | 4.3 / 4.5 | 9.0 / 8.9 | 6.3 / 6.4 | 20000 / 20000 | 0.55 / 0.54 | 15.5 / 15.6 | 1 / 1 |
+| 20000 | Valkey fork | 39.4 / 38.2 | 29 / 29 | 2471 / 2431 | 77 / 74 | 2396 / 2361 | 63 / 61 | 0 / 0 | 8.7 / 8.6 | 0.0 / 0.0 | 39.4 / 38.3 | 19998 / 19998 | 0.56 / 0.53 | 29.6 / 29.5 | 1 / 1 |
+
+### small
+
+| rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | Redis fork (rdb-channel) | 10.1 / 10.1 | 39 / 30 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 9.2 / 9.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid | 10.3 / 10.3 | 2 / 2 | 100 / 115 | 99 / 114 | 1 / 1 | 0 / 0 | 1 / 1 | 0.1 / 0.1 | 9.9 / 9.8 | 1.4 / 1.4 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey fork | 28.0 / 28.1 | 34 / 27 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.9 / 3.9 | 0.0 / 0.0 | 28.0 / 28.1 | - / - | - / - | - / - | 1 / 1 |
+| 20000 | Redis fork (rdb-channel) | 10.3 / 10.7 | 31 / 31 | 1133 / 1164 | 1 / 1 | 1137 / 1164 | 0 / 0 | 23 / 24 | 2.4 / 2.5 | 0.0 / 0.0 | 9.4 / 9.4 | 19997 / 19997 | 0.48 / 0.47 | 30.8 / 31.3 | 1 / 1 |
+| 20000 | hybrid | 10.6 / 10.4 | 2 / 2 | 120 / 118 | 119 / 117 | 1 / 1 | 0 / 0 | 24 / 24 | 2.3 / 2.2 | 10.1 / 10.1 | 1.4 / 1.4 | 20000 / 20000 | 0.52 / 0.51 | 2.0 / 2.8 | 1 / 1 |
+| 20000 | Valkey fork | 30.6 / 30.3 | 28 / 27 | 2124 / 2112 | 68 / 68 | 2057 / 2046 | 57 / 56 | 0 / 0 | 7.0 / 7.1 | 0.0 / 0.0 | 30.6 / 30.3 | 19997 / 19998 | 0.45 / 0.46 | 29.2 / 27.7 | 1 / 1 |
+
+### mixed
+
+| rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | Redis fork (rdb-channel) | 12.6 / 12.4 | 40 / 32 | 4 / 0 | 0 / 0 | 4 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 11.1 / 11.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid | 13.0 / 12.9 | 17 / 16 | 41 / 44 | 22 / 43 | 20 / 1 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 9.8 / 9.7 | 3.2 / 3.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey fork | 28.6 / 30.7 | 40 / 28 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.8 / 4.0 | -0.0 / 0.0 | 28.6 / 30.7 | - / - | - / - | - / - | 1 / 1 |
+| 20000 | Redis fork (rdb-channel) | 13.6 / 13.1 | 33 / 33 | 1264 / 1236 | 1 / 1 | 1268 / 1236 | 0 / 0 | 30 / 29 | 3.5 / 3.4 | 0.0 / -0.0 | 11.4 / 11.3 | 19998 / 19998 | 0.52 / 0.52 | 34.1 / 33.9 | 1 / 1 |
+| 20000 | hybrid | 13.4 / 13.6 | 17 / 17 | 621 / 628 | 61 / 62 | 563 / 569 | 0 / 0 | 30 / 31 | 3.6 / 3.6 | 10.0 / 10.0 | 3.1 / 3.3 | 20000 / 20000 | 0.55 / 0.54 | 17.6 / 18.8 | 1 / 1 |
+| 20000 | Valkey fork | 33.1 / 31.2 | 30 / 30 | 2288 / 2211 | 76 / 71 | 2215 / 2142 | 63 / 59 | 0 / 0 | 7.7 / 7.4 | 0.0 / 0.0 | 33.2 / 31.2 | 19998 / 19998 | 0.52 / 0.53 | 30.9 / 31.0 | 1 / 1 |
+
+### Reading the run
+
+- **Sync time is the replica's load time, and the hybrid matches stock on it.** With the rdb channel and a diskless load
+  the 4 GB replica is up in 10 s (small), 13 s (mixed) and 16-17 s (mixed1m) for both Redis binaries, idle or under 20k
+  writes/s; the primary's child is never the bottleneck once it skips compression. Valkey's fork-based sync takes 28-31 s
+  (small, mixed) and 34-39 s (mixed1m): compressed RDB, single channel.
+- **Primary memory during the sync is where the hybrid differs.** Under 20k writes/s stock's child pays copy-on-write on
+  the whole keyspace: 1.13-1.16 GB (small), 1.24-1.27 GB (mixed), 1.40-1.44 GB (mixed1m). The hybrid pays it on the
+  fork-class values only: 1 MB on small, 0.56-0.57 GB on mixed, 0.69-0.71 GB on mixed1m, plus its queue (60-130 MB): in
+  total 0.12, 0.62 and 0.80 GB. Valkey's fork pays 2.1-2.5 GB and holds 56-77 MB of replication stream in its output
+  buffer. At idle the hybrid's queue is its only cost (41-124 MB) where the fork children hold 0-4 MB.
+- **The fork stall and the worst write follow the page tables.** Stock stalls 29-40 ms at the fork and its worst write
+  during the sync is 30-34 ms; the hybrid stalls 2 ms on small (nothing forkable but the buffers), 14-17 ms on mixed and
+  mixed1m, with worst writes of 2-3 ms and 15-19 ms. Write p99 is equal (0.47-0.55 ms) and the offered 20k writes/s are
+  delivered by all three.
+- **Primary CPU is equal in total and moved off the child.** Main-thread CPU during the sync is the write load
+  (2.2-4.5 s, same for stock and hybrid); stock's child spends 9.4 (small), 11.3 (mixed) and 14.4 s (mixed1m); the hybrid
+  spends 8.9-10.1 s on the scan thread and 1.4, 3.2 and 6.4 s in the child. Valkey's main thread spends 3.8-8.7 s.
+- **The replication stream buffered during a sync is small at these durations**: 23-33 MB on the replica for a 10-17 s
+  sync at 20k writes/s (rdb-channel), 56-77 MB in Valkey's output buffer for a 30-39 s one. This is the number TASK-1.29
+  (inline replication) has to justify itself against: at these sync times it is a few percent of the dataset.
+
+### Addendum: Valkey forkless full sync (PR 4797, experimental)
+
+Pending at the time of writing: `run18b.sh` runs the PR branch (8dc5df0d5, `--forkless-infrastructure-enabled yes
+--bgsave-default-method forkless` on both sides) over the same cells and appends to `run18.csv`; the outcome, including
+whether every sync completed with the replica's dbsize equal, is recorded below when it finishes.
+

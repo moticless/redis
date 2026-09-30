@@ -240,8 +240,22 @@ instant on is appended in order, the offset is the fork offset plus the spliced 
 only additions are one opcode and one replica capability. Replicas without it get the rdb-channel
 path above.
 
-Status: disk-based sync is running; the diskless path and the spliced stream are designed and
-filed, not built or measured.
+Measured on the same 4 GB datasets, each cell a fresh replica loading the stream directly over the
+rdb channel while the primary takes 20k writes/s (stock Redis with its default rdb-channel sync, the
+hybrid on the same channel, Valkey's default fork-based sync; two reps each):
+
+| dataset | primary extra memory during the sync | fork stall / worst write | replica up after |
+|---|---|---|---|
+| small | stock 1.13-1.16 GB, hybrid 0.12 GB, Valkey 2.1 GB | 31 ms / 31 ms, 2 ms / 2-3 ms, 28 ms / 28 ms | 10-11 s, 10-11 s, 30 s |
+| mixed | stock 1.24-1.27 GB, hybrid 0.62 GB, Valkey 2.2 GB | 33 / 34, 17 / 18-19, 30 / 31 | 13 s, 13-14 s, 31-33 s |
+| mixed1m | stock 1.40-1.44 GB, hybrid 0.80 GB, Valkey 2.4-2.5 GB | 29 / 30, 14 / 16, 29 / 30 | 17 s, 17 s, 38-39 s |
+
+Sync time is the replica's load time and the hybrid matches stock on it; what changes is what the
+primary pays while it runs: copy-on-write on the fork-class values only plus the scan thread's queue
+(60-130 MB), a fork stall the size of those values' page tables, and stock's write latency. The
+replication stream buffered on the replica during a sync of this length is 23-33 MB, the number the
+spliced-stream option has to justify itself against. Valkey's fork-based sync is two to three times
+longer because it compresses the RDB and streams on one channel.
 
 ## 7. Benchmark
 
@@ -409,8 +423,9 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   same scan, same child, values copied on clone, no memory benefit. The 32-bit build and its
   test suite pass in that mode.
 
-- **Diskless full sync and AOF rewrite** still take the stock fork path automatically; they
-  work, they do not benefit yet. Disk-based full sync already runs through the hybrid (section 6).
+- **AOF rewrite** still takes the stock fork path automatically; it works, it does not benefit yet.
+  Disk-based and diskless full sync run through the hybrid (section 6); functions-only and
+  slot-migration snapshots still fork the stock child.
 - **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
 - **FLUSHDB, SWAPDB and DEBUG RELOAD** during a hybrid save abort it, as in Valkey's forkless
   save; detaching the frozen keyspace instead is designed, not built.
@@ -449,6 +464,6 @@ line between the halves can move as encodings evolve, one type at a time.
 | Main-thread CPU during a save | none | the whole serialization: 1.6-2.7x | written buckets only: at or below fork |
 | Big values | copy-on-write per page | client blocked or value copied | as fork |
 | Modules | transparent | opt in; thread-safe serializers; NULL-handle branches | opt in; save callbacks must not read the keyspace |
-| Full sync | fork: copy-on-write plus the stream buffer | commands spliced into the RDB, required; new capability; offset sent at the end; no dual-channel | stock protocol, rdb-channel compatible; the same splice as an option with no offset handshake; diskless path pending |
+| Full sync | fork: copy-on-write plus the stream buffer | commands spliced into the RDB, required; new capability; offset sent at the end; no dual-channel | stock protocol on the rdb channel: 0.1-0.8 GB extra against stock's 1.1-1.4 GB at 20k writes/s, same sync time; the same splice as an option |
 | Per-key state | none | 4 bytes declared, 8 in practice, always | one bit per bucket, per save |
 | Switching | n/a | startup flag | runtime |
