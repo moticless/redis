@@ -1,10 +1,11 @@
 ---
 id: TASK-1.21.6
 title: Extend the bucket window scheme to cluster mode (per-slot dicts)
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@Claude'
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-30 20:35'
+updated_date: '2026-09-30 22:39'
 labels:
   - bgsave
   - cluster
@@ -30,9 +31,9 @@ Design (user, 2026-09-30; plan file wondrous-meandering-sketch.md). Today the fr
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
 - [ ] #1 The cluster variant of the race harness (start_cluster 1 0) reloads equal to the fork instant, including keys emitted by the main thread for slots the walker had not reached, and slots whose dict expanded (bitmap remapped) before the walker reached them
-- [ ] #2 SLOT_INFO records in the hybrid RDB are accepted by redis-check-rdb and a stock cluster node loads the file
+- [x] #2 SLOT_INFO records in the hybrid RDB are accepted by redis-check-rdb and a stock cluster node loads the file
 - [ ] #3 Per-slot save metadata is attached on demand (first post-fork write or walker hand-off) and freed at slot completion; unreached dicts may grow and remap their bitmap, a dict under the walker's window is paused by the main thread on first entry, shrink is refused while metadata is attached, dicts already walked resume resizing before the save ends
-- [ ] #4 hybrid-freeze in cluster mode is O(slots) byte work with no per-slot allocation: measured before/after on a 1M-key all-slots node and recorded in notes together with hybrid-merge
+- [x] #4 hybrid-freeze in cluster mode is O(slots) byte work with no per-slot allocation: measured before/after on a 1M-key all-slots node and recorded in notes together with hybrid-merge
 - [ ] #5 An aborted save leaves stale metadata that the next save ignores and frees (generation check); a test covers child killed followed by a successful save
 - [ ] #6 Slot migration during a save is either refused with a clear error or verified safe by a test; the choice is documented in the spec
 <!-- AC:END -->
@@ -47,4 +48,8 @@ Plan of record (2026-09-30, approved with the plan file): 0. Baseline: cluster h
 
 <!-- SECTION:NOTES:BEGIN -->
 Baseline 2026-09-30 (before the on-demand metadata; repo build with -DREDIS_TEST -DDEBUG_ASSERTIONS, laptop): single-node cluster owning all 16384 slots, DEBUG POPULATE 1M keys (about 61 keys per slot, 64-bucket tables), latency-monitor-threshold 1. hybrid-freeze 5 ms on the first save and 3 ms on the second (the BGSAVE command itself 5 ms); hybrid-merge 1 ms total across the 16384 slot completions; stock fork on the same data 3 ms. So in cluster mode the freeze alone costs as much as a stock fork stall, against 0.3-0.7 ms worst PING for the standalone hybrid save (run 6). That is the number the on-demand metadata must bring down. Script: scratchpad clfreeze/run.sh (needs --cluster-bus-port-protected-mode no on this build).
+
+Stage A implemented 2026-10-01 (on-demand attach; uncommitted, verification in progress). The freeze now only marks empty slots DONE and installs a per-store snapshot guard (kvstoreSnapGuardSet, kvstore.h): every dict access without an overlay while the scan runs lands in snapOverlayGuard, which returns NULL for SCANNED/DONE slots, otherwise opens a write section (reads included: a find may step a rehash, and the thread may claim the dict at any moment) and attaches on a structural write, or on any access while the thread's window is on the dict. snapScanAttach pauses rehash/auto-resize, allocates the bitmaps for the tables that exist now (pointer published with a release store; the thread loads with acquire) and attaches the overlay; ctx->attached[s][didx] records it so completion resumes only what was paused. The thread claims each dict with a whole-dict window (table -1, position INSIDE for every bucket) plus quiesce before reading table sizes and rehashidx, so the layout holds still for the walk. Growth of unreached dicts is still blocked once they are attached (a written slot is paused at attach): the bitmap remap / shrink refusal of the plan (stage B) is not built yet. Measured on the same 1M-key all-slots node as the baseline: hybrid-freeze no longer registers above the 1 ms latency-monitor threshold (was 3-5 ms), the BGSAVE command is 1 ms (the fork) against a 2 ms stock fork; hybrid-merge is gone (TASK-1.21.3). Tests: C unit 166/166 after adapting the scan/bitmap/owed/overlay tests to on-demand pausing (deterministic checks between snapScanFreeze and snapScanStartThread; reads in the concurrent-read loop end their 'command' with snapFunnelClose or the thread's quiesce waits forever); unit/snapshot with the feature on passes after the bitmap-lifecycle test learnt that bitmaps appear on the first write. Pending: stock-mode run, TSan, ASan, cluster harness variant for expand-before-reached (stage B), commit.
+
+Stage A committed 2026-10-01 as e7062762b after: unit/snapshot with the feature on (205 s) and off (213 s) all pass; TSan 52/52 no report; ASan 52/52 no report. TSan caught a real bug in the first version: the guard was taken off a store only at snapScanRelease, but FLUSHALL/SWAPDB/DEBUG RELOAD abort the save and free or replace the kvstore before the release runs (heap-use-after-free in kvstoreSnapGuardSet); the guard now comes off when the store's last slot completes (ctx->pending[s]). AC2 checked: a hybrid cluster dump (300k keys, all slots) passes redis-check-rdb and a cluster node started with bgsave-hybrid no loads it with an equal DEBUG DIGEST and the right slot placement (countkeysinslot 0 = 20). AC4 checked: hybrid-freeze 3-5 ms -> below the 1 ms monitor threshold, BGSAVE command 1 ms vs stock fork 2 ms, hybrid-merge gone. Open for stage B: AC1's 'slots whose dict expanded before the walker reached them' and AC3's 'unreached dicts may grow and remap their bitmap, shrink refused' (today a written slot is paused at attach, so it cannot grow until its slot completes, the same limit every dict had before this task); AC5 (generation check): not needed as designed, since state DONE plus guard-off make stale metadata impossible (abort completes every slot before the store is freed) and the abort sweep is a byte loop; propose to reword AC5 to 'abort and release leave no metadata behind; an aborted save followed by a save reloads equal (covered by the ten-aborted-saves test)'. AC6 (slot migration during a save) still open.
 <!-- SECTION:NOTES:END -->
