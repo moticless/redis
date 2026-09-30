@@ -1203,7 +1203,8 @@ foreach rdb_channel {yes no} {
                 assert_equal [$master debug digest] [r debug digest]
                 assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
                 assert_equal 1 [s -1 sync_full]
-                assert {[count_log_message -1 "Background RDB transfer started by pid * to $shape"] >= 1}
+                assert {[count_log_message -1 "Background RDB transfer started by pid"] >= 1}
+                assert {[count_log_message -1 "to $shape (hybrid"] >= 1}
                 assert_equal 0 [s -1 rdb_bgsave_in_progress]
                 # PSYNC continues from the snapshot offset: no second full sync
                 after 500
