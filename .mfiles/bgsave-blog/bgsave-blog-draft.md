@@ -309,14 +309,20 @@ yet.
 
 ### Hashes of a million fields (mixed1m: 19.2 M small keys plus 24 hashes of 1M fields; big1m: 36 such hashes and 32 sorted sets)
 
+The mixed1m rows are a later run of the three binaries on one host and day, with the hybrid's
+scan-thread queue in place (see below); the big1m rows are from the original run. Two reps each.
+
 | dataset | writes/s | config | save s | fork stall ms | peak MB | extra MB | achieved/s | write p99 ms | write max ms | stalled s |
 |---|---|---|---|---|---|---|---|---|---|---|
-| mixed1m | 20k | Redis (fork) | 43.0 | 30 | 6567 | 2494 | 19997 | 0.64 | 31 | 0 |
-| mixed1m | 20k | hybrid | 41.3 | 17 | 5324 | 1251 | 19999 | 0.65 | 19 | 0 |
-| mixed1m | 20k | Valkey forkless | 48.2 | 0 | 4011 | 4 | 15045 (75%) | 1.48 | 22,566 | 6-7 |
-| mixed1m | 50k | Redis (fork) | 43.4 | 31-41 | 7325 | 3252 | 49988 | 0.39 | 32-42 | 0 |
-| mixed1m | 50k | hybrid | 40.7 | 15-16 | 5813 | 1740 | 49999 | 0.38 | 17 | 0 |
-| mixed1m | 50k | Valkey forkless | 45.6 | 0 | 4015 | 8 | 38125 (76%) | 1.41 | 21,745 | 10-11 |
+| mixed1m | 0 | Redis (fork) | 43.1 | 28-41 | 4073-4231 | 1-3 | - | - | - | - |
+| mixed1m | 0 | hybrid | 26.3-28.7 | 14 | 4255 | 136-158 | - | - | - | - |
+| mixed1m | 0 | Valkey forkless | 51.0-52.1 | 0 | 4008-4106 | 1 | - | - | - | - |
+| mixed1m | 20k | Redis (fork) | 40.9-43.3 | 29 | 6542 | 2469 | 19997 | 0.53 | 30 | 0 |
+| mixed1m | 20k | hybrid | 39.9-40.7 | 14 | 5319 | 1238 | 19999 | 0.57 | 16 | 0 |
+| mixed1m | 20k | Valkey forkless | 48.1-49.3 | 0 | 4011 | 3-4 | 15046 (75%) | 1.52 | 21,166-23,609 | 5-6 |
+| mixed1m | 50k | Redis (fork) | 43.8-44.2 | 31 | 7333 | 3260 | 49991 | 0.42-0.61 | 32 | 0 |
+| mixed1m | 50k | hybrid | 37.5-38.3 | 15 | 5796 | 1717 | 49998 | 0.40-0.53 | 17 | 0 |
+| mixed1m | 50k | Valkey forkless | 46.0-47.3 | 0 | 4015 | 8 | 38304 (77%) | 1.39 | 18,471-22,207 | 8-13 |
 | big1m | 20k | Redis (fork) | 34.2 | 30-34 | 5749 | 1901 | 19995 | 0.67 | 30-36 | 0 |
 | big1m | 20k | hybrid | 35.6 | 26 | 5795 | 1946 | 19996 | 0.68 | 27 | 0 |
 | big1m | 20k | Valkey forkless | 34.7 | 0 | 3754 | 1 | 8532 (43%) | 0.64 | 33,946 | 5-7 |
@@ -327,14 +333,12 @@ yet.
 Two things happen here. On big1m, where every byte is fork-class, the hybrid and stock are the
 same save on every column, as designed: nothing eligible, nothing gained, nothing lost, no mode
 to switch. On mixed1m the hybrid again pays copy-on-write for the hashes alone, half of stock's,
-with half the stall. Its save time in this table is not the hybrid's floor: the scan thread finished
-its half in 20 s and then waited for the child, because a child inside a 90 MB hash does not read
-the pipe. A later change let the scan thread queue its output in memory, bounded by the same
-retained-bytes limit, and in a before/after run on the same host the idle mixed1m save went from
-38 s to 22-25 s, within a few percent of the child alone, at the price of up to 128 MB of parent
-memory (the queue's own bound) while the child is behind. Under writes the gain is smaller, 41 s to 36-39 s, for a reason
-still open: the child's wall time exceeds its CPU time. The tables above keep the numbers as
-measured against stock and forkless on the same day.
+with half the stall. The idle row shows what the two workers buy when the child is inside a 90 MB
+hash: the hybrid saves in 26-29 s where stock's single child needs 43 and forkless's single thread
+51-52, because the scan thread queues its output in memory instead of waiting for the child (the
+queue is the 136-158 MB of extra memory in that row, bounded at 128 MB by default plus the
+main-thread queue, released at the end). Under writes the gain narrows to 10-15%: the child's
+wall time then exceeds its CPU time by 10-15 s, for a reason not yet understood.
 
 And forkless meets the value it cannot serialize atomically. A write that lands on the hash
 being saved waits until the whole 90 MB hash is written: 22 to 34 seconds at worst, up to 16
