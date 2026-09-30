@@ -331,8 +331,8 @@ with half the stall. Its save time in this table is not the hybrid's floor: the 
 its half in 20 s and then waited for the child, because a child inside a 90 MB hash does not read
 the pipe. A later change let the scan thread queue its output in memory, bounded by the same
 retained-bytes limit, and in a before/after run on the same host the idle mixed1m save went from
-38 s to 22-25 s, within a few percent of the child alone, at the price of up to 256 MB of parent
-memory while the child is behind. Under writes the gain is smaller, 41 s to 36-39 s, for a reason
+38 s to 22-25 s, within a few percent of the child alone, at the price of up to 128 MB of parent
+memory (the queue's own bound) while the child is behind. Under writes the gain is smaller, 41 s to 36-39 s, for a reason
 still open: the child's wall time exceeds its CPU time. The tables above keep the numbers as
 measured against stock and forkless on the same day.
 
@@ -388,10 +388,12 @@ redis-cli INFO memory | grep allocator_allocated_nofork
 
 One runtime switch. Turning it on changes where *new* values and headers are placed; turning it
 off makes the next save an ordinary fork save. `rdb_bgsave_in_progress`, `rdb_last_bgsave_status`
-and `stop-writes-on-bgsave-error` behave as before, since a child still writes the RDB. Two knobs:
-`save-small-max-bytes` (default 4 KB) is the size line within the eligible encodings, and
+and `stop-writes-on-bgsave-error` behave as before, since a child still writes the RDB. Three knobs:
+`save-small-max-bytes` (default 4 KB) is the size line within the eligible encodings,
 `bgsave-hybrid-max-retained-bytes` (default 256 MB) bounds the memory a save may hold for buckets
-under the scan window before it is aborted and reported as failed. `allocator_allocated_nofork`
+under the scan window before it is aborted and reported as failed, and
+`bgsave-hybrid-max-queued-bytes` (default 128 MB) bounds the records the scan thread may queue
+while the child is busy with a large value before it waits. `allocator_allocated_nofork`
 tells you, before any save, how much of your dataset the child will never see.
 
 ## 9. Where it stands
@@ -415,8 +417,8 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   otherwise have used.
 - **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in
   front of the pipe: on mixed1m the idle save went from 38 s (scan plus child in series) to 22-25 s
-  (the child alone). The queue is memory the save holds while the child is behind, up to the
-  retained-bytes limit, 256 MB by default, released at the end; and under writes the gain is
+  (the child alone). The queue is memory the save holds while the child is behind, up to its own
+  bound, 128 MB by default, released at the end; and under writes the gain is
   smaller, 41 s to 36-39 s, because the child's wall time exceeds its CPU time there, which is not
   yet understood.
 

@@ -232,13 +232,15 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   max, run 13). The scan thread now owns a queue of complete messages and writes the pipe
   non-blockingly after every enqueue (partial writes keep an offset into the head message); the
   staging buffer reserves its header up front and is handed to the queue without a copy, and
-  drained buffers return to a small pool. Past `bgsave-hybrid-max-retained-bytes` (frozen at save
-  start) the thread waits for the child with `poll()` instead of growing; it never aborts for that.
-  The main-thread hard mark still counts only what the main thread retains and queues, so the
-  worst-case save memory is up to twice the configured value. `snap_save_queued_bytes` covers both
-  queues; `snap_last_save_queued_peak` is their peak over the last save. Cost: the queue is memory
-  the save holds while the child is behind, up to the bound (250 MB at the default on mixed1m,
-  where before the change the save held about 1 MB).
+  drained buffers return to a small pool. Past `bgsave-hybrid-max-queued-bytes` (its own knob,
+  default 128 MB, frozen at save start) the thread waits for the child with `poll()` instead of
+  growing; it never aborts for that. The main-thread hard mark (`bgsave-hybrid-max-retained-bytes`,
+  256 MB) still counts only what the main thread retains and queues, so the worst-case save memory
+  is the sum of the two bounds. `snap_save_queued_bytes` covers both queues;
+  `snap_last_save_queued_peak` is their peak over the last save. Cost: the queue is memory the save
+  holds while the child is behind, up to its bound (run 16 measured 250 MB on mixed1m with the
+  queue bounded by the 256 MB retained limit, where before the change the save held about 1 MB;
+  the separate 128 MB default halves that for a few seconds of save time).
 - Diskless full sync: the fork writes the replica socket instead of a file. AOF rewrite: same scan,
   AOF encoders.
 

@@ -1255,7 +1255,7 @@ typedef struct snapSave {
     list *oq;                           /* sds: header followed by payload */
     list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
     size_t oq_head_off;                 /* bytes of the head message already written */
-    size_t oq_limit;                    /* bgsave-hybrid-max-retained-bytes at save start, 0 = none */
+    size_t oq_limit;                    /* bgsave-hybrid-max-queued-bytes at save start, 0 = none */
     redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for the pipe */
     redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
 } snapSave;
@@ -2038,8 +2038,8 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     fcntl(sv->pipe_wr, F_SETPIPE_SZ, 1 << 20);   /* best effort: deeper back-pressure buffer */
 #endif
     /* The scan thread writes the pipe non-blockingly and keeps what does not
-     * fit in its own queue (bounded by the retained-bytes mark). The child's
-     * read end stays blocking. */
+     * fit in its own queue (bounded by bgsave-hybrid-max-queued-bytes). The
+     * child's read end stays blocking. */
     if (fcntl(sv->pipe_wr, F_SETFL, fcntl(sv->pipe_wr, F_GETFL) | O_NONBLOCK) == -1) {
         serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
         snapSaveFree(sv);
@@ -2047,7 +2047,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     }
     sv->oq = listCreate();
     sv->oq_pool = listCreate();
-    sv->oq_limit = server.bgsave_hybrid_max_retained_bytes;
+    sv->oq_limit = server.bgsave_hybrid_max_queued_bytes;
     snapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
