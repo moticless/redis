@@ -4,13 +4,14 @@ title: Extend the bucket window scheme to cluster mode (per-slot dicts)
 status: To Do
 assignee: []
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-21 19:58'
+updated_date: '2026-09-30 20:30'
 labels:
   - bgsave
   - cluster
 milestone: m-3
 dependencies:
   - TASK-1.21.5
+  - TASK-1.21.3
 documentation:
   - poc-hybrid-bgsave-spec.md
 parent_task_id: TASK-1.21
@@ -21,13 +22,23 @@ ordinal: 11960
 ## Description
 
 <!-- SECTION:DESCRIPTION:BEGIN -->
-After the standalone spike: the window W = (dict, table, [lo, hi)) already names the dict, so in cluster mode it walks the 16,384 slot dicts in order and a window often covers a whole small dict. This task makes membership checks, resize lockout (per dict, only while that dict is under the window or still unwalked), the side-table drain and the walk-to-completion rule work over kvstore slot dicts, keeps SLOT_INFO records correct when the main thread emits keys for a slot the walker has not reached, and revisits the M1 note that empty slots are DONE at freeze (no longer a concept). Cluster atomic slot migration during a save stays refused or guarded as today; document which.
+After the standalone spike: the window W = (dict, table, [lo, hi)) already names the dict, so in cluster mode it walks the 16,384 slot dicts in order and a window often covers a whole small dict. This task makes membership checks, the pause of a dict under the walker, the side-table drain and the walk-to-completion rule work over kvstore slot dicts, keeps SLOT_INFO records correct when the main thread emits keys for a slot the walker has not reached, and revisits the M1 note that empty slots are DONE at freeze. Cluster atomic slot migration during a save stays refused or guarded as today; document which.
+
+Design (user, 2026-09-30; plan file wondrous-meandering-sketch.md). Today the freeze visits every non-empty slot dict before the fork and pays, per slot, two pause counters, one bitmap per table and an overlay struct with two dicts (tens of thousands of allocations inside the hybrid-freeze stall on a full node; never measured in cluster mode). Instead, allocate the save metadata of a slot dict ON DEMAND and attach it to the dict (pointer in kvstore's per-dict metadata, kvstoreDictMetaBase): either when the walker starts serializing that slot or when a command modifies a key in it before the walker got there. The metadata holds the save generation, the bucket bitmap(s) and (after TASK-1.21.3) the in-window side table. A dict the walker has not reached is NOT paused: it may grow; dictType.rehashingStarted (kvstore.c kvstoreDictRehashingStarted) remaps the bitmap into the new table (bit i of size n becomes bits i, i+n, ... of the new size; expand may be more than 2x), rehashingCompleted drops the old table's bitmap. During incremental rehash the emit-ahead unit is the hash class (ht0[i] plus its children in ht1) and all their bits are marked. Shrink is refused while current-generation metadata is attached (many-to-one fold has no correct bit value). The walker cannot touch the pause counters (plain fields also bumped by dictScan on the main thread): it publishes the slot as its window and quiesces as today, and the main thread pauses the dict lazily the first time it enters it under the window; for this every kvstore access to a non-DONE slot during a save opens a section, reads included (a rehash step can happen on a find). Slots with zero keys at the fork instant are DONE at start using the slot_keys capture that SLOT_INFO needs anyway; that byte loop and the state array are the whole freeze. Metadata carries server.snap_gen so stale metadata of an aborted save is freed lazily on next access (plus the existing sweeps in kvstoreRelease/kvstoreEmpty); abort and release need no O(16384) sweep. Order: TASK-1.21.3 first (side table lives in this metadata from the start), then this task.
 <!-- SECTION:DESCRIPTION:END -->
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The cluster variant of the race harness (start_cluster 1 0) reloads equal to the fork instant, including keys emitted by the main thread for slots the walker had not reached
+- [ ] #1 The cluster variant of the race harness (start_cluster 1 0) reloads equal to the fork instant, including keys emitted by the main thread for slots the walker had not reached, and slots whose dict expanded (bitmap remapped) before the walker reached them
 - [ ] #2 SLOT_INFO records in the hybrid RDB are accepted by redis-check-rdb and a stock cluster node loads the file
-- [ ] #3 Resize lockout applies per slot dict and dicts already walked resume resizing before the save ends
-- [ ] #4 Slot migration during a save is either refused with a clear error or verified safe by a test; the choice is documented in the spec
+- [ ] #3 Per-slot save metadata is attached on demand (first post-fork write or walker hand-off) and freed at slot completion; unreached dicts may grow and remap their bitmap, a dict under the walker's window is paused by the main thread on first entry, shrink is refused while metadata is attached, dicts already walked resume resizing before the save ends
+- [ ] #4 hybrid-freeze in cluster mode is O(slots) byte work with no per-slot allocation: measured before/after on a 1M-key all-slots node and recorded in notes together with hybrid-merge
+- [ ] #5 An aborted save leaves stale metadata that the next save ignores and frees (generation check); a test covers child killed followed by a successful save
+- [ ] #6 Slot migration during a save is either refused with a clear error or verified safe by a test; the choice is documented in the spec
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Plan of record (2026-09-30, approved with the plan file): 0. Baseline: cluster harness measurement of hybrid-freeze and hybrid-merge (latency latest) on 1M keys over all slots. 1. snapSlotMeta {gen, bits[2], side table, paused} owned by snapshot.c, pointer in kvstoreDictMetaBase; attach on the kvstore write hooks for PENDING/SCANNING slots and on the walker hand-off; gate 'has current-gen metadata or slot under window' replaces kvstoreOverlayIsFrozen. 2. Freeze reduced to the state array and the slot_keys capture; empty slots DONE. 3. Sections opened for reads on non-DONE slots during a save; main-thread lazy pause under the window; resume at completion only if paused. 4. Bitmap remap in kvstoreDictRehashingStarted/Completed; shrink refused with metadata (resizeAllowed or kvstore-level check). 5. Emit-ahead over the hash class during rehash; bitmap allocated on attach. 6. Stale comments (snapshot.h 180/207), spec section 4 Freeze paragraph and 11.z.1 leftover 5, RESULTS.md numbers. Verification: new cluster harness tests (slow walker + forced expand of an unreached slot, writes after attach before hand-off, killed child then a clean save), unit/snapshot both modes, C unit (layout-lock test changes meaning: paused only under the window), TSan and ASan, full runtest with the feature on, redis-check-rdb on a cluster dump.
+<!-- SECTION:PLAN:END -->

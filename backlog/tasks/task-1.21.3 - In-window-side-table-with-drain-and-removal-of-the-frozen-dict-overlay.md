@@ -4,7 +4,7 @@ title: 'In-window side table with drain, and removal of the frozen-dict overlay'
 status: To Do
 assignee: []
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-30 14:10'
+updated_date: '2026-09-30 20:30'
 labels:
   - bgsave
   - db
@@ -16,7 +16,7 @@ dependencies:
 documentation:
   - poc-hybrid-bgsave-spec.md
 parent_task_id: TASK-1.21
-priority: low
+priority: medium
 ordinal: 11930
 ---
 
@@ -39,4 +39,6 @@ Spec section 11.z, 'If b is inside W'. Writes to keys whose bucket is inside the
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-09-30 reassessment with the user: clones are already created only for keys whose bucket is inside the window; this task changes only when they are freed (today at slot completion in snapScanCompleteSlot via kvstoreOverlayMerge, i.e. end of save in standalone; the window-done hook only flushes the main-to-walker queue). Measured, that difference is immaterial: in run 19 (mixed1m, 40 s save, 20k writes/s) snap_last_save_retained_peak minus the queued peak is at most 1 MB in every hybrid row, so the in-window clones cost about nothing. The per-lookup overlay check (ovMapFrozenEntry: temp-dict find plus state-dict lookup on every access to a frozen dict for the whole save) is not visible either: run 17 main-thread CPU during the save is identical for hybrid and stock (10 s at 20k writes/s, 15 s at 50k). What remains is a cleanup: removal of the temp dict, state dict, tombstones, merge (and the hybrid-merge latency event), overlay-aware scan and two-phase unlink in kvstore.c, plus the slot state machine in snapshot.c that exists to know when to merge; one rule for the header-only-clone corner cases (MOVE, RENAME, COPY, RESTORE REPLACE); less overlay handling to carry into TASK-1.24 (detached kvstore would just be walked) and TASK-1.21.6 (window without per-slot overlays). Decision: no measured benefit on its own; do it only if it makes TASK-1.24 or TASK-1.21.6 easier to build. Priority lowered to low. AC #2 ('drained within one funnel entry...never grows beyond a few windows') is therefore a correctness bound, not a memory win.
+
+2026-09-30, later the same day: back to medium. Still no measured benefit on its own, but it is now the enabler for cluster mode: TASK-1.21.6 (design approved 2026-09-30, plan file wondrous-meandering-sketch.md) attaches per-slot save metadata on demand (generation, bucket bitmaps, in-window side table, paused flag) to kvstore's per-dict metadata, and wants the side table to live there from the start rather than moving it later. Plan of record for this task therefore: implement the side table as part of a per-dict snapSlotMeta struct reachable from kvstoreDictMetaBase (one instance per frozen dict; in standalone one per db), drain at funnel entry / cron for buckets the window has passed, then delete the overlay (temp dict, state dict, tombstones, merge, hybrid-merge latency event, overlay-aware scan and two-phase unlink, snapScanSetOverlay). Keep the freeze semantics of today (all non-empty dicts frozen at start) in this task; the on-demand attach, lazy pause and bitmap remap are TASK-1.21.6.
 <!-- SECTION:NOTES:END -->
