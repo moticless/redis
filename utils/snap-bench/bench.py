@@ -245,6 +245,33 @@ def wait_save(r, poll=0.02):
         if not p.get("rdb_bgsave_in_progress") and not p.get("snap_save_in_progress", 0): return time.time()
         time.sleep(poll)
 
+# ------------------------------------------------------------------ full sync (TASK-1.14)
+class Replica:
+    """A throwaway replica process on the load CPUs, one per sync cell, same binary as the primary."""
+    def __init__(self, a):
+        self.a = a; self.port = a.sync_port
+        self.dir = os.path.join(a.workdir, f"replica-{self.port}"); os.makedirs(self.dir, exist_ok=True)
+        for f in os.listdir(self.dir):
+            if f.endswith(".rdb"): os.unlink(os.path.join(self.dir, f))
+        cmd = ["taskset", "-c", a.load_cpus, a.sync_bin, "--port", str(self.port), "--bind", "127.0.0.1", "--save", "",
+               "--appendonly", "no", "--dir", self.dir, "--logfile", os.path.join(self.dir, "replica.log"),
+               "--protected-mode", "no"] + (a.sync_replica_args.split() if a.sync_replica_args else [])
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.r = redis.Redis(port=self.port, socket_timeout=600)
+        for _ in range(100):
+            try: self.r.ping(); break
+            except redis.RedisError: time.sleep(0.1)
+        else: raise RuntimeError("replica did not start")
+        self.srv = Server(self.proc.pid)
+    def info(self, section):
+        try: return self.r.info(section)
+        except redis.RedisError: return {}
+    def stop(self):
+        try: self.r.execute_command("REPLICAOF", "NO", "ONE"); self.r.shutdown(nosave=True)
+        except redis.RedisError: pass
+        try: self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired: self.proc.kill()
+
 # ------------------------------------------------------------------ one cell
 def cool_down(a):
     """Thermal gate: this laptop throttles (package 85-89 C, cores at 0.8-1.6 GHz of 4.7) after minutes of load and
@@ -266,7 +293,7 @@ def run_cell(a, dataset, rate, est_save):
            "hybrid": int(r.config_get("bgsave-hybrid").get("bgsave-hybrid", "no") == "yes") if "bgsave-hybrid" in str(r.config_get("bgsave-hybrid")) else 0}
     row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
-    secs = int(a.warm + est_save * 1.6 + 8)
+    secs = int(a.warm + est_save * (3.0 if a.sync_bin else 1.6) + 8)
     procs, outs = [], {}
     if rate > 0:
         weights = class_weights(r, classes); tot = sum(weights)
@@ -280,8 +307,39 @@ def run_cell(a, dataset, rate, est_save):
     sampler = Sampler(srv, a.port, cpus=parse_cpus(a.server_cpus)); ping = PingProbe(a.port); sampler.start(); ping.start()
     time.sleep(0.3)
     st0 = srv.status(); cpu0 = srv.cpu_ticks()
-    t0 = time.time(); r.bgsave(); t1 = wait_save(r); time.sleep(0.8)
+    rep = None; sync = {}
+    if a.sync_bin:
+        # Full sync instead of a BGSAVE: the primary's child (or forkless thread) streams a fresh replica.
+        for k, v in (("repl-diskless-sync", "yes"), ("repl-diskless-sync-delay", "0")):
+            try: r.config_set(k, v)
+            except redis.RedisError: pass
+        rep = Replica(a); mem_master_cob = []; mem_rep = []; rep_buf_peak = 0; rep_mem0 = rep.info("memory").get("used_memory", 0)
+        sync_full0 = r.info("stats").get("sync_full", 0)
+        t0 = time.time(); rep.r.execute_command("REPLICAOF", "127.0.0.1", str(a.port))
+        t_child = None; started = False
+        while True:
+            p = r.info("persistence")
+            busy = p.get("rdb_bgsave_in_progress") or p.get("snap_save_in_progress", 0) or p.get("rdb_current_bgsave_type") not in (None, "none", "", 0)
+            if busy: started = True
+            elif started and t_child is None: t_child = time.time()
+            m = r.info("memory"); mem_master_cob.append(m.get("mem_clients_slaves", 0))
+            rm = rep.info("memory"); mem_rep.append(rm.get("used_memory", 0))
+            rr = rep.info("replication"); rep_buf_peak = max(rep_buf_peak, rr.get("replica_full_sync_buffer_peak", 0) or 0, rm.get("mem_replica_full_sync_buffer", 0) or 0)
+            if rr.get("master_link_status") == "up": t1 = time.time(); break
+            if time.time() - t0 > 1800: t1 = time.time(); sync["sync_err"] = "timeout"; break
+            time.sleep(0.05)
+        if t_child is None: t_child = t1
+        sync.update(transfer_sec=round(t_child - t0, 2), master_cob_peak_mb=max(mem_master_cob, default=0) // 2**20,
+                    replica_buf_peak_mb=rep_buf_peak // 2**20, replica_mem_growth_mb=(max(mem_rep, default=rep_mem0) - rep_mem0) // 2**20,
+                    sync_full=r.info("stats").get("sync_full", 0) - sync_full0)
+        time.sleep(0.8)
+    else:
+        t0 = time.time(); r.bgsave(); t1 = wait_save(r); time.sleep(0.8)
     cpu1 = srv.cpu_ticks(); sampler.stop_ev.set(); ping.stop_ev.set(); sampler.join(); ping.join()
+    if rep is not None:
+        try: sync["replica_dbsize_equal"] = int(rep.r.dbsize() == r.dbsize())
+        except redis.RedisError: pass
+        rep.stop()
     p1 = r.info("persistence"); st = r.info("stats"); tick = os.sysconf("SC_CLK_TCK")
     row.update(save_sec=round(t1 - t0, 2), status=p1.get("rdb_last_bgsave_status"),
                fork_ms=round(st.get("latest_fork_usec", 0) / 1000, 2), cow_mb=p1.get("rdb_last_cow_size", 0) // 2**20,
@@ -291,6 +349,7 @@ def run_cell(a, dataset, rate, est_save):
                snap_retained_peak_mb=round(p1.get("snap_last_save_retained_peak", 0) / 2**20, 1) if "snap_last_save_retained_peak" in p1 else None,
                snap_hard_mark_aborts=p1.get("snap_hard_mark_aborts"),
                impl_stats=" ".join(f"{k}={p1[k]}" for k in IMPL_STATS if k in p1))
+    row.update(sync)
     base = st0.get("RssAnon", 0) + st0.get("VmSwap", 0)
     rows = [x for x in sampler.rows if t0 - 0.2 <= x["t"] <= t1 + 0.5]
     if rows:
@@ -330,7 +389,8 @@ COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "hot", "sha
            "save_sec", "status", "fork_ms", "extra_mem_peak_mb", "parent_growth_peak_mb", "child_pd_peak_mb", "abs_peak_mb", "cow_mb",
            "used_mem_growth_mb", "cpu_main_s", "cpu_threads_s", "cpu_child_s", "ping_p50_ms", "ping_p99_ms", "ping_max_ms",
            "cmd_events_ge20ms", "ops", "load_avg_ms", "load_p99_ms", "load_p999_ms", "load_max_ms", "stall_s", "target_missed",
-           "blocked_peak", "cpu_mhz_min", "cpu_mhz_avg", "temp_c_start", "temp_c_max", "cooled_s", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err"]
+           "blocked_peak", "cpu_mhz_min", "cpu_mhz_avg", "temp_c_start", "temp_c_max", "cooled_s", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err",
+           "transfer_sec", "master_cob_peak_mb", "replica_buf_peak_mb", "replica_mem_growth_mb", "sync_full", "replica_dbsize_equal", "sync_err"]
 
 def cmd_run(a):
     r = redis.Redis(port=a.port); r.ping()
@@ -395,6 +455,9 @@ def main():
     p.add_argument("--cool-wait", type=int, default=120, help="max seconds to wait for the thermal gate")
     p.add_argument("--hot", type=float, default=1.0, help="fraction of each class's keys that receive the writes (1.0 = uniform over all keys)")
     p.add_argument("--cache", default="/dev/shm/snap-bench-runs/cache", help="dir of cached dataset RDBs ('' to disable)")
+    p.add_argument("--sync-bin", default="", help="measure a full sync to a fresh replica started from this binary instead of a BGSAVE (save_sec = time to link up)")
+    p.add_argument("--sync-port", type=int, default=7601)
+    p.add_argument("--sync-replica-args", default="", help="extra command-line arguments for the replica")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("report"); p.add_argument("csv"); p.set_defaults(fn=cmd_report)
     a = ap.parse_args(); a.fn(a)

@@ -11,6 +11,8 @@ SERVER_CPUS=${SERVER_CPUS:-0-7}   # server, its threads and its fork child (affi
 LOAD_CPUS=${LOAD_CPUS:-8-15}      # snapload.py, bench.py and its probes
 HOT=${HOT:-1.0}                   # fraction of each class's keys the writes hit (bench.py --hot)
 COOL=${COOL:-0}                   # thermal gate: wait before each cell until the package is below this many C (0 = off)
+SYNC=${SYNC:-0}                   # 1: measure a diskless full sync to a fresh replica (same binary, on LOAD_CPUS) instead of a BGSAVE
+SYNC_REPLICA_ARGS=${SYNC_REPLICA_ARGS:-}   # extra flags for the replica (e.g. "--dual-channel-replication-enabled yes" for valkey)
 BASE=${BASE:-/tmp/redis-base/src/redis-server}        # stock 0c1c74706 (M1 baseline)
 UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d (current base)
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
@@ -23,6 +25,7 @@ CLI=${CLI:-$(dirname "$HYB")/redis-cli}                 # any redis-cli
 
 start() {  # start <name> <binary> [flags...]
   local name=$1 bin=$2; shift 2
+  LAST_BIN=$bin
   taskset -c "$SERVER_CPUS" "$bin" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --activedefrag no --disable-thp yes \
     --io-threads 1 --latency-monitor-threshold 5 --jemalloc-bg-thread yes --daemonize yes --enable-debug-command yes \
     --dir "$D" --dbfilename "$name.rdb" --logfile "$D/$name.log" "$@" || return 1
@@ -46,7 +49,9 @@ for cfg in ${CFGS:-base hybrid}; do
     yinon-forkless)  start yinon-forkless "$YINON" --bgsave-mode forkless --forkless-string-max 4096 ;;
   esac || { echo "$cfg: server start failed (see $D/$cfg.log)"; continue; }
   echo "=== $(date +%T) $cfg $($CLI -p $PORT info server | grep -E '^redis_git_sha1|^redis_version|^valkey_version' | tr -d '\r' | tr '\n' ' ')"
-  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL"
+  SYNC_ARGS=()
+  if [ "$SYNC" = 1 ]; then SYNC_ARGS=(--sync-bin "$LAST_BIN" --sync-port $((PORT + 1)) --sync-replica-args "$SYNC_REPLICA_ARGS"); fi
+  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL" "${SYNC_ARGS[@]}"
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 2
 done
 echo "=== $(date +%T) DONE -> $CSV"

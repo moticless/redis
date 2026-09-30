@@ -1156,6 +1156,146 @@ proc snap_wait_forkable {want} {
     }
 }
 
+# ---- Diskless full sync through the hybrid child (TASK-1.14) ----------------
+
+proc snap_sync_dataset {} {
+    r flushall
+    set rd [redis_deferring_client]
+    for {set i 0} {$i < 20000} {incr i} { $rd set k:$i [string repeat v 40] }
+    for {set i 0} {$i < 20000} {incr i} { $rd read }
+    for {set h 0} {$h < 200} {incr h} {
+        set args {}
+        for {set j 0} {$j < 64} {incr j} { lappend args f$j [string repeat w 96] }
+        $rd hset bh:$h {*}$args
+    }
+    for {set h 0} {$h < 200} {incr h} { $rd read }
+    $rd close
+    assert_equal hashtable [r object encoding bh:0]
+    r set big [string repeat x 200000]
+}
+
+proc snap_wait_link_up {{level 0}} {
+    wait_for_condition 500 100 {[s $level master_link_status] eq {up}} else { fail "replication not established" }
+}
+
+foreach rdb_channel {yes no} {
+    start_server {tags {"snapshot diskless external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 10}} {
+        r config set repl-rdb-channel $rdb_channel
+        set master [srv 0 client]
+        set master_host [srv 0 host]
+        set master_port [srv 0 port]
+        set shape [expr {$rdb_channel eq "yes" ? "replica sockets" : "parent process pipe"}]
+
+        test "Hybrid diskless sync (rdb-channel $rdb_channel): converges under write load, one full sync, hybrid path" {
+            snap_sync_dataset
+            set saves0 [s snap_saves]
+            set load1 [start_write_load $master_host $master_port 20]
+            set load2 [start_write_load $master_host $master_port 20]
+            after 200
+            start_server {overrides {save ""}} {
+                r replicaof $master_host $master_port
+                snap_wait_link_up
+                after 500
+                stop_write_load $load1
+                stop_write_load $load2
+                wait_for_ofs_sync $master [srv 0 client]
+                assert_equal [$master dbsize] [r dbsize]
+                assert_equal [$master debug digest] [r debug digest]
+                assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
+                assert_equal 1 [s -1 sync_full]
+                assert {[count_log_message -1 "Hybrid RDB transfer to $shape started"] >= 1}
+                assert_equal 0 [s -1 rdb_bgsave_in_progress]
+                # PSYNC continues from the snapshot offset: no second full sync
+                after 500
+                assert_equal 1 [s -1 sync_full]
+                assert_equal up [s master_link_status]
+                r replicaof no one
+            }
+        }
+
+        test "Hybrid diskless sync (rdb-channel $rdb_channel): two replicas share one child" {
+            snap_sync_dataset
+            set saves0 [s snap_saves]
+            $master config set repl-diskless-sync-delay 2
+            start_server {overrides {save ""}} {
+                start_server {overrides {save ""}} {
+                    [srv 0 client] replicaof $master_host $master_port
+                    [srv -1 client] replicaof $master_host $master_port
+                    snap_wait_link_up 0
+                    snap_wait_link_up -1
+                    wait_for_ofs_sync $master [srv 0 client]
+                    wait_for_ofs_sync $master [srv -1 client]
+                    assert_equal [$master debug digest] [[srv 0 client] debug digest]
+                    assert_equal [$master debug digest] [[srv -1 client] debug digest]
+                    assert_equal [expr {$saves0 + 1}] [s -2 snap_saves]
+                    assert_equal 2 [s -2 connected_slaves]
+                    [srv 0 client] replicaof no one
+                    [srv -1 client] replicaof no one
+                }
+            }
+            $master config set repl-diskless-sync-delay 0
+        }
+
+        test "Hybrid diskless sync (rdb-channel $rdb_channel): replica disconnect mid-transfer, the next sync works" {
+            snap_sync_dataset
+            set saves0 [s snap_saves]
+            $master config set rdb-key-save-delay 200
+            start_server {overrides {save ""}} {
+                r replicaof $master_host $master_port
+                wait_for_condition 100 50 {[s -1 snap_save_in_progress] == 1} else { fail "hybrid transfer did not start" }
+                # drop the replica's connections while the child is streaming
+                $master client kill type replica
+                wait_for_condition 200 100 {[s -1 rdb_bgsave_in_progress] == 0} else { fail "transfer did not end after the disconnect" }
+                assert_equal PONG [$master ping]
+                $master config set rdb-key-save-delay 0
+                snap_wait_link_up
+                wait_for_ofs_sync $master [srv 0 client]
+                assert_equal [$master debug digest] [r debug digest]
+                assert {[s -1 snap_saves] >= $saves0 + 2}
+                r replicaof no one
+            }
+        }
+
+        if {$rdb_channel eq "yes"} {
+            test "Hybrid diskless sync (rdb-channel yes): a replica that stops reading never blocks the master" {
+                snap_sync_dataset
+                # a bigger stream so the socket fills while the replica is stopped
+                set rd [redis_deferring_client]
+                for {set i 0} {$i < 100000} {incr i} { $rd set fill:$i [string repeat z 200] }
+                for {set i 0} {$i < 100000} {incr i} { $rd read }
+                $rd close
+                $master config set rdb-key-save-delay 20
+                $master config set repl-timeout 3
+                start_server {overrides {save ""}} {
+                    set replica_pid [srv 0 pid]
+                    r replicaof $master_host $master_port
+                    wait_for_condition 100 50 {[s -1 snap_save_in_progress] == 1} else { fail "hybrid transfer did not start" }
+                    exec kill -STOP $replica_pid
+                    # the master keeps serving while its child waits on the socket
+                    set pings 0
+                    for {set n 0} {$n < 20} {incr n} {
+                        after 100
+                        if {[$master ping] eq "PONG"} { incr pings }
+                    }
+                    # the transfer ends by repl-timeout (or the hard mark), never by a hung main thread
+                    set ended [catch {wait_for_condition 300 100 {[s -1 rdb_bgsave_in_progress] == 0} else { error "still in progress after 30 s" }} err]
+                    exec kill -CONT $replica_pid
+                    $master config set rdb-key-save-delay 0
+                    $master config set repl-timeout 10
+                    assert_equal 20 $pings
+                    if {$ended} { fail "transfer did not end while the replica was stopped: $err" }
+                    assert_equal 0 [s -1 snap_save_in_progress]
+                    # the replica resyncs once it runs again
+                    snap_wait_link_up
+                    wait_for_ofs_sync $master [srv 0 client]
+                    assert_equal [$master debug digest] [r debug digest]
+                    r replicaof no one
+                }
+            }
+        }
+    }
+}
+
 start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0}} {
     r module load $::snap_fork_module
 
@@ -1191,9 +1331,10 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r config set appendonly no
     }
 
-    test {Diskless full sync with bgsave-hybrid on: the child maps the arena and the replica matches the master} {
+    test {Diskless full sync with bgsave-hybrid on: the hybrid child streams the replica, the arena is never mapped} {
         snap_fallback_dataset
         set digest [debug_digest]
+        set saves0 [s snap_saves]
         start_server {overrides {bgsave-hybrid yes}} {
             r replicaof [srv -1 host] [srv -1 port]
             wait_for_condition 100 100 {
@@ -1203,10 +1344,11 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
                 [r dbsize] == [[srv -1 client] dbsize]
             } else { fail "replica did not receive all keys" }
             assert_equal $digest [debug_digest]
-            assert {[count_log_message -1 "Starting BGSAVE for SYNC with target: replicas sockets"] >= 1}
+            assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
+            assert {[count_log_message -1 "Hybrid RDB transfer to"] >= 1}
+            if {[snap_arena_available]} { assert_equal 0 [s -1 snap_nofork_arena_forkable] }
             r replicaof no one
         }
-        snap_wait_forkable 0
     }
 
     test {Module fork with bgsave-hybrid on: the child runs and exits with its code} {

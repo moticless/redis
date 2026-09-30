@@ -1258,6 +1258,16 @@ typedef struct snapSave {
     size_t oq_limit;                    /* bgsave-hybrid-max-queued-bytes at save start, 0 = none */
     redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for the pipe */
     redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
+    /* Output target (TASK-1.14). A BGSAVE or disk-based sync writes a temp
+     * file renamed at the end. A diskless sync writes the replicas' sockets:
+     * the child owns them, either directly (rdb-channel connections, blocking)
+     * or through the stock rdb pipe that the parent fans out non-blockingly. */
+    int to_sockets;
+    int rdb_channel;
+    connection **conns;        /* rdb-channel: the replica connections the child writes */
+    int numconns;
+    int rdb_pipe_write;        /* pipe shape: child's end of server.rdb_pipe_read */
+    int safe_to_exit_pipe;     /* pipe shape: the child waits on it before exiting */
 } snapSave;
 
 typedef struct snapQueuedMsg {
@@ -1811,8 +1821,12 @@ static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_
     return 0;
 }
 
-static int snapSaveChildWrite(snapSave *sv) {
-    char tmpfile[256];
+/* Child: write the whole RDB stream. 'out' is the socket rio for a diskless
+ * sync (framed with the diskless EOF mark, nothing on disk); NULL means a
+ * temp file renamed to sv->filename at the end. */
+static int snapSaveChildWrite(snapSave *sv, rio *out) {
+    char tmpfile[256] = "";
+    char eofmark[RDB_EOF_MARK_SIZE];
     char *err_op = "";
     int error = 0;
     char *payload = NULL;
@@ -1821,22 +1835,33 @@ static int snapSaveChildWrite(snapSave *sv) {
     long long info_updated_time = 0;
     int cur_db = -1, cur_slot = -1;
     int aborted = 0;
+    FILE *fp = NULL;
+    rio filerio;
+    rio *rdb = out;
 
     startSaving(sv->rdbflags);
-    snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
-    FILE *fp = fopen(tmpfile, "w");
-    if (!fp) {
-        serverLog(LL_WARNING, "Hybrid BGSAVE: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
-        stopSaving(0);
-        return C_ERR;
+    if (!out) {
+        snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
+        fp = fopen(tmpfile, "w");
+        if (!fp) {
+            serverLog(LL_WARNING, "Hybrid BGSAVE: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
+            stopSaving(0);
+            return C_ERR;
+        }
+        rioInitWithFile(&filerio, fp);
+        rdb = &filerio;
+        if (server.rdb_save_incremental_fsync) {
+            rioSetAutoSync(rdb, REDIS_AUTOSYNC_BYTES);
+            if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(rdb, 1);
+        }
+    } else {
+        /* Diskless framing, as rdbSaveRioWithEOFMark(): the replica reads up
+         * to the mark that follows the footer. */
+        getRandomHexChars(eofmark, RDB_EOF_MARK_SIZE);
+        if (rioWrite(rdb, "$EOF:", 5) == 0 || rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0 ||
+            rioWrite(rdb, "\r\n", 2) == 0) { err_op = "eof mark"; goto werr; }
     }
-    rio rdb;
-    rioInitWithFile(&rdb, fp);
-    if (server.rdb_save_incremental_fsync) {
-        rioSetAutoSync(&rdb, REDIS_AUTOSYNC_BYTES);
-        if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(&rdb, 1);
-    }
-    if (rdbSaveRioHeader(sv->req, &rdb, &error, sv->rdbflags, sv->has_rsi ? &sv->rsi : NULL) == C_ERR) {
+    if (rdbSaveRioHeader(sv->req, rdb, &error, sv->rdbflags, sv->has_rsi ? &sv->rsi : NULL) == C_ERR) {
         err_op = "rdbSaveRioHeader";
         goto werr;
     }
@@ -1851,10 +1876,10 @@ static int snapSaveChildWrite(snapSave *sv) {
             payload_cap = h.len;
         }
         if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
-        if (snapChildSelect(&rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+        if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
 
         if (h.type == SNAP_MSG_BUFFER) {
-            if (rioWrite(&rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
+            if (rioWrite(rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
         } else if (h.type == SNAP_MSG_KVOBJ) {
             kvobj *kv = (kvobj *)(payload + h.robj_off);
             /* An embedded string value lives inside the kvobj allocation: its
@@ -1863,14 +1888,14 @@ static int snapSaveChildWrite(snapSave *sv) {
                 kv->ptr = payload + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
             robj key;
             initStaticStringObject(key, kvobjGetKey(kv));
-            size_t before = rdb.processed_bytes;
-            if (rdbSaveKeyValuePair(&rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
+            size_t before = rdb->processed_bytes;
+            if (rdbSaveKeyValuePair(rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
             key_counter++;
             /* As the stock child does after each key: drop the value's pages from
              * this process once written, so later parent writes to them do not
              * leave us a private copy. The value is the parent's forkable
              * allocation, mapped in our CoW view. */
-            size_t dump_size = rdb.processed_bytes - before;
+            size_t dump_size = rdb->processed_bytes - before;
             if (dump_size > server.page_size / 2) dismissObject(kv, dump_size);
         } else {
             err_op = "unknown message";
@@ -1887,7 +1912,15 @@ static int snapSaveChildWrite(snapSave *sv) {
     zfree(payload);
     payload = NULL;
 
-    if (rdbSaveRioFooter(sv->req, &rdb, &error) == C_ERR) { err_op = "rdbSaveRioFooter"; goto werr; }
+    if (rdbSaveRioFooter(sv->req, rdb, &error) == C_ERR) { err_op = "rdbSaveRioFooter"; goto werr; }
+    if (out) {
+        if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) { err_op = "eof mark"; goto werr; }
+        if (rioFlush(rdb) == 0) { err_op = "flush"; goto werr; }
+        serverLog(LL_NOTICE, "Hybrid RDB transfer done, %ld SNAP_FORK keys serialized by the child, %zu bytes sent.",
+                  key_counter, rdb->processed_bytes);
+        stopSaving(1);
+        return C_OK;
+    }
     if (fflush(fp)) { err_op = "fflush"; goto werr; }
     if (fsync(fileno(fp))) { err_op = "fsync"; goto werr; }
     if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE) && reclaimFilePageCache(fileno(fp), 0, 0) == -1)
@@ -1906,7 +1939,7 @@ static int snapSaveChildWrite(snapSave *sv) {
         return C_ERR;
     }
     serverLog(LL_NOTICE, "Hybrid BGSAVE done, %ld SNAP_FORK keys serialized by the child, %zu bytes written.",
-              key_counter, rdb.processed_bytes);
+              key_counter, rdb->processed_bytes);
     stopSaving(1);
     return C_OK;
 
@@ -1919,20 +1952,51 @@ werr:
         serverLog(LL_WARNING, "Hybrid BGSAVE: write error (%s): %s", err_op, strerror(errno));
     zfree(payload);
     if (fp) fclose(fp);
-    unlink(tmpfile);
+    if (tmpfile[0]) unlink(tmpfile);
     stopSaving(0);
     return aborted ? SERVER_CHILD_NOERROR_RETVAL : C_ERR;
 }
 
 static void snapSaveChild(snapSave *sv) {
+    rio sock;
     close(sv->pipe_wr);
-    redisSetProcTitle("redis-rdb-bgsave");
-    redisSetCpuAffinity(server.bgsave_cpulist);
-    int retval = snapSaveChildWrite(sv);
-    if (retval == C_OK) {
-        sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
-        exitFromChild(0, 0);
+    if (sv->to_sockets) {
+        if (sv->rdb_channel) {
+            rioInitWithConnset(&sock, sv->conns, sv->numconns);
+        } else {
+            rioInitWithFd(&sock, sv->rdb_pipe_write);
+            /* Close the reading part, so that if the parent crashes, the child
+             * will get a write error and exit. */
+            close(server.rdb_pipe_read);
+        }
+        redisSetProcTitle("redis-rdb-to-slaves");
+        /* Disable RDB compression and checksum in the fork child if requested.
+         * The parent's configuration is not affected. (The scan thread's copy
+         * of the compression flag was set from the same request at start.) */
+        if (sv->req & SLAVE_REQ_RDB_NO_COMPRESS) server.rdb_compression = 0;
+        if (sv->req & SLAVE_REQ_RDB_NO_CHECKSUM) server.rdb_checksum = 0;
+    } else {
+        redisSetProcTitle("redis-rdb-bgsave");
     }
+    redisSetCpuAffinity(server.bgsave_cpulist);
+    int retval = snapSaveChildWrite(sv, sv->to_sockets ? &sock : NULL);
+    if (retval == C_OK) sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
+    if (sv->to_sockets) {
+        if (sv->rdb_channel) {
+            rioFreeConnset(&sock);
+        } else {
+            rioFreeFd(&sock);
+            /* wake up the reader, tell it we're done. */
+            close(sv->rdb_pipe_write);
+            close(server.rdb_child_exit_pipe); /* close write end so that we can detect the close on the parent. */
+            /* hold exit until the parent tells us it's safe. we're not expecting
+             * to read anything, just get the error when the pipe is closed. */
+            char dummy;
+            ssize_t r = read(sv->safe_to_exit_pipe, &dummy, 1);
+            UNUSED(r);
+        }
+    }
+    if (retval == C_OK) exitFromChild(0, 0);
     /* A parent-requested abort mirrors a SIGUSR1 kill (no error counted). */
     exitFromChild(retval == SERVER_CHILD_NOERROR_RETVAL ? SERVER_CHILD_NOERROR_RETVAL : 1, 0);
 }
@@ -1989,14 +2053,9 @@ static const kvstoreOverlayHooks snap_server_hooks = {
     snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayEnter, snapOverlayPrepare,
 };
 
-int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    if (hasActiveChildProcess()) return C_ERR;
-    if (snapArenaForkable()) {
-        /* Only a Lua debugger session can leave the arena forkable with no
-         * exclusive child around. The hybrid child never touches the arena, so
-         * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
-        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
-    }
+/* Main thread: the save object, its channel, queues and scan context for a
+ * frozen-to-be keyspace. NULL on failure (logged). */
+static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     serverAssert(snap_save == NULL);
 
     snapSave *sv = zcalloc(sizeof(*sv));
@@ -2030,7 +2089,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     if (pipe(fds) != 0) {
         serverLog(LL_WARNING, "Hybrid BGSAVE: pipe() failed: %s", strerror(errno));
         snapSaveFree(sv);
-        return C_ERR;
+        return NULL;
     }
     sv->pipe_rd = fds[0];
     sv->pipe_wr = fds[1];
@@ -2043,7 +2102,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     if (fcntl(sv->pipe_wr, F_SETFL, fcntl(sv->pipe_wr, F_GETFL) | O_NONBLOCK) == -1) {
         serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
         snapSaveFree(sv);
-        return C_ERR;
+        return NULL;
     }
     sv->oq = listCreate();
     sv->oq_pool = listCreate();
@@ -2057,14 +2116,20 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     sv->mstage_dbid = sv->mstage_slot = -1;
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
     sv->maxmemory_policy = server.maxmemory_policy;
-    sv->rdb_compression = server.rdb_compression;
+    sv->rdb_compression = (req & SLAVE_REQ_RDB_NO_COMPRESS) ? 0 : server.rdb_compression;
     server.stat_snap_saves++;
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     snapScanSetOverlay(sv->scan, &snap_server_hooks, sv->privs);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
     snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
     snapScanSetWindowDone(sv->scan, snapSaveWindowDone);
+    return sv;
+}
 
+/* Main thread: FORK INSTANT. Freeze, fork the writer child, start the scan
+ * thread. On a fork failure the keyspace is unfrozen and sv is freed; the
+ * caller undoes its own state (replica states, pipes). */
+static int snapSaveLaunch(snapSave *sv) {
     server.stat_rdb_saves++;
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
@@ -2082,7 +2147,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
         snapSaveChild(sv);   /* never returns */
     }
     if (childpid == -1) {
-        server.lastbgsave_status = C_ERR;
+        if (!sv->to_sockets) server.lastbgsave_status = C_ERR;
         serverLog(LL_WARNING, "Can't save in background (hybrid): fork: %s", strerror(errno));
         snapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
         snapSaveFree(sv);
@@ -2101,7 +2166,135 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
     }
     serverLog(LL_NOTICE, "Hybrid background saving started by pid %ld (scan thread streams to the child)", (long)childpid);
     server.rdb_save_time_start = time(NULL);
+    return C_OK;
+}
+
+int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    if (hasActiveChildProcess()) return C_ERR;
+    if (snapArenaForkable()) {
+        /* Only a Lua debugger session can leave the arena forkable with no
+         * exclusive child around. The hybrid child never touches the arena, so
+         * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
+        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+    }
+    snapSave *sv = snapSaveCreate(req, filename, rsi, rdbflags);
+    if (!sv) return C_ERR;
+    if (snapSaveLaunch(sv) != C_OK) return C_ERR;
     server.rdb_child_type = RDB_CHILD_TYPE_DISK;
+    return C_OK;
+}
+
+/* Diskless full sync through the hybrid save (TASK-1.14): the same scan and
+ * channel as a BGSAVE, but the child writes the replicas instead of a file.
+ * Mirrors rdbSaveToSlavesSockets(): replicas in WAIT_BGSAVE_START with this
+ * exact 'req' are set up for full resync at the current offset just before
+ * the freeze-and-fork, so the offset is the snapshot's; with the rdb channel
+ * the child writes the (blocking) replica connections directly, otherwise it
+ * writes the stock rdb pipe that the parent fans out to the sockets, and
+ * waits on the safe-to-exit pipe before exiting. The stock socket done
+ * handler (RDB_CHILD_TYPE_SOCKET) does the replica bookkeeping afterwards. */
+int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
+    listIter li;
+    listNode *ln;
+    int pipefds[2];
+    int rdb_channel = server.repl_rdb_channel && (req & SLAVE_REQ_RDB_CHANNEL);
+
+    if (hasActiveChildProcess()) return C_ERR;
+    /* Even if the previous fork child exited, don't start a new one until we
+     * drained the pipe. */
+    if (server.rdb_pipe_conns) return C_ERR;
+    if (snapArenaForkable())
+        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+
+    snapSave *sv = snapSaveCreate(req, NULL, rsi, RDBFLAGS_REPLICATION);
+    if (!sv) return C_ERR;
+    sv->to_sockets = 1;
+    sv->rdb_channel = rdb_channel;
+    sv->rdb_pipe_write = sv->safe_to_exit_pipe = -1;
+
+    if (!rdb_channel) {
+        /* The child cannot write the sockets itself: with TLS the parent must
+         * keep a continuous TLS state when it takes over after the child. */
+        if (anetPipe(pipefds, O_NONBLOCK, 0) == -1) {
+            snapScanAbort(sv->scan);
+            snapSaveFree(sv);
+            return C_ERR;
+        }
+        server.rdb_pipe_read = pipefds[0];
+        sv->rdb_pipe_write = pipefds[1];
+        /* The parent tells the child through this pipe that it may exit. */
+        if (anetPipe(pipefds, 0, 0) == -1) {
+            close(sv->rdb_pipe_write);
+            close(server.rdb_pipe_read);
+            server.rdb_pipe_read = -1;
+            snapScanAbort(sv->scan);
+            snapSaveFree(sv);
+            return C_ERR;
+        }
+        sv->safe_to_exit_pipe = pipefds[0];
+        server.rdb_child_exit_pipe = pipefds[1];
+    }
+
+    /* Collect the connections of the replicas we want to transfer the RDB to. */
+    int numconns = 0;
+    connection **conns = zmalloc(sizeof(*conns) * listLength(server.slaves));
+    listRewind(server.slaves, &li);
+    while ((ln = listNext(&li))) {
+        client *slave = ln->value;
+        if (slave->replstate != SLAVE_STATE_WAIT_BGSAVE_START) continue;
+        if (slave->slave_req != req) continue;
+        replicationSetupSlaveForFullResync(slave, getPsyncInitialOffset());
+        conns[numconns++] = slave->conn;
+        if (rdb_channel) {
+            /* Put the socket in blocking mode to simplify RDB transfer. */
+            connSendTimeout(slave->conn, server.repl_timeout * 1000);
+            connBlock(slave->conn);
+        }
+    }
+    sv->conns = conns;
+    sv->numconns = numconns;
+    if (!rdb_channel) {
+        server.rdb_pipe_conns = conns;
+        server.rdb_pipe_numconns = numconns;
+        server.rdb_pipe_numconns_writing = 0;
+    }
+
+    if (snapSaveLaunch(sv) != C_OK) {
+        /* Undo the state change. The caller will perform cleanup on all the
+         * replicas in BGSAVE_START state, but the setup above turned them
+         * into BGSAVE_END. */
+        listRewind(server.slaves, &li);
+        while ((ln = listNext(&li))) {
+            client *slave = ln->value;
+            if (slave->replstate == SLAVE_STATE_WAIT_BGSAVE_END)
+                slave->replstate = SLAVE_STATE_WAIT_BGSAVE_START;
+        }
+        if (!rdb_channel) {
+            close(server.rdb_pipe_read);
+            close(server.rdb_child_exit_pipe);
+            server.rdb_pipe_read = server.rdb_child_exit_pipe = -1;
+            server.rdb_pipe_conns = NULL;
+            server.rdb_pipe_numconns = 0;
+            server.rdb_pipe_numconns_writing = 0;
+        }
+        zfree(conns);
+        return C_ERR;
+    }
+    /* sv is live from here (snap_save); it does not own 'conns'. */
+    sv->conns = NULL;
+    serverLog(LL_NOTICE, "Hybrid RDB transfer to %s started (scan thread streams to the child)",
+              rdb_channel ? "replica sockets" : "parent process pipe");
+    server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
+    if (!rdb_channel) {
+        close(sv->rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
+        sv->rdb_pipe_write = -1;
+        close(sv->safe_to_exit_pipe);
+        sv->safe_to_exit_pipe = -1;
+        if (aeCreateFileEvent(server.el, server.rdb_pipe_read, AE_READABLE, rdbPipeReadHandler, NULL) == AE_ERR)
+            serverPanic("Unrecoverable error creating server.rdb_pipe_read file event.");
+    } else {
+        zfree(conns);
+    }
     return C_OK;
 }
 
@@ -2127,9 +2320,10 @@ void snapSaveChildDone(int exitcode, int bysignal) {
      * merge every remaining slot. Harmless after a clean finish. */
     if (!(!bysignal && exitcode == 0) || !snapScanIsFinished(sv->scan))
         snapScanAbort(sv->scan);
-    if (sv->failed) {
+    if (sv->failed && !sv->to_sockets) {
         /* Our own defined failure (hard mark): the child was ended with the
-         * whitelisted SIGUSR1, which the plain done handler does not count. */
+         * whitelisted SIGUSR1, which the plain done handler does not count.
+         * A socket transfer reports through the replicas, as stock. */
         server.lastbgsave_status = C_ERR;
         server.stat_rdb_consecutive_failures++;
     }

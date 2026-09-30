@@ -5355,8 +5355,9 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid BGSAVE: diskless sync keeps the stock child; redisFork() flips the
-     * SNAP_NOFORK arena forkable for it (see snapArenaBeforeFork()). */
+    /* Hybrid BGSAVE: only functions-only and slots-snapshot transfers reach
+     * this stock child (see startBgsaveForReplication()); redisFork() flips
+     * the SNAP_NOFORK arena forkable for it (see snapArenaBeforeFork()). */
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */
