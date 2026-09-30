@@ -7,7 +7,7 @@ status: Done
 assignee:
   - Claude
 created_date: '2026-09-26 19:52'
-updated_date: '2026-09-30 00:41'
+updated_date: '2026-09-30 11:20'
 labels:
   - hybrid-bgsave
   - performance
@@ -76,6 +76,8 @@ Out of scope: child, funnel, mq, overlay.
 2026-09-30 AC1/AC3 closed with run 16 (RESULTS.md). AC1: mixed1m idle from-cache cells: v1 21.4 s vs child 20.7, v2 23.8 vs 22.2, v3 (final) 24.6 vs 23.7, i.e. within 3-7% of max(scan, child); before 38.1/38.3 = their sum. Caveat recorded: the first cell after a fresh populate is 30-40% slower for every binary (32.2 s for v3, 27-38 for before on other datasets), and at 20k writes/s the gain is only 41-42 -> 36-39 s because the child's wall time exceeds its CPU by 10-15 s; both left as an observation. AC3: pass 4 (3 interleaved reps, before vs v3): mixed 20k 21.3-23.1 vs 20.6-22.5 s, small 20k 31.1-31.5 vs 30.1-31.1 s, main-thread CPU within 0.3 s, mixed 50k 10% faster (30.9-31.9 -> 26.9-28.3) with 1.5 s less main CPU; the +5-7% single-rep cells of passes 1-3 were noise (the unchanged binary itself spreads 21.3-23.1 on the same cell). Extra memory: the queue, up to the bound while the child is behind (231-293 MB on mixed1m, 72-98 on mixed under writes, 0 on small), released at save end.
 
 2026-09-30 follow-up at the user's request (41527cab3, RESULTS.md run 16 pass 5): the queue got its own knob, bgsave-hybrid-max-queued-bytes, default 128 MB (0 = no bound); the retained limit (256 MB) keeps arming the hard mark only, so the worst case is the sum of the two instead of twice the retained limit. Measured on mixed1m interleaved against the 256 MB-bounded build: save time within noise (idle 23.8-26.8 vs 25.3-32.3 s, 20k 36.2-41.0 vs 37.0-38.4), parent memory during the save halved (113-115 vs 230-236 MB idle, 69-83 vs 162-165 under writes), used_memory +132 vs +260. redis.conf, spec section 6 and the blog's knob list document it. tcl 45/45 and C unit 164/164 on the change; TSan not rerun (config plumbing only).
+
+2026-09-30 default lowered to 16 MB at the user's decision after run 19 (RESULTS.md): the queue's only measurable benefit is the idle BGSAVE on datasets with huge fork-class values (mixed1m idle 32-38 s at 128 MB, 40-44 at 16 MB, 41-48 at 2 MB on a slower host day); under writes the bound does not matter (child wall time is the limit), on small a BGSAVE never fills it, and in full syncs (run 18) it filled to 90-150 MB for no time gain since the replica's load is the floor. 16 MB keeps about half of the idle gain for a tenth of the memory; redis.conf documents 128 MB for hundred-megabyte values. Run 17 and run 18 tables were measured at 128 MB and say so; remeasuring them at 16 MB is optional.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
