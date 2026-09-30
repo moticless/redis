@@ -1174,3 +1174,21 @@ in each pair below where a pass has two reps.
   less main-thread CPU, because the shorter save emits fewer buckets. The single-rep differences of passes 1-3 (small 20k
   +7%, mixed 50k v3 29.9 vs 28.5) were noise: the same cells spread 21.3-23.1 and 30.9-31.9 for the unchanged binary.
 - **Write latency is unchanged** (wp99 0.55-0.57 ms at 20k on both, wmax 15-16 ms on mixed1m from the fork stall).
+
+### Pass 5: the queue's own bound, 128 MB vs 256 MB (`run16e.csv`, `run16e.sh`, 41527cab3)
+
+`bgsave-hybrid-max-queued-bytes` (default 128 MB, `hybrid` = ~/redis-after4) against the queue bounded by the 256 MB
+retained limit (`hybrid3`), mixed1m, interleaved, 2 reps (first rep of each pair from a fresh populate).
+
+| rate | queue bound | save s | scan cpu s | child cpu s | extra MB | parent +MB | used_mem +MB | CoW MB | wp99 ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | 256 MB | 32.3 / 25.3 | 18.9 / 17.7 | 20.9 / 24.1 | 247 / 247 | 236 / 230 | 258 / 260 | 11 / 17 | - |
+| 0 | 128 MB | 26.8 / 23.8 | 19.1 / 17.7 | 23.7 / 21.2 | 126 / 138 | 113 / 115 | 132 / 132 | 13 / 23 | - |
+| 20k | 256 MB | 37.0 / 38.4 | 17.1 / 17.3 | 23.4 / 24.6 | 1179 / 1205 | 162 / 165 | 284 / 285 | 1175 / 1196 | 0.57 / 0.56 |
+| 20k | 128 MB | 36.2 / 41.0 | 17.1 / 18.2 | 21.5 / 25.3 | 1159 / 1248 | 83 / 69 | 155 / 160 | 1159 / 1276 | 0.57 / 0.56 |
+
+Halving the bound halves the save's own memory (parent growth 113-115 MB vs 230-236 idle, `used_memory` +132 vs +260) and
+costs no save time that the noise can show: idle 23.8-26.8 s vs 25.3-32.3, 20k 36.2-41.0 vs 37.0-38.4. The reasoning that
+a full 90 MB hash needs about 150 MB of buffered scan output does not bind here because the child drains between hashes
+faster than the scan refills, so a 128 MB queue keeps the two overlapped. 128 MB is the default.
+
