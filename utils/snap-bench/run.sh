@@ -51,7 +51,7 @@ for cfg in ${CFGS:-base hybrid}; do
   echo "=== $(date +%T) $cfg $($CLI -p $PORT info server | grep -E '^redis_git_sha1|^redis_version|^valkey_version' | tr -d '\r' | tr '\n' ' ')"
   SYNC_ARGS=()
   if [ "$SYNC" = 1 ]; then SYNC_ARGS=(--sync-bin "$LAST_BIN" --sync-port $((PORT + 1)) --sync-replica-args "$SYNC_REPLICA_ARGS"); fi
-  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL" "${SYNC_ARGS[@]}"
+  taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL" --workdir "$D" "${SYNC_ARGS[@]}"
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 2
 done
 echo "=== $(date +%T) DONE -> $CSV"
