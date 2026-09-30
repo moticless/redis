@@ -2282,8 +2282,8 @@ int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     }
     /* sv is live from here (snap_save); it does not own 'conns'. */
     sv->conns = NULL;
-    serverLog(LL_NOTICE, "Hybrid RDB transfer to %s started (scan thread streams to the child)",
-              rdb_channel ? "replica sockets" : "parent process pipe");
+    serverLog(LL_NOTICE, "Background RDB transfer started by pid %ld to %s (hybrid: the scan thread streams to the child)",
+              (long)server.child_pid, rdb_channel ? "replica socket" : "parent process pipe");
     server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
     if (!rdb_channel) {
         close(sv->rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */

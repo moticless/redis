@@ -455,6 +455,11 @@ static size_t rioConnsetWrite(rio *r, const void *buf, size_t len) {
          * TCP socket. */
         size_t limit = PROTO_IOBUF_LEN * 2;
         size_t count = buflen < limit ? buflen : limit;
+        /* Count the failed connections afresh for every chunk: a connection
+         * that failed earlier is skipped (and counted) once per chunk, so a
+         * running total would reach n_dst after n_dst chunks with a single
+         * dead replica and abort the transfer to the live ones. */
+        failed = 0;
 
         for (size_t i = 0; i < r->io.connset.n_dst; i++) {
             size_t n_written = 0;

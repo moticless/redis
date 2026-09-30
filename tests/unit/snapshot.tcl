@@ -1184,7 +1184,7 @@ foreach rdb_channel {yes no} {
         set master [srv 0 client]
         set master_host [srv 0 host]
         set master_port [srv 0 port]
-        set shape [expr {$rdb_channel eq "yes" ? "replica sockets" : "parent process pipe"}]
+        set shape [expr {$rdb_channel eq "yes" ? "replica socket" : "parent process pipe"}]
 
         test "Hybrid diskless sync (rdb-channel $rdb_channel): converges under write load, one full sync, hybrid path" {
             snap_sync_dataset
@@ -1203,7 +1203,7 @@ foreach rdb_channel {yes no} {
                 assert_equal [$master debug digest] [r debug digest]
                 assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
                 assert_equal 1 [s -1 sync_full]
-                assert {[count_log_message -1 "Hybrid RDB transfer to $shape started"] >= 1}
+                assert {[count_log_message -1 "Background RDB transfer started by pid * to $shape"] >= 1}
                 assert_equal 0 [s -1 rdb_bgsave_in_progress]
                 # PSYNC continues from the snapshot offset: no second full sync
                 after 500
@@ -1345,7 +1345,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
             } else { fail "replica did not receive all keys" }
             assert_equal $digest [debug_digest]
             assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
-            assert {[count_log_message -1 "Hybrid RDB transfer to"] >= 1}
+            assert {[count_log_message -1 "Background RDB transfer started by pid"] >= 1}
             if {[snap_arena_available]} { assert_equal 0 [s -1 snap_nofork_arena_forkable] }
             r replicaof no one
         }
