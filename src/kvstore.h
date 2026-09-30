@@ -90,8 +90,16 @@ typedef struct kvstoreOverlayHooks {
     kvstoreOverlayPrepareFn *prepare;
     kvstoreOverlayDrainableFn *drainable;
 } kvstoreOverlayHooks;
-void kvstoreOverlayFreeze(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
-int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
+/* Snapshot guard: while a scan runs over the store, every access to a dict
+ * that has no overlay yet asks the snapshot first (write = 1 for structural
+ * writes). The guard may attach an overlay (kvstoreOverlayAttach) and return
+ * it, or return NULL when the dict needs none (its scan is complete, or a
+ * read on a dict the scan thread is not reading). A NULL fn turns the guard
+ * off; the fast path is then one load. */
+typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
+void kvstoreSnapGuardSet(kvstore *kvs, kvstoreSnapGuardFn *fn, void *privdata);
+void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
+int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
 void kvstoreOverlayRelease(kvstore *kvs, int didx); /* apply the rest, unfreeze */
 long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */

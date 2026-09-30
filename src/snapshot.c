@@ -674,7 +674,10 @@ struct snapScanCtx {
     int num_stores;
     int *num_dicts;                 /* kvstoreNumDicts() per store. */
     redisAtomic uint8_t **state;    /* Per store: num_dicts slot states. */
-    int *frozen;                    /* Per store: 1 if its dicts were paused by us. */
+    int *frozen;                    /* Per store: 1 while our guard is installed on it (snapScanFreeze() until its last slot completes). */
+    long *pending;                  /* Per store: slots not yet DONE; the guard comes off at 0, before anyone may free the store. */
+    uint8_t **attached;             /* Per store: 1 per dict we paused and gave a bitmap/overlay (on demand). */
+    struct snapGuardPriv { struct snapScanCtx *ctx; int s; } *guards;   /* Per store, the guard's privdata. */
 
     snapScanDispatchFn *dispatch;
     snapScanSlotDoneFn *slot_done;
@@ -704,7 +707,7 @@ struct snapScanCtx {
     int frozen_all;                 /* snapScanFreeze() done. */
     /* Per-save bucket bitmaps: bits[s][didx*2+table], .b NULL when the slot
      * was not frozen or the table does not exist. */
-    struct snapBitmap { uint8_t *b; size_t bytes; } **bits;
+    struct snapBitmap { uint8_t *b; size_t bytes; } **bits;   /* .b: main thread stores (release), thread loads (acquire) */
     size_t bitmap_bytes;
     unsigned long window_buckets;   /* copied from snap_window_buckets at create */
     redisAtomic long long buckets_skipped;   /* buckets the thread skipped (already emitted) */
@@ -729,7 +732,7 @@ unsigned long snapGetWindowBuckets(void) { return snap_window_buckets; }
 
 typedef struct snapWindow {
     dict *d;                 /* NULL: no window (thread between dicts or finished) */
-    int table;
+    int table;               /* -1: the whole dict (the thread is about to read its layout) */
     unsigned long lo, hi;    /* buckets [lo, hi) */
 } snapWindow;
 
@@ -800,14 +803,25 @@ int snapWindowCoversKey(dict *d, const void *key) {
     if (seq == 0) return 0;
     const snapWindow *w = &snap_win[seq & 1];
     if (w->d != d) return 0;
+    if (w->table < 0) return 1;
     unsigned long idx = dictGetHash(d, key) & DICTHT_SIZE_MASK(d->ht_size_exp[w->table]);
     return idx >= w->lo && idx < w->hi;
+}
+
+/* Inside a write section: is the thread's published window on dict d? */
+static int snapWindowOnDict(dict *d) {
+    uint64_t seq;
+    atomicGetWithSync(snap_win_seq, seq);
+    if (seq == 0) return 0;
+    return snap_win[seq & 1].d == d;
 }
 
 /* ---- Per-save bucket bitmaps ---- */
 
 static inline uint8_t *snapScanBitmap(snapScanCtx *ctx, int s, int didx, int table) {
-    return ctx->bits[s][didx * 2 + table].b;
+    /* Allocated on demand by the main thread while the thread may be
+     * reading: acquire pairs with the release store in snapScanBitmapAlloc. */
+    return __atomic_load_n(&ctx->bits[s][didx * 2 + table].b, __ATOMIC_ACQUIRE);
 }
 
 void snapScanMarkBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
@@ -830,8 +844,8 @@ static void snapScanBitmapAlloc(snapScanCtx *ctx, int s, int didx, dict *d) {
         if (size == 0) continue;
         size_t bytes = (size + 7) / 8;
         struct snapBitmap *bm = &ctx->bits[s][didx * 2 + t];
-        bm->b = zcalloc(bytes);
         bm->bytes = bytes;
+        __atomic_store_n(&bm->b, zcalloc(bytes), __ATOMIC_RELEASE);
         ctx->bitmap_bytes += bytes;
     }
 }
@@ -892,10 +906,17 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
     ctx->num_dicts = zmalloc(sizeof(int) * num_stores);
     ctx->state = zmalloc(sizeof(redisAtomic uint8_t*) * num_stores);
     ctx->frozen = zcalloc(sizeof(int) * num_stores);
+    ctx->pending = zmalloc(sizeof(long) * num_stores);
+    ctx->attached = zmalloc(sizeof(uint8_t *) * num_stores);
+    ctx->guards = zmalloc(sizeof(struct snapGuardPriv) * num_stores);
     ctx->bits = zmalloc(sizeof(*ctx->bits) * num_stores);
     for (int s = 0; s < num_stores; s++) {
         ctx->num_dicts[s] = kvstoreNumDicts(stores[s]);
+        ctx->pending[s] = ctx->num_dicts[s];
         ctx->state[s] = zcalloc(sizeof(redisAtomic uint8_t) * ctx->num_dicts[s]); /* PENDING */
+        ctx->attached[s] = zcalloc(ctx->num_dicts[s]);
+        ctx->guards[s].ctx = ctx;
+        ctx->guards[s].s = s;
         ctx->bits[s] = zcalloc(sizeof(struct snapBitmap) * ctx->num_dicts[s] * 2);
         ctx->slots_total += ctx->num_dicts[s];
     }
@@ -906,6 +927,45 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
     ctx->privdata = privdata;
     ctx->en = createEventNotifier();
     return ctx;
+}
+
+/* Main thread, inside a write section: give dict (s, didx) what the scan
+ * needs from it, on demand (TASK-1.21.6): pause its layout, allocate its
+ * bucket bitmaps, attach the overlay. Called by the guard on the first
+ * structural write to a slot the thread has not finished, or on the first
+ * access of any kind while the thread's window is on the dict. Returns the
+ * overlay (NULL without one). */
+static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d) {
+    if (!ctx->attached[s][didx]) {
+        ctx->attached[s][didx] = 1;
+        dictPauseRehashing(d);
+        dictPauseAutoResize(d);
+        snapScanBitmapAlloc(ctx, s, didx, d);
+        if (ctx->has_ov)
+            kvstoreOverlayAttach(ctx->stores[s], didx, &ctx->ov_hooks, ctx->ov_priv ? ctx->ov_priv[s] : NULL);
+    }
+    if (!ctx->has_ov) return NULL;
+    kvstoreDictMetaBase *meta = kvstoreGetDictMeta(ctx->stores[s], didx, 0);
+    return meta ? meta->ov : NULL;
+}
+
+/* kvstore snapshot guard (kvstore.h): every access to a dict without an
+ * overlay while the scan runs lands here. */
+static struct kvstoreDictOverlay *snapOverlayGuard(void *privdata, kvstore *kvs, int didx, int write) {
+    struct snapGuardPriv *g = privdata;
+    snapScanCtx *ctx = g->ctx;
+    int s = g->s;
+    uint8_t st = snapSlotGetState(ctx, s, didx);
+    if (st == SNAP_SLOT_DONE || st == SNAP_SLOT_SCANNED) return NULL;   /* the thread is finished with it */
+    /* The thread may take this dict at any moment: it publishes a whole-dict
+     * window and waits for open sections, so the layout is stable from then
+     * on only if every access here runs inside a section, reads included (a
+     * find may step a rehash). */
+    snapFunnelOpen();
+    dict *d = kvstoreGetDict(kvs, didx);
+    if (!d) return NULL;
+    if (!write && !snapWindowOnDict(d)) return NULL;   /* a read of a dict the thread is not reading */
+    return snapScanAttach(ctx, s, didx, d);
 }
 
 static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
@@ -919,20 +979,30 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
             atomicIncr(ctx->slots_scanned, 1);
             if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, 0);
             ctx->slots_done++;
+            ctx->pending[s]--;
             continue;
         }
-        dictPauseRehashing(d);
-        dictPauseAutoResize(d);
-        snapScanBitmapAlloc(ctx, s, didx, d);
-        if (ctx->has_ov)
-            kvstoreOverlayFreeze(ctx->stores[s], didx, &ctx->ov_hooks, ctx->ov_priv ? ctx->ov_priv[s] : NULL);
+        /* PENDING (zeroed state). Pause, bitmaps and overlay come on demand
+         * through the guard: nothing per non-empty dict here. */
     }
+    if (ctx->pending[s] == 0) return;   /* nothing to scan in this store */
+    kvstoreSnapGuardSet(ctx->stores[s], snapOverlayGuard, &ctx->guards[s]);
     ctx->frozen[s] = 1;
+}
+
+/* The store's last slot completed: the guard comes off now, not at release,
+ * because the caller of an abort (FLUSHALL, SWAPDB, DEBUG RELOAD) frees or
+ * replaces the store right after, before snapScanRelease() runs. */
+static void snapScanStoreDone(snapScanCtx *ctx, int s) {
+    if (!ctx->frozen[s]) return;
+    kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL);
+    ctx->frozen[s] = 0;
 }
 
 static void snapScanUnfreezeDict(snapScanCtx *ctx, int s, int didx) {
     if (!ctx->frozen[s]) return;
-    if (snapSlotGetState(ctx, s, didx) == SNAP_SLOT_DONE) return;   /* never frozen */
+    if (!ctx->attached[s][didx]) return;   /* never paused */
+    ctx->attached[s][didx] = 0;
     dict *d = kvstoreGetDict(ctx->stores[s], didx);
     if (d) {
         dictResumeRehashing(d);
@@ -1010,6 +1080,13 @@ static void *snapScanThreadMain(void *arg) {
             if (snapSlotGetState(ctx, s, didx) == SNAP_SLOT_DONE) continue;
             dict *d = kvstoreGetDict(ctx->stores[s], didx);
             snapSlotSetState(ctx, s, didx, SNAP_SLOT_SCANNING);
+            /* Claim the whole dict before reading its layout: once every
+             * section open at this point has closed, any main-thread access
+             * pauses the dict first (guard), so table sizes and rehashidx
+             * hold still for the walk. */
+            snapWindowPublish(d, -1, 0, 0);
+            snapWalkerQuiesce(ctx);
+            if (snapScanAborted(ctx)) break;
             if (snapScanWalkDict(ctx, s, didx, d))
                 break;   /* Aborted: leave the slot SCANNING; snapScanAbort() completes it. */
             snapScanPublishScanned(ctx, s, didx);
@@ -1081,6 +1158,7 @@ static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted)
     snapScanUnfreezeDict(ctx, s, didx);
     snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
     ctx->slots_done++;
+    if (--ctx->pending[s] == 0) snapScanStoreDone(ctx, s);
 }
 
 int snapScanHandleCompletions(snapScanCtx *ctx) {
@@ -1146,12 +1224,17 @@ void snapScanRelease(snapScanCtx *ctx) {
         serverAssert(ctx->slots_done == ctx->slots_total);
     }
     for (int s = 0; s < ctx->num_stores; s++) {
+        serverAssert(!ctx->frozen[s]);   /* every slot completed: the guard is already off */
         for (int didx = 0; didx < ctx->num_dicts[s]; didx++) snapScanBitmapFree(ctx, s, didx);
         zfree(ctx->bits[s]);
         zfree(ctx->state[s]);
+        zfree(ctx->attached[s]);
     }
     zfree(ctx->bits);
     zfree(ctx->state);
+    zfree(ctx->attached);
+    zfree(ctx->guards);
+    zfree(ctx->pending);
     zfree(ctx->num_dicts);
     zfree(ctx->frozen);
     zfree(ctx->stores);
@@ -1344,6 +1427,7 @@ static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int ta
     /* SCANNING but the window is another dict's (or none): the thread set the
      * state and has not published its first window of this dict yet. */
     if (w->d != d) return SNAP_POS_AHEAD;
+    if (w->table < 0) return SNAP_POS_INSIDE;   /* the thread is reading the dict's layout */
     if (table != w->table) return table < w->table ? SNAP_POS_BEHIND : SNAP_POS_AHEAD;
     if (idx < w->lo) return SNAP_POS_BEHIND;
     if (idx >= w->hi) return SNAP_POS_AHEAD;
@@ -1522,7 +1606,6 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
     uint8_t st = snapSlotGetState(sv->scan, db->id, slot);
     if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) return 0;
-    if (!kvstoreOverlayIsFrozen(db->keys, slot)) return 0;
     dict *d = kvstoreGetDict(db->keys, slot);
     if (!d) return 0;
     snapFunnelOpen();   /* the window must hold still while we look */
@@ -2645,20 +2728,35 @@ static void snapScanTests(int accurate) {
     st->ctx = ctx;
     st->dispatch_sleep_us = 0;
     test_cond("scan: all slots PENDING before start", snapTestAllState(ctx, SNAP_SLOT_PENDING));
-    test_cond("scan: snapScanStart() succeeds", snapScanStart(ctx) == C_OK);
+    snapScanFreeze(ctx);   /* guard installed, no thread yet: the checks below are deterministic */
     {
+        /* On-demand freeze (TASK-1.21.6): the freeze pauses nothing; the
+         * first write-intent access to a slot the thread has not finished
+         * pauses that dict (guard). A read of a dict the thread is not
+         * reading does not. */
         dict *d = kvstoreGetDict(stores[0], 0);
-        test_cond("scan: dicts are frozen after start", d->pauserehash == 1 && d->pauseAutoResize == 1);
+        test_cond("scan: no dict is paused right after start", d->pauserehash == 0 && d->pauseAutoResize == 0);
+        char *k0 = snapTestKey(0, 0, 0);   /* store 0 dict 0 holds one key */
+        dictEntryLink b = NULL;
+        dictEntryLink l = kvstoreDictFindLink(stores[0], 0, k0, &b);
+        test_cond("scan: a write-intent lookup pauses the dict on demand and finds the key",
+                  l != NULL && d->pauserehash == 1 && d->pauseAutoResize == 1);
+        zfree(k0);
         /* The layout lock: neither the insert path nor the resize cron may
-         * touch a frozen table. */
+         * touch a paused table. */
         dict *big = kvstoreGetDict(stores[0], 2);   /* 5000 keys */
+        char *kb = snapTestKey(0, 2, 1);
+        kvstoreDictFindLink(stores[0], 2, kb, &b);
+        zfree(kb);
         signed char exp0 = big->ht_size_exp[0], exp1 = big->ht_size_exp[1];
         long ridx = big->rehashidx;
         int r1 = dictExpandIfNeeded(big), r2 = dictShrinkIfNeeded(big);
-        test_cond("scan: dictExpandIfNeeded/dictShrinkIfNeeded are no-ops on a frozen dict",
+        test_cond("scan: dictExpandIfNeeded/dictShrinkIfNeeded are no-ops on a paused dict",
                   r1 == DICT_ERR && r2 == DICT_ERR && big->ht_size_exp[0] == exp0 &&
                   big->ht_size_exp[1] == exp1 && big->rehashidx == ridx);
+        snapFunnelClose();   /* the accesses above opened a section: "command end" */
     }
+    test_cond("scan: snapScanStartThread() succeeds", snapScanStartThread(ctx) == C_OK);
     /* Concurrent reads from the owner thread while the scan runs. */
     long reads = 0, misses = 0;
     unsigned seed = 7;
@@ -2672,6 +2770,7 @@ static void snapScanTests(int accurate) {
             if (kvstoreDictFind(stores[s], didx, k) == NULL) misses++;
             zfree(k);
             reads++;
+            snapFunnelClose();   /* a read of a slot under scan opens a section: end the "command" */
         }
         completions += snapScanHandleCompletions(ctx);
     }
@@ -2705,8 +2804,10 @@ static void snapScanTests(int accurate) {
     test_cond("scan: all slots DONE at the end", snapTestAllState(ctx, SNAP_SLOT_DONE));
     test_cond("scan: no slot is owed after completion", !snapScanKeyIsOwed(ctx, 0, 0) && !snapScanKeyIsOwed(ctx, 1, 3));
     test_cond("scan: all dicts unfrozen at the end", snapTestAllUnfrozen(stores));
-    test_cond("scan: mid-rehash dict was still mid-rehash when its slot completed (scan did not rehash)",
-              st->rehashing_at_done);
+    /* With the on-demand freeze a dict left mid-rehash at start may finish
+     * rehashing through main-thread reads before the thread reaches it (the
+     * thread never rehashes: it only reads a layout that holds still). */
+    printf("scan: mid-rehash dict %s mid-rehash when its slot completed\n", st->rehashing_at_done ? "still" : "no longer");
     {
         long t, sc, dn; long long kd;
         snapScanProgress(ctx, &t, &sc, &dn, &kd);
@@ -2837,11 +2938,13 @@ static void snapScanTests(int accurate) {
     snapScanFreeze(ctx);
     {
         dict *d = kvstoreGetDict(stores[1], 0);
+        size_t none = snapScanBitmapBytes(ctx);
+        snapScanAttach(ctx, 1, 0, d);   /* what the guard does on the first write to the slot */
         size_t before = snapScanBitmapBytes(ctx);
         for (int t = 0; t < 2; t++)
             for (unsigned long i = 0; i < DICTHT_SIZE(d->ht_size_exp[t]); i++)
                 snapScanMarkBucketEmitted(ctx, 1, 0, t, i);
-        test_cond("bitmap: allocated for every frozen table", before > 0 &&
+        test_cond("bitmap: none at freeze, allocated for every table of the dict on attach", none == 0 && before > 0 &&
                   snapScanBucketEmitted(ctx, 1, 0, 0, 0) && !snapScanBucketEmitted(ctx, 1, 1, 0, 0));
     }
     test_cond("bitmap: start thread", snapScanStartThread(ctx) == C_OK);
@@ -2875,6 +2978,7 @@ static void snapScanTests(int accurate) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
         int pos, p_ahead, p_after, p_other, p_behind;
         test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
+        snapScanAttach(ctx, 0, 3, d);               /* bitmap and pause, as the guard would */
         snapSlotSetState(ctx, 0, 3, SNAP_SLOT_SCANNING);
         snapWindowPublish(d, 0, 0, mid);            /* the thread reads [0, mid) */
         snapFunnelOpen();                           /* a command opens its write section */
@@ -3155,8 +3259,8 @@ static void snapOverlayTests(int abort_variant) {
     kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL, NULL };
     snapScanSetOverlay(ctx, &hooks, privs);
     test_cond("overlay: start", snapScanStart(ctx) == C_OK);
-    test_cond("overlay: the populated slot is frozen, the empty one is DONE and not frozen",
-              kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !snapScanKeyIsOwed(ctx, 0, 3));
+    test_cond("overlay: nothing is attached at start, the empty slot is DONE",
+              !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !snapScanKeyIsOwed(ctx, 0, 3));
     dict *frozen = kvstoreGetDict(ks, 0);
 
     /* Read: original, no clone. */
@@ -3168,6 +3272,8 @@ static void snapOverlayTests(int abort_variant) {
     dictEntryLink link = kvstoreDictFindLink(ks, 0, "k:0:0:5", &bucket);
     char *clone5 = link ? dictGetKey(*link) : NULL;
     test_cond("overlay: write lookup returns a clone", link && clone5 && clone5 != orig5 && !strcmp(clone5, "k:0:0:5") && cnt.clones == 1);
+    test_cond("overlay: the write attached the overlay to the populated slot only",
+              kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3));
     test_cond("overlay: frozen dict still holds the original", dictGetKey(dictFind(frozen, "k:0:0:5")) == orig5);
     de = kvstoreDictFind(ks, 0, "k:0:0:5");
     test_cond("overlay: subsequent read returns the clone", de && dictGetKey(de) == clone5);

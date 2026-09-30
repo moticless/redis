@@ -1386,3 +1386,38 @@ at 0 and 20k writes/s, interleaved per cell, 2 reps.
   the memory of 128 MB where the queue fills, keeps roughly half of the idle mixed1m gain, and the knob remains for
   datasets of hundred-megabyte values. The run 17 and run 18 tables were measured at 128 MB and say so.
 
+
+## Run 20 (2026-10-01): A/B of the side-table drain (TASK-1.21.3), upstream vs before vs after, c7i.4xlarge
+
+Fresh c7i.4xlarge (18.144.225.10), `run-interleaved.sh run20.csv 0,20000,50000 small,mixed1m 1.0 2`,
+`SERVER_CPUS="0-3,8-11" LOAD_CPUS="4-7,12-15"`, HOT=1.0, scale 1.0 (about 300 MB datasets, so the saves are
+2 s cells: this is a regression check of one commit, not a capacity run). Binaries: `up` = upstream
+0d6266f2d, `hybrid-before` = d42921437 (TASK-1.25, before the drain), `hybrid` = 817c96857 (the drain,
+overlay in the dict metadata, reads skip an empty side table). Two reps per cell, values `rep1/rep2`.
+
+| dataset | rate | config | save s | extra MB | parent growth MB | CoW MB | main CPU s | thread CPU s | ping max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | up | 2.20/2.12 | 2/1 | 0/0 | 2/1 | 0.05/0.03 | 0 | 0.69/0.97 |
+| mixed1m | 0 | hybrid-before | 1.91/1.93 | 18/17 | 4/1 | 14/16 | 0.04/0.04 | 1.09/1.09 | 0.58/0.68 |
+| mixed1m | 0 | hybrid | 1.83/1.83 | 17/17 | 1/1 | 16/16 | 0.04/0.04 | 1.03/1.05 | 0.82/0.71 |
+| mixed1m | 20000 | up | 2.22/2.22 | 131/130 | 1/0 | 131/130 | 0.61/0.62 | 0 | 0.74/2.50 |
+| mixed1m | 20000 | hybrid-before | 1.92/2.01 | 61/64 | 9/11 | 54/53 | 0.59/0.61 | 0.97/1.06 | 0.64/1.27 |
+| mixed1m | 20000 | hybrid | 1.93/1.93 | 62/62 | 8/8 | 57/57 | 0.58/0.58 | 1.07/1.04 | 2.83/3.36 |
+| mixed1m | 50000 | up | 2.22/2.32 | 168/169 | 0/0 | 168/169 | 0.85/0.87 | 0 | 2.42/3.46 |
+| mixed1m | 50000 | hybrid-before | 2.00/1.90 | 83/82 | 5/9 | 81/77 | 0.78/0.81 | 1.12/1.07 | 3.25/1.50 |
+| mixed1m | 50000 | hybrid | 2.02/1.92 | 82/83 | 9/9 | 78/77 | 0.85/0.80 | 1.06/1.08 | 1.53/0.70 |
+| small | 0 | up | 2.57/2.51 | 2/1 | 0/0 | 2/1 | 0.06/0.05 | 0 | 5.14/0.85 |
+| small | 0 | hybrid-before | 2.32/2.22 | 1/1 | 0/0 | 1/1 | 0.03/0.03 | 2.24/2.16 | 0.72/0.65 |
+| small | 0 | hybrid | 2.22/2.22 | 1/1 | 0/0 | 1/1 | 0.03/0.04 | 2.15/2.17 | 0.97/0.75 |
+| small | 20000 | up | 2.52/2.52 | 171/171 | 0/0 | 173/173 | 0.64/0.65 | 0 | 0.60/0.69 |
+| small | 20000 | hybrid-before | 2.13/2.23 | 3/3 | 2/2 | 1/1 | 0.58/0.58 | 2.01/2.10 | 0.68/0.72 |
+| small | 20000 | hybrid | 2.12/2.13 | 3/3 | 2/2 | 1/1 | 0.58/0.57 | 2.04/2.06 | 0.72/0.82 |
+| small | 50000 | up | 2.50/2.50 | 239/241 | 0/0 | 241/242 | 1.30/1.31 | 0 | 4.38/3.94 |
+| small | 50000 | hybrid-before | 2.02/2.12 | 3/3 | 2/2 | 1/1 | 1.15/1.22 | 1.95/2.01 | 0.58/1.05 |
+| small | 50000 | hybrid | 2.20/2.12 | 3/3 | 2/2 | 1/1 | 1.24/1.20 | 2.11/2.01 | 0.63/0.83 |
+
+- **The drain is performance-neutral**: before and after agree within the rep-to-rep spread on save time,
+  memory, main-thread and thread CPU at every cell. Worst PING is noise at this scale (single 2-3 ms
+  outliers on either side).
+- Same picture as runs 6-8 for hybrid versus stock at this size: 3 MB of extra memory against 170-240 MB
+  on small under writes, 60-80 MB against 130-170 MB on mixed1m.

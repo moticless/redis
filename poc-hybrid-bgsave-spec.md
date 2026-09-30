@@ -127,11 +127,20 @@ kept in §11.y for history.
 waiting for the main thread to release it) or `DONE` (released: side table applied, dict unfrozen).
 The scan thread advances the state, the main thread reads it with an atomic load.
 
-**Freeze.** At save start, on the main thread and before the fork: pause rehashing and forbid
-auto-resize on every non-empty dict (`dictExpandIfNeeded` / `dictShrinkIfNeeded` return `DICT_ERR`
-while paused, `kvstoreExpand` skips paused dicts), allocate one bucket bitmap per table of every
-frozen dict, and install the overlay hooks. The bucket layout of a frozen dict is therefore fixed
-for the whole save; the chains are not.
+**Freeze (on demand since TASK-1.21.6, 2026-10-01).** At save start, on the main thread and before
+the fork: mark the slots that are empty right now `DONE` and install the store's *snapshot guard*
+(`kvstoreSnapGuardSet`). Nothing is paused or allocated per dict: in cluster mode that was a 3-5 ms
+stall for 16,384 slot dicts (as long as a stock fork), now below the 1 ms latency-monitor threshold.
+The guard runs on every kvstore access to a dict that has no overlay while the scan runs: it returns
+nothing for `SCANNED`/`DONE` slots; otherwise it opens the write section (reads included, since a find
+may step a rehash and the thread may claim the dict at any moment) and *attaches* on a structural
+write, or on any access while the thread's window is on the dict. Attaching (`snapScanAttach`) pauses
+rehashing and auto-resize (`dictExpandIfNeeded` / `dictShrinkIfNeeded` return `DICT_ERR` while paused,
+`kvstoreExpand` skips paused dicts), allocates one bucket bitmap per table the dict has right now and
+attaches the overlay (§ side table). The thread claims a dict by publishing a whole-dict window
+(table -1, every bucket "inside") and quiescing before it reads table sizes and `rehashidx`; from then
+on any main-thread access pauses the dict first, so the layout of a dict under the walk is fixed. A
+dict nobody writes and the thread has not reached is untouched, and may rehash or resize freely.
 
 **The window.** The scan thread reads a dict one window of `W` consecutive buckets at a time
 (`SNAP_WINDOW_BUCKETS_DEFAULT` = 1024, settable only through `DEBUG SNAP-WINDOW-BUCKETS n` for tests; no config option yet). Before reading

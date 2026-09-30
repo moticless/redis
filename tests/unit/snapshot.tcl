@@ -1110,12 +1110,15 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {$hy_dexp * 2 < $st_dexp}
         }
 
-        test {Hybrid BGSAVE harness: the bucket bitmaps exist only while a save runs} {
+        test {Hybrid BGSAVE harness: the bucket bitmaps exist only while a save runs, and only once a slot needs them} {
             snap_populate_race 0 0
             assert_equal 0 [s snap_save_bitmap_bytes]
             r config set rdb-key-save-delay 1000
             r bgsave
             snap_wait_save_started
+            # on demand: the freeze allocates nothing; the first write to the
+            # owed slot (or the walker's arrival) attaches the bitmap
+            r set bitmap:probe 1
             assert {[s snap_save_bitmap_bytes] > 0}
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done

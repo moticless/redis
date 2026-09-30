@@ -177,12 +177,15 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata);
 
-/* Main thread. Freezes every non-empty dict of every store (rehash and
- * auto-resize paused; empty dicts are DONE at once), publishes the others as
- * PENDING and spawns the scan thread. Returns C_OK or C_ERR (nothing frozen
- * on error). From this point until snapScanRelease() every main-thread write
- * to a frozen dict goes through the overlay hooks (kvstore.h): in place once
- * the snapshot holds the bucket, to the side table while the thread reads it. */
+/* Main thread. Marks the dicts that are empty right now DONE, installs the
+ * snapshot guard on every store (kvstore.h) and spawns the scan thread; the
+ * other slots start PENDING. Nothing is paused or allocated per dict: a dict
+ * is paused and gets its bucket bitmaps and overlay on demand, at the first
+ * structural write to it or when the thread's window is on it. Returns C_OK
+ * or C_ERR (nothing frozen on error). From this point until
+ * snapScanRelease() every main-thread write to an owed dict goes through the
+ * overlay hooks: in place once the snapshot holds the bucket, to the side
+ * table while the thread reads it. */
 int snapScanStart(snapScanCtx *ctx);
 
 /* Main thread. Handles slots the thread finished since the last call: for
@@ -204,8 +207,8 @@ void snapScanAbort(snapScanCtx *ctx);
  * Every slot must be DONE by then unless the ctx was never started. */
 void snapScanRelease(snapScanCtx *ctx);
 
-/* Attach the keyspace overlay (kvstore.h) to the scan: every non-empty dict
- * of every store is frozen at snapScanStart() with these hooks; its side
+/* Attach the keyspace overlay (kvstore.h) to the scan: a dict gets an
+ * overlay with these hooks the first time the guard attaches it; its side
  * table drains on the main thread as the window moves and is released when
  * its slot completes. 'store_privdata[s]' is passed to the hooks for store s
  * (the server passes the redisDb). Must be called before snapScanStart().
