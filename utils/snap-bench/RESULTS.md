@@ -1192,3 +1192,40 @@ costs no save time that the noise can show: idle 23.8-26.8 s vs 25.3-32.3, 20k 3
 a full 90 MB hash needs about 150 MB of buffered scan output does not bind here because the child drains between hashes
 faster than the scan refills, so a 128 MB queue keeps the two overlapped. 128 MB is the default.
 
+## Run 17 (2026-09-30): mixed1m three-way on one host and day, upstream vs hybrid (with the queue) vs Valkey forkless
+
+Raw: `run17.csv`, driver `run17.sh`. Same c7i.4xlarge and layout as run 16. `up` = 0d6266f2d, `hybrid` = the tree of
+41527cab3 (outbound queue, 128 MB queue bound), `valkey-forkless` = 06d35aca6 (`--forkless-infrastructure-enabled yes
+--bgsave-default-method forkless`). mixed1m at scale 16, rates 0 / 20k / 50k at HOT=1.0, 2 reps, interleaved per cell,
+every save `ok`. Values as rep a / rep b.
+
+| rate | config | save s | fork ms | peak MB | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | ops | wavg ms | wp99 ms | wmax ms | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 43.2 / 43.1 | 41 / 28 | 4231 / 4073 | 3 / 1 | 0 | 3 / 1 | 0.6 | 0 | 43.0 | 40.1 / 26.5 | - | - | - | - | - | 0 |
+| 0 | hybrid | 28.7 / 26.3 | 14 / 14 | 4262 / 4248 | 158 / 136 | 126 / 96 | 32 / 40 | 0.4 | 19.0 | 24.2 / 23.6 | 11.2 / 12.1 | - | - | - | - | - | 0 |
+| 0 | valkey-forkless | 51.0 / 52.1 | 0 | 4106 / 4008 | 1 | 1 | 0 | 12.3 / 11.5 | 40.7 / 45.0 | 0 | 1.9 / 2.0 | - | - | - | - | - | 0 |
+| 20k | up | 43.3 / 40.9 | 29 / 29 | 6574 / 6510 | 2501 / 2437 | 1 | 2502 / 2438 | 10.2 / 9.6 | 0 | 43.2 / 40.8 | 26.2 / 25.3 | 19997 | 0.18 | 0.53 | 29.9 / 30.1 | 0 | 0 |
+| 20k | hybrid | 39.9 / 40.7 | 14 / 14 | 5311 / 5326 | 1230 / 1245 | 88 / 88 | 1229 / 1243 | 10.1 / 9.6 | 18.8 / 18.7 | 23.6 / 24.5 | 11.7 / 15.4 | 19999 | 0.18 / 0.19 | 0.56 / 0.57 | 15.7 / 15.6 | 0 | 0 |
+| 20k | valkey-forkless | 49.3 / 48.1 | 0 | 4010 / 4011 | 3 / 4 | 3 / 4 | 0 | 14.0 / 14.2 | 46.9 / 45.6 | 0 | 1.9 / 1.8 | 14851 / 15242 (75%) | 0.65 / 0.60 | 1.51 / 1.53 | 23609 / 21166 | 5 / 6 | 9 |
+| 50k | up | 43.8 / 44.2 | 31 / 31 | 7331 / 7334 | 3258 / 3261 | 2 | 3256 / 3260 | 17.0 / 14.4 | 0 | 43.7 / 44.1 | 31.1 / 30.0 | 49991 | 0.09 / 0.12 | 0.42 / 0.61 | 31.8 / 31.7 | 0 | 0 |
+| 50k | hybrid | 38.3 / 37.5 | 15 / 15 | 5796 / 5796 | 1721 / 1713 | 108 / 97 | 1711 | 15.5 / 15.6 | 16.8 / 18.5 | 23.7 / 21.5 | 16.3 / 16.0 | 49998 | 0.10 / 0.09 | 0.53 / 0.40 | 17.4 / 16.9 | 0 | 0 |
+| 50k | valkey-forkless | 47.3 / 46.0 | 0 | 4015 | 8 | 8 | 0 | 19.1 / 18.6 | 45.8 / 44.5 | 0 | 1.7 / 1.6 | 38356 / 38252 (77%) | 0.37 / 0.38 | 1.38 / 1.41 | 22207 / 18471 | 8 / 13 | 16 |
+
+### Reading the run
+
+- **Idle: the hybrid now saves mixed1m in 26-29 s against 43 for stock and 51-52 for forkless.** Run 13 had it at 42, tied
+  with stock, because the scan thread waited on the pipe while the child was inside a hash; the queue (TASK-1.27) is the
+  difference. The cost is the queue, 96-126 MB of parent growth (bounded at 128 MB plus the main-thread queue), 136-158 MB
+  extra in total against 1-3 MB for the others; it is released at the end of the save.
+- **Under writes the hybrid keeps its memory advantage and gains 10-15% of save time, not the idle 40%.** 20k: 40-41 s
+  against 41-43 (stock) and 48-49 (forkless); 50k: 37.5-38.3 against 43.8-44.2 and 46-47. Copy-on-write is the hashes
+  only, 1.23-1.71 GB against stock's 2.44-3.26 GB; the fork stall 14-15 ms against 29-31. The child's CPU is 22-25 s in
+  every hybrid cell, so under writes the child's wall time exceeds its CPU by 13-16 s; that gap is what caps the gain and
+  is still unexplained (run 16 reading).
+- **Forkless on 1M-field hashes still cannot serve writes to them**: 75-77% of the offered rate, worst writes of 18-24 s,
+  9-16 clients blocked at the peak, 5-13 stalled seconds per save, with 1.4-1.5 ms p99 that hides it. Its idle save is
+  20% longer than stock's and twice the hybrid's, and its main thread spends 11.5-19 CPU-seconds per save against the
+  hybrid's 0.4-15.6 (the hybrid's main-thread CPU under writes is the write load itself: stock's is 9.6-17.0).
+- **Write latency on the hybrid is stock's**: p99 0.40-0.57 ms against 0.42-0.61 (stock) and 1.4-1.5 (forkless); the
+  worst write is the fork stall, 16-17 ms against 30-32.
+
