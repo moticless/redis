@@ -984,7 +984,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal ok [s rdb_last_bgsave_status]
             assert {[s snap_last_save_queued_peak] >= 262144}
             assert_equal 0 [s snap_save_queued_bytes]
-            r config set bgsave-hybrid-max-queued-bytes 128mb
+            r config set bgsave-hybrid-max-queued-bytes 16mb
             r config set rdbcompression yes
             r debug reload nosave
             assert_equal $ref [debug_digest]
@@ -1007,9 +1007,11 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             $rd close
             assert_equal hashtable [r object encoding bigh:0]
             set ref [debug_digest]
+            r config set bgsave-hybrid-max-queued-bytes 128mb
             r bgsave
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
+            r config set bgsave-hybrid-max-queued-bytes 16mb
             # more than the 1 MB pipe was pending at some point: the scan thread ran ahead of the child
             assert {[s snap_last_save_queued_peak] > 1048576}
             assert_equal 0 [s snap_save_queued_bytes]

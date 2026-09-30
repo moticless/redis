@@ -233,7 +233,8 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   non-blockingly after every enqueue (partial writes keep an offset into the head message); the
   staging buffer reserves its header up front and is handed to the queue without a copy, and
   drained buffers return to a small pool. Past `bgsave-hybrid-max-queued-bytes` (its own knob,
-  default 128 MB, frozen at save start) the thread waits for the child with `poll()` instead of
+  default 16 MB, frozen at save start; 128 MB buys the full overlap on datasets of hundred-megabyte
+  values, run 19) the thread waits for the child with `poll()` instead of
   growing; it never aborts for that. The main-thread hard mark (`bgsave-hybrid-max-retained-bytes`,
   256 MB) still counts only what the main thread retains and queues, so the worst-case save memory
   is the sum of the two bounds. `snap_save_queued_bytes` covers both queues;

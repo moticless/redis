@@ -1348,3 +1348,41 @@ forkless` on the primary, the infrastructure flag on the replica) over the same 
   the worst write was 0.85-0.91 s, 5 clients were blocked at the peak and 31-34 of the 44-47 s were stalled seconds. On
   small and mixed it kept the rate, with write p99 1.0 ms (stock and hybrid 0.5) and a worst write of 3-5 ms.
 - The branch is a day old and under review; treat the numbers as its shape, not its final performance.
+
+## Run 19 (2026-09-30): the scan thread's queue bound, 128 MB vs 16 MB vs 2 MB
+
+Raw: `run19.csv`, driver `run19.sh`. Same host as runs 16-18, later in the day and measurably slower (the 128 MB idle
+mixed1m cells took 32-38 s here against 26-29 in run 17 with the same binary; compare within rows only). BGSAVE, hybrid
+build c5183cd4b, `bgsave-hybrid-max-queued-bytes` 128 MB (the default until this run) vs 16 MB vs 2 MB, mixed1m and small
+at 0 and 20k writes/s, interleaved per cell, 2 reps.
+
+| dataset | rate | queue bound | save s | extra MB | queue (parent +MB) | CoW MB | scan cpu s | child cpu s | wp99 ms | wmax ms |
+|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | 128 MB | 38.5 / 32.5 | 126 / 135 | 98 / 110 | 28 / 25 | 22.2 / 20.9 | 25.5 / 26.7 | - | - |
+| mixed1m | 0 | 16 MB | 44.3 / 40.4 | 17 / 17 | 9 / 7 | 8 / 10 | 24.2 / 20.9 | 28.8 / 26.2 | - | - |
+| mixed1m | 0 | 2 MB | 47.7 / 40.6 | 4 / 3 | 1 / 0 | 3 / 3 | 23.8 / 17.8 | 26.5 / 25.0 | - | - |
+| mixed1m | 20000 | 128 MB | 37.7 / 40.6 | 1193 / 1241 | 91 / 79 | 1184 / 1248 | 18.3 / 18.6 | 21.9 / 24.5 | 0.56 / 0.55 | 15.6 / 16.1 |
+| mixed1m | 20000 | 16 MB | 40.7 / 39.6 | 1243 / 1224 | 27 / 29 | 1241 / 1219 | 18.6 / 16.6 | 23.5 / 24.3 | 0.56 / 0.56 | 15.1 / 15.8 |
+| mixed1m | 20000 | 2 MB | 42.0 / 38.1 | 1265 / 1197 | 24 / 21 | 1258 / 1190 | 18.0 / 18.4 | 25.2 / 21.0 | 0.56 / 0.54 | 15.7 / 15.6 |
+| small | 0 | 128 MB | 30.3 / 31.2 | 6 / 2 | 0 / 1 | 6 / 1 | 30.1 / 31.0 | 2.9 / 2.8 | - | - |
+| small | 0 | 16 MB | 31.0 / 31.8 | 2 / 2 | 1 / 1 | 1 / 1 | 30.8 / 31.6 | 2.9 / 2.9 | - | - |
+| small | 0 | 2 MB | 30.7 / 31.2 | 2 / 2 | 1 / 1 | 1 / 1 | 30.5 / 31.0 | 2.9 / 2.8 | - | - |
+| small | 20000 | 128 MB | 30.1 / 29.6 | 8 / 8 | 7 / 7 | 1 / 1 | 29.8 / 29.5 | 3.1 / 3.1 | 0.51 / 0.54 | 2.3 / 2.5 |
+| small | 20000 | 16 MB | 29.5 / 30.9 | 8 / 8 | 7 / 7 | 1 / 1 | 29.4 / 30.6 | 3.1 / 3.1 | 0.52 / 0.49 | 2.6 / 2.6 |
+| small | 20000 | 2 MB | 30.3 / 30.5 | 8 / 8 | 7 / 7 | 1 / 1 | 30.1 / 30.4 | 3.1 / 3.0 | 0.52 / 0.52 | 2.4 / 2.2 |
+
+### Reading the run
+
+- **The queue's only measurable benefit is the idle save on datasets with huge fork-class values.** mixed1m idle: 32-38 s
+  at 128 MB, 40-44 at 16 MB, 41-48 at 2 MB. The 128 MB queue lets the scan thread run for the whole of one 90 MB hash
+  while the child is inside it; 16 MB covers a sixth of it and keeps about half of the gain; 2 MB is the pipe plus a
+  little and gives the sum of the two halves back.
+- **Under writes the bound does not matter** (37.7-42.0 s for all three, within the run's noise): the child's wall time
+  is the limit there, as in runs 16-17.
+- **On small the queue never fills in a BGSAVE** (0-7 MB at any bound), so the bound changes nothing. It does fill during
+  a full sync (run 18: 90-150 MB, the child drains more slowly into a socket than into a file) while the sync time is the
+  replica's load either way, so there the bound is pure memory.
+- **Decision (the user's): the default is 16 MB** (config.c, redis.conf, spec section 6, blog). It costs about a tenth of
+  the memory of 128 MB where the queue fills, keeps roughly half of the idle mixed1m gain, and the knob remains for
+  datasets of hundred-megabyte values. The run 17 and run 18 tables were measured at 128 MB and say so.
+

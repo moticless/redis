@@ -252,7 +252,7 @@ hybrid on the same channel, Valkey's default fork-based sync; two reps each):
 
 Sync time is the replica's load time and the hybrid matches stock on it; what changes is what the
 primary pays while it runs: copy-on-write on the fork-class values only plus the scan thread's queue
-(60-130 MB), a fork stall the size of those values' page tables, and stock's write latency. The
+(60-130 MB with the 128 MB bound used for these runs, about 20 MB at the 16 MB default), a fork stall the size of those values' page tables, and stock's write latency. The
 replication stream buffered on the replica during a sync of this length is 23-33 MB, the number the
 spliced-stream option has to justify itself against. Valkey's fork-based sync is two to three times
 longer because it compresses the RDB and streams on one channel. Its forkless full sync, run from
@@ -353,8 +353,9 @@ to switch. On mixed1m the hybrid again pays copy-on-write for the hashes alone, 
 with half the stall. The idle row shows what the two workers buy when the child is inside a 90 MB
 hash: the hybrid saves in 26-29 s where stock's single child needs 43 and forkless's single thread
 51-52, because the scan thread queues its output in memory instead of waiting for the child (the
-queue is the 136-158 MB of extra memory in that row, bounded at 128 MB by default plus the
-main-thread queue, released at the end). Under writes the gain narrows to 10-15%: the child's
+queue is the 136-158 MB of extra memory in that row, measured with the bound at 128 MB and
+released at the end; the default ships at 16 MB, which keeps about half of this gain for a tenth of
+the memory). Under writes the gain narrows to 10-15%: the child's
 wall time then exceeds its CPU time by 10-15 s, for a reason not yet understood.
 
 And forkless meets the value it cannot serialize atomically. A write that lands on the hash
@@ -413,8 +414,9 @@ and `stop-writes-on-bgsave-error` behave as before, since a child still writes t
 `save-small-max-bytes` (default 4 KB) is the size line within the eligible encodings,
 `bgsave-hybrid-max-retained-bytes` (default 256 MB) bounds the memory a save may hold for buckets
 under the scan window before it is aborted and reported as failed, and
-`bgsave-hybrid-max-queued-bytes` (default 128 MB) bounds the records the scan thread may queue
-while the child is busy with a large value before it waits. `allocator_allocated_nofork`
+`bgsave-hybrid-max-queued-bytes` (default 16 MB) bounds the records the scan thread may queue
+while the child is busy with a large value before it waits; 128 MB buys the full overlap on
+datasets of hundred-megabyte values. `allocator_allocated_nofork`
 tells you, before any save, how much of your dataset the child will never see.
 
 ## 9. Where it stands
@@ -440,7 +442,7 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
 - **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in
   front of the pipe: on mixed1m the idle save went from 38 s (scan plus child in series) to 22-25 s
   (the child alone). The queue is memory the save holds while the child is behind, up to its own
-  bound, 128 MB by default, released at the end; and under writes the gain is
+  bound, 16 MB by default and 128 MB for that measurement, released at the end; and under writes the gain is
   smaller, 41 s to 36-39 s, because the child's wall time exceeds its CPU time there, which is not
   yet understood.
 
