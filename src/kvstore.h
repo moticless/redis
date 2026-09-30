@@ -48,40 +48,53 @@ typedef struct _kvstoreDictIterator {
     int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = temp dict (ADDs) */
 } kvstoreDictIterator;
 
-/* ---- Snapshot overlay (hybrid BGSAVE) --------------------------------------
+/* ---- Snapshot overlay: the in-window side table (hybrid BGSAVE) -------------
  *
- * While a dict is "frozen" (owed to a running snapshot scan) it is never
- * modified: every write goes to a per-dict temp dict and every read consults
- * the temp dict first. The first write-lookup of a key that only exists in the
- * frozen dict calls 'clone' to obtain a private copy that is stored in the temp
- * dict and returned to the caller, so all in-place mutation done by callers
- * lands on the clone. Deletes leave a tombstone. Enumeration and sizes describe
- * the logical keyspace (frozen minus tombstones, clones substituted, plus
- * adds). kvstoreOverlayMerge() applies the temp dict to the real dict on the
- * owner thread once the scan of that dict has finished. */
+ * While a dict is "frozen" (owed to a running snapshot scan) its bucket layout
+ * is fixed and every write first asks the snapshot ('prepare') whether the
+ * chain may be written in place. When it may not (the scan thread is reading
+ * that bucket right now) the write goes to the dict's side table instead: the
+ * first write-lookup of such a key calls 'clone' to obtain a private copy that
+ * is stored in the side table and returned to the caller, so all in-place
+ * mutation done by callers lands on the clone; deletes leave a tombstone; adds
+ * land in the side table. While the side table is non-empty, reads, sizes and
+ * enumeration describe the logical keyspace (frozen minus tombstones, clones
+ * substituted, plus adds); while it is empty they are plain dict reads.
+ * kvstoreOverlayDrain() applies the side table to the real dict on the owner
+ * thread for every key whose bucket the snapshot no longer reads ('drainable'),
+ * kvstoreOverlayRelease() applies whatever is left and unfreezes the dict once
+ * its scan is complete. The overlay lives in the dict's metadata
+ * (kvstoreDictMetaBase.ov). */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
 /* Called at the start of every main-thread write operation on a frozen dict
- * (before the overlay decides between in-place and temp-dict paths). Optional. */
+ * (before the overlay decides between in-place and side-table paths). Optional. */
 typedef void (kvstoreOverlayEnterFn)(void *privdata);
 /* Called before a structural write (add, unlink, replace) of 'key' in frozen
  * dict 'd', after 'enter'. KVSTORE_OV_INPLACE: the snapshot already holds
  * this bucket (the callee may have just emitted it), the frozen chain may be
  * written in place. KVSTORE_OV_DEFER: the snapshot thread is reading the
- * bucket right now, the write must go to the temp dict. Optional (absent:
+ * bucket right now, the write must go to the side table. Optional (absent:
  * always DEFER, i.e. pure clone-on-write). */
 #define KVSTORE_OV_DEFER   0
 #define KVSTORE_OV_INPLACE 1
 typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key);
+/* May the side-table entry of 'key' be applied to the frozen chain now, i.e.
+ * will the snapshot thread never read that bucket again? Optional (absent:
+ * nothing drains before kvstoreOverlayRelease). */
+typedef int (kvstoreOverlayDrainableFn)(void *privdata, int didx, dict *d, const void *key);
 typedef struct kvstoreOverlayHooks {
     kvstoreOverlayCloneFn *clone;
     kvstoreOverlayFreeOrigFn *free_orig;
     kvstoreOverlayEnterFn *enter;
     kvstoreOverlayPrepareFn *prepare;
+    kvstoreOverlayDrainableFn *drainable;
 } kvstoreOverlayHooks;
 void kvstoreOverlayFreeze(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
-void kvstoreOverlayMerge(kvstore *kvs, int didx);
+long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
+void kvstoreOverlayRelease(kvstore *kvs, int didx); /* apply the rest, unfreeze */
+long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */
 void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);
 
 typedef int (kvstoreScanShouldSkipDict)(dict *d, int didx);
@@ -119,6 +132,7 @@ typedef struct kvstoreType {
  * in a new, larger structure. */
 typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
+    struct kvstoreDictOverlay *ov;  /* snapshot overlay while the dict is frozen (hybrid BGSAVE), else NULL */
 } kvstoreDictMetaBase;
 
 #define KVSTORE_ALLOCATE_DICTS_ON_DEMAND (1<<0)

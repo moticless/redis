@@ -177,11 +177,12 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata);
 
-/* Main thread. Freezes every existing dict of every store (rehash and
- * auto-resize paused), publishes all slots as PENDING and spawns the scan
- * thread. Returns C_OK or C_ERR (nothing frozen on error). From this point
- * until snapScanRelease() the main thread must not insert into or delete
- * from any of the scanned dicts (writes go to the temp dict). */
+/* Main thread. Freezes every non-empty dict of every store (rehash and
+ * auto-resize paused; empty dicts are DONE at once), publishes the others as
+ * PENDING and spawns the scan thread. Returns C_OK or C_ERR (nothing frozen
+ * on error). From this point until snapScanRelease() every main-thread write
+ * to a frozen dict goes through the overlay hooks (kvstore.h): in place once
+ * the snapshot holds the bucket, to the side table while the thread reads it. */
 int snapScanStart(snapScanCtx *ctx);
 
 /* Main thread. Handles slots the thread finished since the last call: for
@@ -203,11 +204,12 @@ void snapScanAbort(snapScanCtx *ctx);
  * Every slot must be DONE by then unless the ctx was never started. */
 void snapScanRelease(snapScanCtx *ctx);
 
-/* Attach the keyspace overlay (kvstore.h) to the scan: every dict of every
- * store is frozen at snapScanStart() with these hooks and merged on the
- * main thread when its slot completes. 'store_privdata[s]' is passed to the
- * hooks for store s (the server passes the redisDb). Must be called before
- * snapScanStart(). The hooks struct is copied. */
+/* Attach the keyspace overlay (kvstore.h) to the scan: every non-empty dict
+ * of every store is frozen at snapScanStart() with these hooks; its side
+ * table drains on the main thread as the window moves and is released when
+ * its slot completes. 'store_privdata[s]' is passed to the hooks for store s
+ * (the server passes the redisDb). Must be called before snapScanStart().
+ * The hooks struct is copied. */
 void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata);
 
 /* ---- Bucket window and write sections (spec 11.z) -------------------------
@@ -341,6 +343,7 @@ int snapScanRdbCompression(void);
  * tombstoned originals), the peak of the last completed save, and the
  * hard-mark abort counter. */
 size_t snapSaveRetainedBytes(void);
+long snapSaveSideEntries(void);          /* clones, adds and tombstones waiting in side tables */
 size_t snapSaveLastRetainedPeak(void);
 /* Main-thread emission (spec 11.z): bytes queued for the scan thread to
  * forward to the child, buckets and keys the main thread emitted itself. */

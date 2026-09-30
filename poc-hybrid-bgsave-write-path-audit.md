@@ -383,7 +383,7 @@ Reviewed line by line against the tree. The primitive inventory, the command tab
 | Header copy / value copy-or-share, expires + subexpires repointing | `snapOverlayCloneKey` (snapshot.c): whole allocation copy, EMBSTR ptr rebased; arena-resident sds/listpack/intset/listpackEx deep-copied; multi-allocation and outside-arena values shared. |
 | TOMBSTONE | `kvstoreDictTwoPhaseUnlinkFree` / `kvstoreDictDelete` on a frozen dict (state flag `OV_STATE_TOMB`). |
 | ADD_TEMP | `kvstoreDictSetAtLink(newItem)` / `kvstoreDictAddRaw` on a frozen dict. |
-| Merge and original release | `kvstoreOverlayMerge` (kvstore.c) called from `snapScanCompleteSlot`; `snapOverlayFreeOriginal` (header-only when shared, `kvobjFreeValueOnly` otherwise). |
+| Drain, release and original release | Since 2026-09-30 (TASK-1.21.3): `kvstoreOverlayDrain` (kvstore.c) from `snapFunnelCloseSlow` and `snapSaveCron` applies every side-table entry whose bucket is behind the window (`snapOverlayDrainable`); `kvstoreOverlayRelease` from `snapScanCompleteSlot` applies the rest and unfreezes. Every "until merge" above now reads "until the window passes the bucket, at the latest when the slot is released". `snapOverlayFreeOriginal` (header-only when shared, `kvobjFreeValueOnly` otherwise). |
 | SUSPEND: active hash-field expiry | `activeSubexpiresCycle` (expire.c) returns while `snapSaveInProgress()`. |
 | SUSPEND: lazy field expiry on read, HRANDFIELD expiry | `hashTypeGetValue`, `hashTypeExpireIfNeeded` (t_hash.c) via `snapKeyIsOwed`. |
 | ABORT_SAVE | `emptyData`, `dbSwapDatabases` (db.c), `killRDBChild` (rdb.c) call `snapSaveAbort`. |

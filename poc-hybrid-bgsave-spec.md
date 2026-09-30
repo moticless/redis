@@ -124,8 +124,8 @@ kept in §11.y for history.
 
 **States.** Every frozen dict (one per db in standalone, one per slot in cluster) is in one of
 `PENDING` (the scan thread has not reached it), `SCANNING` (being read), `SCANNED` (fully dispatched,
-waiting for the main-thread merge) or `DONE` (merged, dict unfrozen). The scan thread advances the
-state, the main thread reads it with an atomic load.
+waiting for the main thread to release it) or `DONE` (released: side table applied, dict unfrozen).
+The scan thread advances the state, the main thread reads it with an atomic load.
 
 **Freeze.** At save start, on the main thread and before the fork: pause rehashing and forbid
 auto-resize on every non-empty dict (`dictExpandIfNeeded` / `dictShrinkIfNeeded` return `DICT_ERR`
@@ -169,22 +169,32 @@ protection: their bucket was emitted or walked before the command ran, and the t
 to a bucket. Keys with module metadata, module-type values and everything larger than
 `save-small-max-bytes` are SNAP_FORK and serialized by the child from the kvobj copy (§5).
 
-**Reads during a save** consult the temp dict first (clones, adds, tombstones), then the frozen dict.
-Only keys written while their bucket was inside the window live in the temp dict, so it is tiny:
-run 7 measured 0.6-11 MB of retained clones at 20-50k writes/s on a 300 MB dataset, against 5-17 MB
-for the overlay scheme and 135-232 MB of child copy-on-write for a stock fork.
+**The side table** (TASK-1.21.3, 2026-09-30; `kvstoreDictOverlay`, reachable from the dict's
+metadata `kvstoreDictMetaBase.ov`) holds the clones, adds and tombstones of keys written while their
+bucket was inside the window. **Reads during a save** consult it first while it is non-empty and are
+plain dict reads otherwise (`ovActive`), so a frozen dict with nothing pending costs a read nothing.
+It is tiny: run 7 measured 0.6-11 MB of retained clones at 20-50k writes/s on a 300 MB dataset,
+against 5-17 MB for the slot-lifetime overlay and 135-232 MB of child copy-on-write for a stock
+fork; run 19 measured at most 1 MB.
 
-**Merge.** When the thread publishes `SCANNED` for a dict, the main thread (from the event loop,
-`snapScanHandleCompletions`) applies the temp dict to the real dict, frees the fork-instant
-originals it replaced (SNAP_NOFORK memory: DONTFORK, so the free is CoW-free), resumes rehashing
-and auto-resize, frees the bitmap and marks the dict `DONE`. From then on writes to it are stock
-writes.
+**Drain.** An entry stays in the side table only while the walker may still read its bucket. At the
+end of every write section (`snapFunnelCloseSlow`, i.e. the outermost command end or beforeSleep;
+no caller holds a link there) and once per cron tick, the main thread applies every entry whose
+bucket is now behind the window (`snapOverlayDrainable`: position `BEHIND`, or the dict `SCANNED`):
+a clone replaces its original at the link and the original is freed (SNAP_NOFORK memory: DONTFORK,
+so the free is CoW-free), a tombstoned original is unlinked and freed, an add is inserted
+(`kvstoreOverlayDrain`, over the store's list of dirty overlays only). The drain is skipped while the
+window has not moved since the last one. **Release.** When the thread publishes `SCANNED` for a
+dict, the main thread (from the event loop, `snapScanHandleCompletions`) applies whatever is left
+(normally nothing), resumes rehashing and auto-resize, frees the bitmap and marks the dict `DONE`
+(`kvstoreOverlayRelease`). There is no merge step and no `hybrid-merge` latency event any more.
+From then on writes to it are stock writes. INFO `snap_save_side_entries` counts what is pending.
 
 **Backpressure and abort.** The main thread's queue is bounded only by the hard mark: `snapSaveCron`
 aborts the save when retained clones plus queued bytes exceed `bgsave-hybrid-max-retained-bytes`
 (default 256 MB, 0 = unlimited). Abort marks the context, joins the thread (which gives up its
 quiescence wait when it sees the abort, since the aborting command may itself hold the section
-open), kills the child, merges every temp dict and unfreezes. FLUSHALL, FLUSHDB, SWAPDB, SHUTDOWN
+open), kills the child, releases every side table and unfreezes. FLUSHALL, FLUSHDB, SWAPDB, SHUTDOWN
 and a killed child take the same path. The previous dump file is untouched.
 
 **Other fork children (fallback).** The arena is one reserved range carrying
@@ -509,11 +519,14 @@ Left over, in the order I would do it:
    counter and their INFO fields; the scan thread still stamps every key it
    emits (dead work, about one release store per key). Expose bitmap bytes in
    INFO.
-2. TASK-1.21.3: drain the temp dict per window instead of merging at slot
-   end. Today the temp dict only ever holds keys written while their bucket
-   was inside the window, so the slot-end merge is small; the `hybrid-merge`
-   latency event still exists and the temp/state dicts still exist. In-window
-   deletes clone the key only to tombstone it (rare, wasteful).
+2. TASK-1.21.3 (done 2026-09-30): the side table drains at the end of every
+   write section and per cron tick for buckets the window has passed; slot
+   completion is a release (no merge, no `hybrid-merge` event); reads take the
+   stock path while the side table is empty; the overlay lives in the dict's
+   metadata (`kvstoreDictMetaBase.ov`, the home TASK-1.21.6 attaches on
+   demand). Kept as is: the temp dict + state dict pair as the side table's
+   representation (a working, sanitizer-clean structure; measured cost about
+   nothing), and in-window deletes still clone the key only to tombstone it.
 3. Cost trims: `dictKeyBucket()` hashes the key a second time per write
    during a save (reuse the lookup's hash); `snapSendMsg` does two `write()`s
    per message (writev); the walker's `snapWalkerQuiesce` spins with

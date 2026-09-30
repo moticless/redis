@@ -781,10 +781,17 @@ void snapFunnelOpen(void) {
     atomicSetWithSync(snap_funnel_seq, v + 1);   /* seq_cst: pairs with snapWindowPublish */
 }
 
+static void snapSaveDrainSideTables(void);
+
 void snapFunnelCloseSlow(void) {
     uint64_t v;
     atomicGet(snap_funnel_seq, v);
-    if (v & 1) atomicSetWithSync(snap_funnel_seq, v + 1);
+    if (v & 1) {
+        /* Still inside the section (the window holds still) and at a point
+         * where no caller holds a link: apply what the walker has passed. */
+        snapSaveDrainSideTables();
+        atomicSetWithSync(snap_funnel_seq, v + 1);
+    }
 }
 
 int snapWindowCoversKey(dict *d, const void *key) {
@@ -1062,18 +1069,14 @@ static inline void snapScanRequestAbort(snapScanCtx *ctx) {
     atomicSetWithSync(ctx->abort, 1);
 }
 
-/* Main thread: finish one slot (merge, slot-done hook, unfreeze, publish DONE). */
+/* Main thread: finish one slot (release the side table, slot-done hook,
+ * unfreeze, publish DONE). */
 static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
-    /* The thread no longer reads this slot: apply the temp dict to the real
-     * dict and free the replaced originals. */
+    /* The thread no longer reads this slot: whatever the side table still
+     * holds (normally nothing: it drains as the window moves) is applied to
+     * the real dict and the dict is unfrozen. */
     snapScanBitmapFree(ctx, s, didx);
-    if (ctx->has_ov) {
-        mstime_t lat;
-        latencyStartMonitor(lat);
-        kvstoreOverlayMerge(ctx->stores[s], didx);
-        latencyEndMonitor(lat);
-        latencyAddSampleIfNeeded("hybrid-merge", lat);
-    }
+    if (ctx->has_ov) kvstoreOverlayRelease(ctx->stores[s], didx);
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
     snapScanUnfreezeDict(ctx, s, didx);
     snapSlotSetState(ctx, s, didx, SNAP_SLOT_DONE);
@@ -1475,6 +1478,43 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
     return KVSTORE_OV_INPLACE;
 }
 
+/* Overlay 'drainable' hook: may the side-table entry of 'key' be applied to
+ * the frozen chain now? Yes once the walker has passed its bucket (the
+ * position is stable inside the section the caller holds). */
+static int snapOverlayDrainable(void *privdata, int didx, dict *d, const void *key) {
+    redisDb *db = privdata;
+    snapSave *sv = snap_save;
+    if (!sv) return 1;
+    int table;
+    unsigned long idx;
+    dictKeyBucket(d, key, &table, &idx);
+    return snapBucketPosition(sv->scan, db->id, didx, d, table, idx) == SNAP_POS_BEHIND;
+}
+
+/* Main thread, inside a write section: apply the side-table entries whose
+ * bucket the walker has passed (spec 11.z, "drained once W has moved").
+ * Called at the end of every section and from cron; a no-op until the window
+ * has moved since the last drain, since nothing new can be drainable. */
+static uint64_t snap_drain_seq = 0;
+static void snapSaveDrainSideTables(void) {
+    snapSave *sv = snap_save;
+    if (!sv || sv->aborted) return;
+    uint64_t seq;
+    atomicGetWithSync(snap_win_seq, seq);
+    if (seq == snap_drain_seq) return;
+    snap_drain_seq = seq;
+    for (int j = 0; j < sv->dbnum; j++) kvstoreOverlayDrain(server.db[j].keys);
+}
+
+/* Side-table entries (clones, adds, tombstones) of the running save. */
+long snapSaveSideEntries(void) {
+    snapSave *sv = snap_save;
+    if (!sv) return 0;
+    long n = 0;
+    for (int j = 0; j < sv->dbnum; j++) n += kvstoreOverlayPending(server.db[j].keys);
+    return n;
+}
+
 int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return 0;
@@ -1560,6 +1600,13 @@ static void snapSaveRetainedSub(kvobj *orig, int value_shared) {
 void snapSaveCron(void) {
     if (!snap_save || snap_save->aborted) return;
     snapSave *sv = snap_save;
+    /* Writes may have stopped since the window moved: drain from here too,
+     * so a side-table entry never outlives the window by more than a tick. */
+    if (snapSaveSideEntries()) {
+        snapFunnelOpen();
+        snapSaveDrainSideTables();
+        snapFunnelClose();
+    }
     size_t queued;
     atomicGet(sv->mq_bytes, queued);
     /* The peak reported by INFO covers every kind of save-time memory: the
@@ -2066,7 +2113,7 @@ static void snapSaveFree(snapSave *sv) {
 /* Overlay hooks for the server keyspace (privdata = redisDb *). */
 static void snapOverlayEnter(void *privdata) { UNUSED(privdata); snapFunnelOpen(); }
 static const kvstoreOverlayHooks snap_server_hooks = {
-    snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayEnter, snapOverlayPrepare,
+    snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayEnter, snapOverlayPrepare, snapOverlayDrainable,
 };
 
 /* Main thread: the save object, its channel, queues and scan context for a
@@ -3105,7 +3152,7 @@ static void snapOverlayTests(int abort_variant) {
 
     snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
     st->ctx = ctx;
-    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL };
+    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL, NULL };
     snapScanSetOverlay(ctx, &hooks, privs);
     test_cond("overlay: start", snapScanStart(ctx) == C_OK);
     test_cond("overlay: the populated slot is frozen, the empty one is DONE and not frozen",

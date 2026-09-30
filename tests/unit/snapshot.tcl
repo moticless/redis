@@ -809,6 +809,43 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
+        test {Hybrid BGSAVE: writes inside the window go to the side table and drain once the window has moved} {
+            r flushall
+            populate 10000 sd: 40
+            wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+            set size [snap_main_table_size]
+            # two windows over the whole table: the first half is read while
+            # the writes below run, the second half is ahead of the walker
+            r debug snap-window-buckets [expr {$size / 2}]
+            set ref [debug_digest]
+            r config set rdb-key-save-delay 1000   ;# 1 ms x 5000 keys: about 5 s per window
+            r bgsave
+            snap_wait_save_started
+            # write half of the keys by name: by hash about half of them sit
+            # in the first window (cloned into the side table), the rest in
+            # the second (emitted ahead, written in place); the second window
+            # keeps the other 2500 or so unwritten keys to walk, so the save
+            # outlives the drain by seconds
+            for {set i 0} {$i < 5000} {incr i} { r set sd:$i [string repeat d 40] }
+            assert_equal 1 [s snap_save_in_progress]
+            assert {[s snap_save_side_entries] > 0}
+            assert {[s snap_save_main_buckets] > 0}
+            # once the walker moves to the second window the side table drains
+            # (at the end of a write section or within a cron tick), while the
+            # save is still running
+            wait_for_condition 400 50 {[s snap_save_side_entries] == 0} else { fail "side table did not drain" }
+            assert_equal 1 [s snap_save_in_progress]
+            assert_equal 0 [s snap_save_retained_bytes]
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal [string repeat d 40] [r get sd:0]
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            r debug snap-window-buckets 1024
+            snap_assert_placement_clean
+        }
+
         test {Hybrid BGSAVE harness: keys with module metadata leave the arena, survive writes during the save and reload with their metadata} {
             r module load [file normalize tests/modules/test_keymeta.so]
             r debug enable-keymeta-runtime-registration 1

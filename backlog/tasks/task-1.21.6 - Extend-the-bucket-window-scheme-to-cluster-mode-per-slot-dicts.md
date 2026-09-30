@@ -4,7 +4,7 @@ title: Extend the bucket window scheme to cluster mode (per-slot dicts)
 status: To Do
 assignee: []
 created_date: '2026-09-21 19:57'
-updated_date: '2026-09-30 20:30'
+updated_date: '2026-09-30 20:35'
 labels:
   - bgsave
   - cluster
@@ -42,3 +42,9 @@ Design (user, 2026-09-30; plan file wondrous-meandering-sketch.md). Today the fr
 <!-- SECTION:PLAN:BEGIN -->
 Plan of record (2026-09-30, approved with the plan file): 0. Baseline: cluster harness measurement of hybrid-freeze and hybrid-merge (latency latest) on 1M keys over all slots. 1. snapSlotMeta {gen, bits[2], side table, paused} owned by snapshot.c, pointer in kvstoreDictMetaBase; attach on the kvstore write hooks for PENDING/SCANNING slots and on the walker hand-off; gate 'has current-gen metadata or slot under window' replaces kvstoreOverlayIsFrozen. 2. Freeze reduced to the state array and the slot_keys capture; empty slots DONE. 3. Sections opened for reads on non-DONE slots during a save; main-thread lazy pause under the window; resume at completion only if paused. 4. Bitmap remap in kvstoreDictRehashingStarted/Completed; shrink refused with metadata (resizeAllowed or kvstore-level check). 5. Emit-ahead over the hash class during rehash; bitmap allocated on attach. 6. Stale comments (snapshot.h 180/207), spec section 4 Freeze paragraph and 11.z.1 leftover 5, RESULTS.md numbers. Verification: new cluster harness tests (slow walker + forced expand of an unreached slot, writes after attach before hand-off, killed child then a clean save), unit/snapshot both modes, C unit (layout-lock test changes meaning: paused only under the window), TSan and ASan, full runtest with the feature on, redis-check-rdb on a cluster dump.
 <!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Baseline 2026-09-30 (before the on-demand metadata; repo build with -DREDIS_TEST -DDEBUG_ASSERTIONS, laptop): single-node cluster owning all 16384 slots, DEBUG POPULATE 1M keys (about 61 keys per slot, 64-bucket tables), latency-monitor-threshold 1. hybrid-freeze 5 ms on the first save and 3 ms on the second (the BGSAVE command itself 5 ms); hybrid-merge 1 ms total across the 16384 slot completions; stock fork on the same data 3 ms. So in cluster mode the freeze alone costs as much as a stock fork stall, against 0.3-0.7 ms worst PING for the standalone hybrid save (run 6). That is the number the on-demand metadata must bring down. Script: scratchpad clfreeze/run.sh (needs --cluster-bus-port-protected-mode no on this build).
+<!-- SECTION:NOTES:END -->
