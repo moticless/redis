@@ -7,6 +7,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-25 22:51'
+updated_date: '2026-09-30 03:50'
 labels:
   - hybrid-bgsave
   - modules
@@ -45,3 +46,20 @@ Define and enforce the contract written in poc-hybrid-bgsave-spec.md section 11.
 - [ ] #5 Full tests/modules suite passes with --config bgsave-hybrid yes and the test modules opted in (hybrid path exercised, not the fallback)
 - [ ] #6 Spec section 11.z.4 and redismodule.h documentation match the implementation
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+DRAFT for approval (written 2026-09-30 while the user is OOO; not started).
+
+1. redismodule.h: REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE (1<<4), _REDISMODULE_OPTIONS_FLAGS_NEXT -> (1<<5); doc comment on RM_SetModuleOptions stating the contract (save-side callbacks never touch the keyspace: no RM_OpenKey/KeyExists/Scan/ScanKey/Call/DbSize/RandomKey/GetExpire on any key; value passed in, module memory and the IO context only).
+2. module.c: moduleAllModulesHandleHybridBgsave() (every loaded module has the bit; a module with no data types, no aux callbacks and no persistence event handler counts as compliant); LL_WARNING once at load for a module that registers a type/aux/persistence handler without the bit; the name of the first blocking module kept for INFO.
+3. Fallback: snapSaveBackground and snapSaveToSlavesSockets check moduleAllModulesHandleHybridBgsave() and route to rdbSaveBackground / rdbSaveToSlavesSockets (stock child, arena flipped forkable by the TASK-1.22 mechanism) when it returns 0; INFO persistence snap_hybrid_blocked_by:<module> (empty when none), snap_saves unchanged on the fallback.
+4. Child-side guards: in a hybrid child (a new server flag set in snapSaveChild), RM_OpenKey returns NULL, RM_KeyExists/RM_DbSize/RM_GetExpire return 0 / REDISMODULE_NO_EXPIRE, RM_Scan/RM_ScanKey return 0, RM_RandomKey returns NULL, RM_Call returns an error reply; each logs once ('module X touched the keyspace in the hybrid save child'). The stock child keeps today's behaviour.
+5. RM_SetLRU/RM_SetLFU require REDISMODULE_WRITE on the handle (return REDISMODULE_ERR otherwise); document.
+6. Test modules that register types, key metadata or aux callbacks set the bit (tests/modules/datatype.c, datatype2.c, testrdb.c, test_keymeta.c, keymeta_notify.c, mallocsize.c, test_lazyfree.c, blockonkeys.c and any other the suite loads with the feature on); one new module violates rule 1 (RM_OpenKey inside rdb_save) to cover the fallback (bit missing: stock path, warning, INFO names it) and the guard (bit set: NULL, log line, child survives, save result honest).
+7. Tests (tests/unit/moduleapi/*.tcl and unit/snapshot): AC1-AC4 of the task; the full tests/modules suite with --config bgsave-hybrid yes exercises the hybrid path (snap_saves increments) rather than the fallback.
+8. Spec 11.z.4 and redismodule.h match; blog section 5's 'one new rule' paragraph names the option bit.
+
+Risks: modules bundled in Redis 8 (JSON, Search, TimeSeries, Bloom) do not set the bit until they are rebuilt; until then the hybrid save falls back to the stock fork on any server loading them, which is the safe default but means the feature is off for those deployments. Decide whether the bit should default to 'compliant' for modules without save callbacks (proposed yes).
+<!-- SECTION:PLAN:END -->
