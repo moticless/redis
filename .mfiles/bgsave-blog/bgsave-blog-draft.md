@@ -255,7 +255,10 @@ primary pays while it runs: copy-on-write on the fork-class values only plus the
 (60-130 MB), a fork stall the size of those values' page tables, and stock's write latency. The
 replication stream buffered on the replica during a sync of this length is 23-33 MB, the number the
 spliced-stream option has to justify itself against. Valkey's fork-based sync is two to three times
-longer because it compresses the RDB and streams on one channel.
+longer because it compresses the RDB and streams on one channel. Its forkless full sync, run from
+the open pull request on the same cells, does hold the primary to 1-13 MB of extra memory, and takes
+36-50 s per sync with 11-17 CPU-seconds on the main thread; on the million-field hashes it delivers
+92% of the offered writes with a worst write near one second.
 
 ## 7. Benchmark
 

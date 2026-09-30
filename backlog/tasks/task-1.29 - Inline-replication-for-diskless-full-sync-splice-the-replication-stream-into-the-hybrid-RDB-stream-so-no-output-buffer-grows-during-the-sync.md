@@ -6,7 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-09-29 18:07'
-updated_date: '2026-09-29 18:53'
+updated_date: '2026-09-30 03:13'
 labels:
   - hybrid-bgsave
   - replication
@@ -71,4 +71,6 @@ Considered and rejected: letting the replica deduce when a bucket/slot is comple
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-09-29 precedent: Dragonfly has run this exact model in production for years. During full sync the snapshot fiber registers as a journal consumer and appends every journal record for every key inline into the same serializer buffer (RDB_OPCODE_JOURNAL_BLOB), relying on the bucket being serialized before the write (their bucket-version pre-update hook, our funnel). The end of traversal is marked with RDB_OPCODE_FULLSYNC_END; the switch to the live stream happens under a global transaction guard with no commands running, and the stream carries RDB_OPCODE_JOURNAL_OFFSET(LSN) so the replica knows where the live stream resumes: same shape as our atomic main-thread handoff. Replica executes blobs as it parses them; a FLUSHALL/FLUSHDB inside a blob aborts the load and restarts the sync (their issue 1231), which is the behavior to copy until TASK-1.24. Their backpressure lands on writer latency (blocking flush to the socket from the writer's fiber); ours must land on mq bounded by the hard mark instead, never on the main thread.
+
+2026-09-30 evidence from run 18 (RESULTS.md, diskless full sync of 4 GB datasets at 20k writes/s, replica loading the stream directly over the rdb channel): the replication stream buffered on the replica during the sync peaked at 23-24 MB (small, 10 s sync), 29-31 MB (mixed, 13 s) and 32-33 MB (mixed1m, 17 s); Valkey's single-channel fork-based sync held 56-77 MB in the primary's output buffer over 30-39 s. At these sync durations the buffer inline replication would remove is a few percent of the dataset; the case for it is long syncs (tens of GB, minutes) or replicas without the rdb channel. Keep the task, lower its urgency.
 <!-- SECTION:NOTES:END -->

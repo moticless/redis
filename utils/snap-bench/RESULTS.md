@@ -1250,9 +1250,11 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 | 0 | Redis fork (rdb-channel) | 16.3 / 16.2 | 40 / 28 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.3 / 0.2 | 0.0 / 0.0 | 14.2 / 14.3 | - / - | - / - | - / - | 1 / 1 |
 | 0 | hybrid | 16.6 / 16.4 | 14 / 14 | 123 / 124 | 79 / 107 | 44 / 30 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 8.9 / 8.9 | 6.4 / 6.3 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 34.0 / 39.2 | 41 / 28 | 2 / 1 | 1 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 4.4 / 4.8 | 0.0 / 0.0 | 34.0 / 39.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey forkless (PR 4797) | 48.3 / 49.6 | 0 / 0 | 1 / 1 | 1 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.5 / 11.4 | 38.6 / 41.1 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
 | 20000 | Redis fork (rdb-channel) | 17.3 / 16.7 | 29 / 29 | 1436 / 1398 | 2 / 2 | 1435 / 1396 | 0 / 0 | 33 / 32 | 4.3 / 4.2 | 0.0 / -0.0 | 14.4 / 14.4 | 19998 / 19998 | 0.52 / 0.54 | 29.4 / 30.0 | 1 / 1 |
 | 20000 | hybrid | 17.2 / 17.5 | 14 / 15 | 799 / 806 | 129 / 124 | 692 / 713 | 0 / 0 | 33 / 33 | 4.3 / 4.5 | 9.0 / 8.9 | 6.3 / 6.4 | 20000 / 20000 | 0.55 / 0.54 | 15.5 / 15.6 | 1 / 1 |
 | 20000 | Valkey fork | 39.4 / 38.2 | 29 / 29 | 2471 / 2431 | 77 / 74 | 2396 / 2361 | 63 / 61 | 0 / 0 | 8.7 / 8.6 | 0.0 / 0.0 | 39.4 / 38.3 | 19998 / 19998 | 0.56 / 0.53 | 29.6 / 29.5 | 1 / 1 |
+| 20000 | Valkey forkless (PR 4797) | 47.0 / 43.9 | 0 / 0 | 13 / 13 | 13 / 13 | 0 / 0 | 0 / 0 | 0 / 0 | 15.9 / 15.1 | 44.4 / 40.5 | 0.0 / 0.0 | 18331 / 18503 | 1.39 / 1.45 | 908.8 / 847.1 | 1 / 1 |
 
 ### small
 
@@ -1261,9 +1263,11 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 | 0 | Redis fork (rdb-channel) | 10.1 / 10.1 | 39 / 30 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 9.2 / 9.3 | - / - | - / - | - / - | 1 / 1 |
 | 0 | hybrid | 10.3 / 10.3 | 2 / 2 | 100 / 115 | 99 / 114 | 1 / 1 | 0 / 0 | 1 / 1 | 0.1 / 0.1 | 9.9 / 9.8 | 1.4 / 1.4 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 28.0 / 28.1 | 34 / 27 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.9 / 3.9 | 0.0 / 0.0 | 28.0 / 28.1 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey forkless (PR 4797) | 36.3 / 36.8 | 0 / 0 | 2 / 1 | 2 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.4 / 11.3 | 35.7 / 36.1 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
 | 20000 | Redis fork (rdb-channel) | 10.3 / 10.7 | 31 / 31 | 1133 / 1164 | 1 / 1 | 1137 / 1164 | 0 / 0 | 23 / 24 | 2.4 / 2.5 | 0.0 / 0.0 | 9.4 / 9.4 | 19997 / 19997 | 0.48 / 0.47 | 30.8 / 31.3 | 1 / 1 |
 | 20000 | hybrid | 10.6 / 10.4 | 2 / 2 | 120 / 118 | 119 / 117 | 1 / 1 | 0 / 0 | 24 / 24 | 2.3 / 2.2 | 10.1 / 10.1 | 1.4 / 1.4 | 20000 / 20000 | 0.52 / 0.51 | 2.0 / 2.8 | 1 / 1 |
 | 20000 | Valkey fork | 30.6 / 30.3 | 28 / 27 | 2124 / 2112 | 68 / 68 | 2057 / 2046 | 57 / 56 | 0 / 0 | 7.0 / 7.1 | 0.0 / 0.0 | 30.6 / 30.3 | 19997 / 19998 | 0.45 / 0.46 | 29.2 / 27.7 | 1 / 1 |
+| 20000 | Valkey forkless (PR 4797) | 45.1 / 45.0 | 0 / 0 | 11 / 11 | 11 / 11 | 0 / 0 | 0 / 0 | 0 / 0 | 16.6 / 16.4 | 40.5 / 40.4 | 0.0 / 0.0 | 20000 / 20000 | 0.97 / 0.97 | 5.2 / 3.4 | 1 / 1 |
 
 ### mixed
 
@@ -1272,9 +1276,11 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 | 0 | Redis fork (rdb-channel) | 12.6 / 12.4 | 40 / 32 | 4 / 0 | 0 / 0 | 4 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 11.1 / 11.2 | - / - | - / - | - / - | 1 / 1 |
 | 0 | hybrid | 13.0 / 12.9 | 17 / 16 | 41 / 44 | 22 / 43 | 20 / 1 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 9.8 / 9.7 | 3.2 / 3.2 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 28.6 / 30.7 | 40 / 28 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.8 / 4.0 | -0.0 / 0.0 | 28.6 / 30.7 | - / - | - / - | - / - | 1 / 1 |
+| 0 | Valkey forkless (PR 4797) | 37.6 / 39.9 | 0 / 0 | 1 / 1 | 1 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.4 / 11.8 | 35.6 / 37.9 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
 | 20000 | Redis fork (rdb-channel) | 13.6 / 13.1 | 33 / 33 | 1264 / 1236 | 1 / 1 | 1268 / 1236 | 0 / 0 | 30 / 29 | 3.5 / 3.4 | 0.0 / -0.0 | 11.4 / 11.3 | 19998 / 19998 | 0.52 / 0.52 | 34.1 / 33.9 | 1 / 1 |
 | 20000 | hybrid | 13.4 / 13.6 | 17 / 17 | 621 / 628 | 61 / 62 | 563 / 569 | 0 / 0 | 30 / 31 | 3.6 / 3.6 | 10.0 / 10.0 | 3.1 / 3.3 | 20000 / 20000 | 0.55 / 0.54 | 17.6 / 18.8 | 1 / 1 |
 | 20000 | Valkey fork | 33.1 / 31.2 | 30 / 30 | 2288 / 2211 | 76 / 71 | 2215 / 2142 | 63 / 59 | 0 / 0 | 7.7 / 7.4 | 0.0 / 0.0 | 33.2 / 31.2 | 19998 / 19998 | 0.52 / 0.53 | 30.9 / 31.0 | 1 / 1 |
+| 20000 | Valkey forkless (PR 4797) | 42.9 / 41.4 | 0 / 0 | 13 / 13 | 13 / 13 | 0 / 0 | 0 / 0 | 0 / 0 | 16.8 / 16.2 | 39.4 / 38.1 | 0.0 / 0.0 | 20000 / 20000 | 1.01 / 1.01 | 4.0 / 4.2 | 1 / 1 |
 
 ### Reading the run
 
@@ -1300,7 +1306,17 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 
 ### Addendum: Valkey forkless full sync (PR 4797, experimental)
 
-Pending at the time of writing: `run18b.sh` runs the PR branch (8dc5df0d5, `--forkless-infrastructure-enabled yes
---bgsave-default-method forkless` on both sides) over the same cells and appends to `run18.csv`; the outcome, including
-whether every sync completed with the replica's dbsize equal, is recorded below when it finishes.
+`run18b.sh` ran the PR branch (8dc5df0d5 at the time, `--forkless-infrastructure-enabled yes --bgsave-default-method
+forkless` on the primary, the infrastructure flag on the replica) over the same cells afterwards; its rows are the
+`Valkey forkless (PR 4797)` lines above. Every sync completed with the replica's dbsize equal to the primary's.
 
+- **It delivers what it promises on memory**: 1-2 MB extra at idle and 11-13 MB under 20k writes/s on every dataset, no
+  copy-on-write and no replication buffer anywhere, since the commands are spliced into the stream and applied as the
+  replica loads.
+- **It pays in time and on the main thread.** 36-50 s per sync against 10-17 s for the two Redis binaries (the same
+  3-4x as its BGSAVE, single thread, compressed); main-thread CPU 11.3-16.8 s per sync against 0.2-4.5 for stock and the
+  hybrid, ping p99 1.1-1.7 ms against 0.5.
+- **And the 1M-field hashes are still the wall**: on mixed1m at 20k writes/s the load delivered 92% of the offered rate,
+  the worst write was 0.85-0.91 s, 5 clients were blocked at the peak and 31-34 of the 44-47 s were stalled seconds. On
+  small and mixed it kept the rate, with write p99 1.0 ms (stock and hybrid 0.5) and a worst write of 3-5 ms.
+- The branch is a day old and under review; treat the numbers as its shape, not its final performance.
