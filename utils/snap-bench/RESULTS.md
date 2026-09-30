@@ -1247,12 +1247,16 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 
 | rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | Redis fork (rdb-channel) | 16.3 / 16.2 | 40 / 28 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.3 / 0.2 | 0.0 / 0.0 | 14.2 / 14.3 | - / - | - / - | - / - | 1 / 1 |
-| 0 | hybrid | 16.6 / 16.4 | 14 / 14 | 123 / 124 | 79 / 107 | 44 / 30 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 8.9 / 8.9 | 6.4 / 6.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, rdb-channel | 16.3 / 16.2 | 40 / 28 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.3 / 0.2 | 0.0 / 0.0 | 14.2 / 14.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, one connection | 15.6 / 15.7 | 38 / 27 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 0 / 0 | 2.2 / 2.1 | -0.0 / 0.0 | 14.0 / 13.8 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, rdb-channel | 16.6 / 16.4 | 14 / 14 | 123 / 124 | 79 / 107 | 44 / 30 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 8.9 / 8.9 | 6.4 / 6.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, one connection | 16.1 / 15.9 | 14 / 14 | 115 / 124 | 94 / 89 | 21 / 42 | 0 / 0 | 0 / 0 | 1.5 / 1.7 | 8.8 / 8.8 | 6.3 / 6.2 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 34.0 / 39.2 | 41 / 28 | 2 / 1 | 1 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 4.4 / 4.8 | 0.0 / 0.0 | 34.0 / 39.2 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey forkless (PR 4797) | 48.3 / 49.6 | 0 / 0 | 1 / 1 | 1 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.5 / 11.4 | 38.6 / 41.1 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
-| 20000 | Redis fork (rdb-channel) | 17.3 / 16.7 | 29 / 29 | 1436 / 1398 | 2 / 2 | 1435 / 1396 | 0 / 0 | 33 / 32 | 4.3 / 4.2 | 0.0 / -0.0 | 14.4 / 14.4 | 19998 / 19998 | 0.52 / 0.54 | 29.4 / 30.0 | 1 / 1 |
-| 20000 | hybrid | 17.2 / 17.5 | 14 / 15 | 799 / 806 | 129 / 124 | 692 / 713 | 0 / 0 | 33 / 33 | 4.3 / 4.5 | 9.0 / 8.9 | 6.3 / 6.4 | 20000 / 20000 | 0.55 / 0.54 | 15.5 / 15.6 | 1 / 1 |
+| 20000 | stock, rdb-channel | 17.3 / 16.7 | 29 / 29 | 1436 / 1398 | 2 / 2 | 1435 / 1396 | 0 / 0 | 33 / 32 | 4.3 / 4.2 | 0.0 / -0.0 | 14.4 / 14.4 | 19998 / 19998 | 0.52 / 0.54 | 29.4 / 30.0 | 1 / 1 |
+| 20000 | stock, one connection | 16.0 / 16.4 | 30 / 29 | 1382 / 1408 | 31 / 32 | 1354 / 1378 | 29 / 29 | 0 / 0 | 4.6 / 4.8 | 0.0 / 0.0 | 13.9 / 14.0 | 19998 / 19998 | 0.51 / 0.53 | 30.7 / 29.8 | 1 / 1 |
+| 20000 | hybrid, rdb-channel | 17.2 / 17.5 | 14 / 15 | 799 / 806 | 129 / 124 | 692 / 713 | 0 / 0 | 33 / 33 | 4.3 / 4.5 | 9.0 / 8.9 | 6.3 / 6.4 | 20000 / 20000 | 0.55 / 0.54 | 15.5 / 15.6 | 1 / 1 |
+| 20000 | hybrid, one connection | 16.4 / 16.6 | 14 / 14 | 749 / 768 | 123 / 135 | 683 / 674 | 29 / 30 | 0 / 0 | 4.0 / 4.0 | 9.2 / 9.0 | 6.4 / 6.4 | 20000 / 20000 | 0.52 / 0.54 | 15.1 / 15.6 | 1 / 1 |
 | 20000 | Valkey fork | 39.4 / 38.2 | 29 / 29 | 2471 / 2431 | 77 / 74 | 2396 / 2361 | 63 / 61 | 0 / 0 | 8.7 / 8.6 | 0.0 / 0.0 | 39.4 / 38.3 | 19998 / 19998 | 0.56 / 0.53 | 29.6 / 29.5 | 1 / 1 |
 | 20000 | Valkey forkless (PR 4797) | 47.0 / 43.9 | 0 / 0 | 13 / 13 | 13 / 13 | 0 / 0 | 0 / 0 | 0 / 0 | 15.9 / 15.1 | 44.4 / 40.5 | 0.0 / 0.0 | 18331 / 18503 | 1.39 / 1.45 | 908.8 / 847.1 | 1 / 1 |
 
@@ -1260,12 +1264,16 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 
 | rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | Redis fork (rdb-channel) | 10.1 / 10.1 | 39 / 30 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 9.2 / 9.3 | - / - | - / - | - / - | 1 / 1 |
-| 0 | hybrid | 10.3 / 10.3 | 2 / 2 | 100 / 115 | 99 / 114 | 1 / 1 | 0 / 0 | 1 / 1 | 0.1 / 0.1 | 9.9 / 9.8 | 1.4 / 1.4 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, rdb-channel | 10.1 / 10.1 | 39 / 30 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 9.2 / 9.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, one connection | 10.1 / 10.1 | 37 / 29 | 3 / 0 | 0 / 0 | 3 / 0 | 0 / 0 | 0 / 0 | 2.0 / 2.0 | 0.0 / 0.0 | 9.4 / 9.3 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, rdb-channel | 10.3 / 10.3 | 2 / 2 | 100 / 115 | 99 / 114 | 1 / 1 | 0 / 0 | 1 / 1 | 0.1 / 0.1 | 9.9 / 9.8 | 1.4 / 1.4 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, one connection | 10.2 / 10.1 | 2 / 2 | 102 / 114 | 101 / 113 | 1 / 1 | 0 / 0 | 0 / 0 | 1.5 / 1.5 | 9.9 / 9.7 | 1.2 / 1.2 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 28.0 / 28.1 | 34 / 27 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.9 / 3.9 | 0.0 / 0.0 | 28.0 / 28.1 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey forkless (PR 4797) | 36.3 / 36.8 | 0 / 0 | 2 / 1 | 2 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.4 / 11.3 | 35.7 / 36.1 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
-| 20000 | Redis fork (rdb-channel) | 10.3 / 10.7 | 31 / 31 | 1133 / 1164 | 1 / 1 | 1137 / 1164 | 0 / 0 | 23 / 24 | 2.4 / 2.5 | 0.0 / 0.0 | 9.4 / 9.4 | 19997 / 19997 | 0.48 / 0.47 | 30.8 / 31.3 | 1 / 1 |
-| 20000 | hybrid | 10.6 / 10.4 | 2 / 2 | 120 / 118 | 119 / 117 | 1 / 1 | 0 / 0 | 24 / 24 | 2.3 / 2.2 | 10.1 / 10.1 | 1.4 / 1.4 | 20000 / 20000 | 0.52 / 0.51 | 2.0 / 2.8 | 1 / 1 |
+| 20000 | stock, rdb-channel | 10.3 / 10.7 | 31 / 31 | 1133 / 1164 | 1 / 1 | 1137 / 1164 | 0 / 0 | 23 / 24 | 2.4 / 2.5 | 0.0 / 0.0 | 9.4 / 9.4 | 19997 / 19997 | 0.48 / 0.47 | 30.8 / 31.3 | 1 / 1 |
+| 20000 | stock, one connection | 10.3 / 10.5 | 30 / 30 | 1155 / 1179 | 24 / 24 | 1136 / 1154 | 22 / 22 | 0 / 0 | 3.4 / 3.3 | 0.0 / 0.0 | 9.4 / 9.3 | 19997 / 19997 | 0.46 / 0.47 | 31.3 / 30.5 | 1 / 1 |
+| 20000 | hybrid, rdb-channel | 10.6 / 10.4 | 2 / 2 | 120 / 118 | 119 / 117 | 1 / 1 | 0 / 0 | 24 / 24 | 2.3 / 2.2 | 10.1 / 10.1 | 1.4 / 1.4 | 20000 / 20000 | 0.52 / 0.51 | 2.0 / 2.8 | 1 / 1 |
+| 20000 | hybrid, one connection | 10.5 / 10.3 | 2 / 2 | 154 / 90 | 153 / 89 | 1 / 1 | 22 / 21 | 0 / 0 | 2.6 / 2.6 | 10.0 / 10.1 | 1.2 / 1.1 | 20000 / 20000 | 0.51 / 0.50 | 2.5 / 2.2 | 1 / 1 |
 | 20000 | Valkey fork | 30.6 / 30.3 | 28 / 27 | 2124 / 2112 | 68 / 68 | 2057 / 2046 | 57 / 56 | 0 / 0 | 7.0 / 7.1 | 0.0 / 0.0 | 30.6 / 30.3 | 19997 / 19998 | 0.45 / 0.46 | 29.2 / 27.7 | 1 / 1 |
 | 20000 | Valkey forkless (PR 4797) | 45.1 / 45.0 | 0 / 0 | 11 / 11 | 11 / 11 | 0 / 0 | 0 / 0 | 0 / 0 | 16.6 / 16.4 | 40.5 / 40.4 | 0.0 / 0.0 | 20000 / 20000 | 0.97 / 0.97 | 5.2 / 3.4 | 1 / 1 |
 
@@ -1273,12 +1281,16 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 
 | rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| 0 | Redis fork (rdb-channel) | 12.6 / 12.4 | 40 / 32 | 4 / 0 | 0 / 0 | 4 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 11.1 / 11.2 | - / - | - / - | - / - | 1 / 1 |
-| 0 | hybrid | 13.0 / 12.9 | 17 / 16 | 41 / 44 | 22 / 43 | 20 / 1 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 9.8 / 9.7 | 3.2 / 3.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, rdb-channel | 12.6 / 12.4 | 40 / 32 | 4 / 0 | 0 / 0 | 4 / 0 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 0.0 / 0.0 | 11.1 / 11.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | stock, one connection | 12.4 / 12.5 | 37 / 33 | 2 / 0 | 0 / 0 | 2 / 0 | 0 / 0 | 0 / 0 | 1.9 / 1.9 | 0.0 / 0.0 | 11.4 / 11.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, rdb-channel | 13.0 / 12.9 | 17 / 16 | 41 / 44 | 22 / 43 | 20 / 1 | 0 / 0 | 1 / 1 | 0.2 / 0.2 | 9.8 / 9.7 | 3.2 / 3.2 | - / - | - / - | - / - | 1 / 1 |
+| 0 | hybrid, one connection | 12.9 / 12.9 | 16 / 16 | 44 / 44 | 43 / 43 | 1 / 1 | 0 / 0 | 0 / 0 | 1.8 / 1.7 | 9.7 / 9.7 | 3.5 / 3.3 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey fork | 28.6 / 30.7 | 40 / 28 | 1 / 1 | 0 / 0 | 1 / 1 | 0 / 0 | 0 / 0 | 3.8 / 4.0 | -0.0 / 0.0 | 28.6 / 30.7 | - / - | - / - | - / - | 1 / 1 |
 | 0 | Valkey forkless (PR 4797) | 37.6 / 39.9 | 0 / 0 | 1 / 1 | 1 / 1 | 0 / 0 | 0 / 0 | 0 / 0 | 11.4 / 11.8 | 35.6 / 37.9 | 0.0 / 0.0 | - / - | - / - | - / - | 1 / 1 |
-| 20000 | Redis fork (rdb-channel) | 13.6 / 13.1 | 33 / 33 | 1264 / 1236 | 1 / 1 | 1268 / 1236 | 0 / 0 | 30 / 29 | 3.5 / 3.4 | 0.0 / -0.0 | 11.4 / 11.3 | 19998 / 19998 | 0.52 / 0.52 | 34.1 / 33.9 | 1 / 1 |
-| 20000 | hybrid | 13.4 / 13.6 | 17 / 17 | 621 / 628 | 61 / 62 | 563 / 569 | 0 / 0 | 30 / 31 | 3.6 / 3.6 | 10.0 / 10.0 | 3.1 / 3.3 | 20000 / 20000 | 0.55 / 0.54 | 17.6 / 18.8 | 1 / 1 |
+| 20000 | stock, rdb-channel | 13.6 / 13.1 | 33 / 33 | 1264 / 1236 | 1 / 1 | 1268 / 1236 | 0 / 0 | 30 / 29 | 3.5 / 3.4 | 0.0 / -0.0 | 11.4 / 11.3 | 19998 / 19998 | 0.52 / 0.52 | 34.1 / 33.9 | 1 / 1 |
+| 20000 | stock, one connection | 12.6 / 12.7 | 33 / 33 | 1228 / 1235 | 29 / 29 | 1199 / 1207 | 27 / 27 | 0 / 0 | 3.9 / 3.8 | -0.0 / -0.0 | 11.3 / 11.2 | 19999 / 19998 | 0.52 / 0.53 | 33.7 / 33.8 | 1 / 1 |
+| 20000 | hybrid, rdb-channel | 13.4 / 13.6 | 17 / 17 | 621 / 628 | 61 / 62 | 563 / 569 | 0 / 0 | 30 / 31 | 3.6 / 3.6 | 10.0 / 10.0 | 3.1 / 3.3 | 20000 / 20000 | 0.55 / 0.54 | 17.6 / 18.8 | 1 / 1 |
+| 20000 | hybrid, one connection | 13.9 / 13.2 | 17 / 17 | 667 / 638 | 91 / 87 | 580 / 554 | 29 / 28 | 0 / 0 | 3.8 / 3.8 | 9.8 / 9.8 | 3.5 / 3.3 | 20000 / 20000 | 0.53 / 0.53 | 18.2 / 18.5 | 1 / 1 |
 | 20000 | Valkey fork | 33.1 / 31.2 | 30 / 30 | 2288 / 2211 | 76 / 71 | 2215 / 2142 | 63 / 59 | 0 / 0 | 7.7 / 7.4 | 0.0 / 0.0 | 33.2 / 31.2 | 19998 / 19998 | 0.52 / 0.53 | 30.9 / 31.0 | 1 / 1 |
 | 20000 | Valkey forkless (PR 4797) | 42.9 / 41.4 | 0 / 0 | 13 / 13 | 13 / 13 | 0 / 0 | 0 / 0 | 0 / 0 | 16.8 / 16.2 | 39.4 / 38.1 | 0.0 / 0.0 | 20000 / 20000 | 1.01 / 1.01 | 4.0 / 4.2 | 1 / 1 |
 
@@ -1303,6 +1315,22 @@ request and compresses, which is most of its extra time. 2 reps, values as rep a
 - **The replication stream buffered during a sync is small at these durations**: 23-33 MB on the replica for a 10-17 s
   sync at 20k writes/s (rdb-channel), 56-77 MB in Valkey's output buffer for a 30-39 s one. This is the number TASK-1.29
   (inline replication) has to justify itself against: at these sync times it is a few percent of the dataset.
+
+### Addendum: the single-connection shape (`run18c.sh`, `up-1ch` and `hybrid-1ch`)
+
+The same 12 cells with `repl-rdb-channel no` on the primary: the child (stock or hybrid) writes a pipe, the parent relays
+it to the replica's one connection, and the replication stream waits in the primary's replica output buffer instead of on
+the replica. Their rows are the `one connection` lines above.
+
+- Sync time, copy-on-write, fork stall and worst write are the same as on the rdb channel for both binaries: the shape of
+  the connection does not change what the child does or what the parent's pages cost.
+- The stream buffer moves, not shrinks: 22-33 MB in the primary's output buffer (`mem_clients_slaves`) instead of the
+  replica's full-sync buffer, and it counts in the parent's growth (the stock rows show +24-32 MB of parent growth under
+  writes where the rdb-channel rows show 1-2).
+- The relay costs the primary's main thread about 2 CPU-seconds per 4 GB sync (idle: 1.9-2.2 s against 0.2-0.3 with the
+  rdb channel, stock and hybrid alike): it copies every RDB byte from the pipe to the socket.
+- The hybrid's queue growth is a little higher on one connection (mixed1m 123-135 vs 79-129 MB; small 89-153 vs 99-119)
+  because the relay drains the child in bursts; within the 128 MB bound plus one message either way.
 
 ### Addendum: Valkey forkless full sync (PR 4797, experimental)
 
