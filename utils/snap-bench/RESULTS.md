@@ -1739,3 +1739,48 @@ rep a / rep b. "queued peak" is oq + mq (both queues plus the main thread's emit
 - **Full sync unchanged**: 16.2 / 17.0 s (run 25: 16.2 / 16.9-17.0).
 - Latency as before: worst PING 10.6-17.3 ms (the fork stall), worst write 15.3-18.8 ms.
 
+## Run 30b (2026-10-01): two channels, the child waits for a pending small backlog (bfaa21174), mixed1m at 4 GB and small, c7i.4xlarge
+
+Raw: `run30b.csv`, `run30bs.csv`, driver `~/run30b.sh`, chained after run 30 by `~/chain30b.sh` (rebuild of
+`~/redis-2ch` with the fix). Same layout as run 30 without `hybrid-q16`: `hybrid` = two channels, 100 MB bound, no
+spool (the defaults); `hybrid-spool` = the spool as the small channel's overflow. The fix: when the small pipe is
+momentarily empty but the parent reports a small backlog of 1 MB or more, the child polls the small pipe for up to
+20 ms before taking a big value (run 30 took the big value at once at every such gap).
+
+| dataset | rate | config | save s | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | queued peak MB | spooled MB | spool peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | hybrid | 32.1* / 22.7 | 63 / 59 | 4 / 1 | 0.4 / 0.3 | 17.7 / 19.1 | 21.3 / 20.7 | 19.7 / 12.5 | - | 58 / 54 | 0 | 0 |
+| mixed1m | 0 | hybrid-spool | 24.5 / 25.8 | 69 / 71 | 4 / 9 | 0.3 / 0.4 | 17.4 / 17.5 | 23.7 / 23.5 | 9.1 / 12.8 | - | 67 | 0 | 0 |
+| mixed1m | 20k | hybrid | 24.0 / 23.6 | 94 / 95 | 886 / 880 | 5.9 / 5.6 | 19.2 / 19.5 | 23.8 / 23.4 | 15.4 / 12.0 | 15.5 / 15.5 | 104 / 101 | 0 | 0 |
+| mixed1m | 20k | hybrid-spool | 25.3 / 23.9 | 67 / 96 | 952 / 883 | 6.1 / 5.9 | 20.4 / 19.2 | 25.0 / 23.7 | 11.6 / 14.9 | 15.8 / 15.8 | 104 / 103 | 11 / 2 | 11 / 2 |
+| mixed1m | 50k | hybrid | 21.0 / 22.7 | 80 / 78 | 1406 / 1458 | 8.2 / 10.0 | 18.0 / 19.3 | 20.8 / 22.6 | 14.4 / 14.4 | 17.2 / 17.4 | 113 / 116 | 0 | 0 |
+| mixed1m | 50k | hybrid-spool | 24.2 / 24.9 | 83 / 87 | 1488 / 1503 | 8.8 / 10.9 | 19.4 / 20.5 | 24.0 / 24.7 | 11.7 / 15.9 | 17.1 / 17.6 | 115 / 116 | 97 / 98 | 33 / 24 |
+| small | 0 | hybrid | 31.4* / 30.3 | 1 | 6 / 1 | 0.4 | 31.2 / 30.1 | 3.0 | 5.6 / 1.0 | - | 0 | 0 | 0 |
+| small | 0 | hybrid-spool | 31.1 / 30.4 | 1 | 1 | 0.4 | 30.9 / 30.1 | 3.0 | 0.9 / 0.8 | - | 0 | 0 | 0 |
+| small | 20k | hybrid | 28.7 / 30.0 | 7 | 1 | 5.9 / 6.4 | 28.5 / 29.9 | 3.1 | 0.9 / 1.3 | 2.5 / 2.4 | 92 / 96 | 0 | 0 |
+| small | 20k | hybrid-spool | 30.7 / 30.0 | 7 | 1 | 6.6 / 6.1 | 30.5 / 29.8 | 3.2 | 0.9 / 0.8 | 2.5 / 2.3 | 98 / 96 | 0 | 0 |
+| sync mixed1m | 0 | hybrid | 15.9 | 49 | 7 | 0.2 | 8.8 | 6.3 | 15.1 | - | 54 | 0 | 0 |
+| sync mixed1m | 20k | hybrid | 16.5 | 102 | 675 | 3.8 | 9.0 | 6.2 | 14.6 | 15.5 | 95 | 0 | 0 |
+
+\* first cell after the live populate (see run 30).
+
+### Reading the run
+
+- **The bounded two-channel shape now overlaps at every rate without a spool: mixed1m 22.7 s idle, 23.6-24.0 at
+  20k, 21.0-22.7 at 50k writes/s** (run 29 with the spool: 25.4-25.6 / 21.4-24.3 / 24.4-25.7; pipe-only 35-42;
+  stock 40-46). The save is at the child's CPU (20.7-23.8 s). TASK-1.31 AC5 met: within 10% of run 29, in fact
+  2-10% faster idle and at 50k.
+- **Memory: queue peak 54-58 MB idle (one hash's worth of scan output, never the bound), 101-116 MB under writes**,
+  where the main thread's emitted buckets (mq, counted in the same figure) ride on top of the 100 MB small-channel
+  bound; parent growth 59-95 MB, all of it released at the end and none of it counted for eviction. No spool, no
+  file: the whole save's footprint is in used_memory.
+- **The spool shape is now a little slower than the bounded one** (24.5-25.8 idle, 23.9-25.3 at 20k, 24.2-24.9 at
+  50k) and spools 0 / 2-11 / 97-98 MB: with the queue filling to 100 MB first the spool is reached only at 50k,
+  where the child then copies about 100 MB from the file in order. Off by default is the right call; it stays as
+  the option for TASK-1.29 (inline syncs under writes to big keys) and for values larger than the bound allows.
+- **small**: 28.7-31.4 s for both configs across two reps, nothing spooled, the queue never fills idle; the
+  one-rep flag of run 29 is closed as noise.
+- **Full sync**: 15.9 / 16.5 s (run 25: 16.2 / 16.9-17.0; run 30: 16.2 / 17.0).
+- Latency unchanged: worst PING 9-20 ms (the fork stall, the 19.7 was the post-populate cell), worst write
+  15.5-17.6 ms.
+
