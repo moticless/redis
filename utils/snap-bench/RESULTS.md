@@ -1544,3 +1544,43 @@ Values as rep a / rep b.
   the queue is at its bound, with the scan thread returning to the queue when the child has drained it to half.
 - The benchmark's `dir` is tmpfs, so here the spool's pages are RAM, not reclaimable page cache; they are outside
   `used_memory` and RSS (extra memory 2 MB) and are freed at save end. On a disk-backed `dir` they are page cache.
+
+## Run 24 (2026-10-01): queue first, spool as the overflow (TASK-1.30 final), mixed1m at 4 GB and small, c7i.4xlarge
+
+Raw: `run24.csv`, driver `~/run24.sh`. Same instance and layout as runs 20-23. Binary bc33196f5: `hybrid-nospool` =
+`--bgsave-hybrid-spool no` (pipe + 16 MB queue, the scan thread waits at the bound), `hybrid` = the default: the queue
+fills first, BUFFER messages overflow to the unlinked spool once the queue is at its 16 MB bound, the scan thread
+returns to the queue when the child has drained it to half; the scan thread closes its spool end, the child's exit
+frees the pages. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates 0 / 20k, 1 rep.
+
+| dataset | rate | config | save s | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | spooled MB | queued peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | nospool | 34.8 / 37.0 | 20 / 17 | 8 / 5 | 12 / 12 | 0.5 | 19.3 / 19.4 | 21.3 / 24.2 | 17.3 / 13.9 | - | 0 | 16 |
+| mixed1m | 0 | overflow spool | 25.4 / 26.1 | 18 / 17 | 1 / 2 | 17 / 15 | 0.4 | 19.1 / 19.1 | 24.5 / 24.6 | 14.3 / 11.5 | - | 951 / 803 | 16 |
+| mixed1m | 20k | nospool | 40.5 / 40.4 | 1239 / 1238 | 29 / 26 | 1236 / 1238 | 9.4 / 9.3 | 18.3 / 18.8 | 23.6 / 23.0 | 12.1 / 11.4 | 15.5 / 15.5 | 0 | 45 / 44 |
+| mixed1m | 20k | overflow spool | 24.4 / 21.6 | 909 / 835 | 10 / 11 | 902 / 826 | 6.2 / 5.3 | 19.9 / 19.4 | 24.4 / 21.5 | 13.0 / 13.2 | 16.6 / 15.7 | 1063 | 23 |
+| mixed1m | 50k | nospool | 40.3 / 42.3 | 1736 / 1752 | 52 / 56 | 1730 / 1745 | 16.8 / 17.6 | 18.2 / 18.2 | 23.4 / 25.4 | 13.0 / 12.3 | 16.9 / 17.0 | 0 | 88 / 95 |
+| mixed1m | 50k | overflow spool | 21.4 / 21.2 | 1423 / 1414 | 5 / 11 | 1420 / 1405 | 9.7 / 9.6 | 18.2 / 19.6 | 21.4 / 21.0 | 14.8 / 13.7 | 17.4 / 18.2 | 1064 | 31 / 33 |
+| small | 0 | nospool | 29.9 | 6 | 0 | 6 | 0.4 | 29.7 | 3.0 | 4.2 | - | 0 | 0 |
+| small | 0 | overflow spool | 31.5 | 2 | 1 | 1 | 0.4 | 31.3 | 3.1 | 1.8 | - | 0 | 0 |
+| small | 20k | nospool | 30.7 | 8 | 7 | 1 | 6.3 | 30.5 | 3.1 | 1.0 | 2.3 | 0 | 98 |
+| small | 20k | overflow spool | 31.3 | 8 | 7 | 1 | 6.6 | 31.2 | 3.3 | 1.5 | 2.7 | 0 | 100 |
+
+### Reading the run
+
+- **mixed1m: 21-26 s at every write rate**, against 35-42 for the pipe shape and 40-46 for stock (run 21): idle 25-26
+  (-30%), 20k 22-24 (-45%), 50k 21 (-49%). Under writes the save is now shorter than idle because the main thread hands
+  the child every big value at the first write to it (run 22), so the child starts on them at t = 0 and the spool
+  absorbs the scan's output meanwhile. Copy-on-write follows the save time down (0.83-0.91 GB against 1.24 at 20k,
+  1.41-1.42 against 1.73-1.75 at 50k), and so does the main thread's CPU (5-6 s against 9 at 20k, 10 against 17 at 50k:
+  fewer buckets to emit ahead of a faster walker).
+- **Memory: the queue holds at most its 16 MB bound plus big-value headers** (queued peak 16 / 23 / 31-33 MB against
+  16 / 44-45 / 88-95 for the pipe shape, whose main-thread queue grows while the scan thread is parked); parent growth
+  1-11 MB. The 0.8-1.1 GB that overflowed sits in the spool (page cache on disk, RAM on this tmpfs benchmark dir),
+  outside `used_memory` and RSS, freed when the child exits.
+- **Latency: back to the fork stall.** Worst PING 11.5-14.8 ms, worst write 15.7-18.2 ms, the same as the pipe shape;
+  run 23's 55-155 ms close spike is gone.
+- **small never touches the file** (0 MB spooled: the child keeps up and the queue never reaches its bound) and stays
+  within one rep's noise of the pipe shape (31.5 against 29.9 idle, 31.3 against 30.7 at 20k, single reps on a dataset
+  whose cells spread 29-33 s in earlier runs).
+- The remaining gap to max(scan, child) is small: 21-26 s against 19-20 s of scan CPU and 21-25 s of child CPU.
