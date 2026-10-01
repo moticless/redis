@@ -437,9 +437,10 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   same scan, same child, values copied on clone, no memory benefit. The 32-bit build and its
   test suite pass in that mode.
 
-- **AOF rewrite** still takes the stock fork path automatically; it works, it does not benefit yet.
-  Disk-based and diskless full sync run through the hybrid (section 6); functions-only and
-  slot-migration snapshots still fork the stock child.
+- **AOF rewrite** runs through the hybrid when the base file is an RDB (`aof-use-rdb-preamble yes`,
+  the default): same scan thread, same child, the INCR file starts at the fork instant. With the
+  preamble off it still takes the stock fork path. Disk-based and diskless full sync run through the
+  hybrid (section 6); functions-only and slot-migration snapshots still fork the stock child.
 - **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
 - **FLUSHALL and DEBUG RELOAD** during a hybrid save abort it, as stock kills its child there.
   FLUSHDB hands the flushed db's keyspace to the save and SWAPDB just moves it to the other db id,

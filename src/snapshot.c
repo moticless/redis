@@ -1380,6 +1380,7 @@ struct snapSave {
     int tag_all;                      /* debug (bgsave-hybrid-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
+    int child_type;            /* CHILD_TYPE_RDB (BGSAVE, full sync) or CHILD_TYPE_AOF (rewrite with the RDB preamble, TASK-1.15) */
     char *filename;
     rdbSaveInfo rsi;
     int has_rsi;
@@ -2292,7 +2293,10 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
 
     startSaving(sv->rdbflags);
     if (!out) {
-        snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
+        if (sv->child_type == CHILD_TYPE_AOF)
+            snprintf(tmpfile, sizeof(tmpfile), "temp-rewriteaof-%d.aof", (int)getpid());   /* as rewriteAppendOnlyFile() */
+        else
+            snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
         fp = fopen(tmpfile, "w");
         if (!fp) {
             serverLog(LL_WARNING, "Hybrid BGSAVE: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
@@ -2301,7 +2305,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         }
         rioInitWithFile(&filerio, fp);
         rdb = &filerio;
-        if (server.rdb_save_incremental_fsync) {
+        if (sv->child_type == CHILD_TYPE_AOF ? server.aof_rewrite_incremental_fsync : server.rdb_save_incremental_fsync) {
             rioSetAutoSync(rdb, REDIS_AUTOSYNC_BYTES);
             if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(rdb, 1);
         }
@@ -2506,6 +2510,13 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         stopSaving(0);
         return C_ERR;
     }
+    if (sv->child_type == CHILD_TYPE_AOF) {
+        /* The parent's done handler renames it into the manifest and fsyncs the directory. */
+        serverLog(LL_NOTICE, "Hybrid AOF rewrite done, %ld SNAP_FORK keys serialized by the child, %zu bytes written to %s.",
+                  key_counter, rdb->processed_bytes, sv->filename);
+        stopSaving(1);
+        return C_OK;
+    }
     if (fsyncFileDir(sv->filename) != 0) {
         serverLog(LL_WARNING, "Hybrid BGSAVE: failed to fsync directory: %s", strerror(errno));
         stopSaving(0);
@@ -2554,6 +2565,7 @@ static void snapChildReserveArenaRange(void) {
 
 static void snapSaveChild(snapSave *sv) {
     rio sock;
+    char aofname[256];
     snap_in_hybrid_child = 1;
     snapChildReserveArenaRange();
     close(sv->pipe_wr);
@@ -2575,12 +2587,21 @@ static void snapSaveChild(snapSave *sv) {
          * of the compression flag was set from the same request at start.) */
         if (sv->req & SLAVE_REQ_RDB_NO_COMPRESS) server.rdb_compression = 0;
         if (sv->req & SLAVE_REQ_RDB_NO_CHECKSUM) server.rdb_checksum = 0;
+    } else if (sv->child_type == CHILD_TYPE_AOF) {
+        /* The name backgroundRewriteDoneHandler and aofRemoveTempFile expect. */
+        snprintf(aofname, sizeof(aofname), "temp-rewriteaof-bg-%d.aof", (int)getpid());
+        sv->filename = aofname;
+        redisSetProcTitle("redis-aof-rewrite");
+        redisSetCpuAffinity(server.aof_rewrite_cpulist);
     } else {
         redisSetProcTitle("redis-rdb-bgsave");
     }
-    redisSetCpuAffinity(server.bgsave_cpulist);
+    if (sv->child_type == CHILD_TYPE_RDB) redisSetCpuAffinity(server.bgsave_cpulist);
     int retval = snapSaveChildWrite(sv, sv->to_sockets ? &sock : NULL);
-    if (retval == C_OK) sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
+    if (retval == C_OK) {
+        if (sv->child_type == CHILD_TYPE_AOF) sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
+        else sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
+    }
     if (sv->to_sockets) {
         if (sv->rdb_channel) {
             rioFreeConnset(&sock);
@@ -2677,6 +2698,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->dbnum = server.dbnum;
     sv->req = req;
     sv->rdbflags = rdbflags;
+    sv->child_type = CHILD_TYPE_RDB;
     sv->filename = filename;
     if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
     sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
@@ -2783,9 +2805,11 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
  * thread. On a fork failure the keyspace is unfrozen and sv is freed; the
  * caller undoes its own state (replica states, pipes). */
 static int snapSaveLaunch(snapSave *sv) {
-    server.stat_rdb_saves++;
-    server.dirty_before_bgsave = server.dirty;
-    server.lastbgsave_try = time(NULL);
+    if (sv->child_type == CHILD_TYPE_RDB) {
+        server.stat_rdb_saves++;
+        server.dirty_before_bgsave = server.dirty;
+        server.lastbgsave_try = time(NULL);
+    }
 
     /* FORK INSTANT: freeze, then fork. */
     mstime_t freeze_lat;
@@ -2794,13 +2818,14 @@ static int snapSaveLaunch(snapSave *sv) {
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
     snap_forking_hybrid = 1;
-    pid_t childpid = redisFork(CHILD_TYPE_RDB);
+    pid_t childpid = redisFork(sv->child_type);
     snap_forking_hybrid = 0;
     if (childpid == 0) {
         snapSaveChild(sv);   /* never returns */
     }
     if (childpid == -1) {
-        if (!sv->to_sockets) server.lastbgsave_status = C_ERR;
+        if (sv->child_type == CHILD_TYPE_AOF) server.aof_lastbgrewrite_status = C_ERR;
+        else if (!sv->to_sockets) server.lastbgsave_status = C_ERR;
         serverLog(LL_WARNING, "Can't save in background (hybrid): fork: %s", strerror(errno));
         snapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
         snapSaveFree(sv);
@@ -2820,9 +2845,27 @@ static int snapSaveLaunch(snapSave *sv) {
         aeCreateFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE, snapScanAeHandler, sv->scan);
         sv->ae_registered = 1;
     }
-    serverLog(LL_NOTICE, "Hybrid background saving started by pid %ld (scan thread streams to the child)", (long)childpid);
-    server.rdb_save_time_start = time(NULL);
+    if (sv->child_type == CHILD_TYPE_AOF) {
+        serverLog(LL_NOTICE, "Hybrid AOF rewrite started by pid %ld (scan thread streams the RDB base file to the child)", (long)childpid);
+    } else {
+        serverLog(LL_NOTICE, "Hybrid background saving started by pid %ld (scan thread streams to the child)", (long)childpid);
+        server.rdb_save_time_start = time(NULL);
+    }
     return C_OK;
+}
+
+/* BGREWRITEAOF with the RDB preamble (TASK-1.15): the base file is an RDB, so
+ * the hybrid scan and child write it. The caller (rewriteAppendOnlyFileBackground)
+ * has flushed the AOF and opened the new INCR file, so the fork instant below
+ * is where the INCR file's history starts; backgroundRewriteDoneHandler does
+ * the manifest work on the temp file the child leaves behind, as for the stock
+ * child. */
+int snapSaveBackgroundAof(void) {
+    if (hasActiveChildProcess()) return C_ERR;
+    snapSave *sv = snapSaveCreate(SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
+    if (!sv) return C_ERR;
+    sv->child_type = CHILD_TYPE_AOF;
+    return snapSaveLaunch(sv);   /* the child names its own temp file */
 }
 
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
@@ -2980,7 +3023,7 @@ void snapSaveChildDone(int exitcode, int bysignal) {
      * merge every remaining slot. Harmless after a clean finish. */
     if (!(!bysignal && exitcode == 0) || !snapScanIsFinished(sv->scan))
         snapScanAbort(sv->scan);
-    if (sv->failed && !sv->to_sockets) {
+    if (sv->failed && !sv->to_sockets && sv->child_type == CHILD_TYPE_RDB) {
         /* Our own defined failure (hard mark): the child was ended with the
          * whitelisted SIGUSR1, which the plain done handler does not count.
          * A socket transfer reports through the replicas, as stock. */

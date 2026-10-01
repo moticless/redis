@@ -1359,6 +1359,44 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal $digest [debug_digest]
         }
 
+        test {Hybrid BGSAVE harness: BGREWRITEAOF with the RDB preamble under writes goes through the hybrid scan, the AOF replays to the live keyspace, a killed child fails it cleanly} {
+            r flushall
+            snap_populate_race 0 1
+            r config set appendonly yes
+            waitForBgrewriteaof r   ;# the rewrite that turning it on starts
+            set saves0 [s snap_saves]
+            r config set rdb-key-save-delay 400
+            r bgrewriteaof
+            snap_wait_save_started
+            for {set n 0} {$n < 300} {incr n} { snap_random_op 0 1 }
+            r config set rdb-key-save-delay 0
+            waitForBgrewriteaof r
+            assert_equal ok [s aof_last_bgrewrite_status]
+            assert_equal [expr {$saves0 + 1}] [s snap_saves]
+            after 600
+            wait_for_condition 50 100 {[r dbsize] == [llength [r keys *]]} else { fail "expired keys linger" }
+            set live [debug_digest]
+            set livekeys [snap_key_digests]
+            r debug loadaof
+            if {[debug_digest] ne $live} { snap_fail_with_diff $livekeys [snap_key_digests] "the AOF (hybrid base + incr) differs from the live keyspace" }
+            # a child killed mid-rewrite: the rewrite fails, the previous base stays, the next one works
+            r config set rdb-key-save-delay 400
+            r bgrewriteaof
+            snap_wait_save_started
+            exec kill -9 [get_child_pid 0]
+            wait_for_condition 300 100 {[s aof_rewrite_in_progress] == 0 && [s snap_save_in_progress] == 0} else { fail "rewrite did not end" }
+            assert_equal err [s aof_last_bgrewrite_status]
+            r config set rdb-key-save-delay 0
+            set live [debug_digest]
+            r bgrewriteaof
+            waitForBgrewriteaof r
+            assert_equal ok [s aof_last_bgrewrite_status]
+            r debug loadaof
+            assert_equal $live [debug_digest]
+            r config set appendonly no
+            snap_assert_placement_clean
+        }
+
         test {Hybrid BGSAVE harness: ten saves aborted by a killed child, then one that completes, reload equal} {
             snap_populate_race 0 1
             for {set k 0} {$k < 10} {incr k} {
@@ -1841,9 +1879,28 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
     }
 
-    test {BGREWRITEAOF with bgsave-hybrid on: the arena is forkable for the child, DONTFORK after, the AOF reloads} {
+    test {BGREWRITEAOF with bgsave-hybrid on and the RDB preamble: the hybrid scan writes the base file, the arena stays DONTFORK, the AOF reloads} {
         snap_fallback_dataset
         set digest [debug_digest]
+        set saves0 [s snap_saves]
+        r config set rdb-key-save-delay 300
+        r config set appendonly yes   ;# starts the rewrite
+        wait_for_condition 100 20 {[s snap_save_in_progress] == 1} else { fail "hybrid rewrite not started" }
+        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
+        assert_equal ok [s aof_last_bgrewrite_status]
+        assert_equal [expr {$saves0 + 1}] [s snap_saves]
+        r debug loadaof
+        assert_equal $digest [debug_digest]
+        r config set appendonly no
+    }
+
+    test {BGREWRITEAOF with bgsave-hybrid on and no preamble: the stock child, the arena is forkable for it, DONTFORK after, the AOF reloads} {
+        r config set aof-use-rdb-preamble no
+        snap_fallback_dataset
+        set digest [debug_digest]
+        set saves0 [s snap_saves]
         r config set rdb-key-save-delay 300
         r config set appendonly yes   ;# starts the rewrite
         if {[snap_arena_available]} {
@@ -1852,10 +1909,12 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r config set rdb-key-save-delay 0
         waitForBgrewriteaof r
         assert_equal ok [s aof_last_bgrewrite_status]
+        assert_equal $saves0 [s snap_saves]
         snap_wait_forkable 0
         r debug loadaof
         assert_equal $digest [debug_digest]
         r config set appendonly no
+        r config set aof-use-rdb-preamble yes
     }
 
     test {Diskless full sync with bgsave-hybrid on: the hybrid child streams the replica, the arena is never mapped} {
@@ -1906,6 +1965,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
     }
 
     test {Mutual exclusion: BGSAVE during a fallback child is scheduled, the arena stays forkable until that child exits} {
+        r config set aof-use-rdb-preamble no   ;# a rewrite without the preamble is a stock (fallback) child
         snap_fallback_dataset
         r config set rdb-key-save-delay 1000
         r bgrewriteaof
@@ -1922,6 +1982,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         } else { fail "scheduled save did not run" }
         assert_equal ok [s rdb_last_bgsave_status]   ;# snap_saves moved: the scheduled save took the hybrid path
         snap_wait_forkable 0
+        r config set aof-use-rdb-preamble yes
     }
 
     test {CONFIG SET bgsave-hybrid is refused while a save runs} {

@@ -278,6 +278,16 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   the separate 128 MB default halves that for a few seconds of save time).
 - Diskless full sync: the fork writes the replica socket instead of a file. AOF rewrite: same scan,
   AOF encoders.
+- **AOF rewrite with the RDB preamble (TASK-1.15 stage 1, 2026-10-01).** `aof-use-rdb-preamble yes` (the
+  default) makes the base file an RDB, so `rewriteAppendOnlyFileBackground` hands the rewrite to the hybrid
+  save (`snapSaveBackgroundAof`): the AOF is flushed and the new INCR file opened as today, then the freeze
+  and fork are the instant the INCR file's history starts; the child is `CHILD_TYPE_AOF`, writes
+  `temp-rewriteaof-<pid>.aof` and renames it to `temp-rewriteaof-bg-<pid>.aof`, the name
+  `backgroundRewriteDoneHandler` and `aofRemoveTempFile` expect, and the stock done handler does the manifest
+  work after `snapSaveChildDone` released the save; `killAppendOnlyChild` calls `snapSaveAbort` as
+  `killRDBChild` does. The arena stays DONTFORK for this child. Without the preamble, or with a module that
+  has not opted in, the stock fork child does the rewrite as before (arena made forkable). The AOF command
+  form from the scan thread (preamble off) is stage 2, not done.
 
 - **Spool file instead of the pipe for the bulk (TASK-1.30, 2026-10-01).** Run 22 showed the two halves
   of a mixed1m save running in series: the child cannot read the pipe while it is inside a 90 MB hash,
@@ -398,8 +408,8 @@ surfaced, not worked around.
   rewrite therefore cannot use the stock serializer while placement is on; §9's M1 statement that
   replication keeps the stock path holds only for main-thread paths (SAVE, DEBUG RELOAD). A
   startup-only config `bgsave-hybrid` (default `no`) gates the arena and all placement. With it on,
-  disk-based replication works through the hybrid BGSAVE file; diskless sync and AOF rewrite are
-  M2 (§9) and are refused until then.
+  disk-based replication works through the hybrid BGSAVE file; diskless sync (TASK-1.14) and AOF
+  rewrite with the RDB preamble (TASK-1.15) run through the hybrid too; the AOF command form is M2 (§9).
 - **listpackEx.** The `listpackEx` struct is arena-born and never moved (its `ExpireMeta` is linked
   into the db's ebuckets). A LISTPACK_EX key is served by the background thread whenever its struct
   is in the arena, regardless of size. The struct's `meta` is written by ebuckets and read by
@@ -733,7 +743,7 @@ big values and owns the RDB. The split of responsibilities differs:
 | Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | two pipes parent to child fed from bounded in-memory queues on the scan thread (non-blocking writes): a small channel (1 MB pipe) for the 64 KB buffers of small values, a big channel for big-value headers, END and ABORT; the child drains the small backlog first and takes a big value when it is low (TASK-1.31), so the two halves overlap with the queue at about one big value's worth; an optional spool file takes the small channel's overflow (TASK-1.30); `SELECTDB` only on change |
 | Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
 | Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
-| Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB only; diskless sync and AOF rewrite are M2 |
+| Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB, diskless sync and AOF rewrite with the RDB preamble through the hybrid child; the AOF command form (preamble off) is stock |
 | Tests | 15 tcl suites, C unit tests, a python fault-injection harness for the arena | one tcl suite with a randomized race harness, C unit tests, TSan/ASan runs |
 
 Where theirs is ahead: runtime mode switching, replication coverage,

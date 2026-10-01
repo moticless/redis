@@ -1250,6 +1250,9 @@ void killAppendOnlyChild(void) {
     /* Kill AOFRW child, wait for child exit. */
     serverLog(LL_NOTICE,"Killing running AOF rewrite child: %ld",
         (long) server.child_pid);
+    /* Hybrid rewrite: stop the scan thread and merge the overlay first, as
+     * killRDBChild does. */
+    snapSaveAbort();
     if (kill(server.child_pid,SIGUSR1) != -1) {
         while(waitpid(-1, &statloc, 0) != server.child_pid);
     }
@@ -3251,6 +3254,29 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
+    /* Hybrid BGSAVE (TASK-1.15): with the RDB preamble the base file is an
+     * RDB, written by the hybrid scan thread and child like a BGSAVE; the INCR
+     * file opened above takes the writes from the fork instant on. Without
+     * the preamble, or with a module that has not opted in, the stock child
+     * below does the rewrite (the arena is made forkable for it). */
+    if (server.aof_use_rdb_preamble && snapHybridEnabled()) {
+        if (moduleAllModulesHandleHybridBgsave()) {
+            if (snapSaveBackgroundAof() != C_OK) {
+                server.aof_lastbgrewrite_status = C_ERR;
+                serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");
+                return C_ERR;
+            }
+            serverLog(LL_NOTICE,
+                "Background append only file rewriting started by pid %ld (hybrid)", (long) server.child_pid);
+            server.aof_rewrite_scheduled = 0;
+            server.aof_rewrite_time_start = time(NULL);
+            aof_cmd_duration_at_rewrite = server.aof_cmd_duration;
+            server.aof_cmd_duration = 0;
+            return C_OK;
+        }
+        snapHybridFallbackLog();
+    }
+
     if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
         char tmpfile[256];
 
@@ -3866,6 +3892,11 @@ NULL
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     int rewrite_success = 0;
     char bgrewrite_error[256] = "";
+
+    /* Hybrid rewrite (RDB preamble): stop the scan thread if still running,
+     * merge the remaining slots and release the save object first; a no-op
+     * for the stock child. */
+    snapSaveChildDone(exitcode, bysignal);
 
     if (!bysignal && exitcode == 0) {
         char tmpfile[256];

@@ -301,7 +301,8 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);   /* diskless full sync through the hybrid child */
 int snapInHybridChild(void);      /* 1 in the hybrid save child (no keyspace mapped) */
-void snapHybridFallbackLog(void); /* a module without the opt-in sends the save to the stock child */
+void snapHybridFallbackLog(void);
+int snapSaveBackgroundAof(void);  /* BGREWRITEAOF with the RDB preamble through the hybrid scan (TASK-1.15) */ /* a module without the opt-in sends the save to the stock child */
 int snapSaveInProgress(void);
 /* FLUSHDB and SWAPDB during a save (TASK-1.24). A store is a kvstore the
  * save is scanning, identified by the db id it had at the fork instant. */
