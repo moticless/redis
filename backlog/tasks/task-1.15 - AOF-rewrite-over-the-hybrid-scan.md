@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-09-20 17:22'
-updated_date: '2026-10-01 15:54'
+updated_date: '2026-10-01 16:57'
 labels:
   - bgsave
   - persistence
@@ -56,4 +56,6 @@ Tests: harness race workload with BGREWRITEAOF in both preamble modes, load the 
 2026-10-01 stage 1 implemented (preamble on): snapSaveBackgroundAof() in snapshot.c (snapSave.child_type, CHILD_TYPE_AOF: no RDB stats, redisFork(CHILD_TYPE_AOF), the child names temp-rewriteaof-<pid>.aof and renames to temp-rewriteaof-bg-<pid>.aof, aof_rewrite_incremental_fsync, CHILD_INFO_TYPE_AOF_COW_SIZE, no dir fsync); rewriteAppendOnlyFileBackground calls it when aof-use-rdb-preamble and the hybrid are on and every module handles the hybrid, after flushAppendOnlyFile/openNewIncrAofForAppend, and does the parent bookkeeping; killAppendOnlyChild calls snapSaveAbort(); backgroundRewriteDoneHandler calls snapSaveChildDone() first. Tests: the BGREWRITEAOF arena test split into preamble-on (hybrid path, arena DONTFORK, snap_saves +1) and preamble-off (stock fallback, arena forkable); the mutual-exclusion fallback-child test uses preamble off; a harness test runs BGREWRITEAOF under random writes, DEBUG LOADAOF equals the live digest, a killed child fails the rewrite and the next one works. All pass alone; whole unit, stock mode and the AOF suites with the feature on pending. Stage 2 (AOF command form, preamble off) not started.
 
 Stage 1 verified and committed (2026-10-01): unit/snapshot feature on and stock all pass; unit/aofrw, integration/aof and integration/aof-multi-part pass with --config bgsave-hybrid yes (AC3, AC6); the harness test covers the killed-child abort with the manifest intact and the next rewrite succeeding (AC5). AC1 is met for the preamble-on half; AC1's preamble-off half, AC2 and AC4 are stage 2 (AOF command form from the scan thread), left for a later session with the plan of record above.
+
+Bug found by the full feature-on suite (unit/wait 'WAITAOF local if AOFRW was postponed'): killAppendOnlyChild (appendonly no, postponed rewrite, shutdown) waits for the child and resets the child state without any done handler, so the hybrid rewrite's save object stayed behind and the next BGSAVE asserted snap_save == NULL in snapSaveCreate. Fixed by calling snapSaveChildDone after the waitpid there; regression test 'BGREWRITEAOF through the hybrid killed by appendonly no'. unit/wait, the three AOF suites and unit/snapshot pass with the feature on; the full suite and TSan are rerunning on the fixed head.
 <!-- SECTION:NOTES:END -->

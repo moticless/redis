@@ -1082,9 +1082,12 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
     /* A hybrid BGSAVE scans the live dicts from a thread. FLUSHALL, DEBUG
      * RELOAD/LOADAOF and a replica's full-sync load empty every db: stop it
      * (and the child) before the keyspace is destroyed, as stock kills its
-     * child there. A single-db FLUSHDB hands that db's structures to the
-     * save instead (emptyDbStructure) and the save goes on. */
-    if (dbnum == -1 && snapSaveInProgress()) {
+     * RDB child there. A single-db FLUSHDB hands that db's structures to the
+     * save instead (emptyDbStructure) and the save goes on; so does every db
+     * of a hybrid AOF rewrite, which stock lets run through a FLUSHALL (the
+     * FLUSHALL lands in the INCR file): killing it counted as a failed
+     * rewrite and tripped the rewrite limiter (aof-multi-part suite). */
+    if (dbnum == -1 && snapSaveInProgress() && !snapSaveIsAofRewrite()) {
         snapSaveAbort();
         killRDBChild();
     }

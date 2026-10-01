@@ -1453,6 +1453,10 @@ long long snapSaveLastInplaceWrites(void) { return snap_last_inplace_writes; }
 
 
 int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
+/* The running hybrid save is a BGREWRITEAOF (RDB preamble): FLUSHALL and the
+ * other empty-everything paths let it finish on the detached fork-instant
+ * dbs, as stock keeps its AOF child through them. */
+int snapSaveIsAofRewrite(void) { return snap_save != NULL && !snap_save->aborted && snap_save->child_type == CHILD_TYPE_AOF; }
 size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
 size_t snapSaveBitmapBytes(void) { return snap_save ? snapScanBitmapBytes(snap_save->scan) : 0; }

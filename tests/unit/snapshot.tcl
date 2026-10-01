@@ -1913,6 +1913,26 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         assert_equal $digest [debug_digest]
     }
 
+    test {FLUSHALL during a hybrid BGREWRITEAOF lets the rewrite finish on the detached dbs; the AOF then loads empty} {
+        snap_fallback_dataset
+        set saves0 [s snap_saves]
+        r config set rdb-key-save-delay 300
+        r config set appendonly yes   ;# starts the hybrid rewrite
+        wait_for_condition 100 20 {[s snap_save_in_progress] == 1} else { fail "hybrid rewrite not started" }
+        r flushall
+        assert_equal 0 [r dbsize]
+        assert_equal 1 [s snap_save_in_progress]   ;# the rewrite goes on with the fork-instant dbs
+        r config set rdb-key-save-delay 0
+        waitForBgrewriteaof r
+        assert_equal ok [s aof_last_bgrewrite_status]
+        assert_equal [expr {$saves0 + 1}] [s snap_saves]
+        r set after:flush 1
+        r debug loadaof   ;# base (fork instant) + incr (FLUSHALL, SET)
+        assert_equal 1 [r dbsize]
+        assert_equal 1 [r get after:flush]
+        r config set appendonly no
+    }
+
     test {BGREWRITEAOF with bgsave-hybrid on and no preamble: the stock child, the arena is forkable for it, DONTFORK after, the AOF reloads} {
         r config set aof-use-rdb-preamble no
         snap_fallback_dataset
