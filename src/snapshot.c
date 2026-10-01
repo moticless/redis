@@ -2683,11 +2683,14 @@ static void snapSaveFree(snapSave *sv) {
     }
     sdsfree(sv->mstage);
     sdsfree(sv->mscratch);
+    /* Flushed dbs still held (every db of an AOF rewrite that saw FLUSHALL,
+     * when the child ended before their slots completed): free them while
+     * sv->stores is still there, snapSaveFreeFlushed clears the entry. */
+    for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
+    zfree(sv->flushed);
     zfree(sv->stores);
     zfree(sv->privs);
     zfree(sv->store_priv);
-    for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
-    zfree(sv->flushed);
     zfree(sv);
 }
 
