@@ -1000,7 +1000,6 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
 
         test {Hybrid BGSAVE harness: a stalled child fills the scan thread's queue up to the bound, the thread waits, the save completes} {
             r flushall
-            r config set bgsave-hybrid-spool no   ;# the bound is the pipe queue's: send everything through it
             # rdb compression would shrink the repeated values to a few bytes
             # each; the point is volume: 100k records of about 75 bytes, 7 MB
             r config set rdbcompression no
@@ -1061,8 +1060,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal ok [s rdb_last_bgsave_status]
             assert {[s snap_last_save_queued_peak] >= 262144}
             assert_equal 0 [s snap_save_queued_bytes]
-            r config set bgsave-hybrid-spool yes
-            r config set bgsave-hybrid-max-queued-bytes 16mb
+            r config set bgsave-hybrid-max-queued-bytes 100mb
             r config set rdbcompression yes
             r debug reload nosave
             assert_equal $ref [debug_digest]
@@ -1070,7 +1068,6 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
 
         test {Hybrid BGSAVE harness: the queue absorbs scan output while the child serializes big fork-class values} {
             r flushall
-            r config set bgsave-hybrid-spool no   ;# measures the pipe queue: send everything through it
             r config set rdbcompression no
             set rd [redis_deferring_client]
             for {set i 0} {$i < 400000} {incr i} { $rd set a:$i [string repeat a 100] }
@@ -1090,8 +1087,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r bgsave
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            r config set bgsave-hybrid-spool yes
-            r config set bgsave-hybrid-max-queued-bytes 16mb
+            r config set bgsave-hybrid-max-queued-bytes 100mb
             # more than the 1 MB pipe was pending at some point: the scan thread ran ahead of the child
             assert {[s snap_last_save_queued_peak] > 1048576}
             assert_equal 0 [s snap_save_queued_bytes]
@@ -1153,8 +1149,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {$hy_dexp * 2 < $st_dexp}
         }
 
-        test {Hybrid BGSAVE harness: the queue fills first, the overflow goes to an unlinked spool file the child drains; no file is left} {
+        test {Hybrid BGSAVE harness: with the spool on the queue fills first, the overflow goes to an unlinked spool file the child drains in order; no file is left} {
             r flushall
+            r config set bgsave-hybrid-spool yes
             r config set rdbcompression no
             populate 200000 sp: 60
             for {set i 0} {$i < 3000} {incr i} { r hset sp:big f$i [string repeat v 40] }
@@ -1188,11 +1185,12 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r debug reload nosave
             assert_equal $digest [debug_digest]
             r config set rdbcompression yes
-            r config set bgsave-hybrid-max-queued-bytes 16mb
+            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set bgsave-hybrid-spool no
         }
 
-        test {Hybrid BGSAVE harness: with the spool off everything goes through the pipe and the save still reloads equal} {
-            r config set bgsave-hybrid-spool no
+        test {Hybrid BGSAVE harness: with the spool off (the default) everything goes through the two pipes and the save reloads equal} {
+            assert_equal no [lindex [r config get bgsave-hybrid-spool] 1]
             set digest [debug_digest]
             r bgsave
             snap_wait_bgsave_done
@@ -1200,11 +1198,11 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal 0 [s snap_last_save_spool_bytes]
             r debug reload nosave
             assert_equal $digest [debug_digest]
-            r config set bgsave-hybrid-spool yes
         }
 
         test {Hybrid BGSAVE harness: a child killed while draining the spool leaves no spool file and the next save works} {
             r flushall
+            r config set bgsave-hybrid-spool yes
             r config set rdbcompression no
             populate 100000 spk: 60
             set dir [lindex [r config get dir] 1]
@@ -1219,12 +1217,83 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             wait_for_condition 100 50 {[s snap_save_in_progress] == 0 && [s rdb_bgsave_in_progress] == 0} else { fail "save did not end" }
             assert_equal 0 [llength [glob -nocomplain -directory $dir temp-snap-*]]
             r config set rdb-key-save-delay 0
-            r config set bgsave-hybrid-max-queued-bytes 16mb
+            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set bgsave-hybrid-spool no
             r config set rdbcompression yes
             set digest [debug_digest]
             r bgsave
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+        }
+
+        test {Hybrid BGSAVE harness: the queue the save holds for its child is not counted for eviction} {
+            r flushall
+            r config set rdbcompression no
+            r config set maxmemory-policy allkeys-random
+            populate 20000 ev: 100
+            set digest [debug_digest]
+            set ev0 [s evicted_keys]
+            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set rdb-key-save-delay 50
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            exec kill -STOP $child
+            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            # maxmemory a little above what the dataset and the server need:
+            # the queue alone would put used_memory past it
+            set queued [s snap_save_queued_bytes]
+            r config set maxmemory [expr {[s used_memory] - $queued + 300000}]
+            for {set i 0} {$i < 20} {incr i} { r ping }
+            set evicted [expr {[s evicted_keys] - $ev0}]
+            set size [r dbsize]
+            exec kill -CONT $child
+            r config set maxmemory 0
+            r config set rdb-key-save-delay 0
+            assert_equal 0 $evicted
+            assert_equal 20000 $size
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set rdbcompression yes
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+        }
+
+        test {Hybrid BGSAVE harness: a buffer that depends on big values waits for them (debug tag-all), the save completes and reloads equal} {
+            r flushall
+            r config set rdbcompression no
+            r config set bgsave-hybrid-tag-all yes
+            populate 60000 tg: 60
+            for {set h 0} {$h < 4} {incr h} {
+                set args {}
+                for {set j 0} {$j < 2000} {incr j} { lappend args f$j [string repeat v 40] }
+                r hset tgh:$h {*}$args
+            }
+            assert_equal hashtable [r object encoding tgh:0]
+            set digest [debug_digest]
+            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set rdb-key-save-delay 20
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            # a stopped child lets the small backlog build past the bound, so
+            # that once continued it drains small first and meets buffers whose
+            # dependency on the big values is not met yet
+            exec kill -STOP $child
+            # writes to the big hashes hand them to the child at once (emitted
+            # ahead): every later buffer depends on them
+            for {set i 0} {$i < 100} {incr i} { r hset tgh:[expr {$i % 4}] new$i v }
+            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            exec kill -CONT $child
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r config set bgsave-hybrid-tag-all no
+            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set rdbcompression yes
             r debug reload nosave
             assert_equal $digest [debug_digest]
         }

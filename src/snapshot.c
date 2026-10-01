@@ -1311,8 +1311,10 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
 
 #define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
 #define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
-#define SNAP_MSG_END    3
+#define SNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
 #define SNAP_MSG_ABORT  4
+#define SNAP_MSG_SPOOL  5     /* small channel: the next bytes of this stream sit in the spool (payload: offset, length) */
+#define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
 #define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
 
 typedef struct snapMsgHdr {
@@ -1320,7 +1322,10 @@ typedef struct snapMsgHdr {
     int32_t dbid;
     int32_t slot;
     uint32_t len;        /* payload bytes */
-    uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation */
+    uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation.
+                          * BUFFER: dependency, the number of big values (KVOBJ messages) that
+                          * must precede this buffer in the output (0 = none; TASK-1.29 sets it
+                          * for buffers carrying inline commands on big keys) */
     uint64_t src_addr;   /* KVOBJ: parent address of the copied allocation, to relocate
                           * pointers into it (an EMBSTR value points inside its kvobj) */
 } snapMsgHdr;
@@ -1340,6 +1345,11 @@ typedef struct snapFlushedDb {
     dict *stream_idmp_keys;
 } snapFlushedDb;
 
+/* One page shared with the child (MAP_SHARED, mapped before the fork). */
+typedef struct snapShared {
+    redisAtomic size_t small_queued;   /* small-channel bytes queued in the parent, for the child's choice of channel */
+} snapShared;
+
 struct snapSave {
     snapScanCtx *scan;
     kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
@@ -1347,20 +1357,26 @@ struct snapSave {
     snapStorePriv *store_priv;
     snapFlushedDb *flushed;    /* per store */
     int dbnum;
-    int pipe_rd, pipe_wr;
-    /* Spool (TASK-1.30): the scan thread's BUFFER messages go to an unlinked
-     * file instead of the pipe, so the child's big values and the scan's small
-     * values overlap without a memory bound. -1: pipe for everything. */
+    /* Two channels to the child (TASK-1.31). The small channel carries the
+     * BUFFER messages (and SPOOL markers), the big channel KVOBJ, END and
+     * ABORT, so the child can drain the small backlog first and take a big
+     * value only when that backlog is low: a bounded queue then never parks
+     * the scan thread while the child is inside a big value. */
+    int pipe_rd, pipe_wr;             /* small channel */
+    int big_rd, big_wr;               /* big channel */
+    snapShared *shared;
+    /* Spool (TASK-1.30, overflow only since TASK-1.31, off by default): when
+     * the small channel's queue is at its bound, BUFFER messages go to an
+     * unlinked file and a SPOOL marker in the queue stands for them, so the
+     * child reads the stream in production order. -1: no spool. */
     int spool_wr, spool_rd;
-    int spool_stat;                   /* main thread: a descriptor of its own, for fstat() (allocated bytes) */
+    int spool_stat;                   /* main thread: a descriptor of its own, for the footprint (SEEK_DATA) */
     redisAtomic size_t spool_bytes;   /* written by the scan thread this save */
+    off_t spool_seg_off;              /* scan thread: where the open (unmarked) spool segment starts */
     off_t spool_frontier;             /* main thread: first data offset found last time (holes grow from the start) */
-    redisAtomic size_t *spool_committed;   /* shared (MAP_SHARED) with the child: bytes fully written to the spool.
-                                            * A pread of a message the scan thread is still writing returns the
-                                            * requested length with torn content (the page cache is filled byte by
-                                            * byte), so the child trusts a message only below this offset. */
     size_t spool_alloc_peak;          /* main thread: peak of the file's allocated bytes (sampled) */
     int spilling;                     /* scan thread: queue reached its bound, BUFFERs go to the spool until it drains to half */
+    int tag_all;                      /* debug (bgsave-hybrid-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
     char *filename;
@@ -1394,11 +1410,15 @@ struct snapSave {
      * forwards waits here for the pipe, which is written non-blockingly, so a
      * child busy inside one huge fork-class value does not stall the scan.
      * Owned by the scan thread; oq_bytes and queued_peak are read by INFO. */
-    list *oq;                           /* sds: header followed by payload */
+    list *oq;                           /* small channel: sds, header followed by payload */
+    list *bq;                           /* big channel */
     list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
-    size_t oq_head_off;                 /* bytes of the head message already written */
+    size_t oq_head_off, bq_head_off;    /* bytes of each head message already written */
     size_t oq_limit;                    /* bgsave-hybrid-max-queued-bytes at save start, 0 = none */
-    redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for the pipe */
+    redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for both pipes */
+    size_t sq_bytes;                    /* of which the small channel's (scan thread; published to the child) */
+    uint32_t kv_seq;                    /* KVOBJ messages sent so far (scan thread) */
+    uint64_t small_seq;                 /* small-channel messages sent so far (scan thread) */
     redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
     /* Output target (TASK-1.14). A BGSAVE or disk-based sync writes a temp
      * file renamed at the end. A diskless sync writes the replicas' sockets:
@@ -1944,94 +1964,162 @@ static void snapOutRecycle(snapSave *sv, sds m) {
     }
 }
 
-/* Scan thread: write queued messages to the (non-blocking) pipe. Returns -1
- * when the pipe is broken (child gone) or a BOUND wait saw an abort. */
-static int snapOutDrain(snapSave *sv, int mode, size_t target) {
+static void snapOutPublish(snapSave *sv) {
+    atomicSet(sv->shared->small_queued, sv->sq_bytes);
+}
+
+/* Scan thread: write one channel's queued messages to its (non-blocking)
+ * pipe. 0 = the list is empty, 1 = the pipe is full, -1 = broken (child gone). */
+static int snapOutDrainList(snapSave *sv, list *l, int fd, size_t *head_off, int small) {
     listNode *ln;
-    while ((ln = listFirst(sv->oq)) != NULL) {
+    while ((ln = listFirst(l)) != NULL) {
         sds m = listNodeValue(ln);
         size_t len = sdslen(m);
-        ssize_t w = write(sv->pipe_wr, m + sv->oq_head_off, len - sv->oq_head_off);
+        ssize_t w = write(fd, m + *head_off, len - *head_off);
         if (w < 0) {
             if (errno == EINTR) continue;
-            if (errno != EAGAIN && errno != EWOULDBLOCK) return -1;
-            if (mode == SNAP_DRAIN_TRY) return 0;
-            if (mode == SNAP_DRAIN_BOUND) {
-                size_t q;
-                atomicGet(sv->oq_bytes, q);
-                if (q <= target) return 0;
-                if (snapScanAborted(sv->scan)) return -1;
-            }
-            struct pollfd pfd = { .fd = sv->pipe_wr, .events = POLLOUT, .revents = 0 };
-            int r = poll(&pfd, 1, 100);
-            if (r < 0 && errno != EINTR) return -1;
-            if (r > 0 && (pfd.revents & (POLLERR | POLLHUP)) && !(pfd.revents & POLLOUT)) return -1;
-            continue;
+            if (errno == EAGAIN || errno == EWOULDBLOCK) return 1;
+            return -1;
         }
-        sv->oq_head_off += w;
-        if (sv->oq_head_off == len) {
-            atomicDecr(sv->oq_bytes, sdsAllocSize(m));
-            listDelNode(sv->oq, ln);
+        *head_off += w;
+        if (*head_off == len) {
+            size_t a = sdsAllocSize(m);
+            atomicDecr(sv->oq_bytes, a);
+            if (small) {
+                sv->sq_bytes -= a;
+                snapOutPublish(sv);
+            }
+            listDelNode(l, ln);
             snapOutRecycle(sv, m);
-            sv->oq_head_off = 0;
+            *head_off = 0;
         }
     }
     return 0;
 }
 
-static void snapOutClear(snapSave *sv) {
-    listNode *ln;
-    while ((ln = listFirst(sv->oq)) != NULL) {
-        sdsfree(listNodeValue(ln));
-        listDelNode(sv->oq, ln);
+/* Scan thread: push both pipes. Returns -1 when a pipe is broken (child
+ * gone) or a BOUND wait saw an abort. */
+static int snapOutDrain(snapSave *sv, int mode, size_t target) {
+    for (;;) {
+        int rs = snapOutDrainList(sv, sv->oq, sv->pipe_wr, &sv->oq_head_off, 1);
+        int rb = snapOutDrainList(sv, sv->bq, sv->big_wr, &sv->bq_head_off, 0);
+        if (rs < 0 || rb < 0) return -1;
+        if (rs == 0 && rb == 0) return 0;
+        if (mode == SNAP_DRAIN_TRY) return 0;
+        if (mode == SNAP_DRAIN_BOUND) {
+            size_t q;
+            atomicGet(sv->oq_bytes, q);
+            if (q <= target) return 0;
+            if (snapScanAborted(sv->scan)) return -1;
+        }
+        struct pollfd pfd[2];
+        int n = 0;
+        if (rs == 1) pfd[n++] = (struct pollfd){ .fd = sv->pipe_wr, .events = POLLOUT, .revents = 0 };
+        if (rb == 1) pfd[n++] = (struct pollfd){ .fd = sv->big_wr, .events = POLLOUT, .revents = 0 };
+        int r = poll(pfd, n, 100);
+        if (r < 0 && errno != EINTR) return -1;
+        for (int i = 0; r > 0 && i < n; i++)
+            if ((pfd[i].revents & (POLLERR | POLLHUP)) && !(pfd[i].revents & POLLOUT)) return -1;
     }
-    sv->oq_head_off = 0;
+}
+
+static void snapOutClearList(list *l) {
+    listNode *ln;
+    while ((ln = listFirst(l)) != NULL) {
+        sdsfree(listNodeValue(ln));
+        listDelNode(l, ln);
+    }
+}
+
+static void snapOutClear(snapSave *sv) {
+    snapOutClearList(sv->oq);
+    snapOutClearList(sv->bq);
+    sv->oq_head_off = sv->bq_head_off = 0;
+    sv->sq_bytes = 0;
     atomicSet(sv->oq_bytes, 0);
+    snapOutPublish(sv);
+}
+
+static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
+
+/* Scan thread: close the open spool segment with a SPOOL marker in the small
+ * channel's queue, so the child reads the spooled buffers at their place in
+ * the stream. Nothing to do if nothing was spooled since the last marker. */
+static int snapSpoolMarker(snapSave *sv) {
+    size_t total;
+    atomicGet(sv->spool_bytes, total);
+    if ((off_t)total <= sv->spool_seg_off) return 0;
+    uint64_t seg[2] = { (uint64_t)sv->spool_seg_off, (uint64_t)total - (uint64_t)sv->spool_seg_off };
+    sv->spool_seg_off = (off_t)total;
+    return snapSendMsg(sv, SNAP_MSG_SPOOL, -1, -1, seg, sizeof(seg), 0, 0);
 }
 
 /* Scan thread: queue a complete message (header + payload in 'm', owned by
- * the queue from here on) and push the pipe. Past the bound the thread waits
- * for the child rather than growing further; it never aborts for that (the
- * main-thread hard mark covers what the main thread retains and queues). A
- * broken pipe (child gone) aborts the scan. */
+ * the queue from here on) on its channel and push the pipes. Past the bound
+ * the thread waits for the child rather than growing further; it never aborts
+ * for that (the main-thread hard mark covers what the main thread retains and
+ * queues). A broken pipe (child gone) aborts the scan. */
 static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
     size_t n = sdslen(m);
-    if (type == SNAP_MSG_BUFFER && sv->spool_wr != -1 && sv->oq_limit) {
-        /* Queue first, spool as the overflow: push the pipe, and if the queue
-         * is at its bound (the child is inside a big value) send this and the
-         * following buffers to the spool, until the child has drained the
-         * queue to half. On a dataset the child keeps up with nothing ever
-         * touches the file. */
-        if (snapOutDrain(sv, SNAP_DRAIN_TRY, 0) != 0) {
+    int big = (type == SNAP_MSG_KVOBJ || type == SNAP_MSG_END || type == SNAP_MSG_ABORT);
+    if (type == SNAP_MSG_BUFFER) {
+        if (sv->tag_all) {
+            /* Debug: depend on every big value sent so far (TASK-1.29 will set
+             * the exact dependency per inline command). */
+            snapMsgHdr h;
+            memcpy(&h, m, sizeof(h));
+            h.robj_off = sv->kv_seq;
+            memcpy(m, &h, sizeof(h));
+        }
+        if (sv->spool_wr != -1 && sv->oq_limit) {
+            /* Queue first, spool as the overflow: push the pipes, and if the
+             * small channel is at its bound (the child is inside a big value)
+             * send this and the following buffers to the spool, until the child
+             * has drained the queue to half; a marker then takes their place
+             * in the queue. On a dataset the child keeps up with nothing ever
+             * touches the file. */
+            if (snapOutDrain(sv, SNAP_DRAIN_TRY, 0) != 0) {
+                snapOutRecycle(sv, m);
+                snapScanRequestAbort(sv->scan);
+                return -1;
+            }
+            if (sv->spilling) {
+                if (sv->sq_bytes <= sv->oq_limit / 2) {
+                    sv->spilling = 0;
+                    if (snapSpoolMarker(sv) != 0) {
+                        snapOutRecycle(sv, m);
+                        return -1;
+                    }
+                }
+            } else if (sv->sq_bytes + sdsAllocSize(m) > sv->oq_limit) {
+                sv->spilling = 1;
+            }
+        }
+        if (sv->spilling) {   /* with a spool and no bound: for the whole save */
+            int rc = snapSpoolWrite(sv, m, n);
+            atomicIncr(sv->msgs_sent, 1);
+            atomicIncr(sv->bytes_sent, (long long)n);
+            atomicIncr(sv->spool_bytes, n);
             snapOutRecycle(sv, m);
-            snapScanRequestAbort(sv->scan);
-            return -1;
-        }
-        size_t q;
-        atomicGet(sv->oq_bytes, q);
-        if (sv->spilling) {
-            if (q <= sv->oq_limit / 2) sv->spilling = 0;
-        } else if (q + sdsAllocSize(m) > sv->oq_limit) {
-            sv->spilling = 1;
+            if (rc != 0) {
+                snapScanRequestAbort(sv->scan);
+                return -1;
+            }
+            return 0;
         }
     }
-    if (type == SNAP_MSG_BUFFER && sv->spool_wr != -1 && (sv->spilling || !sv->oq_limit)) {
-        int rc = snapSpoolWrite(sv, m, n);
-        atomicIncr(sv->msgs_sent, 1);
-        atomicIncr(sv->bytes_sent, (long long)n);
-        size_t total;
-        atomicIncrGet(sv->spool_bytes, total, n);
-        if (rc == 0) atomicSetWithSync(*sv->spool_committed, total);   /* release: the child may read up to here */
-        snapOutRecycle(sv, m);
-        if (rc != 0) {
-            snapScanRequestAbort(sv->scan);
-            return -1;
-        }
-        return 0;
+    if (big) {
+        listAddNodeTail(sv->bq, m);
+        if (type == SNAP_MSG_KVOBJ) sv->kv_seq++;
+    } else {
+        listAddNodeTail(sv->oq, m);
+        sv->sq_bytes += sdsAllocSize(m);
+        sv->small_seq++;
+        snapOutPublish(sv);
     }
-    listAddNodeTail(sv->oq, m);
     size_t q, mqb, peak;
-    atomicIncrGet(sv->oq_bytes, q, sdsAllocSize(m));   /* what the queue really holds */
+    atomicIncrGet(sv->oq_bytes, q, sdsAllocSize(m));   /* what the queues really hold */
     atomicGet(sv->mq_bytes, mqb);
     atomicGet(sv->queued_peak, peak);
     if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
@@ -2139,9 +2227,14 @@ static void snapSaveThreadDone(void *priv, int aborted) {
         snapOutDrain(sv, SNAP_DRAIN_ALL, 0);
     } else {
         snapStageFlush(sv);
-        if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, 0, 0) == 0 &&
-            snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0)
+        /* Close the open spool segment (if any), then END with both channels'
+         * message counts: the child finishes when it has consumed them. */
+        if (sv->spool_wr != -1 && snapSpoolMarker(sv) != 0) {
             snapScanRequestAbort(sv->scan);
+        } else if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, sv->kv_seq, sv->small_seq) == 0 &&
+                   snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0) {
+            snapScanRequestAbort(sv->scan);
+        }
     }
     /* Our side of the spool is done: close it here, on this thread. The child
      * holds the other descriptor, so the file's pages (a gigabyte for a large
@@ -2186,6 +2279,8 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     int error = 0;
     char *payload = NULL;
     size_t payload_cap = 0;
+    char *bigbuf = NULL;               /* KVOBJ copies: apart from 'payload', which may hold a held buffer */
+    size_t bigbuf_cap = 0;
     long key_counter = 0, msgs = 0;
     long long info_updated_time = 0;
     int cur_db = -1, cur_slot = -1;
@@ -2221,122 +2316,148 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         goto werr;
     }
 
-    /* Two sources: the spool (BUFFER messages, read at our own pace from
-     * 'spool_off') and the pipe (KVOBJ, END, ABORT; everything when there is
-     * no spool). The spool is drained whenever it has a complete message;
-     * the pipe is polled in between, with a short wait only when the spool
-     * is caught up. After END the spool is complete: drain it to its end. */
-    off_t spool_off = 0, spool_punched = 0;
+    /* Two channels (TASK-1.31). Small: BUFFER messages in production order,
+     * with SPOOL markers standing for ranges of the stream that overflowed to
+     * the spool file. Big: KVOBJ (one big value each), then END (or ABORT).
+     * Policy: the small channel while the parent reports a backlog of at
+     * least SNAP_SMALL_BACKLOG on it (or nothing waits on the big channel), a
+     * big value otherwise. The bounded queue then never parks the scan thread
+     * while we are inside a big value, and the big values come up as soon as
+     * the small side is caught up (a single FIFO took the big values handed
+     * ahead by the main thread back to back and lost the overlap, run 17). A
+     * BUFFER whose dependency (header robj_off: big values that must precede
+     * it) is not met waits for the big channel. END carries both channels'
+     * message counts: we are done when both are consumed. */
+    uint64_t small_total = 0, small_seen = 0, kv_total = 0, kv_written = 0;
     int ended = 0;
-    int flush_spool = 0;   /* after a big value: empty the spool before the next pipe message */
+    snapMsgHdr held;
+    int have_held = 0;                 /* a BUFFER (in 'payload') waiting for big values */
+    off_t seg_off = 0, spool_punched = 0;
+    uint64_t seg_left = 0;             /* the open spool segment */
     for (;;) {
         snapMsgHdr h;
-        int from_spool = 0;
-        int pipe_ready = (sv->spool_rd == -1);   /* no spool: the pipe is the only source; after END: spool only */
-        if (sv->spool_rd != -1 && !ended && !flush_spool) {
-            /* Round-robin: a pipe message when one is waiting (so the queue
-             * drains while we copy the spool and big values start promptly),
-             * else a spool message. */
-            struct pollfd pfd = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
-            int pr = poll(&pfd, 1, 0);
-            pipe_ready = pr > 0 && (pfd.revents & POLLIN);
-            if (pr > 0 && !(pfd.revents & POLLIN)) { err_op = "channel closed"; goto werr; }
-        }
-        if (sv->spool_rd != -1 && !pipe_ready) {
-            size_t committed;
-            atomicGetWithSync(*sv->spool_committed, committed);   /* acquire: pairs with the scan thread's store */
-            int r = 0;
-            if ((size_t)spool_off + sizeof(h) <= committed) {
-                r = snapSpoolPread(sv->spool_rd, &h, sizeof(h), spool_off);
-                if (r < 0) { err_op = "spool read (header)"; goto werr; }
+        int src;   /* 0 = small channel, 1 = big channel */
+        if (have_held) {
+            if (held.robj_off <= kv_written) {
+                h = held;
+                have_held = 0;
+                goto write_small;
             }
-            if (r == 1) {
-                if ((size_t)spool_off + sizeof(h) + h.len > committed) {
-                    r = 0;   /* the payload is still being written */
-                } else {
-                    if (h.len > payload_cap) {
-                        payload = zrealloc(payload, h.len);
-                        payload_cap = h.len;
-                    }
-                    r = h.len ? snapSpoolPread(sv->spool_rd, payload, h.len, spool_off + sizeof(h)) : 1;
-                    if (r < 0) { err_op = "spool read (payload)"; goto werr; }
-                    if (r == 0) { err_op = "spool short read below the committed offset"; goto werr; }
-                }
-            }
-            if (r == 0) flush_spool = 0;   /* spool caught up: back to pipe-first */
-            if (r == 1) {
-                spool_off += sizeof(h) + h.len;
-                from_spool = 1;
-                /* Give the consumed range back as we go, so the file's footprint
-                 * is the unconsumed tail, not the whole save: a hole on tmpfs or
-                 * disk frees the pages; where holes are unsupported, drop the
-                 * page cache instead. 16 MB at a time. */
-                off_t punch_end = spool_off & ~(off_t)4095;   /* whole blocks only: a straddling block would stay
-                                                                * allocated and SEEK_DATA would stop at it for good */
-                if (punch_end - spool_punched >= (off_t)(16 * 1024 * 1024)) {
-                    off_t len = punch_end - spool_punched;
-#ifdef FALLOC_FL_PUNCH_HOLE
-                    if (fallocate(sv->spool_rd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, spool_punched, len) != 0)
-#endif
-                        posix_fadvise(sv->spool_rd, spool_punched, len, POSIX_FADV_DONTNEED);
-                    spool_punched = punch_end;
-                }
-            } else if (ended) {
-                break;   /* the scan thread wrote END after its last spool message: done */
-            }
-        }
-        if (!from_spool) {
-            if (sv->spool_rd != -1) {
-                /* Spool caught up: wait for the pipe, briefly, then look again. */
-                struct pollfd pfd = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
-                int pr = poll(&pfd, 1, 5);
-                if (pr < 0 && errno != EINTR) { err_op = "channel poll"; goto werr; }
-                if (pr <= 0) continue;
-                if (!(pfd.revents & POLLIN)) { err_op = "channel closed"; goto werr; }
-            }
-            if (snapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
-            if (h.type == SNAP_MSG_END) {
-                if (sv->spool_rd == -1) break;
-                ended = 1;   /* finish the spool first */
-                continue;
-            }
-            if (h.type == SNAP_MSG_ABORT) { aborted = 1; goto werr; }
+            if (ended) { errno = EPROTO; err_op = "buffer depends on a big value that never comes"; goto werr; }
+            src = 1;
+        } else if (seg_left) {
+            /* The next message of the small stream is in the spool: whole
+             * messages, all written before the marker was queued. */
+            if (seg_left < sizeof(h)) { errno = EPROTO; err_op = "spool segment"; goto werr; }
+            if (snapSpoolPread(sv->spool_rd, &h, sizeof(h), seg_off) != 1) { err_op = "spool read (header)"; goto werr; }
+            if (h.type != SNAP_MSG_BUFFER || sizeof(h) + h.len > seg_left) { errno = EPROTO; err_op = "spool segment"; goto werr; }
             if (h.len > payload_cap) {
                 payload = zrealloc(payload, h.len);
                 payload_cap = h.len;
             }
-            if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+            if (h.len && snapSpoolPread(sv->spool_rd, payload, h.len, seg_off + sizeof(h)) != 1) { err_op = "spool read (payload)"; goto werr; }
+            seg_off += sizeof(h) + h.len;
+            seg_left -= sizeof(h) + h.len;
+            /* Give the consumed range back as we go, so the file's footprint
+             * is the unconsumed tail, not the whole save: a hole on tmpfs or
+             * disk frees the pages; where holes are unsupported, drop the
+             * page cache instead. 16 MB at a time, whole blocks only (a
+             * straddling block would stay allocated and SEEK_DATA would stop
+             * at it for good). */
+            off_t punch_end = seg_off & ~(off_t)4095;
+            if (punch_end - spool_punched >= (off_t)(16 * 1024 * 1024)) {
+                off_t len = punch_end - spool_punched;
+#ifdef FALLOC_FL_PUNCH_HOLE
+                if (fallocate(sv->spool_rd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, spool_punched, len) != 0)
+#endif
+                    posix_fadvise(sv->spool_rd, spool_punched, len, POSIX_FADV_DONTNEED);
+                spool_punched = punch_end;
+            }
+            goto small_msg;
+        } else if (ended && small_seen == small_total) {
+            break;
+        } else {
+            int small_open = !(ended && small_seen == small_total);
+            struct pollfd pfd[2] = {
+                { .fd = sv->pipe_rd, .events = small_open ? POLLIN : 0, .revents = 0 },
+                { .fd = sv->big_rd, .events = ended ? 0 : POLLIN, .revents = 0 },
+            };
+            int pr = poll(pfd, 2, -1);
+            if (pr < 0) {
+                if (errno == EINTR) continue;
+                err_op = "channel poll";
+                goto werr;
+            }
+            int small_ready = small_open && (pfd[0].revents & POLLIN);
+            int big_ready = !ended && (pfd[1].revents & POLLIN);
+            if (!small_ready && !big_ready) { errno = 0; err_op = "channel closed"; goto werr; }
+            size_t backlog;
+            atomicGet(sv->shared->small_queued, backlog);
+            src = (small_ready && (backlog >= SNAP_SMALL_BACKLOG || !big_ready)) ? 0 : 1;
         }
-        if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
-
-        if (h.type == SNAP_MSG_BUFFER) {
-            if (rioWrite(rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
-        } else if (h.type == SNAP_MSG_KVOBJ) {
-            kvobj *kv = (kvobj *)(payload + h.robj_off);
+        if (src == 1) {
+            if (snapReadAll(sv->big_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
+            if (h.type == SNAP_MSG_END) {
+                ended = 1;
+                kv_total = h.robj_off;
+                small_total = h.src_addr;
+                if (kv_written != kv_total) { errno = EPROTO; err_op = "big value count"; goto werr; }
+                continue;
+            }
+            if (h.type == SNAP_MSG_ABORT) { aborted = 1; goto werr; }
+            if (h.type != SNAP_MSG_KVOBJ) { errno = EPROTO; err_op = "unknown message"; goto werr; }
+            if (h.len > bigbuf_cap) {
+                bigbuf = zrealloc(bigbuf, h.len);
+                bigbuf_cap = h.len;
+            }
+            if (h.len && snapReadAll(sv->big_rd, bigbuf, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+            if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+            kvobj *kv = (kvobj *)(bigbuf + h.robj_off);
             /* An embedded string value lives inside the kvobj allocation: its
              * pointer is the parent's address, relocate it into our copy. */
             if (kv->encoding == OBJ_ENCODING_EMBSTR)
-                kv->ptr = payload + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
+                kv->ptr = bigbuf + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
             robj key;
             initStaticStringObject(key, kvobjGetKey(kv));
             size_t before = rdb->processed_bytes;
             if (rdbSaveKeyValuePair(rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
             key_counter++;
+            kv_written++;
             /* As the stock child does after each key: drop the value's pages from
              * this process once written, so later parent writes to them do not
              * leave us a private copy. The value is the parent's forkable
              * allocation, mapped in our CoW view. */
             size_t dump_size = rdb->processed_bytes - before;
             if (dump_size > server.page_size / 2) dismissObject(kv, dump_size);
-            /* The scan thread spooled while we were inside this value: flush
-             * that backlog before the next big value, so the spool's footprint
-             * stays at about one value's worth instead of the whole save's
-             * (run 26 measured the latter with pipe-first alone). */
-            flush_spool = 1;
-        } else {
-            err_op = "unknown message";
-            goto werr;
+            goto progress;
         }
+        /* Small channel, from the pipe. */
+        if (snapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
+        small_seen++;
+        if (h.type == SNAP_MSG_SPOOL) {
+            uint64_t seg[2];
+            if (h.len != sizeof(seg) || sv->spool_rd == -1) { errno = EPROTO; err_op = "spool marker"; goto werr; }
+            if (snapReadAll(sv->pipe_rd, seg, sizeof(seg)) != 0) { err_op = "channel read (payload)"; goto werr; }
+            seg_off = (off_t)seg[0];
+            seg_left = seg[1];
+            continue;
+        }
+        if (h.type != SNAP_MSG_BUFFER) { errno = EPROTO; err_op = "unknown message"; goto werr; }
+        if (h.len > payload_cap) {
+            payload = zrealloc(payload, h.len);
+            payload_cap = h.len;
+        }
+        if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+    small_msg:
+        if (h.robj_off > kv_written) {
+            held = h;
+            have_held = 1;
+            continue;
+        }
+    write_small:
+        if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+        if (rioWrite(rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
+    progress:
         if ((msgs++ & 1023) == 0) {
             long long now = mstime();
             if (now - info_updated_time >= 1000) {
@@ -2345,6 +2466,8 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             }
         }
     }
+    zfree(bigbuf);
+    bigbuf = NULL;
     zfree(payload);
     payload = NULL;
 
@@ -2387,6 +2510,7 @@ werr:
     else
         serverLog(LL_WARNING, "Hybrid BGSAVE: write error (%s): %s", err_op, strerror(errno));
     zfree(payload);
+    zfree(bigbuf);
     if (fp) fclose(fp);
     if (tmpfile[0]) unlink(tmpfile);
     stopSaving(0);
@@ -2419,6 +2543,7 @@ static void snapSaveChild(snapSave *sv) {
     snap_in_hybrid_child = 1;
     snapChildReserveArenaRange();
     close(sv->pipe_wr);
+    close(sv->big_wr);
     if (sv->spool_wr != -1) { close(sv->spool_wr); sv->spool_wr = -1; }
     if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
     if (sv->to_sockets) {
@@ -2469,8 +2594,12 @@ static void snapSaveFree(snapSave *sv) {
         aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
     if (sv->scan) snapScanRelease(sv->scan);
     if (sv->oq) {
-        snapOutClear(sv);
+        snapOutClearList(sv->oq);
         listRelease(sv->oq);
+    }
+    if (sv->bq) {
+        snapOutClearList(sv->bq);
+        listRelease(sv->bq);
     }
     if (sv->oq_pool) {
         listNode *ln;
@@ -2482,10 +2611,12 @@ static void snapSaveFree(snapSave *sv) {
     }
     if (sv->pipe_wr != -1) close(sv->pipe_wr);
     if (sv->pipe_rd != -1) close(sv->pipe_rd);
+    if (sv->big_wr != -1) close(sv->big_wr);
+    if (sv->big_rd != -1) close(sv->big_rd);
     if (sv->spool_wr != -1) close(sv->spool_wr);
     if (sv->spool_rd != -1) close(sv->spool_rd);
     if (sv->spool_stat != -1) close(sv->spool_stat);   /* the child punched the consumed ranges: little left to free */
-    if (sv->spool_committed) munmap((void *)sv->spool_committed, sizeof(redisAtomic size_t));
+    if (sv->shared) munmap(sv->shared, sizeof(snapShared));
     if (sv->sizes) {
         for (int j = 0; j < sv->dbnum; j++) {
             zfree(sv->sizes[j].slot_keys);
@@ -2527,7 +2658,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     serverAssert(snap_save == NULL);
 
     snapSave *sv = zcalloc(sizeof(*sv));
-    sv->pipe_rd = sv->pipe_wr = -1;
+    sv->pipe_rd = sv->pipe_wr = sv->big_rd = sv->big_wr = -1;
     sv->spool_rd = sv->spool_wr = sv->spool_stat = -1;
     sv->dbnum = server.dbnum;
     sv->req = req;
@@ -2557,28 +2688,43 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
             }
         }
     }
-    int fds[2];
-    if (pipe(fds) != 0) {
-        serverLog(LL_WARNING, "Hybrid BGSAVE: pipe() failed: %s", strerror(errno));
-        snapSaveFree(sv);
-        return NULL;
-    }
-    sv->pipe_rd = fds[0];
-    sv->pipe_wr = fds[1];
+    /* Two pipes. The scan thread writes them non-blockingly and keeps what
+     * does not fit in its own queues (bounded by bgsave-hybrid-max-queued-bytes);
+     * the child's read ends stay blocking. The small channel's pipe is
+     * deepened to 1 MB (best effort). */
+    int *ends[2] = { &sv->pipe_rd, &sv->big_rd };
+    int *wends[2] = { &sv->pipe_wr, &sv->big_wr };
+    for (int c = 0; c < 2; c++) {
+        int fds[2];
+        if (pipe(fds) != 0) {
+            serverLog(LL_WARNING, "Hybrid BGSAVE: pipe() failed: %s", strerror(errno));
+            snapSaveFree(sv);
+            return NULL;
+        }
+        *ends[c] = fds[0];
+        *wends[c] = fds[1];
 #ifdef F_SETPIPE_SZ
-    fcntl(sv->pipe_wr, F_SETPIPE_SZ, 1 << 20);   /* best effort: deeper back-pressure buffer */
+        if (c == 0) fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);
 #endif
-    /* The scan thread writes the pipe non-blockingly and keeps what does not
-     * fit in its own queue (bounded by bgsave-hybrid-max-queued-bytes). The
-     * child's read end stays blocking. */
-    if (fcntl(sv->pipe_wr, F_SETFL, fcntl(sv->pipe_wr, F_GETFL) | O_NONBLOCK) == -1) {
-        serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+        if (fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) == -1) {
+            serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+            snapSaveFree(sv);
+            return NULL;
+        }
+    }
+    sv->shared = mmap(NULL, sizeof(snapShared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    if (sv->shared == MAP_FAILED) {
+        sv->shared = NULL;
+        serverLog(LL_WARNING, "Hybrid BGSAVE: mmap(MAP_SHARED) failed: %s", strerror(errno));
         snapSaveFree(sv);
         return NULL;
     }
+    atomicSet(sv->shared->small_queued, 0);
     sv->oq = listCreate();
+    sv->bq = listCreate();
     sv->oq_pool = listCreate();
     sv->oq_limit = server.bgsave_hybrid_max_queued_bytes;
+    sv->tag_all = server.bgsave_hybrid_tag_all;
     if (server.bgsave_hybrid_spool) {
         /* Unlinked at once: both descriptors keep it alive, a crash leaves
          * nothing behind. In the working directory, next to the temp RDB. */
@@ -2589,18 +2735,15 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
             sv->spool_rd = open(path, O_RDWR);          /* the child reads it and punches holes behind its reads */
             sv->spool_stat = open(path, O_RDONLY);      /* the main thread's own descriptor, for INFO */
             unlink(path);
-            if (sv->spool_rd != -1) {
-                void *p = mmap(NULL, sizeof(redisAtomic size_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
-                if (p == MAP_FAILED) { close(sv->spool_rd); sv->spool_rd = -1; }
-                else { sv->spool_committed = p; atomicSet(*sv->spool_committed, 0); }
-            }
             if (sv->spool_rd == -1) {
                 close(sv->spool_wr); sv->spool_wr = -1;
                 if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
             }
         }
         if (sv->spool_wr == -1)
-            serverLog(LL_WARNING, "Hybrid BGSAVE: cannot create the spool file %s (%s): the pipe carries everything", path, strerror(errno));
+            serverLog(LL_WARNING, "Hybrid BGSAVE: cannot create the spool file %s (%s): the queue waits at its bound instead", path, strerror(errno));
+        else if (!sv->oq_limit)
+            sv->spilling = 1;   /* no bound: every buffer goes to the spool, one marker at the end */
     }
     snapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
@@ -2651,6 +2794,8 @@ static int snapSaveLaunch(snapSave *sv) {
     }
     close(sv->pipe_rd);
     sv->pipe_rd = -1;
+    close(sv->big_rd);
+    sv->big_rd = -1;
     if (sv->spool_rd != -1) { close(sv->spool_rd); sv->spool_rd = -1; }
     snap_save = sv;
     if (snapScanStartThread(sv->scan) != C_OK) {

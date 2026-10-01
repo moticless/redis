@@ -3457,7 +3457,8 @@ standardConfig static_configs[] = {
     createBoolConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, server.rdb_compression, 1, NULL, NULL),
     createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, server.rdb_del_sync_files, 0, NULL, NULL),
     createBoolConfig("bgsave-hybrid", NULL, MODIFIABLE_CONFIG, server.bgsave_hybrid, 0, NULL, snapHybridConfigApply),
-    createBoolConfig("bgsave-hybrid-spool", NULL, MODIFIABLE_CONFIG, server.bgsave_hybrid_spool, 1, NULL, NULL),
+    createBoolConfig("bgsave-hybrid-spool", NULL, MODIFIABLE_CONFIG, server.bgsave_hybrid_spool, 0, NULL, NULL),
+    createBoolConfig("bgsave-hybrid-tag-all", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.bgsave_hybrid_tag_all, 0, NULL, NULL),
     createBoolConfig("activerehashing", NULL, MODIFIABLE_CONFIG, server.activerehashing, 1, NULL, NULL),
     createBoolConfig("stop-writes-on-bgsave-error", NULL, MODIFIABLE_CONFIG, server.stop_writes_on_bgsave_err, 1, NULL, NULL),
     createBoolConfig("set-proc-title", NULL, IMMUTABLE_CONFIG, server.set_proc_title, 1, NULL, NULL), /* Should setproctitle be used? */
@@ -3657,7 +3658,7 @@ standardConfig static_configs[] = {
     createSizeTConfig("set-max-listpack-value", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.set_max_listpack_value, 64, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("save-small-max-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.save_small_max_bytes, 4096, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("bgsave-hybrid-max-retained-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.bgsave_hybrid_max_retained_bytes, 256*1024*1024, MEMORY_CONFIG, NULL, NULL),
-    createSizeTConfig("bgsave-hybrid-max-queued-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.bgsave_hybrid_max_queued_bytes, 16*1024*1024, MEMORY_CONFIG, NULL, NULL),
+    createSizeTConfig("bgsave-hybrid-max-queued-bytes", NULL, MODIFIABLE_CONFIG, 0, LONG_MAX, server.bgsave_hybrid_max_queued_bytes, 100*1024*1024, MEMORY_CONFIG, NULL, NULL),
     createSizeTConfig("zset-max-listpack-entries", "zset-max-ziplist-entries", MODIFIABLE_CONFIG, 0, LONG_MAX, server.zset_max_listpack_entries, 128, INTEGER_CONFIG, NULL, NULL),
     createSizeTConfig("active-defrag-ignore-bytes", NULL, MODIFIABLE_CONFIG, 1, LLONG_MAX, server.active_defrag_ignore_bytes, 100<<20, MEMORY_CONFIG, NULL, NULL), /* Default: don't defrag if frag overhead is below 100mb */
     createSizeTConfig("hash-max-listpack-value", "hash-max-ziplist-value", MODIFIABLE_CONFIG, 0, LONG_MAX, server.hash_max_listpack_value, 64, MEMORY_CONFIG, NULL, NULL),
