@@ -1630,3 +1630,37 @@ The spool's pages are outside `used_memory` and RSS (page cache on disk, RAM on 
   range is not mapped in the child, the kernel reused those addresses for the child's own heap, and `zmalloc_is_nofork`
   then routed a realloc of a child buffer to the parent-only arena (fixed: the child re-reserves the range PROT_NONE
   right after the fork). The latter is what the 'converges under write load' test's occasional second save was.
+
+## Run 29 (2026-10-01): final spool (overflow, aligned punches, committed offset, frontier resume) vs pipe only, c7i.4xlarge
+
+Raw: `run29.csv` (header restored from run 28 after an interrupted first start), driver `~/run29.sh`. Binary fd2034f0b.
+`hybrid-nospool` = `--bgsave-hybrid-spool no`, `hybrid` = default. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps
+interleaved; small scale 13.5, rates 0 / 20k, 1 rep. Every save `ok`. "spool peak" is the file's true footprint
+(allocated bytes not yet consumed by the child).
+
+| dataset | rate | config | save s | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | spooled MB | spool peak MB | queued peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | nospool | 34.8 / 35.2 | 20 / 18 | 9 / 1 | 11 / 17 | 0.5 | 17.3 / 19.4 | 21.7 / 21.8 | 15.4 / 13.1 | - | 0 | 0 | 16 |
+| mixed1m | 0 | spool | 25.6 / 25.4 | 17 / 17 | 10 / 2 | 7 / 15 | 0.4 / 0.3 | 17.1 / 18.5 | 24.9 / 24.7 | 11.1 / 10.2 | - | 957 / 922 | 77 / 73 | 16 |
+| mixed1m | 20k | nospool | 41.1 / 39.3 | 1249 / 1218 | 29 / 27 | 1245 / 1216 | 9.7 / 9.3 | 18.2 / 19.2 | 24.3 / 21.5 | 14.8 / 12.6 | 15.5 / 16.1 | 0 | 0 | 46 / 43 |
+| mixed1m | 20k | spool | 24.3 / 21.4 | 904 / 829 | 12 / 7 | 897 / 824 | 6.2 / 5.5 | 18.9 / 19.5 | 24.2 / 21.3 | 15.0 / 11.9 | 15.4 / 15.8 | 1063 | 71 / 61 | 22 / 23 |
+| mixed1m | 50k | nospool | 41.9 / 41.5 | 1748 / 1745 | 54 / 54 | 1745 / 1742 | 15.7 / 14.5 | 17.9 / 17.7 | 25.4 / 25.2 | 15.4 / 21.7 | 16.8 / 22.4 | 0 | 0 | 95 / 94 |
+| mixed1m | 50k | spool | 25.7 / 24.4 | 1529 / 1507 | 12 / 14 | 1524 / 1494 | 11.5 / 10.3 | 19.6 / 19.4 | 25.6 / 24.4 | 11.9 / 15.8 | 17.4 / 17.0 | 1064 | 73 / 69 | 33 |
+| small | 0 | nospool | 29.6 | 4 | 0 | 4 | 0.4 | 29.4 | 2.9 | 4.0 | - | 0 | 0 | 0 |
+| small | 0 | spool | 32.9 | 2 | 1 | 1 | 0.5 | 32.7 | 3.1 | 0.9 | - | 0 | 0 | 0 |
+| small | 20k | nospool | 31.8 | 8 | 7 | 1 | 6.8 | 31.6 | 3.1 | 1.4 | 2.4 | 0 | 0 | 102 |
+| small | 20k | spool | 31.6 | 8 | 7 | 1 | 6.9 | 31.4 | 3.2 | 1.0 | 2.3 | 0 | 0 | 101 |
+
+### Reading the run
+
+- **mixed1m: 21-26 s at every write rate against 35-42 for the pipe shape** (run 21's stock: 40-46), as run 24; the
+  three fixes since (committed offset, aligned punches, frontier resume) cost nothing measurable.
+- **The spool's true footprint is 61-77 MB** while 0.92-1.06 GB pass through it: one big value's worth of scan output,
+  freed as the child consumes it; the queue stays at 16-33 MB; parent growth 2-14 MB. This is the number to put next to
+  RSS: the save holds about 90 MB outside `used_memory` at its peak, not a gigabyte.
+- **Latency is back to the fork stall**: worst PING 10-16 ms (run 27/28's 34-41 ms SEEK_DATA walks are gone), worst
+  write 15-17 ms.
+- **small never spools.** Its idle cell reads 32.9 against 29.6 s (single reps; the same cell has read 29.6-33.6 s
+  for both shapes across runs 23, 24 and 29), its 20k cell 31.6 against 31.8. Flagged, not established: a two-rep
+  interleaved small pass would settle whether the per-buffer drain attempt costs anything on a dataset the child
+  keeps up with.
