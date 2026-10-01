@@ -499,6 +499,12 @@ proc snap_wait_bgsave_done {} {
     } else { fail "bgsave did not finish" }
 }
 
+# The address of a key's kvobj, from DEBUG OBJECT.
+proc snap_addr_of {key} {
+    if {![regexp {at:(0x[0-9a-fA-F]+)} [r debug object $key] -> a]} { fail "no address in DEBUG OBJECT $key" }
+    return $a
+}
+
 proc snap_seq_list {prefix n} {
     set l {}
     for {set k 0} {$k < $n} {incr k} { lappend l $prefix$k }
@@ -1313,6 +1319,42 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal 0 [s snap_save_bitmap_bytes]
         }
 
+        test {Hybrid BGSAVE harness: a crash in the hybrid child writes a full report without the keyspace sections; the stock child keeps them} {
+            r flushall
+            populate 20000 cr: 60
+            set keyspace0 [count_log_message 0 "# Keyspace"]
+            r config set rdb-key-save-delay 300
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            exec kill -SEGV $child
+            snap_wait_bgsave_done
+            r config set rdb-key-save-delay 0
+            assert_equal err [s rdb_last_bgsave_status]
+            wait_for_condition 50 100 {[count_log_message 0 "INFO OUTPUT"] >= 1} else { fail "no crash report from the child" }
+            # the whole report, not the reduced one of a handler that faulted again
+            assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
+            assert {[count_log_message 0 "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped"] >= 1}
+            assert_equal $keyspace0 [count_log_message 0 "# Keyspace"]
+            # the stock child has the keyspace mapped and prints it
+            r config set bgsave-hybrid no
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 100 50 {[s rdb_bgsave_in_progress] == 1} else { fail "stock save not started" }
+            exec kill -SEGV [get_child_pid 0]
+            wait_for_condition 300 100 {[s rdb_bgsave_in_progress] == 0} else { fail "stock save did not end" }
+            r config set rdb-key-save-delay 0
+            r config set bgsave-hybrid yes
+            wait_for_condition 50 100 {[count_log_message 0 "# Keyspace"] == $keyspace0 + 1} else { fail "the stock child's report has no Keyspace section" }
+            assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
+            set digest [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+        }
+
         test {Hybrid BGSAVE harness: ten saves aborted by a killed child, then one that completes, reload equal} {
             snap_populate_race 0 1
             for {set k 0} {$k < 10} {incr k} {
@@ -1338,6 +1380,124 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
+        test {Hybrid BGSAVE harness: a key created at the address of one deleted during the save (address reuse) reloads with the fork-instant key} {
+            r flushall
+            r config set rdbcompression no
+            for {set i 0} {$i < 3000} {incr i} { r set ar:$i [string repeat x 40] }
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 1500
+            r bgsave
+            snap_wait_save_started
+            # A key the scan already passed is freed at once on DEL and its
+            # slot is the first the allocator hands out again for the same
+            # size; a key still owed is retained until its bucket is scanned,
+            # so its address cannot come back. Scan order is bucket order, so
+            # walking the keys in creation order meets both kinds.
+            set reused 0
+            for {set i 0} {$i < 3000 && $reused == 0} {incr i} {
+                set old [snap_addr_of ar:$i]
+                r del ar:$i
+                r set nw:$i [string repeat y 40]
+                if {[snap_addr_of nw:$i] eq $old && [s snap_save_in_progress] == 1} { set reused 1 }
+            }
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 1 $reused
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            r config set rdbcompression yes
+            snap_assert_placement_clean
+        }
+
+        test {Hybrid BGSAVE harness: read commands that write the value in place (PFCOUNT cache, XREADGROUP consumer state) during the save keep the fork instant} {
+            r flushall
+            for {set i 0} {$i < 300} {incr i} { r pfadd hll:$i a$i b$i c$i d$i }
+            set big {}
+            for {set j 0} {$j < 3000} {incr j} { lappend big e$j }
+            r pfadd hlldense {*}$big
+            for {set i 0} {$i < 100} {incr i} {
+                r xadd st:$i * f v
+                r xadd st:$i * f w
+                r xgroup create st:$i g 0
+            }
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 5000
+            r bgsave
+            snap_wait_save_started
+            for {set i 0} {$i < 300} {incr i} { r pfcount hll:$i }
+            r pfcount hlldense
+            for {set i 0} {$i < 100} {incr i} { r xreadgroup GROUP g c1 COUNT 1 STREAMS st:$i > }
+            # the reads changed the live values (cached cardinalities, pending entries)
+            assert {[debug_digest] ne $digest}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            snap_assert_placement_clean
+        }
+
+        test {Hybrid BGSAVE harness: a child killed after it started writing leaves the previous dump untouched and loadable} {
+            r flushall
+            r config set rdbcompression no
+            populate 20000 fp: 60
+            set ref [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            set dir [lindex [r config get dir] 1]
+            set dump [file join $dir [lindex [r config get dbfilename] 1]]
+            set md5 [lindex [exec md5sum $dump] 0]
+            populate 20000 fq: 60
+            r config set rdb-key-save-delay 200
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            set tmp [file join $dir temp-$child.rdb]
+            wait_for_condition 100 50 {[file exists $tmp] && [file size $tmp] > 100000} else { fail "the child wrote nothing" }
+            exec kill -9 $child
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal err [s rdb_last_bgsave_status]
+            assert_equal $md5 [lindex [exec md5sum $dump] 0]
+            wait_for_condition 50 100 {![file exists $tmp]} else { fail "temp file left behind" }
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            r config set rdbcompression yes
+        }
+
+        test {Hybrid BGSAVE harness: FLUSHALL while the scan thread waits at the queue bound (child stopped) returns at once and the next save works} {
+            r flushall
+            r config set rdbcompression no
+            populate 60000 cb: 60
+            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set rdb-key-save-delay 20
+            r bgsave
+            snap_wait_save_started
+            set child [get_child_pid 0]
+            exec kill -STOP $child
+            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            after 200   ;# the scan thread is in its bound wait now
+            set t0 [clock milliseconds]
+            r flushall
+            set dt [expr {[clock milliseconds] - $t0}]
+            exec kill -CONT $child
+            r config set rdb-key-save-delay 0
+            r config set bgsave-hybrid-max-queued-bytes 100mb
+            assert {$dt < 3000}
+            snap_wait_bgsave_done
+            assert_equal 0 [r dbsize]
+            populate 1000 cc: 10
+            set digest [debug_digest]
+            r bgsave
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            r config set rdbcompression yes
+        }
+
         test {Hybrid BGSAVE harness: SHUTDOWN NOSAVE during a save exits cleanly} {
             start_server {overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
                 set pid [srv 0 pid]
@@ -1348,6 +1508,33 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
                 catch {r shutdown nosave}
                 wait_for_condition 100 50 {![process_is_alive $pid]} else { fail "server did not exit" }
                 assert_equal 0 [count_log_message 0 "crashed by signal"]
+            }
+        }
+
+        test {Hybrid BGSAVE harness: SHUTDOWN NOSAVE while the scan thread waits at the queue bound (child stopped) exits cleanly} {
+            start_server {overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+                set pid [srv 0 pid]
+                r config set rdbcompression no
+                populate 60000 sb: 60
+                r config set bgsave-hybrid-max-queued-bytes 1mb
+                r config set rdb-key-save-delay 20
+                r bgsave
+                snap_wait_save_started
+                set child [get_child_pid 0]
+                exec kill -STOP $child
+                wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+                after 200
+                # The stopped child holds this connection's socket open (a fork
+                # child inherits the client sockets), so a reply would never
+                # come: send SHUTDOWN without waiting for one.
+                set rd [redis_deferring_client]
+                $rd shutdown nosave
+                wait_for_condition 100 50 {![process_is_alive $pid]} else { exec kill -CONT $child; fail "server did not exit" }
+                assert_equal 0 [count_log_message 0 "crashed by signal"]
+                # the stopped child is an orphan with a pending SIGUSR1: let it go
+                catch {exec kill -CONT $child}
+                wait_for_condition 100 50 {![process_is_alive $child]} else { catch {exec kill -9 $child}; fail "child did not exit" }
+                catch {$rd close}
             }
         }
     }

@@ -1784,3 +1784,58 @@ momentarily empty but the parent reports a small backlog of 1 MB or more, the ch
 - Latency unchanged: worst PING 9-20 ms (the fork stall, the 19.7 was the post-populate cell), worst write
   15.5-17.6 ms.
 
+## Run 31 (2026-10-01): three-way, stock upstream vs the two-channel hybrid vs Valkey forkless, mixed1m and small at 4 GB, c7i.4xlarge
+
+Raw: `run31.csv`, driver `~/run31.sh`. `up` = upstream 0d6266f2d (`~/redis-up`), `hybrid` = bfaa21174 (`~/redis-2ch`, two
+channels, 100 MB bound, no spool, the defaults), `valkey-forkless` = Valkey 06d35aca6 `--forkless-infrastructure-enabled yes
+--bgsave-default-method forkless`. mixed1m scale 16 and small scale 13.5 (about 4 GB each), rates 0 / 20k / 50k at HOT=1.0,
+2 reps interleaved per cell, one host and day. Ranges are rep a / rep b (one value when they agree within 0.05).
+"extra" = peak (parent RSS + child private dirty) minus the parent's RSS before the save. Run 17 was the previous three-way
+on mixed1m (hybrid then with the 128 MB single FIFO); run 12 the previous one on small.
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | idle | stock upstream | 39.8 / 45.8 * | 29 / 48 | 1 / 4 | 1 / 4 | 0.6 / 0.7 | 0.0 | 39.6 / 45.6 | 26.1 / 47.0 | - | - | - | - | 0 |
+| mixed1m | idle | hybrid (two channels) | 25.8 / 26.3 | 14 / 14 | 67 / 75 | 3 / 8 | 0.3 / 0.4 | 19.3 / 19.7 | 24.7 / 24.8 | 10.5 / 11.6 | - | - | - | - | 0 |
+| mixed1m | idle | Valkey forkless | 49.7 / 53.7 | 0 | 0 | 0 | 11.4 / 12.1 | 41.2 / 45.1 | 0.0 | 2.1 / 2.6 | - | - | - | - | 0 |
+| mixed1m | 20k | stock upstream | 44.4 / 46.0 | 29 / 30 | 2532 / 2573 | 2531 / 2573 | 10.2 / 10.4 | 0.0 | 44.3 / 45.9 | 29.9 / 30.7 | 0.52 | 30 / 31 | 19997 | 0 | 0 |
+| mixed1m | 20k | hybrid (two channels) | 21.9 / 25.2 | 15 / 15 | 875 / 939 | 835 / 920 | 5.4 / 6.1 | 19.8 / 20.2 | 21.7 / 24.9 | 11.3 / 13.5 | 0.54 | 16 / 16 | 19999 | 0 | 0 |
+| mixed1m | 20k | Valkey forkless | 44.9 / 49.6 | 0 | 3 | 0 | 13.8 / 14.6 | 41.5 / 46.4 | 0.0 | 1.9 | 1.57 | 20665 / 22597 | 15269 / 15530 | 6 / 7 | 9 |
+| mixed1m | 50k | stock upstream | 43.6 / 45.0 | 31 / 31 | 3256 / 3271 | 3254 / 3269 | 15.2 / 17.4 | 0.0 | 43.4 / 44.8 | 27.0 / 29.7 | 0.34 / 0.60 | 32 / 33 | 49990 | 0 | 0 |
+| mixed1m | 50k | hybrid (two channels) | 25.1 / 25.5 | 15 / 15 | 1552 / 1572 | 1511 / 1518 | 9.2 / 10.8 | 20.6 / 21.0 | 24.9 / 25.2 | 12.6 / 13.6 | 0.46 / 0.63 | 18 | 49998 | 0 | 0 |
+| mixed1m | 50k | Valkey forkless | 45.3 / 49.5 | 0 | 8 | 0 | 17.9 / 19.5 | 44.4 / 48.6 | 0.0 | 1.5 / 1.7 | 1.41 | 22335 / 23892 | 37340 / 38458 | 10 | 16 |
+| small | idle | stock upstream | 34.8 / 36.3 * | 30 / 48 | 1 / 4 | 1 / 4 | 0.5 | 0.0 | 34.7 / 36.2 | 27.9 / 46.6 | - | - | - | - | 0 |
+| small | idle | hybrid (two channels) | 30.8 / 33.2 | 2 | 2 | 1 | 0.3 / 0.4 | 30.6 / 33.0 | 3.0 / 3.0 | 1.0 / 1.7 | - | - | - | - | 0 |
+| small | idle | Valkey forkless | 35.0 / 38.1 | 0 | 0 / 1 | 0 | 11.6 | 34.1 / 37.4 | 0.0 | 1.9 / 2.1 | - | - | - | - | 0 |
+| small | 20k | stock upstream | 33.6 / 36.0 | 31 | 2327 / 2406 | 2330 / 2407 | 7.1 / 7.6 | 0.0 | 33.5 / 35.9 | 29.2 / 30.0 | 0.51 | 32 / 32 | 19995 | 0 | 0 |
+| small | 20k | hybrid (two channels) | 32.0 / 32.2 | 2 | 8 | 1 | 6.6 / 6.8 | 31.8 / 32.1 | 3.3 | 1.1 / 1.1 | 0.54 | 2 / 3 | 19999 / 20000 | 0 | 0 |
+| small | 20k | Valkey forkless | 44.9 / 46.8 | 0 | 6 / 11 | 0 | 17.3 / 17.7 | 40.9 / 42.5 | 0.0 | 1.8 / 2.1 | 3.44 / 3.52 | 7 / 7 | 19983 / 19990 | 0 | 2 |
+| small | 50k | stock upstream | 34.7 / 36.1 | 32 / 33 | 3287 / 3314 | 3288 / 3315 | 14.8 / 15.1 | 0.0 | 34.6 / 36.0 | 32.5 / 32.7 | 0.35 | 34 / 34 | 49986 | 0 | 0 |
+| small | 50k | hybrid (two channels) | 30.6 / 31.0 | 2 | 7 | 1 | 12.2 / 13.6 | 30.3 / 30.8 | 3.1 | 1.6 / 1.6 | 0.34 / 0.41 | 3 / 4 | 49999 | 0 | 0 |
+| small | 50k | Valkey forkless | 42.6 / 45.1 | 0 | 21 | 0 | 26.6 / 28.0 | 41.3 / 42.9 | 0.0 | 1.6 | 1.29 / 1.43 | 4 / 6 | 49998 / 49999 | 0 | 5 |
+
+\* first cell of the dataset, right after the live populate (slower for every binary; on mixed1m the layout also puts the
+big hashes last in scan order, see the run 22 correction).
+
+### Reading the run
+
+- **mixed1m: the hybrid saves in 22-26 s at every write rate; stock needs 40-46, forkless 45-54.** Idle 25.8-26.3 against
+  39.8 (stock, from cache) and 49.7-53.7; 20k 21.9-25.2 against 44.4-46.0 and 44.9-49.6; 50k 25.2-25.5 against 43.6-45.0
+  and 45.3-49.5. Run 17's hybrid was 26-29 idle and 38-41 under writes: the two channels took the under-writes cells from
+  "10-15% better than stock" to "about half of stock".
+- **Memory under writes: the hybrid copies the hashes only.** Extra 0.88-1.57 GB (CoW 0.84-1.52 GB plus 64-89 MB of queue)
+  against stock's 2.5-3.3 GB (CoW of the whole dataset) and forkless's 3-8 MB. Idle the hybrid holds 64-75 MB (the queue,
+  released at the end), stock 1-4 MB, forkless 0.
+- **Latency: the hybrid's fork stall is 14-15 ms against stock's 27-31**, and its worst write is that stall (16-18 ms) where
+  stock's is 30-33 ms. Forkless has no stall and 1.5-2.6 ms worst PING, but a write that lands on the hash being serialized
+  waits for the whole hash: worst writes of 20.7-23.9 s, 9-16 clients blocked at the peak, 6-10 stalled seconds per save
+  (the p99 of 1.4-1.6 ms hides it; stock and hybrid p99 are 0.34-0.63 ms).
+- **CPU: forkless pays with the main thread.** Its main thread spends 11-19 CPU-seconds per save (serialization and
+  copy-on-write in process) against the hybrid's 0.3-10.8 and stock's 0.6-17.4, which are the write load itself; the hybrid's
+  scan thread adds 18-21 s and its child 21-25 s, both off the main thread, where stock's child is 40-46 s.
+- **small: the hybrid saves in 30.3-33.2 s, stock 33.6-36.3, forkless 35.0-46.8.** Here the child has nothing to do (3 s of
+  CPU) and the save is the scan thread's serialization, 30-33 s against stock's single child's 34-36; memory is 7-8 MB extra
+  against stock's 2.3-3.3 GB at 20k/50k; the fork stall is 1.6 ms against 30-33 (a keyspace with no fork-class values has
+  almost no page tables for the child to copy); worst write 2.0-4.3 ms against 32-34. Forkless is 35-47 s, with a main
+  thread at 11.6-28.0 CPU-seconds and 1.3-3.5 ms p99 writes; 2-5 clients blocked at the peak even here.
+

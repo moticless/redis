@@ -1747,6 +1747,13 @@ void pfcountCommand(client *c) {
         addReply(c,shared.czero);
     } else {
         if (isHLLObjectOrReply(c,o) != C_OK) return;
+        /* The cache update below writes the value in place. During a hybrid
+         * BGSAVE a key the scan has not reached yet is a frozen original the
+         * scan thread reads: take it through the write funnel first (a write
+         * lookup clones it into the snapshot overlay), as every write command
+         * does. The read lookup above already settled expiry, so the key is
+         * there either way. */
+        if (snapKvobjIsFrozenOriginal(c->db, o)) o = lookupKeyWrite(c->db, c->argv[1]);
         o = dbUnshareStringValue(c->db,c->argv[1],o);
 
         /* Check if the cached cardinality is valid. */

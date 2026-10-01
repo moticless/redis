@@ -2342,9 +2342,21 @@ void logServerInfo(void) {
     sds infostring, clients;
     serverLogRaw(LL_WARNING|LL_RAW, "\n------ INFO OUTPUT ------\n");
     int all = 0, everything = 0;
-    robj *argv[1];
-    argv[0] = createStringObject("all", strlen("all"));
-    dict *section_dict = genInfoSectionDict(argv, 1, NULL, &all, &everything);
+    robj *argv[16];
+    int argc = 0;
+    if (snapInHybridChild()) {
+        /* The keyspace kvstores live in the DONTFORK arena, which is not
+         * mapped in the hybrid save child: the memory, keyspace, keysizes and
+         * hotkeys sections would fault inside this handler and leave the
+         * reduced report (TASK-1.26). */
+        serverLogRaw(LL_WARNING|LL_RAW, "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n");
+        char *keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
+                        "cpu", "module_list", "errorstats", "cluster", NULL};
+        for (int i = 0; keep[i]; i++) argv[argc++] = createStringObject(keep[i], strlen(keep[i]));
+    } else {
+        argv[argc++] = createStringObject("all", strlen("all"));
+    }
+    dict *section_dict = genInfoSectionDict(argv, argc, NULL, &all, &everything);
     infostring = genRedisInfoString(section_dict, all, everything);
     if (server.cluster_enabled){
         infostring = genClusterDebugString(infostring);
@@ -2356,7 +2368,7 @@ void logServerInfo(void) {
     sdsfree(infostring);
     sdsfree(clients);
     releaseInfoSectionDict(section_dict);
-    decrRefCount(argv[0]);
+    for (int i = 0; i < argc; i++) decrRefCount(argv[i]);
 }
 
 /* Log certain config values, which can be used for debugging */
@@ -2517,6 +2529,10 @@ static void killMainThread(void) {
  * Currently Redis does this only on crash (for instance on SIGSEGV) in order
  * to perform a fast memory check without other threads messing with memory. */
 void killThreads(void) {
+    /* A fork child has exactly one thread: the parent's pthread handles are
+     * stale here and pthread_cancel on them faulted inside the crash handler
+     * (the hybrid save child, TASK-1.26), which left the reduced report. */
+    if (server.in_fork_child) return;
     killMainThread();
     bioKillThreads();
     killIOThreads();
