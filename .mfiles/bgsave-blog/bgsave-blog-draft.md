@@ -442,7 +442,8 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   preamble off it still takes the stock fork path. Disk-based and diskless full sync run through the
   hybrid (section 6); functions-only and slot-migration snapshots still fork the stock child.
 - **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
-- **FLUSHALL and DEBUG RELOAD** during a hybrid save abort it, as stock kills its child there.
+- **FLUSHALL and DEBUG RELOAD** during a hybrid BGSAVE abort it, as stock kills its child there;
+  during a hybrid AOF rewrite they hand the dbs to the rewrite, which finishes, as stock's AOF child does.
   FLUSHDB hands the flushed db's keyspace to the save and SWAPDB just moves it to the other db id,
   so both keep the save running (Valkey's forkless save cancels on FLUSHDB).
 - **The module opt-in flag** is implemented (fallback to the fork child, INFO naming the

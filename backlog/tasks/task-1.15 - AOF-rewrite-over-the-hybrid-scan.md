@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-09-20 17:22'
-updated_date: '2026-10-01 16:57'
+updated_date: '2026-10-01 17:26'
 labels:
   - bgsave
   - persistence
@@ -58,4 +58,6 @@ Tests: harness race workload with BGREWRITEAOF in both preamble modes, load the 
 Stage 1 verified and committed (2026-10-01): unit/snapshot feature on and stock all pass; unit/aofrw, integration/aof and integration/aof-multi-part pass with --config bgsave-hybrid yes (AC3, AC6); the harness test covers the killed-child abort with the manifest intact and the next rewrite succeeding (AC5). AC1 is met for the preamble-on half; AC1's preamble-off half, AC2 and AC4 are stage 2 (AOF command form from the scan thread), left for a later session with the plan of record above.
 
 Bug found by the full feature-on suite (unit/wait 'WAITAOF local if AOFRW was postponed'): killAppendOnlyChild (appendonly no, postponed rewrite, shutdown) waits for the child and resets the child state without any done handler, so the hybrid rewrite's save object stayed behind and the next BGSAVE asserted snap_save == NULL in snapSaveCreate. Fixed by calling snapSaveChildDone after the waitpid there; regression test 'BGREWRITEAOF through the hybrid killed by appendonly no'. unit/wait, the three AOF suites and unit/snapshot pass with the feature on; the full suite and TSan are rerunning on the fixed head.
+
+FLUSHALL semantic (2026-10-01 evening): emptyData(-1) aborted every hybrid save and killed the child; for an AOF rewrite that is a behavior change from stock (which keeps its AOF child; the FLUSHALL lands in the INCR file) and each such kill counted as a failed rewrite, feeding aofRewriteLimited (three failures => retries delayed by minutes), which is how the full suite's aof-multi-part 'temporary INCR AOF' test came to wait 50 s for a retry. Now emptyData skips the abort when snapSaveIsAofRewrite(): every db detaches to the running rewrite as FLUSHDB does and the rewrite completes with the fork-instant data. Test added. The full suite and the sanitizers are rerunning on the fixed head.
 <!-- SECTION:NOTES:END -->

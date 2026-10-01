@@ -356,7 +356,7 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
 4. **Class-change safety.** A SNAP_NOFORK value that becomes SNAP_FORK during a save is cloned into
    SNAP_FORK memory; its fork-instant SNAP_NOFORK original is what the bg serializes. Never let a
    SNAP_FORK value sit in the SNAP_NOFORK arena (the fork could not read it).
-5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save. (Since TASK-1.24, 2026-10-01: only FLUSHALL, DEBUG RELOAD/LOADAOF and a full-sync load abort; FLUSHDB detaches the db, SWAPDB needs nothing, see §4.)
+5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save. (Since TASK-1.24, 2026-10-01: only FLUSHALL, DEBUG RELOAD/LOADAOF and a full-sync load abort a BGSAVE, and since TASK-1.15 stage 1 they detach every db of a hybrid AOF rewrite instead, which then finishes with the fork-instant data as stock's AOF child does; FLUSHDB detaches the db, SWAPDB needs nothing, see §4.)
 6. **Memory bound.** Clones + preserved originals for still-owed slots are bounded by
    write_rate x save_duration. Add a soft watermark (backpressure the scan) and a hard watermark that
    ABORTS the save rather than stalling clients.
