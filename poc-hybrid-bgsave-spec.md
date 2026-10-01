@@ -279,6 +279,21 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
 - Diskless full sync: the fork writes the replica socket instead of a file. AOF rewrite: same scan,
   AOF encoders.
 
+- **Spool file instead of the pipe for the bulk (TASK-1.30, 2026-10-01).** Run 22 showed the two halves
+  of a mixed1m save running in series: the child cannot read the pipe while it is inside a 90 MB hash,
+  the scan thread blocks after 16 MB, and whichever side starts first finishes before the other begins
+  (35-42 s against a 24 s overlap). With `bgsave-hybrid-spool yes` (default) the scan thread appends its
+  BUFFER messages (header + payload, the same framing) to an unlinked `temp-snap-<pid>.spool` in the
+  working directory with blocking `write()`: no queue, no bound, no poll; the page cache holds it and
+  disk space bounds it. KVOBJ, END and ABORT keep the pipe and the queue above, which now carries only
+  big-value headers. The child drains the spool from its own offset with `pread()` whenever a complete
+  message is there (a reader may see a partially written one: it retries from the same offset), polls
+  the pipe for 5 ms when the spool is caught up, serializes KVOBJ messages as they arrive, and after END
+  drains the spool to its end. Both descriptors are opened before the fork and the name is unlinked at
+  once, so a crash of either side leaves nothing behind. SELECTDB/RESIZEDB/SLOT_INFO tracking is
+  unchanged (the messages carry their db and slot). INFO: `snap_save_spool_bytes`,
+  `snap_last_save_spool_bytes`. If the file cannot be created the pipe carries everything, as before.
+
 ## 7. Correctness invariants (worst-first)
 1. **Total clone-on-write for owed keys.** A bg thread reads LIVE parent memory for every kvobj header
    and every SNAP_NOFORK value; that read is correct only if the parent never writes a fork-instant
@@ -683,7 +698,7 @@ big values and owns the RDB. The split of responsibilities differs:
 | Write to an unsaved small key | pin: retain by refcount (immutable strings), type Dup copy, or pre-encoded bytes; memory held until the helper reaches the key (evicted keys jump the queue); two budgets, abort when exceeded | serialize the bucket's chain into the queue, then write in place; retention only for buckets inside the window being read |
 | "Already saved" | 2-bit alternating round in the kvobj header (took 2 of the 8 module metadata classes), recovery mode after a failed save | per-save bucket bitmap plus window position; nothing outlives the save |
 | Thread sync | one mutex and condvar; each side publishes the one object it reads; the main thread waits if the helper is reading that object | the main thread never waits; the scan thread waits for the open write section at each window boundary |
-| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | one pipe parent to child, 1 MB, fed from a bounded in-memory queue on the scan thread (non-blocking writes); whole 64 KB buffers or header copies; `SELECTDB` only on change |
+| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | one pipe parent to child, 1 MB, fed from a bounded in-memory queue on the scan thread (non-blocking writes) for big-value headers, END and ABORT; the bulk (64 KB buffers of small values) goes to an unlinked spool file the child drains between big values (TASK-1.30), so the two halves overlap without memory; `SELECTDB` only on change |
 | Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
 | Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
 | Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB only; diskless sync and AOF rewrite are M2 |

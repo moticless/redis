@@ -1,12 +1,14 @@
 ---
-id: DRAFT-1
+id: TASK-1.30
 title: >-
   Spool the scan thread's output to a file instead of the pipe, so the child's
   big values and the scan's small values overlap (run 22: 35-42 s -> about 24 s
   on mixed1m)
-status: Draft
-assignee: []
+status: In Progress
+assignee:
+  - '@Claude'
 created_date: '2026-10-01 06:30'
+updated_date: '2026-10-01 06:35'
 labels:
   - hybrid-bgsave
   - performance
@@ -39,3 +41,9 @@ Expected: mixed1m idle about 24 s (max of scan 19.5 and child 21), under writes 
 - [ ] #4 Race harness, unit/snapshot both modes, TSan and ASan clean; abort, child killed and FLUSHDB-detach paths unlink the spool
 - [ ] #5 Spec section 6 (channel) and the comparison table describe the spool; redis.conf documents the spool directory and the removed or narrowed queue bound
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+Approved by the user 2026-10-01 ('do it'). 1. Spool file: parent creates `<dir>/temp-snap-<pid>.spool` at save start (O_RDWR|O_CREAT|O_EXCL), opens a second read-only fd for the child, unlinks the name at once (both fds stay valid, nothing to clean on a crash); the child inherits the read fd, the scan thread owns the write fd. Fallback to the pipe for everything when the file cannot be created. 2. Scan thread: BUFFER messages (staging buffers, header + payload as today) go to the spool with blocking write(); KVOBJ/END/ABORT keep the pipe and the existing outbound queue (now low-volume). Main-thread emissions forwarded at window boundaries follow the same split. 3. Child: between pipe messages, read the spool from its offset and write the chunks to the output through the same message parser (SELECTDB/RESIZEDB/SLOT_INFO tracking unchanged); poll the pipe with a short timeout when the spool is at EOF-so-far; on END drain the spool to its end, then finish; on ABORT stop. 4. INFO: snap_save_spool_bytes (written by the scan thread); queued bytes keep describing the pipe queue. Config `bgsave-hybrid-spool` yes|no (default yes) for the A/B and for hosts without a writable dir. 5. Tests: spool used (INFO > 0, file unlinked), abort and killed child leave no file, diskless sync through the spool, FLUSHDB-detach unaffected. 6. Spec section 6 and comparison table, redis.conf. 7. Measure on the host: mixed1m idle/20k and small, spool vs no-spool, against run 21/22.
+<!-- SECTION:PLAN:END -->

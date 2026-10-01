@@ -2592,6 +2592,7 @@ struct redisServer {
     size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
     size_t bgsave_hybrid_max_retained_bytes; /* Hybrid save aborts when the overlay retains more than this (0 = no limit). */
     size_t bgsave_hybrid_max_queued_bytes;   /* Scan thread waits for the child past this much queued output (0 = no bound). */
+    int bgsave_hybrid_spool;                 /* Scan thread spools its output to an unlinked file in dir (default yes). */
     long long stat_snap_hard_mark_aborts;    /* Hybrid saves aborted at the retained-bytes hard mark. */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;

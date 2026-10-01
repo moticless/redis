@@ -39,6 +39,7 @@ for cfg in ${CFGS:-base hybrid}; do
     base)            start base "$BASE" ;;
     up)              start up "$UP" ;;
     hybrid)          start hybrid "$HYB" --bgsave-hybrid yes ;;
+    hybrid-nospool)  start hybrid-nospool "$HYB" --bgsave-hybrid yes --bgsave-hybrid-spool no ;;   # TASK-1.30 A/B: pipe + queue only
     hybrid-q16)      start hybrid-q16 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 16mb ;;
     hybrid-q2)       start hybrid-q2 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 2mb ;;
     hybrid-1ch)      start hybrid-1ch "$HYB" --bgsave-hybrid yes --repl-rdb-channel no ;;   # diskless sync on one connection (parent relays the child's pipe)
