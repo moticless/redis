@@ -1465,3 +1465,45 @@ bound at 128 MB; this run replaces their footnote. Values as rep a / rep b.
   against 1.45-1.50 GB.
 - The child wall-time gap under writes (child CPU 22-25 s inside a 37-43 s save) is unchanged from run 17 and still the
   open observation.
+
+## Run 22 (2026-10-01): probing the child wall-time gap, mixed1m at 4 GB, idle and 20k writes/s
+
+Raw: `run22-probe-samples.txt` (one line per 0.5 s: child process state, utime+stime, schedstat run/wait, wchan;
+scan thread state, schedstat, wchan; INFO queue, keys and bytes counters), driver `~/probe.sh` + `~/sampler.sh` on the
+host, same c7i.4xlarge and binaries as run 21, hybrid only, `run.sh ~/probe.csv 0,20000 mixed1m 16 1`.
+
+| cell | wall s | child cpu s | child run-queue wait | scan thread cpu s | child sleeping (pipe_read) | scan sleeping (poll at the 16 MB bound) |
+|---|---|---|---|---|---|---|
+| idle (save 0) | 35.4 | 20.9 | 0.00 s | 19.5 | 23 of 70 samples | 33 of 70 samples |
+| idle (save 1) | 36.4 | 21.5 | 0.00 s | 19.5 | 21 of 72 | 31 of 72 |
+| 20k writes/s | 42.1 | 23.9 | 0.00 s | 19.5 | 33 of 83 | 44 of 83 |
+
+Timeline, idle: t = 0-14 s the child sleeps in `pipe_read` about half the time while the scan thread serializes small
+values at about 1M keys/s (14M of 19.2M keys, 820 MB sent); the first big hash reaches the child at t = 15 s (keys_fork
+3) because the 24 hashes sit where scan order puts them; t = 15-35 s the child serializes the hashes (keys_fork 3 -> 24,
+about 0.85 s each) and the scan thread sleeps in poll with the queue pinned at 16 MB, finishing its last 5M keys only as
+the child drains between hashes. Wall = scan-bound phase (14 s) + child-bound phase (21 s).
+
+Timeline, 20k writes/s: t = 0-25 s the child is running flat out and the scan thread is parked after 195,471 keys
+(bytes sent stuck at 12 MB, queue 11 -> 49 MB: the scan queue at its 16 MB bound plus the main-thread queue of emitted
+buckets, which is not bounded). The child's work is the 24 hashes, delivered at once by the main thread: the first HSET
+on each hash during the save emits it ahead (a KVOBJ header copy), so the child gets all the big values up front. From
+t = 25 s the hashes are done, the child sleeps in `pipe_read` and the scan thread serializes the remaining 19M keys in
+17 s. Wall = child-bound phase (25 s) + scan-bound phase (17 s). Neither side ever waits on the run queue; neither side
+page-faults (child minor faults 5-167 per save).
+
+### Reading the run
+
+- **The gap is serialization of the two halves, not a stall inside either.** The scan thread needs 19.5 s and the child
+  21-24 s; a full overlap would give a 24 s save against 35-42 today and 40-46 for stock. The 16 MB queue is what
+  prevents it: the child cannot read the pipe while it is inside a 90 MB hash, so the scan thread blocks after 16 MB.
+  Run 17's 26-29 s at the 128 MB bound was the partial overlap that bound bought; run 19 measured the same curve.
+- **Under writes the main thread hands the child every big value at the start** (the first write to each hash emits it),
+  so the child-bound phase comes first and the scan-bound phase after; the total is the same sum.
+- **A bigger queue is the wrong fix**: holding 1 GB of scan output in anonymous parent memory to hide 21 s of hashing.
+  Two designs give the overlap without that memory: (1) the scan thread spools its output to a file instead of the pipe
+  (a spool in the save's directory; page cache, reclaimable, no parent memory, no bound, no poll), and the child copies
+  spool -> RDB file or socket between big values and at the end, which also lets the child serialize the big values
+  first; (2) a per-db index of SNAP_FORK values maintained at placement time, so the child can start on the big values
+  at the fork instant instead of waiting for scan order. (1) alone gives the overlap; (2) additionally removes the
+  dependence on scan order and makes the child's part start at t = 0 in the idle case. Proposed as a task.
