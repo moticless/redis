@@ -1507,6 +1507,20 @@ page-faults (child minor faults 5-167 per save).
   first; (2) a per-db index of SNAP_FORK values maintained at placement time, so the child can start on the big values
   at the fork instant instead of waiting for scan order. (1) alone gives the overlap; (2) additionally removes the
   dependence on scan order and makes the child's part start at t = 0 in the idle case. Proposed as a task.
+- **Correction (2026-10-01, after run 29).** "The 24 hashes sit where scan order puts them" undersold what the probe
+  showed: the first hash at 12.5-12.8M of 19.2M keys on both saves is not where 24 uniformly hashed keys land. The
+  probe's instance was populated live (no cache yet) and its main dict was still mid-rehash from 2^24 to 2^25 when the
+  saves ran: the walker visits table 0 from `rehashidx` up and only then table 1 (snapshot.c, the window loop), and the
+  24 hashes, inserted last, were all in table 1, behind the 2/3 of the keys still in table 0. A dict loaded from the RDB
+  cache (DEBUG RELOAD, RESIZEDB hint, no rehash) spreads them evenly: measured locally with 1M strings + 24 hashes and
+  `rdb-key-save-delay`, the first hash is met at 1-8% of the scan, the 24th at 92-99%, after a live populate, after
+  DEBUG RELOAD and in a fresh process alike. Consequence: with the pipe the order never mattered (the scan parks while
+  the child is inside a hash, so wall = scan + child either way), but with the spool the idle gain depends on the child
+  getting big values early. Runs 23-29 loaded from the cache, so the hashes came at a steady rate and the child was
+  busy from the start (run 29 idle: child CPU 24.9 s of a 25.5 s save). On the probe's layout the spool alone would
+  have given about 13 + 21 = 34 s, no better than the pipe. Design (2), the per-db index of SNAP_FORK values handed to
+  the child at the fork instant, is what makes the idle case independent of scan order; under writes the main thread's
+  emit-ahead already does this.
 
 ## Run 23 (2026-10-01): spool file instead of the pipe (TASK-1.30, first version), mixed1m at 4 GB and small, c7i.4xlarge
 
@@ -1584,6 +1598,8 @@ frees the pages. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; smal
   within one rep's noise of the pipe shape (31.5 against 29.9 idle, 31.3 against 30.7 at 20k, single reps on a dataset
   whose cells spread 29-33 s in earlier runs).
 - The remaining gap to max(scan, child) is small: 21-26 s against 19-20 s of scan CPU and 21-25 s of child CPU.
+- Idle depends on the big values arriving early in scan order (see the run 22 correction): here the dataset comes
+  from the RDB cache and the 24 hashes are spread evenly, so the child is busy from the first seconds.
 
 ## Run 25 (2026-10-01): full sync through the overflow spool, mixed1m at 4 GB, c7i.4xlarge
 
