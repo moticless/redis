@@ -1322,6 +1322,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
         test {Hybrid BGSAVE harness: a crash in the hybrid child writes a full report without the keyspace sections; the stock child keeps them} {
             r flushall
             populate 20000 cr: 60
+            # the fast memory test of the crash report is not under test here
+            # and faults in sanitizer builds (ASan's shadow mappings)
+            r config set crash-memcheck-enabled no
             set keyspace0 [count_log_message 0 "# Keyspace"]
             r config set rdb-key-save-delay 300
             r bgsave
@@ -1347,6 +1350,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set bgsave-hybrid yes
             wait_for_condition 50 100 {[count_log_message 0 "# Keyspace"] == $keyspace0 + 1} else { fail "the stock child's report has no Keyspace section" }
             assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
+            r config set crash-memcheck-enabled yes
             set digest [debug_digest]
             r bgsave
             snap_wait_bgsave_done
@@ -1403,7 +1407,10 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            assert_equal 1 $reused
+            # jemalloc hands a freed slot straight back; a sanitizer build (libc
+            # malloc with a quarantine) never does, and then this only checks
+            # that the churn reloads right
+            if {[string match jemalloc* [s mem_allocator]]} { assert_equal 1 $reused }
             r debug reload nosave
             assert_equal $digest [debug_digest]
             r config set rdbcompression yes
