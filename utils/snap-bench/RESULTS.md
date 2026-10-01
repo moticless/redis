@@ -1680,3 +1680,62 @@ interleaved; small scale 13.5, rates 0 / 20k, 1 rep. Every save `ok`. "spool pea
   for both shapes across runs 23, 24 and 29), its 20k cell 31.6 against 31.8. Flagged, not established: a two-rep
   interleaved small pass would settle whether the per-buffer drain attempt costs anything on a dataset the child
   keeps up with.
+
+## Run 30 (2026-10-01): two channels and a small-first child (TASK-1.31, first build 3406f4b4c), mixed1m at 4 GB and small, c7i.4xlarge
+
+Raw: `run30.csv`, `run30s.csv` (full sync), driver `~/run30.sh`. The user's design: the scan thread feeds two pipes
+(BUFFER messages on a small channel, KVOBJ/END/ABORT on a big one), the child takes the small channel while the
+parent reports a small backlog of 1 MB or more and a big value otherwise, `bgsave-hybrid-max-queued-bytes` default
+100 MB, spool off by default. `hybrid` = that default; `hybrid-spool` = `--bgsave-hybrid-spool yes` (spool as the
+small channel's overflow past the bound, in stream order through SPOOL markers); `hybrid-q16` = the two channels
+with run 29's 16 MB bound. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates
+0 / 20k, 2 reps (`hybrid`, `hybrid-spool`); full sync (run 25 recipe) rates 0 / 20k, 1 rep, `hybrid`. Values as
+rep a / rep b. "queued peak" is oq + mq (both queues plus the main thread's emitted buckets).
+
+| dataset | rate | config | save s | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | queued peak MB | spooled MB | spool peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | hybrid | 33.2* / 26.2 | 48 / 110 | 9 / 8 | 0.5 / 0.4 | 18.9 / 19.4 | 21.1 / 24.9 | 17.3 / 12.6 | - | 54 / 100 | 0 | 0 |
+| mixed1m | 0 | hybrid-spool | 27.2 / 27.0 | 103 / 99 | 2 / 6 | 0.4 | 17.7 / 18.9 | 23.8 / 23.7 | 12.3 / 13.5 | - | 100 | 8 / 16 | 8 / 16 |
+| mixed1m | 0 | hybrid-q16 | 32.9 / 35.9 | 7 / 9 | 10 / 8 | 0.5 | 19.0 / 19.4 | 21.0 / 23.3 | 11.4 / 10.6 | - | 16 | 0 | 0 |
+| mixed1m | 20k | hybrid | 28.9 / 35.1 | 101 / 85 | 1014 / 1145 | 6.8 / 8.1 | 17.6 / 17.5 | 23.0 / 24.3 | 14.9 / 12.1 | 15.3 / 15.5 | 111 / 113 | 0 | 0 |
+| mixed1m | 20k | hybrid-spool | 21.2 / 23.3 | 95 / 97 | 815 / 874 | 5.1 / 5.6 | 17.9 / 17.9 | 21.1 / 23.1 | 13.4 / 11.5 | 16.4 / 16.1 | 106 | 119 / 183 | 119 / 71 |
+| mixed1m | 20k | hybrid-q16 | 36.4 / 39.0 | 19 / 18 | 1166 / 1212 | 8.8 / 9.1 | 19.1 / 19.2 | 21.3 / 23.8 | 11.2 / 14.6 | 15.8 / 16.3 | 28 / 30 | 0 | 0 |
+| mixed1m | 50k | hybrid | 36.5 / 33.0 | 78 / 93 | 1696 / 1655 | 15.2 / 11.1 | 19.5 / 17.5 | 23.3 / 23.2 | 15.8 / 16.5 | 16.7 / 17.5 | 133 / 131 | 0 | 0 |
+| mixed1m | 50k | hybrid-spool | 24.0 / 21.2 | 81 / 96 | 1490 / 1412 | 10.6 / 8.8 | 20.3 / 19.9 | 23.8 / 21.2 | 13.8 / 15.8 | 17.6 / 17.1 | 117 | 577 / 563 | 244 / 162 |
+| mixed1m | 50k | hybrid-q16 | 38.9 / 35.8 | 23 / 21 | 1722 / 1691 | 16.2 / 14.9 | 17.4 / 18.0 | 25.0 / 21.5 | 15.9 / 13.8 | 17.7 / 18.8 | 54 / 48 | 0 | 0 |
+| small | 0 | hybrid | 29.4* / 31.0 | 0 / 1 | 6 / 1 | 0.4 | 29.2 / 30.7 | 3.0 | 4.0 / 1.1 | - | 0 | 0 | 0 |
+| small | 0 | hybrid-spool | 31.6 / 32.3 | 1 | 1 | 0.4 | 31.4 / 32.1 | 3.0 | 0.9 | - | 0 | 0 | 0 |
+| small | 20k | hybrid | 31.1 / 31.6 | 7 | 1 | 6.5 / 6.8 | 30.8 / 31.4 | 3.2 | 1.0 / 0.9 | 2.2 / 2.5 | 99 / 101 | 0 | 0 |
+| small | 20k | hybrid-spool | 30.7 / 31.0 | 7 | 1 | 6.4 / 6.5 | 30.5 / 30.8 | 3.2 | 1.1 / 0.8 | 2.8 / 2.6 | 98 / 99 | 0 | 0 |
+| sync mixed1m | 0 | hybrid | 16.2 | 54 | 3 | 0.2 | 8.9 | 6.5 | 19.6 | - | 57 | 0 | 0 |
+| sync mixed1m | 20k | hybrid | 17.0 | 99 | 695 | 3.8 | 9.3 | 6.4 | 15.9 | 15.9 | 104 | 0 | 0 |
+
+\* first cell of the dataset, right after the live populate (run 16 pitfall): for mixed1m that layout also puts the
+24 hashes last in scan order (the run 22 correction), so it is not comparable.
+
+### Reading the run
+
+- **Idle, from the cache: the bounded two-channel shape overlaps (26.2 s against run 29's 25.4-25.6 with the spool
+  and 34.8-35.2 pipe-only)**, with the queue at its 100 MB bound and parent growth 110 MB: the child is the longer
+  side (24.9 s CPU against 19.4 of scan), so whatever the policy, the scan thread's lead accumulates up to the bound.
+  The 16 MB bound does not (32.9-35.9 s): one hash's worth of scan output, about 47 MB, has to fit.
+- **Under writes the bounded shape did NOT overlap: 28.9-36.5 s against 21.2-24.0 for the spool shape** (run 29's
+  spool: 21.4-25.7; pipe-only 39-42). Parent growth 78-101 MB says the queue hit the bound and the scan thread parked.
+  Cause (fixed as bfaa21174, run 30b): the child's rule read "small channel while the backlog is 1 MB or more" but
+  the child could only act on it when the small *pipe* was readable, and the scan thread pushes the queue into the
+  pipe only at its own enqueues (about once a millisecond, a pipe's worth each time). At every such gap the child
+  found the pipe empty and the big channel ready, and took the next big value with tens of megabytes waiting in
+  the parent's queue; with the 24 hashes handed over at the first write to each, that is the back-to-back shape of
+  run 17 again, slightly interleaved. The fix makes the child wait up to 20 ms for the pending backlog before taking
+  a big value.
+- **The spool shape is unchanged by the two channels** (21.2-27.2 s at every rate), with the spool doing more of the
+  work than in run 29 because the queue now fills to 100 MB before anything spills: 8-16 MB spooled idle, 119-183 MB
+  at 20k, 563-577 MB at 50k, footprint peak up to 244 MB (the child reads spooled segments at their place in the
+  stream, after the queued buffers that precede them, so the footprint is no longer bounded by one big value's
+  worth as in run 29).
+- **small is noise either way**: 29.4-32.3 idle and 30.7-31.6 at 20k for both configs (two reps each); nothing is
+  spooled and the queue never fills (the 98-101 MB peak at 20k is the main thread's emitted buckets, as in runs
+  24-29). This settles run 29's single-rep flag: no cost from the spool's drain attempt.
+- **Full sync unchanged**: 16.2 / 17.0 s (run 25: 16.2 / 16.9-17.0).
+- Latency as before: worst PING 10.6-17.3 ms (the fork stall), worst write 15.3-18.8 ms.
+
