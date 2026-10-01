@@ -297,26 +297,52 @@ static void protectClientReplyObjects(void) {
 /* Empty a Redis DB asynchronously. What the function does actually is to
  * create a new empty set of hash tables and scheduling the old ones for
  * lazy freeing. */
-void emptyDbAsync(redisDb *db) {
+/* Give 'db' fresh, empty structures; the old ones are returned to the caller. */
+static void dbSwapInFreshStructures(redisDb *db, kvstore **oldkeys, kvstore **oldexpires,
+                                    estore **oldsubexpires, dict **old_stream_idmp_keys, kvstore **oldblessed) {
     int slot_count_bits = 0;
     int flags = KVSTORE_ALLOCATE_DICTS_ON_DEMAND;
     if (server.cluster_enabled) {
         slot_count_bits = CLUSTER_SLOT_MASK_BITS;
         flags |= KVSTORE_FREE_EMPTY_DICTS;
     }
-    kvstore *oldkeys = db->keys, *oldexpires = db->expires;
-    estore *oldsubexpires = db->subexpires;
-    dict *old_stream_idmp_keys = db->stream_idmp_keys;
-    kvstore *oldblessed = db->blessed_keys;
+    *oldkeys = db->keys;
+    *oldexpires = db->expires;
+    *oldsubexpires = db->subexpires;
+    *old_stream_idmp_keys = db->stream_idmp_keys;
+    *oldblessed = db->blessed_keys;
     db->keys = kvstoreCreate(&kvstoreExType, &dbDictType, slot_count_bits, flags);
     db->expires = kvstoreCreate(&kvstoreBaseType, &dbExpiresDictType, slot_count_bits, flags);
     db->subexpires = estoreCreate(&subexpiresBucketsType, slot_count_bits);
     db->stream_idmp_keys = dictCreate(&objectKeyNoValueDictType);
     db->blessed_keys = blessedKvstoreCreate(slot_count_bits, flags);
+}
+
+void emptyDbAsync(redisDb *db) {
+    kvstore *oldkeys, *oldexpires, *oldblessed;
+    estore *oldsubexpires;
+    dict *old_stream_idmp_keys;
+    dbSwapInFreshStructures(db, &oldkeys, &oldexpires, &oldsubexpires, &old_stream_idmp_keys, &oldblessed);
     protectClientReplyObjects(); /* Protect client reply objects before async free. */
     /* The old blessed index is freed on the BIO thread with the other structures. */
     emptyDbDataAsync(oldkeys, oldexpires, oldsubexpires, old_stream_idmp_keys,
                      oldblessed, NULL, NULL);
+}
+
+/* FLUSHDB while a hybrid BGSAVE scans this db (TASK-1.24): the db gets fresh,
+ * empty structures at once, as the ASYNC flush does, and the fork-instant
+ * ones stay with the save, which frees them on BIO when it is done with
+ * them. Stock keeps its child alive on FLUSHDB; this keeps the save alive.
+ * Returns 1 when the save took them, 0 when the caller must empty the db. */
+int emptyDbDetachToSnapshot(redisDb *db) {
+    if (!snapSaveOwnsKvstore(db->keys)) return 0;
+    kvstore *oldkeys, *oldexpires, *oldblessed;
+    estore *oldsubexpires;
+    dict *old_stream_idmp_keys;
+    dbSwapInFreshStructures(db, &oldkeys, &oldexpires, &oldsubexpires, &old_stream_idmp_keys, &oldblessed);
+    protectClientReplyObjects();
+    serverAssert(snapSaveDetachDb(oldkeys, oldexpires, oldsubexpires, old_stream_idmp_keys, oldblessed));
+    return 1;
 }
 
 /* Empty kvstore data asynchronously. If callback is provided, invoke it from

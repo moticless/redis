@@ -392,26 +392,65 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [r dbsize]
         }
 
-        test {Hybrid BGSAVE: FLUSHDB and SWAPDB during the save abort it} {
+        test {Hybrid BGSAVE: FLUSHDB during the save empties the live db at once and the save completes with the fork-instant keys} {
+            foreach async {{} async} {
+                r flushall
+                populate_fillers 3000
+                set digest [debug_digest]
+                r config set rdb-key-save-delay 300
+                r bgsave
+                wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+                set mem_full [s used_memory]
+                r flushdb {*}$async
+                # the live db is empty for everyone right away; the save goes on
+                # over the detached fork-instant keyspace
+                assert_equal 0 [r dbsize]
+                assert_equal 1 [s snap_save_in_progress]
+                r set after:flush 1
+                assert_equal 1 [r dbsize]
+                r config set rdb-key-save-delay 0
+                wait_hybrid_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                # the detached keyspace is freed (on BIO) once the save is done with it
+                wait_for_condition 100 50 {[s lazyfree_pending_objects] == 0 && [s used_memory] < $mem_full - 100000} else {
+                    fail "flushed keyspace not released after the save"
+                }
+                r debug reload nosave
+                assert_equal $digest [debug_digest]
+                assert_equal 3000 [r dbsize]
+                assert_equal 0 [r exists after:flush]
+            }
+        }
+
+        test {Hybrid BGSAVE: SWAPDB during the save keeps the save running, keys stay under their fork-instant db} {
+            r flushall
             populate_fillers 3000
+            r select 10
+            populate 100 ten: 40
+            r select 9
+            set digest [debug_digest]
             r config set rdb-key-save-delay 300
             r bgsave
             wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
-            r flushdb
-            assert_equal 0 [s snap_save_in_progress]
-            wait_hybrid_bgsave_done
-            populate_fillers 3000
-            r bgsave
-            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
             r swapdb 9 10
-            assert_equal 0 [s snap_save_in_progress]
-            wait_hybrid_bgsave_done
-            r swapdb 9 10
-            r config set rdb-key-save-delay 0
+            assert_equal 1 [s snap_save_in_progress]
+            assert_equal 100 [r dbsize]            ;# db 9 now holds the former db 10
+            r set swapped:probe 1                  ;# a write through the swapped db reaches the right kvstore
+            r select 10
             assert_equal 3000 [r dbsize]
-            r bgsave
+            r set filler:0 [string repeat s 60]    ;# in-place write on an owed key of the swapped store
+            r select 9
+            r config set rdb-key-save-delay 0
             wait_hybrid_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
+            # the dump holds the fork instant: 3000 fillers in db 9, 100 keys in db 10
+            r debug reload nosave
+            assert_equal $digest [debug_digest]
+            assert_equal 3000 [r dbsize]
+            r select 10
+            assert_equal 100 [r dbsize]
+            r select 9
+            r flushall
         }
 
         test {Hybrid BGSAVE: disk-based full sync places values on the replica and matches the master} {
@@ -1252,6 +1291,27 @@ foreach rdb_channel {yes no} {
                 after 500
                 assert_equal 1 [s -1 sync_full]
                 assert_equal up [s master_link_status]
+                r replicaof no one
+            }
+        }
+
+        test "Hybrid diskless sync (rdb-channel $rdb_channel): a replica's own running hybrid save is aborted by the full-sync load" {
+            snap_sync_dataset
+            start_server {overrides {save "" bgsave-hybrid yes}} {
+                populate 3000 old: 40
+                r config set rdb-key-save-delay 2000
+                r bgsave
+                wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started on the replica" }
+                r replicaof $master_host $master_port
+                snap_wait_link_up
+                # the load emptied every db: the save was stopped first, as stock kills its child
+                assert_equal 0 [s snap_save_in_progress]
+                assert {[count_log_message 0 "Hybrid BGSAVE: scan aborted"] >= 1}
+                wait_for_ofs_sync $master [srv 0 client]
+                assert_equal [$master dbsize] [r dbsize]
+                assert_equal [$master debug digest] [r debug digest]
+                assert_equal 0 [r exists old:1]
+                r config set rdb-key-save-delay 0
                 r replicaof no one
             }
         }

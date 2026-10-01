@@ -7,7 +7,7 @@ status: Done
 assignee:
   - Claude
 created_date: '2026-09-26 19:52'
-updated_date: '2026-09-30 11:20'
+updated_date: '2026-10-01 05:42'
 labels:
   - hybrid-bgsave
   - performance
@@ -78,6 +78,8 @@ Out of scope: child, funnel, mq, overlay.
 2026-09-30 follow-up at the user's request (41527cab3, RESULTS.md run 16 pass 5): the queue got its own knob, bgsave-hybrid-max-queued-bytes, default 128 MB (0 = no bound); the retained limit (256 MB) keeps arming the hard mark only, so the worst case is the sum of the two instead of twice the retained limit. Measured on mixed1m interleaved against the 256 MB-bounded build: save time within noise (idle 23.8-26.8 vs 25.3-32.3 s, 20k 36.2-41.0 vs 37.0-38.4), parent memory during the save halved (113-115 vs 230-236 MB idle, 69-83 vs 162-165 under writes), used_memory +132 vs +260. redis.conf, spec section 6 and the blog's knob list document it. tcl 45/45 and C unit 164/164 on the change; TSan not rerun (config plumbing only).
 
 2026-09-30 default lowered to 16 MB at the user's decision after run 19 (RESULTS.md): the queue's only measurable benefit is the idle BGSAVE on datasets with huge fork-class values (mixed1m idle 32-38 s at 128 MB, 40-44 at 16 MB, 41-48 at 2 MB on a slower host day); under writes the bound does not matter (child wall time is the limit), on small a BGSAVE never fills it, and in full syncs (run 18) it filled to 90-150 MB for no time gain since the replica's load is the floor. 16 MB keeps about half of the idle gain for a tenth of the memory; redis.conf documents 128 MB for hundred-megabyte values. Run 17 and run 18 tables were measured at 128 MB and say so; remeasuring them at 16 MB is optional.
+
+Run 21 (2026-10-01, c7i.4xlarge, mixed1m at 4 GB, RESULTS.md): the 16 MB default remeasured against upstream on the run 17 and run 18 recipes. BGSAVE idle 36.7-37.0 s vs 39.6-43.5 stock with 17 MB extra memory (run 17 at 128 MB: 26-29 s with 136-158 MB); under 20k/50k writes 37.5-43.3 / 38.4-41.3 s vs 45.6-46.2 / 39.7-44.1, CoW 1.18-1.75 GB vs 2.56-3.26 GB, parent growth 26-51 MB; queued peak 16 MB idle, 43-48 MB at 20k, 87-90 MB at 50k (the main-thread queue of emitted buckets is bounded only by the hard mark, the 16 MB bound is the scan thread's). Full sync: 16.5-18.4 s both (replica load), hybrid child CPU 6.4-6.8 s vs 14.2-14.5, primary extra memory 0.71-0.72 GB vs 1.45-1.50 GB at 20k. The runs 17/18 footnote ('measured at 128 MB') is now answered by run 21 in RESULTS.md and the blog.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

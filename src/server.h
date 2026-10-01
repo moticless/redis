@@ -4423,6 +4423,7 @@ void scanGenericCommand(client *c, robj *o, unsigned long long cursor);
 int parseScanCursorOrReply(client *c, robj *o, unsigned long long *cursor);
 int dbAsyncDelete(redisDb *db, robj *key);
 void emptyDbAsync(redisDb *db);
+int emptyDbDetachToSnapshot(redisDb *db);
 void streamMoveIdmpKeys(dict *src, dict *dst, struct slotRangeArray *slots);
 typedef void (*lazyfreeKvsCallback)(kvstore *kvs, void *userdata);
 void emptyDbDataAsync(kvstore *keys, kvstore *expires, ebuckets hexpires,

@@ -203,8 +203,23 @@ From then on writes to it are stock writes. INFO `snap_save_side_entries` counts
 aborts the save when retained clones plus queued bytes exceed `bgsave-hybrid-max-retained-bytes`
 (default 256 MB, 0 = unlimited). Abort marks the context, joins the thread (which gives up its
 quiescence wait when it sees the abort, since the aborting command may itself hold the section
-open), kills the child, releases every side table and unfreezes. FLUSHALL, FLUSHDB, SWAPDB, SHUTDOWN
-and a killed child take the same path. The previous dump file is untouched.
+open), kills the child, releases every side table and unfreezes. FLUSHALL, DEBUG RELOAD/LOADAOF, a
+replica's full-sync load, SHUTDOWN and a killed child take the same path (stock kills its child there
+too). The previous dump file is untouched.
+
+**FLUSHDB and SWAPDB during a save do not abort it (TASK-1.24, 2026-10-01).** The save scans
+*kvstores*, indexed by the db id they had at the fork instant; the overlay hooks carry that index and
+resolve the db that owns the kvstore at call time (`snapStoreOwnerDb`), and `snapKvobjIsOwed` maps a
+db's kvstore back to its store (`snapStoreIndexOf`). So SWAPDB just moves a scanned kvstore to another
+db id: its keys are still serialized under the fork-instant id (stock and Valkey semantics), writes
+through the new id take the overlay path as before. A single-db FLUSHDB (sync or ASYNC) gives the db
+fresh, empty structures at once, as the ASYNC flush does, and hands the fork-instant ones to the save
+(`emptyDbDetachToSnapshot`, `snapSaveDetachDb`): the thread keeps walking the detached kvstore, nobody
+else can reach it, and it is freed on BIO when the store's last slot completes (`snapSaveStoreDone`).
+FLUSHDB is atomic for every client, the dump holds the fork instant, and a disk-based full sync fed by
+the save no longer fails on a FLUSHDB. The memory of a synchronously flushed db is released at the end
+of the save instead of inside the command. Dragonfly does the same (its snapshot holds a refcounted
+copy of the table array and FLUSHDB swaps fresh tables into the slice).
 
 **Other fork children (fallback).** The arena is one reserved range carrying
 `MADV_DONTFORK`. Any child that is not the hybrid save's (stock RDB save while the
@@ -284,7 +299,7 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
 4. **Class-change safety.** A SNAP_NOFORK value that becomes SNAP_FORK during a save is cloned into
    SNAP_FORK memory; its fork-instant SNAP_NOFORK original is what the bg serializes. Never let a
    SNAP_FORK value sit in the SNAP_NOFORK arena (the fork could not read it).
-5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save.
+5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save. (Since TASK-1.24, 2026-10-01: only FLUSHALL, DEBUG RELOAD/LOADAOF and a full-sync load abort; FLUSHDB detaches the db, SWAPDB needs nothing, see §4.)
 6. **Memory bound.** Clones + preserved originals for still-owed slots are bounded by
    write_rate x save_duration. Add a soft watermark (backpressure the scan) and a hard watermark that
    ABORTS the save rather than stalling clients.
@@ -780,9 +795,10 @@ contract is narrower, but the child side is stricter than stock.
    emits or clones the bucket and refreshes the handle's pointer), the same
    thing a WRITE handle does at open time.
 4. Behaviour a module can observe on the main thread during a hybrid save:
-   `RM_ResetDataset` (`emptyData`) aborts the save and kills the child (stock:
-   the child finishes the pre-flush dataset); `RM_Call` of FLUSHDB or SWAPDB
-   aborts it too (TASK-1.24 will detach the frozen kvstore instead). `RM_Fork`
+   `RM_ResetDataset` (`emptyData` of every db) aborts the save and kills the
+   child (stock: the child finishes the pre-flush dataset); `RM_Call` of
+   FLUSHDB or SWAPDB does not (TASK-1.24: the flushed db's structures stay
+   with the save, a swap moves the scanned kvstore to the other db id). `RM_Fork`
    during a save is refused by `redisFork`'s child exclusivity as in stock;
    outside a save it works and the arena is flipped forkable for that child
    (§11.z.1 item 6). `REDISMODULE_CTX_FLAGS_ACTIVE_CHILD` is set for the whole

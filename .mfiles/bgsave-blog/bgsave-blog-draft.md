@@ -255,7 +255,7 @@ hybrid on the same channel, Valkey's default fork-based sync; two reps each):
 
 Sync time is the replica's load time and the hybrid matches stock on it; what changes is what the
 primary pays while it runs: copy-on-write on the fork-class values only plus the scan thread's queue
-(60-130 MB with the 128 MB bound used for these runs, about 20 MB at the 16 MB default), a fork stall the size of those values' page tables, and stock's write latency. The
+(16 MB at the default bound, measured in run 21: 60-130 MB when the bound was 128 MB), a fork stall the size of those values' page tables, and stock's write latency. The
 replication stream buffered on the replica during a sync of this length is 23-33 MB, the number the
 spliced-stream option has to justify itself against. Valkey's fork-based sync is two to three times
 longer because it compresses the RDB and streams on one channel. Its forkless full sync, run from
@@ -357,8 +357,8 @@ with half the stall. The idle row shows what the two workers buy when the child 
 hash: the hybrid saves in 26-29 s where stock's single child needs 43 and forkless's single thread
 51-52, because the scan thread queues its output in memory instead of waiting for the child (the
 queue is the 136-158 MB of extra memory in that row, measured with the bound at 128 MB and
-released at the end; the default ships at 16 MB, which keeps about half of this gain for a tenth of
-the memory). Under writes the gain narrows to 10-15%: the child's
+released at the end; the default ships at 16 MB, where the same cells measure 37 s against 40-43
+for stock with 17 MB of extra memory, run 21). Under writes the gain narrows to 5-15%: the child's
 wall time then exceeds its CPU time by 10-15 s, for a reason not yet understood.
 
 And forkless meets the value it cannot serialize atomically. A write that lands on the hash
@@ -435,8 +435,9 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   Disk-based and diskless full sync run through the hybrid (section 6); functions-only and
   slot-migration snapshots still fork the stock child.
 - **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
-- **FLUSHDB, SWAPDB and DEBUG RELOAD** during a hybrid save abort it, as in Valkey's forkless
-  save; detaching the frozen keyspace instead is designed, not built.
+- **FLUSHALL and DEBUG RELOAD** during a hybrid save abort it, as stock kills its child there.
+  FLUSHDB hands the flushed db's keyspace to the save and SWAPDB just moves it to the other db id,
+  so both keep the save running (Valkey's forkless save cancels on FLUSHDB).
 - **The module opt-in flag** is implemented (fallback to the fork child, INFO naming the
   module, child-side guards); the bundled modules have not declared it yet, so a server
   loading JSON or Search saves through the stock child until they are rebuilt. The per-type
@@ -447,9 +448,9 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
 - **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in
   front of the pipe: on mixed1m the idle save went from 38 s (scan plus child in series) to 22-25 s
   (the child alone). The queue is memory the save holds while the child is behind, up to its own
-  bound, 16 MB by default and 128 MB for that measurement, released at the end; and under writes the gain is
-  smaller, 41 s to 36-39 s, because the child's wall time exceeds its CPU time there, which is not
-  yet understood.
+  bound, 16 MB by default and 128 MB for that measurement (at the default the idle save is 37 s, run 21),
+  released at the end; and under writes the gain is smaller, 41 s to 36-39 s, because the child's
+  wall time exceeds its CPU time there, which is not yet understood.
 
 ## 10. Conclusion
 

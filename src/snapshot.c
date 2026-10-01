@@ -424,11 +424,20 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
 }
 
 static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
+/* Overlay hook privdata of store s: the store index. The redisDb owning the
+ * store is resolved at call time (SWAPDB moves a store to another db id; a
+ * FLUSHDB leaves it with no owner), the db id in the dump is always s. */
+typedef struct snapStorePriv { int s; } snapStorePriv;
+typedef struct snapSave snapSave;
+static snapSave *snap_save;   /* defined with the save object below */
+static redisDb *snapStoreOwnerDb(snapSave *sv, int s);
 static void snapSaveRetainedSub(kvobj *orig, int value_shared);
 void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int64_t newsize);   /* db.c */
 
 void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
-    redisDb *db = privdata;
+    /* The db owning the store right now (NULL once FLUSHDB detached it: no
+     * expires/subexpires to keep in step, and no writes reach it anyway). */
+    redisDb *db = snap_save ? snapStoreOwnerDb(snap_save, ((snapStorePriv *)privdata)->s) : NULL;
     kvobj *orig = orig_;
     kvobj *kv = snapKvobjCloneHeader(orig);
     *value_shared = 0;
@@ -714,6 +723,7 @@ struct snapScanCtx {
     snapScanThreadDoneFn *thread_done;
     void (*thread_init)(void *privdata);   /* first thing on the scan thread */
     void (*window_done)(void *privdata);   /* after every window, and before thread_done */
+    void (*store_done)(void *privdata, int s);   /* main thread, when a store's last slot completed */
 };
 
 static __thread int snap_on_scan_thread = 0;
@@ -873,6 +883,10 @@ void snapScanSetWindowDone(snapScanCtx *ctx, void (*fn)(void *privdata)) {
     ctx->window_done = fn;
 }
 
+void snapScanSetStoreDone(snapScanCtx *ctx, void (*fn)(void *privdata, int s)) {
+    ctx->store_done = fn;
+}
+
 void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata)
 {
     serverAssert(!ctx->started);
@@ -997,6 +1011,7 @@ static void snapScanStoreDone(snapScanCtx *ctx, int s) {
     if (!ctx->frozen[s]) return;
     kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL);
     ctx->frozen[s] = 0;
+    if (ctx->store_done) ctx->store_done(ctx->privdata, s);
 }
 
 static void snapScanUnfreezeDict(snapScanCtx *ctx, int s, int didx) {
@@ -1314,10 +1329,21 @@ typedef struct snapDbSizes {
     int nslots;
 } snapDbSizes;
 
-typedef struct snapSave {
+/* A db flushed during the save: its fork-instant structures, kept alive for
+ * the scan and freed (on BIO, as FLUSHDB ASYNC does) when the store completes. */
+typedef struct snapFlushedDb {
+    int set;
+    kvstore *keys, *expires, *blessed;
+    void *subexpires;
+    dict *stream_idmp_keys;
+} snapFlushedDb;
+
+struct snapSave {
     snapScanCtx *scan;
-    kvstore **stores;
-    void **privs;              /* redisDb * per store */
+    kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
+    void **privs;              /* &store_priv[s] per store */
+    snapStorePriv *store_priv;
+    snapFlushedDb *flushed;    /* per store */
     int dbnum;
     int pipe_rd, pipe_wr;
     snapDbSizes *sizes;
@@ -1369,7 +1395,7 @@ typedef struct snapSave {
     int numconns;
     int rdb_pipe_write;        /* pipe shape: child's end of server.rdb_pipe_read */
     int safe_to_exit_pipe;     /* pipe shape: the child waits on it before exiting */
-} snapSave;
+};
 
 typedef struct snapQueuedMsg {
     snapMsgHdr h;
@@ -1545,20 +1571,20 @@ static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table,
  * 'key' be written in place? Emits the bucket first when the thread has not
  * reached it. */
 static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key) {
-    redisDb *db = privdata;
+    int s = ((snapStorePriv *)privdata)->s;
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (!snapBucketOwed(sv->scan, db->id, didx, d, table, idx, &pos)) {
+    if (!snapBucketOwed(sv->scan, s, didx, d, table, idx, &pos)) {
         sv->inplace_writes++;
         server.stat_snap_inplace_writes++;
         return KVSTORE_OV_INPLACE;
     }
     if (pos == SNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
-    snapSaveEmitBucket(sv, db->id, didx, d, table, idx);
-    snapScanMarkBucketEmitted(sv->scan, db->id, didx, table, idx);
+    snapSaveEmitBucket(sv, s, didx, d, table, idx);
+    snapScanMarkBucketEmitted(sv->scan, s, didx, table, idx);
     return KVSTORE_OV_INPLACE;
 }
 
@@ -1566,13 +1592,13 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
  * the frozen chain now? Yes once the walker has passed its bucket (the
  * position is stable inside the section the caller holds). */
 static int snapOverlayDrainable(void *privdata, int didx, dict *d, const void *key) {
-    redisDb *db = privdata;
+    int s = ((snapStorePriv *)privdata)->s;
     snapSave *sv = snap_save;
     if (!sv) return 1;
     int table;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    return snapBucketPosition(sv->scan, db->id, didx, d, table, idx) == SNAP_POS_BEHIND;
+    return snapBucketPosition(sv->scan, s, didx, d, table, idx) == SNAP_POS_BEHIND;
 }
 
 /* Main thread, inside a write section: apply the side-table entries whose
@@ -1593,18 +1619,75 @@ static void snapSaveDrainSideTables(void) {
 /* Side-table entries (clones, adds, tombstones) of the running save. */
 long snapSaveSideEntries(void) {
     snapSave *sv = snap_save;
-    if (!sv) return 0;
+    if (!sv || sv->aborted) return 0;
     long n = 0;
-    for (int j = 0; j < sv->dbnum; j++) n += kvstoreOverlayPending(server.db[j].keys);
+    for (int s = 0; s < sv->dbnum; s++)
+        if (sv->stores[s]) n += kvstoreOverlayPending(sv->stores[s]);
     return n;
+}
+
+/* ---- Stores versus dbs (SWAPDB, FLUSHDB during a save; TASK-1.24) ---- */
+
+/* Store index of a kvstore being scanned, -1 if the save does not own it
+ * (a keyspace created after the fork, e.g. by a FLUSHDB during the save). */
+static int snapStoreIndexOf(snapSave *sv, kvstore *kvs) {
+    for (int s = 0; s < sv->dbnum; s++)
+        if (sv->stores[s] && sv->stores[s] == kvs) return s;
+    return -1;
+}
+
+/* The db that holds store s right now, NULL when none (FLUSHDB detached it). */
+static redisDb *snapStoreOwnerDb(snapSave *sv, int s) {
+    if (!sv->stores[s]) return NULL;   /* flushed and already freed */
+    for (int j = 0; j < server.dbnum; j++)
+        if (server.db[j].keys == sv->stores[s]) return &server.db[j];
+    return NULL;
+}
+
+int snapSaveOwnsKvstore(kvstore *kvs) {
+    snapSave *sv = snap_save;
+    if (!sv || sv->aborted) return 0;
+    return snapStoreIndexOf(sv, kvs) >= 0;
+}
+
+/* FLUSHDB during a save (db.c emptyDbStructure): the db swapped in fresh,
+ * empty structures and hands its fork-instant ones to the save. The scan
+ * thread keeps walking 'keys' (the live db is already empty for everyone
+ * else); everything is freed on BIO when the store completes. Returns 1
+ * when adopted, 0 when the caller must free them itself. */
+int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed) {
+    snapSave *sv = snap_save;
+    if (!sv || sv->aborted) return 0;
+    int s = snapStoreIndexOf(sv, keys);
+    if (s < 0 || sv->flushed[s].set) return 0;
+    sv->flushed[s] = (snapFlushedDb){ 1, keys, expires, blessed, subexpires, stream_idmp_keys };
+    serverLog(LL_NOTICE, "Hybrid BGSAVE: db %d flushed during the save, its keyspace stays with the save until its slots complete", s);
+    return 1;
+}
+
+static void snapSaveFreeFlushed(snapSave *sv, int s) {
+    snapFlushedDb *f = &sv->flushed[s];
+    if (!f->set) return;
+    f->set = 0;
+    /* The store is gone for us from here on (INFO counters, store lookups). */
+    sv->stores[s] = NULL;
+    emptyDbDataAsync(f->keys, f->expires, f->subexpires, f->stream_idmp_keys, f->blessed, NULL, NULL);
+}
+
+/* Scan callback: store s has no slot left owed (completed or aborted). */
+static void snapSaveStoreDone(void *privdata, int s) {
+    snapSave *sv = privdata;
+    snapSaveFreeFlushed(sv, s);
 }
 
 int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return 0;
+    int s = snapStoreIndexOf(sv, db->keys);
+    if (s < 0) return 0;   /* a keyspace created after the fork: nothing in it is owed */
     sds key = kvobjGetKey(kv);
     int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
-    uint8_t st = snapSlotGetState(sv->scan, db->id, slot);
+    uint8_t st = snapSlotGetState(sv->scan, s, slot);
     if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) return 0;
     dict *d = kvstoreGetDict(db->keys, slot);
     if (!d) return 0;
@@ -1612,7 +1695,7 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (!snapBucketOwed(sv->scan, db->id, slot, d, table, idx, &pos)) return 0;
+    if (!snapBucketOwed(sv->scan, s, slot, d, table, idx, &pos)) return 0;
     /* Ahead and not emitted, or being read: the frozen entry itself is owed,
      * a temp-dict clone of it is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
@@ -2190,6 +2273,9 @@ static void snapSaveFree(snapSave *sv) {
     sdsfree(sv->mscratch);
     zfree(sv->stores);
     zfree(sv->privs);
+    zfree(sv->store_priv);
+    for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
+    zfree(sv->flushed);
     zfree(sv);
 }
 
@@ -2213,11 +2299,14 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
     sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
     sv->privs = zmalloc(sizeof(void *) * sv->dbnum);
+    sv->store_priv = zmalloc(sizeof(snapStorePriv) * sv->dbnum);
+    sv->flushed = zcalloc(sizeof(snapFlushedDb) * sv->dbnum);
     sv->sizes = zcalloc(sizeof(snapDbSizes) * sv->dbnum);
     for (int j = 0; j < sv->dbnum; j++) {
         redisDb *db = &server.db[j];
         sv->stores[j] = db->keys;
-        sv->privs[j] = db;
+        sv->store_priv[j].s = j;
+        sv->privs[j] = &sv->store_priv[j];
         sv->sizes[j].keys = kvstoreSize(db->keys);
         sv->sizes[j].expires = kvstoreSize(db->expires);
         if (server.cluster_enabled) {
@@ -2266,6 +2355,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     server.stat_snap_saves++;
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     snapScanSetOverlay(sv->scan, &snap_server_hooks, sv->privs);
+    snapScanSetStoreDone(sv->scan, snapSaveStoreDone);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
     snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
     snapScanSetWindowDone(sv->scan, snapSaveWindowDone);
@@ -2451,6 +2541,10 @@ void snapSaveAbort(void) {
     /* Stops the thread within one cursor step, joins it, merges every slot.
      * A thread blocked on write() returns once the child reads or dies. */
     snapScanAbort(sv->scan);
+    /* Every slot is complete and every overlay released: the stores are not
+     * ours to look at any more (the aborting FLUSHALL ASYNC or full-sync load
+     * frees them on BIO while this save object waits for the child). */
+    for (int s = 0; s < sv->dbnum; s++) sv->stores[s] = NULL;
     if (sv->ae_registered) {
         aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
         sv->ae_registered = 0;

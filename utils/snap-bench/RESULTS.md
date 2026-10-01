@@ -1421,3 +1421,47 @@ overlay in the dict metadata, reads skip an empty side table). Two reps per cell
   outliers on either side).
 - Same picture as runs 6-8 for hybrid versus stock at this size: 3 MB of extra memory against 170-240 MB
   on small under writes, 60-80 MB against 130-170 MB on mixed1m.
+
+## Run 21 (2026-10-01): mixed1m at 4 GB with the 16 MB queue default, BGSAVE and full sync, upstream vs hybrid, c7i.4xlarge
+
+Raw: `run21.csv` (BGSAVE) and `run21s.csv` (full sync), driver `~/run21.sh` on the host (recipe: run 17 for part A,
+run 18 for part B). Same instance as run 20 (18.144.225.10). `up` = 0d6266f2d, `hybrid` = e7062762b (TASK-1.21.3 drain,
+TASK-1.21.6 stage A, `bgsave-hybrid-max-queued-bytes` at its 16 MB default). mixed1m at scale 16 (19.2M keys, 4.0 GB),
+HOT=1.0, 2 reps interleaved per cell, every save and sync `ok`. Runs 17 and 18 measured the same cells with the queue
+bound at 128 MB; this run replaces their footnote. Values as rep a / rep b.
+
+### Part A: BGSAVE, rates 0 / 20k / 50k writes/s
+
+| rate | config | save s | fork ms | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | queued peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 43.5 / 39.6 | 39 / 28 | 4 / 1 | 0 | 4 / 1 | 0.6 | 0 | 43.4 / 39.5 | 39.2 / 26.0 | - | - |
+| 0 | hybrid | 36.7 / 37.0 | 14 / 14 | 17 / 17 | 8 / 9 | 9 / 8 | 0.5 / 0.6 | 19.2 / 18.8 | 23.9 / 24.1 | 12.0 / 13.7 | - | 16 / 16 |
+| 20k | up | 46.2 / 45.6 | 29 / 29 | 2579 / 2559 | 1 | 2578 / 2560 | 10.6 / 10.5 | 0 | 46.0 / 45.5 | 26.1 / 29.2 | 29.7 / 30.7 | - |
+| 20k | hybrid | 37.5 / 43.3 | 14 / 15 | 1184 / 1283 | 26 / 28 | 1183 / 1282 | 8.6 / 9.4 | 17.1 / 19.6 | 21.7 / 25.2 | 11.0 / 13.8 | 15.5 / 16.1 | 43 / 48 |
+| 50k | up | 44.1 / 39.7 | 30 / 31 | 3263 / 3215 | 3 / 2 | 3261 / 3213 | 17.8 / 16.1 | 0 | 44.0 / 39.6 | 27.0 / 29.5 | 32.2 / 32.5 | - |
+| 50k | hybrid | 41.3 / 38.4 | 15 / 15 | 1745 / 1721 | 51 / 51 | 1744 / 1714 | 17.3 / 16.1 | 18.7 / 16.9 | 23.9 / 22.9 | 12.7 / 13.1 | 18.2 / 17.8 | 90 / 87 |
+
+### Part B: diskless full sync to a fresh replica (rdb-channel yes, replica `--repl-diskless-load on-empty-db`), rates 0 / 20k
+
+| rate | config | sync s | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | wmax ms |
+|---|---|---|---|---|---|---|---|---|---|
+| 0 | up | 16.6 / 16.4 | 3 / 0 | 0 | 3 / 0 | 0.3 / 0.2 | 0 | 14.2 / 14.3 | - |
+| 0 | hybrid | 16.5 / 16.6 | 16 / 16 | 7 / 13 | 9 / 3 | 0.2 | 9.0 / 9.0 | 6.4 / 6.4 | - |
+| 20k | up | 17.6 / 18.4 | 1451 / 1499 | 1 | 1455 / 1499 | 4.1 / 4.4 | 0 | 14.5 / 14.5 | 29.3 / 29.6 |
+| 20k | hybrid | 17.6 / 17.2 | 724 / 711 | 26 / 24 | 705 / 693 | 4.2 / 4.1 | 9.0 / 9.0 | 6.8 / 6.7 | 16.1 / 15.0 |
+
+### Reading the run
+
+- **Idle BGSAVE: 36.7-37.0 s against 39.6-43.5 for stock**, with 17 MB of extra memory against the 136-158 MB the 128 MB
+  bound cost in run 17 (where the save was 26-29 s). This is the trade the 16 MB default makes: about a third of the idle
+  gain for a tenth of the memory, as run 19 predicted (40-44 s there; this host and day land at 37).
+- **Under writes the hybrid keeps its memory advantage and 5-15% of the save time**: 20k 37.5-43.3 s against 45.6-46.2,
+  50k 38.4-41.3 against 39.7-44.1; copy-on-write 1.18-1.75 GB against 2.56-3.26 GB; parent growth 26-51 MB. The queued
+  peak passes the 16 MB scan-thread bound (43-90 MB) because the main-thread queue of emitted buckets is bounded only by
+  the hard mark; still a fifth of stock's child copy-on-write.
+- **Worst write latency is the fork stall**: 15-18 ms against 30-33 for stock; worst PING 11-14 against 26-39.
+- **Full sync: the sync time is the replica's load either way** (16.5-18.4 s both). The hybrid child spends 6.4-6.8 CPU-s
+  against 14.2-14.5 (the scan thread does 9.0 s of the work) and under 20k writes/s the primary pays 0.71-0.72 GB
+  against 1.45-1.50 GB.
+- The child wall-time gap under writes (child CPU 22-25 s inside a 37-43 s save) is unchanged from run 17 and still the
+  open observation.

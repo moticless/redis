@@ -1040,7 +1040,10 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
 
     for (int j = startdb; j <= enddb; j++) {
         removed += kvstoreSize(dbarray[j].keys);
-        if (async) {
+        if (emptyDbDetachToSnapshot(&dbarray[j])) {
+            /* A hybrid BGSAVE is scanning this db: it took the structures,
+             * the db is empty from here on (see lazyfree.c). */
+        } else if (async) {
             /* emptyDbAsync also swaps blessed_keys and frees the old one on BIO. */
             emptyDbAsync(&dbarray[j]);
         } else {
@@ -1076,9 +1079,12 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
  * database(s). Otherwise -1 is returned in the specific case the
  * DB number is out of range, and errno is set to EINVAL. */
 long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
-    /* A hybrid BGSAVE scans the live dicts from a thread: stop it (and the
-     * child) before the keyspace is destroyed. */
-    if (snapSaveInProgress()) {
+    /* A hybrid BGSAVE scans the live dicts from a thread. FLUSHALL, DEBUG
+     * RELOAD/LOADAOF and a replica's full-sync load empty every db: stop it
+     * (and the child) before the keyspace is destroyed, as stock kills its
+     * child there. A single-db FLUSHDB hands that db's structures to the
+     * save instead (emptyDbStructure) and the save goes on. */
+    if (dbnum == -1 && snapSaveInProgress()) {
         snapSaveAbort();
         killRDBChild();
     }
@@ -2637,11 +2643,10 @@ void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with, slotRa
  * Returns C_ERR if at least one of the DB ids are out of range, otherwise
  * C_OK is returned. */
 int dbSwapDatabases(int id1, int id2) {
-    /* Hybrid BGSAVE: slot ownership is per db; abort before swapping. */
-    if (snapSaveInProgress()) {
-        snapSaveAbort();
-        killRDBChild();
-    }
+    /* A hybrid BGSAVE scans kvstores, not db ids: the swap moves a scanned
+     * kvstore to another db, its keys are still serialized under the db id
+     * they had at the fork instant (stock and Valkey semantics), and the
+     * overlay hooks resolve the owning db at call time. No abort needed. */
     if (id1 < 0 || id1 >= server.dbnum ||
         id2 < 0 || id2 >= server.dbnum) return C_ERR;
     if (id1 == id2) return C_OK;

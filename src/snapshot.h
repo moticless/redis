@@ -283,6 +283,7 @@ void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn);
  * more before thread_done (with no window published and the main thread's
  * open write section closed): where the main-thread queue is drained. */
 void snapScanSetWindowDone(snapScanCtx *ctx, void (*fn)(void *privdata));
+void snapScanSetStoreDone(snapScanCtx *ctx, void (*fn)(void *privdata, int s));   /* main thread: a store's last slot completed */
 /* Slot state (SNAP_SLOT_*) of (store, dict). */
 int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 
@@ -302,6 +303,10 @@ int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);   /* diskless full sync 
 int snapInHybridChild(void);      /* 1 in the hybrid save child (no keyspace mapped) */
 void snapHybridFallbackLog(void); /* a module without the opt-in sends the save to the stock child */
 int snapSaveInProgress(void);
+/* FLUSHDB and SWAPDB during a save (TASK-1.24). A store is a kvstore the
+ * save is scanning, identified by the db id it had at the fork instant. */
+int snapSaveOwnsKvstore(kvstore *kvs);
+int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed);
 /* Stop the scan thread and merge every slot (main thread). Safe to call when
  * no hybrid save is running. Does not touch the child (see killRDBChild). */
 void snapSaveAbort(void);
