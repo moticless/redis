@@ -1351,6 +1351,7 @@ struct snapSave {
      * values overlap without a memory bound. -1: pipe for everything. */
     int spool_wr, spool_rd;
     redisAtomic size_t spool_bytes;   /* written by the scan thread this save */
+    int spilling;                     /* scan thread: queue reached its bound, BUFFERs go to the spool until it drains to half */
     snapDbSizes *sizes;
     int req, rdbflags;
     char *filename;
@@ -1956,9 +1957,26 @@ static void snapOutClear(snapSave *sv) {
  * broken pipe (child gone) aborts the scan. */
 static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
     size_t n = sdslen(m);
-    if (type == SNAP_MSG_BUFFER && sv->spool_wr != -1) {
-        /* The bulk of the output: straight to the spool, no queue, no bound.
-         * The child copies it to its output between big values. */
+    if (type == SNAP_MSG_BUFFER && sv->spool_wr != -1 && sv->oq_limit) {
+        /* Queue first, spool as the overflow: push the pipe, and if the queue
+         * is at its bound (the child is inside a big value) send this and the
+         * following buffers to the spool, until the child has drained the
+         * queue to half. On a dataset the child keeps up with nothing ever
+         * touches the file. */
+        if (snapOutDrain(sv, SNAP_DRAIN_TRY, 0) != 0) {
+            snapOutRecycle(sv, m);
+            snapScanRequestAbort(sv->scan);
+            return -1;
+        }
+        size_t q;
+        atomicGet(sv->oq_bytes, q);
+        if (sv->spilling) {
+            if (q <= sv->oq_limit / 2) sv->spilling = 0;
+        } else if (q + sdsAllocSize(m) > sv->oq_limit) {
+            sv->spilling = 1;
+        }
+    }
+    if (type == SNAP_MSG_BUFFER && sv->spool_wr != -1 && (sv->spilling || !sv->oq_limit)) {
         int rc = snapSpoolWrite(sv, m, n);
         atomicIncr(sv->msgs_sent, 1);
         atomicIncr(sv->bytes_sent, (long long)n);
@@ -2172,7 +2190,17 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     for (;;) {
         snapMsgHdr h;
         int from_spool = 0;
-        if (sv->spool_rd != -1) {
+        int pipe_ready = (sv->spool_rd == -1);   /* no spool: the pipe is the only source; after END: spool only */
+        if (sv->spool_rd != -1 && !ended) {
+            /* Round-robin: a pipe message when one is waiting (so the queue
+             * drains while we copy the spool and big values start promptly),
+             * else a spool message. */
+            struct pollfd pfd = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
+            int pr = poll(&pfd, 1, 0);
+            pipe_ready = pr > 0 && (pfd.revents & POLLIN);
+            if (pr > 0 && !(pfd.revents & POLLIN)) { err_op = "channel closed"; goto werr; }
+        }
+        if (sv->spool_rd != -1 && !pipe_ready) {
             int r = snapSpoolPread(sv->spool_rd, &h, sizeof(h), spool_off);
             if (r < 0) { err_op = "spool read (header)"; goto werr; }
             if (r == 1) {

@@ -1153,7 +1153,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {$hy_dexp * 2 < $st_dexp}
         }
 
-        test {Hybrid BGSAVE harness: the scan thread spools its output to an unlinked file, the child drains it; no file is left} {
+        test {Hybrid BGSAVE harness: the queue fills first, the overflow goes to an unlinked spool file the child drains; no file is left} {
             r flushall
             r config set rdbcompression no
             populate 200000 sp: 60
@@ -1161,22 +1161,31 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal hashtable [r object encoding sp:big]   ;# one fork-class value goes through the pipe
             set digest [debug_digest]
             set dir [lindex [r config get dir] 1]
-            r config set rdb-key-save-delay 20
+            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set rdb-key-save-delay 10
             r bgsave
             snap_wait_save_started
-            wait_for_condition 100 50 {[s snap_save_spool_bytes] > 1000000} else { fail "nothing spooled" }
-            # unlinked at creation: the directory never shows it
-            assert_equal 0 [llength [glob -nocomplain -directory $dir temp-snap-*]]
-            # the pipe queue carries only big-value headers now
-            assert {[s snap_save_queued_bytes] < 1000000}
+            # a child that keeps up never fills the queue: nothing is spooled
+            after 200
+            assert_equal 0 [s snap_save_spool_bytes]
+            # stop the child: the queue fills to its bound, then the output overflows to the spool
+            set child [get_child_pid 0]
+            exec kill -STOP $child
+            wait_for_condition 100 50 {[s snap_save_spool_bytes] > 1000000} else { exec kill -CONT $child; fail "nothing spooled" }
+            set queued [s snap_save_queued_bytes]
+            set nofile [llength [glob -nocomplain -directory $dir temp-snap-*]]
+            exec kill -CONT $child
+            assert {$queued > 500000 && $queued <= 1100000}   ;# at the bound (never past it), not beyond
+            assert_equal 0 $nofile                              ;# unlinked at creation: the directory never shows it
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            assert {[s snap_last_save_spool_bytes] > 10000000}
+            assert {[s snap_last_save_spool_bytes] > 1000000}
             assert_equal 0 [s snap_save_spool_bytes]
             r debug reload nosave
             assert_equal $digest [debug_digest]
             r config set rdbcompression yes
+            r config set bgsave-hybrid-max-queued-bytes 16mb
         }
 
         test {Hybrid BGSAVE harness: with the spool off everything goes through the pipe and the save still reloads equal} {
@@ -1193,16 +1202,22 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
 
         test {Hybrid BGSAVE harness: a child killed while draining the spool leaves no spool file and the next save works} {
             r flushall
-            populate 50000 spk: 60
+            r config set rdbcompression no
+            populate 100000 spk: 60
             set dir [lindex [r config get dir] 1]
-            r config set rdb-key-save-delay 200   ;# 10 s of scan: the kill lands mid-spool
+            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set rdb-key-save-delay 10
             r bgsave
             snap_wait_save_started
-            wait_for_condition 100 50 {[s snap_save_spool_bytes] > 0} else { fail "nothing spooled" }
-            exec kill -9 [get_child_pid 0]
+            set child [get_child_pid 0]
+            exec kill -STOP $child   ;# force the overflow into the spool
+            wait_for_condition 100 50 {[s snap_save_spool_bytes] > 0} else { exec kill -CONT $child; fail "nothing spooled" }
+            exec kill -9 $child
             wait_for_condition 100 50 {[s snap_save_in_progress] == 0 && [s rdb_bgsave_in_progress] == 0} else { fail "save did not end" }
             assert_equal 0 [llength [glob -nocomplain -directory $dir temp-snap-*]]
             r config set rdb-key-save-delay 0
+            r config set bgsave-hybrid-max-queued-bytes 16mb
+            r config set rdbcompression yes
             set digest [debug_digest]
             r bgsave
             snap_wait_bgsave_done

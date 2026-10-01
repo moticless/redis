@@ -1507,3 +1507,40 @@ page-faults (child minor faults 5-167 per save).
   first; (2) a per-db index of SNAP_FORK values maintained at placement time, so the child can start on the big values
   at the fork instant instead of waiting for scan order. (1) alone gives the overlap; (2) additionally removes the
   dependence on scan order and makes the child's part start at t = 0 in the idle case. Proposed as a task.
+
+## Run 23 (2026-10-01): spool file instead of the pipe (TASK-1.30, first version), mixed1m at 4 GB and small, c7i.4xlarge
+
+Raw: `run23.csv`, driver `~/run23.sh` on the host. Same instance and layout as runs 20-22. One binary, the spool
+commit c85968b09 as first built (every BUFFER message to the spool; the scan thread's close of the spool fixed in the
+same commit but after this run), `hybrid-nospool` = `--bgsave-hybrid-spool no` (pipe + 16 MB queue, run 21's shape),
+`hybrid` = spool on. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates 0 / 20k, 1 rep.
+Values as rep a / rep b.
+
+| dataset | rate | config | save s | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | spooled MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 0 | nospool | 35.8 / 36.9 | 20 / 18 | 8 / 8 | 12 / 10 | 0.5 | 18.5 / 19.3 | 22.0 / 24.5 | 17.6 / 12.0 | - | 0 |
+| mixed1m | 0 | spool | 25.8 / 24.9 | 2 / 2 | 1 / 1 | 1 / 1 | 0.4 | 20.3 / 19.2 | 24.1 / 24.1 | 56.1 / 57.2 | - | 1071 |
+| mixed1m | 20k | nospool | 43.3 / 43.1 | 1283 / 1282 | 31 / 30 | 1281 / 1277 | 10.2 / 9.4 | 19.0 / 19.2 | 25.7 / 25.3 | 15.3 / 14.8 | 16.2 / 15.4 | 0 |
+| mixed1m | 20k | spool | 25.1 / 24.6 | 915 / 906 | 7 / 7 | 913 / 901 | 6.3 / 5.8 | 20.3 / 18.0 | 24.9 / 24.5 | 55.2 / 58.1 | 57.2 / 61.2 | 1072 |
+| mixed1m | 50k | nospool | 39.8 / 41.4 | 1733 / 1749 | 51 / 53 | 1729 / 1744 | 16.9 / 14.3 | 17.2 / 18.1 | 24.0 / 24.7 | 14.3 / 20.5 | 17.2 / 22.5 | 0 |
+| mixed1m | 50k | spool | 25.1 / 23.5 | 1510 / 1470 | 7 / 7 | 1509 / 1470 | 11.1 / 10.4 | 20.4 / 19.9 | 25.0 / 23.4 | 54.5 / 56.0 | 58.0 / 57.7 | 1072 |
+| small | 0 | nospool | 30.1 | 6 | 1 | 5 | 0.4 | 29.9 | 2.9 | 5.0 | - | 0 |
+| small | 0 | spool | 33.6 | 2 | 1 | 1 | 0.6 | 33.2 | 2.1 | 154.8 | - | 2987 |
+| small | 20k | nospool | 31.5 | 8 | 7 | 1 | 6.6 | 31.2 | 3.2 | 0.8 | 2.7 | 0 |
+| small | 20k | spool | 30.1 | 8 | 7 | 1 | 6.5 | 29.8 | 2.2 | 153.3 | 153.8 | 2988 |
+
+### Reading the run
+
+- **mixed1m saves in 24-26 s at every write rate**, where the pipe shape takes 36-43 and stock 40-46 (run 21): the two
+  halves overlap as run 22 predicted (max of scan 19-20 s and child 24-25 s). The shorter save also cuts the child's
+  copy-on-write under writes (0.90-0.91 GB against 1.28 at 20k, 1.47-1.51 against 1.73-1.75 at 50k) and the main
+  thread's CPU (6 s against 10 at 20k: fewer emissions ahead of a faster walker). Parent growth 7 MB against 30-53: the
+  queue holds only big-value headers.
+- **Two costs of spooling everything, both fixed in the follow-up commit:** (1) worst PING 55-58 ms on mixed1m and
+  153-155 ms on small, which is the main thread's close of the unlinked spool freeing its 1-3 GB of pages at save end
+  (now the scan thread closes its end and the child's exit frees the pages); (2) on small, where the child keeps up, the
+  spool is pure overhead: 3.0 GB written and read for nothing, +3.3 s of scan-thread CPU idle (33.2 against 29.9).
+  The user's refinement measured as run 24: the queue stays the primary path and the spool takes only the overflow once
+  the queue is at its bound, with the scan thread returning to the queue when the child has drained it to half.
+- The benchmark's `dir` is tmpfs, so here the spool's pages are RAM, not reclaimable page cache; they are outside
+  `used_memory` and RSS (extra memory 2 MB) and are freed at save end. On a disk-backed `dir` they are page cache.

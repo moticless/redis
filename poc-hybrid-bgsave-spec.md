@@ -282,17 +282,22 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
 - **Spool file instead of the pipe for the bulk (TASK-1.30, 2026-10-01).** Run 22 showed the two halves
   of a mixed1m save running in series: the child cannot read the pipe while it is inside a 90 MB hash,
   the scan thread blocks after 16 MB, and whichever side starts first finishes before the other begins
-  (35-42 s against a 24 s overlap). With `bgsave-hybrid-spool yes` (default) the scan thread appends its
-  BUFFER messages (header + payload, the same framing) to an unlinked `temp-snap-<pid>.spool` in the
-  working directory with blocking `write()`: no queue, no bound, no poll; the page cache holds it and
-  disk space bounds it. KVOBJ, END and ABORT keep the pipe and the queue above, which now carries only
-  big-value headers. The child drains the spool from its own offset with `pread()` whenever a complete
-  message is there (a reader may see a partially written one: it retries from the same offset), polls
-  the pipe for 5 ms when the spool is caught up, serializes KVOBJ messages as they arrive, and after END
-  drains the spool to its end. Both descriptors are opened before the fork and the name is unlinked at
-  once, so a crash of either side leaves nothing behind. SELECTDB/RESIZEDB/SLOT_INFO tracking is
-  unchanged (the messages carry their db and slot). INFO: `snap_save_spool_bytes`,
-  `snap_last_save_spool_bytes`. If the file cannot be created the pipe carries everything, as before.
+  (35-42 s against a 24 s overlap). With `bgsave-hybrid-spool yes` (default) the queue stays the primary
+  path and an unlinked `temp-snap-<pid>.spool` in the working directory takes the overflow (the user's
+  refinement, 2026-10-01): when a BUFFER message would push the queue past `bgsave-hybrid-max-queued-bytes`
+  the scan thread switches to appending BUFFER messages (header + payload, the same framing) to the spool
+  with blocking `write()`, and switches back to the queue once the child has drained it to half (run 23
+  showed that spooling everything cost small, where the child keeps up, 3 GB of file traffic and 10% of
+  scan CPU for nothing). KVOBJ, END and ABORT always take the pipe and the queue. The child alternates:
+  a pipe message when one is waiting (so the queue drains and big values start promptly), else the next
+  complete spool message from its own offset with `pread()` (a reader may see a partially written one:
+  it retries from the same offset); it polls the pipe for 5 ms when both are empty, and after END drains
+  the spool to its end. Both descriptors are opened before the fork and the name is unlinked at once;
+  the scan thread closes its end when it is done and the child's exit frees the pages (the parent's
+  close of a 1-3 GB unlinked file freed them on the main thread: 55-155 ms PING in run 23). On a tmpfs
+  working directory the spool is RAM outside `used_memory`; on disk it is page cache. SELECTDB/RESIZEDB/
+  SLOT_INFO tracking is unchanged. INFO: `snap_save_spool_bytes`, `snap_last_save_spool_bytes`. If the
+  file cannot be created the pipe carries everything, as before.
 
 ## 7. Correctness invariants (worst-first)
 1. **Total clone-on-write for owed keys.** A bg thread reads LIVE parent memory for every kvobj header
