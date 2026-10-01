@@ -295,9 +295,15 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   the spool to its end. Both descriptors are opened before the fork and the name is unlinked at once;
   the scan thread closes its end when it is done and the child's exit frees the pages (the parent's
   close of a 1-3 GB unlinked file freed them on the main thread: 55-155 ms PING in run 23). On a tmpfs
-  working directory the spool is RAM outside `used_memory`; on disk it is page cache. SELECTDB/RESIZEDB/
-  SLOT_INFO tracking is unchanged. INFO: `snap_save_spool_bytes`, `snap_last_save_spool_bytes`. If the
-  file cannot be created the pipe carries everything, as before.
+  working directory the spool is RAM outside `used_memory`; on disk it is page cache. The child punches
+  holes behind its reads (`fallocate(PUNCH_HOLE)`, 16 MB at a time; `posix_fadvise(DONTNEED)` where
+  unsupported), so the file's footprint is the unconsumed tail, not the whole save, and the final close
+  has little left to free. INFO reports that footprint as written bytes minus the first data offset of
+  the file (`lseek(SEEK_DATA)`: block counts would lie under delayed allocation) in `snap_save_spool_bytes`,
+  with `snap_last_save_spool_peak` its peak sampled by cron, next to what was written
+  (`snap_save_spool_written_bytes`, `snap_last_save_spool_bytes`); the benchmark records the peak as the
+  spool's true memory cost beside RSS. SELECTDB/RESIZEDB/SLOT_INFO tracking is unchanged. If the file
+  cannot be created the pipe carries everything, as before.
 
 ## 7. Correctness invariants (worst-first)
 1. **Total clone-on-write for owed keys.** A bg thread reads LIVE parent memory for every kvobj header

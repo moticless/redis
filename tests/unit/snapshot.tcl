@@ -1181,6 +1181,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
             assert {[s snap_last_save_spool_bytes] > 1000000}
+            # the footprint (allocated bytes, the child punches holes behind
+            # its reads) never exceeds what was written and is gone with the save
+            assert {[s snap_last_save_spool_peak] > 0 && [s snap_last_save_spool_peak] <= [s snap_last_save_spool_bytes]}
             assert_equal 0 [s snap_save_spool_bytes]
             r debug reload nosave
             assert_equal $digest [debug_digest]

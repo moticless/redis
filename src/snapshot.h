@@ -357,8 +357,10 @@ size_t snapSaveLastRetainedPeak(void);
  * forward to the child, buckets and keys the main thread emitted itself. */
 size_t snapSaveQueuedBytes(void);        /* main-thread queue plus the scan thread's outbound queue */
 size_t snapSaveLastQueuedPeak(void);     /* peak of the two queues over the last save */
-size_t snapSaveSpoolBytes(void);         /* bytes the scan thread spooled so far (TASK-1.30) */
-size_t snapSaveLastSpoolBytes(void);
+size_t snapSaveSpoolBytes(void);         /* the spool's footprint right now: allocated bytes, i.e. not yet consumed by the child (TASK-1.30) */
+size_t snapSaveSpoolWritten(void);       /* bytes the scan thread spooled so far */
+size_t snapSaveLastSpoolBytes(void);     /* written over the last save */
+size_t snapSaveLastSpoolPeak(void);      /* peak footprint over the last save */
 size_t snapSaveBitmapBytes(void);   /* bucket bitmaps of the running save, 0 when none runs */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);

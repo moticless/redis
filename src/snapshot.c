@@ -31,6 +31,8 @@
 #include "server.h"
 #include "snapshot.h"
 #include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
 #ifdef HAVE_NOFORK_ARENA
 #define SNAP_NOFORK_ARENA_SUPPORTED 1
@@ -1350,7 +1352,14 @@ struct snapSave {
      * file instead of the pipe, so the child's big values and the scan's small
      * values overlap without a memory bound. -1: pipe for everything. */
     int spool_wr, spool_rd;
+    int spool_stat;                   /* main thread: a descriptor of its own, for fstat() (allocated bytes) */
     redisAtomic size_t spool_bytes;   /* written by the scan thread this save */
+    off_t spool_frontier;             /* main thread: first data offset found last time (holes grow from the start) */
+    redisAtomic size_t *spool_committed;   /* shared (MAP_SHARED) with the child: bytes fully written to the spool.
+                                            * A pread of a message the scan thread is still writing returns the
+                                            * requested length with torn content (the page cache is filled byte by
+                                            * byte), so the child trusts a message only below this offset. */
+    size_t spool_alloc_peak;          /* main thread: peak of the file's allocated bytes (sampled) */
     int spilling;                     /* scan thread: queue reached its bound, BUFFERs go to the spool until it drains to half */
     snapDbSizes *sizes;
     int req, rdbflags;
@@ -1434,14 +1443,43 @@ size_t snapSaveQueuedBytes(void) {
     return n + o;
 }
 size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
-static size_t snap_last_spool_bytes = 0;
-size_t snapSaveSpoolBytes(void) {
+static size_t snap_last_spool_bytes = 0;        /* written over the last save */
+static size_t snap_last_spool_alloc_peak = 0;   /* peak footprint over the last save */
+size_t snapSaveSpoolWritten(void) {
     if (!snap_save) return 0;
     size_t n;
     atomicGet(snap_save->spool_bytes, n);
     return n;
 }
+/* Main thread: what the spool occupies right now, i.e. what the child has not
+ * consumed yet (it punches holes behind its reads), from the file itself. On
+ * tmpfs that is RAM, on disk it is page cache. Also tracks the peak. */
+size_t snapSaveSpoolBytes(void) {
+    snapSave *sv = snap_save;
+    if (!sv || sv->spool_stat == -1) return 0;
+    size_t written;
+    atomicGet(sv->spool_bytes, written);
+    /* The child punches holes from the start of the file up to what it has
+     * consumed: the first data offset is that frontier. (Block counts would
+     * lie on filesystems with delayed allocation, where dirty pages have no
+     * blocks yet.) */
+    /* Resume from the last frontier: a SEEK_DATA from 0 over a gigabyte of
+     * holes walks every page of them and cost 20-40 ms per INFO call on the
+     * main thread (run 27/28 PING). */
+    off_t first = lseek(sv->spool_stat, sv->spool_frontier, SEEK_DATA);
+    size_t n;
+    if (first < 0) {
+        if (errno == ENXIO) { sv->spool_frontier = (off_t)written; n = 0; }   /* nothing but holes past the frontier */
+        else n = written > (size_t)sv->spool_frontier ? written - (size_t)sv->spool_frontier : 0;
+    } else {
+        sv->spool_frontier = first;
+        n = (size_t)first < written ? written - (size_t)first : 0;
+    }
+    if (n > sv->spool_alloc_peak) sv->spool_alloc_peak = n;
+    return n;
+}
 size_t snapSaveLastSpoolBytes(void) { return snap_last_spool_bytes; }
+size_t snapSaveLastSpoolPeak(void) { return snap_last_spool_alloc_peak; }
 long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
 long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; }
 
@@ -1794,6 +1832,7 @@ void snapSaveCron(void) {
      * both threads. The abort below counts only what the main thread holds:
      * the scan thread's queue waits for the child instead of growing. */
     size_t all_queued = snapSaveQueuedBytes();
+    snapSaveSpoolBytes();   /* samples the spool's footprint peak */
     if (sv->retained_bytes + all_queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + all_queued;
     if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
         if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
@@ -1980,7 +2019,9 @@ static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
         int rc = snapSpoolWrite(sv, m, n);
         atomicIncr(sv->msgs_sent, 1);
         atomicIncr(sv->bytes_sent, (long long)n);
-        atomicIncr(sv->spool_bytes, n);
+        size_t total;
+        atomicIncrGet(sv->spool_bytes, total, n);
+        if (rc == 0) atomicSetWithSync(*sv->spool_committed, total);   /* release: the child may read up to here */
         snapOutRecycle(sv, m);
         if (rc != 0) {
             snapScanRequestAbort(sv->scan);
@@ -2185,13 +2226,14 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
      * no spool). The spool is drained whenever it has a complete message;
      * the pipe is polled in between, with a short wait only when the spool
      * is caught up. After END the spool is complete: drain it to its end. */
-    off_t spool_off = 0;
+    off_t spool_off = 0, spool_punched = 0;
     int ended = 0;
+    int flush_spool = 0;   /* after a big value: empty the spool before the next pipe message */
     for (;;) {
         snapMsgHdr h;
         int from_spool = 0;
         int pipe_ready = (sv->spool_rd == -1);   /* no spool: the pipe is the only source; after END: spool only */
-        if (sv->spool_rd != -1 && !ended) {
+        if (sv->spool_rd != -1 && !ended && !flush_spool) {
             /* Round-robin: a pipe message when one is waiting (so the queue
              * drains while we copy the spool and big values start promptly),
              * else a spool message. */
@@ -2201,19 +2243,44 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             if (pr > 0 && !(pfd.revents & POLLIN)) { err_op = "channel closed"; goto werr; }
         }
         if (sv->spool_rd != -1 && !pipe_ready) {
-            int r = snapSpoolPread(sv->spool_rd, &h, sizeof(h), spool_off);
-            if (r < 0) { err_op = "spool read (header)"; goto werr; }
-            if (r == 1) {
-                if (h.len > payload_cap) {
-                    payload = zrealloc(payload, h.len);
-                    payload_cap = h.len;
-                }
-                r = h.len ? snapSpoolPread(sv->spool_rd, payload, h.len, spool_off + sizeof(h)) : 1;
-                if (r < 0) { err_op = "spool read (payload)"; goto werr; }
+            size_t committed;
+            atomicGetWithSync(*sv->spool_committed, committed);   /* acquire: pairs with the scan thread's store */
+            int r = 0;
+            if ((size_t)spool_off + sizeof(h) <= committed) {
+                r = snapSpoolPread(sv->spool_rd, &h, sizeof(h), spool_off);
+                if (r < 0) { err_op = "spool read (header)"; goto werr; }
             }
+            if (r == 1) {
+                if ((size_t)spool_off + sizeof(h) + h.len > committed) {
+                    r = 0;   /* the payload is still being written */
+                } else {
+                    if (h.len > payload_cap) {
+                        payload = zrealloc(payload, h.len);
+                        payload_cap = h.len;
+                    }
+                    r = h.len ? snapSpoolPread(sv->spool_rd, payload, h.len, spool_off + sizeof(h)) : 1;
+                    if (r < 0) { err_op = "spool read (payload)"; goto werr; }
+                    if (r == 0) { err_op = "spool short read below the committed offset"; goto werr; }
+                }
+            }
+            if (r == 0) flush_spool = 0;   /* spool caught up: back to pipe-first */
             if (r == 1) {
                 spool_off += sizeof(h) + h.len;
                 from_spool = 1;
+                /* Give the consumed range back as we go, so the file's footprint
+                 * is the unconsumed tail, not the whole save: a hole on tmpfs or
+                 * disk frees the pages; where holes are unsupported, drop the
+                 * page cache instead. 16 MB at a time. */
+                off_t punch_end = spool_off & ~(off_t)4095;   /* whole blocks only: a straddling block would stay
+                                                                * allocated and SEEK_DATA would stop at it for good */
+                if (punch_end - spool_punched >= (off_t)(16 * 1024 * 1024)) {
+                    off_t len = punch_end - spool_punched;
+#ifdef FALLOC_FL_PUNCH_HOLE
+                    if (fallocate(sv->spool_rd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, spool_punched, len) != 0)
+#endif
+                        posix_fadvise(sv->spool_rd, spool_punched, len, POSIX_FADV_DONTNEED);
+                    spool_punched = punch_end;
+                }
             } else if (ended) {
                 break;   /* the scan thread wrote END after its last spool message: done */
             }
@@ -2261,6 +2328,11 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
              * allocation, mapped in our CoW view. */
             size_t dump_size = rdb->processed_bytes - before;
             if (dump_size > server.page_size / 2) dismissObject(kv, dump_size);
+            /* The scan thread spooled while we were inside this value: flush
+             * that backlog before the next big value, so the spool's footprint
+             * stays at about one value's worth instead of the whole save's
+             * (run 26 measured the latter with pipe-first alone). */
+            flush_spool = 1;
         } else {
             err_op = "unknown message";
             goto werr;
@@ -2321,11 +2393,34 @@ werr:
     return aborted ? SERVER_CHILD_NOERROR_RETVAL : C_ERR;
 }
 
+/* Hybrid child, first thing after the fork: the arena's range is not mapped
+ * here (MADV_DONTFORK), so the kernel would hand its addresses to our own
+ * allocations as the heap grows; zmalloc routes frees and reallocs by address
+ * (zmalloc_is_nofork), so such a block would be reallocated in the parent-only
+ * arena and the write would fault (run 29's crash in the pipe reader). Reserve
+ * the whole range PROT_NONE so nothing of ours can land in it. */
+static void snapChildReserveArenaRange(void) {
+#ifdef HAVE_NOFORK_ARENA
+    if (!zmalloc_nofork_lo || !zmalloc_nofork_hi) return;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#else
+    flags |= MAP_FIXED;
+#endif
+    void *p = mmap(zmalloc_nofork_lo, (size_t)(zmalloc_nofork_hi - zmalloc_nofork_lo), PROT_NONE, flags, -1, 0);
+    if (p == MAP_FAILED)
+        serverLog(LL_WARNING, "Hybrid BGSAVE child: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
+#endif
+}
+
 static void snapSaveChild(snapSave *sv) {
     rio sock;
     snap_in_hybrid_child = 1;
+    snapChildReserveArenaRange();
     close(sv->pipe_wr);
     if (sv->spool_wr != -1) { close(sv->spool_wr); sv->spool_wr = -1; }
+    if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
     if (sv->to_sockets) {
         if (sv->rdb_channel) {
             rioInitWithConnset(&sock, sv->conns, sv->numconns);
@@ -2389,6 +2484,8 @@ static void snapSaveFree(snapSave *sv) {
     if (sv->pipe_rd != -1) close(sv->pipe_rd);
     if (sv->spool_wr != -1) close(sv->spool_wr);
     if (sv->spool_rd != -1) close(sv->spool_rd);
+    if (sv->spool_stat != -1) close(sv->spool_stat);   /* the child punched the consumed ranges: little left to free */
+    if (sv->spool_committed) munmap((void *)sv->spool_committed, sizeof(redisAtomic size_t));
     if (sv->sizes) {
         for (int j = 0; j < sv->dbnum; j++) {
             zfree(sv->sizes[j].slot_keys);
@@ -2431,7 +2528,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
 
     snapSave *sv = zcalloc(sizeof(*sv));
     sv->pipe_rd = sv->pipe_wr = -1;
-    sv->spool_rd = sv->spool_wr = -1;
+    sv->spool_rd = sv->spool_wr = sv->spool_stat = -1;
     sv->dbnum = server.dbnum;
     sv->req = req;
     sv->rdbflags = rdbflags;
@@ -2489,9 +2586,18 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
         snprintf(path, sizeof(path), "temp-snap-%d.spool", (int)getpid());
         sv->spool_wr = open(path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND, 0600);
         if (sv->spool_wr != -1) {
-            sv->spool_rd = open(path, O_RDONLY);
+            sv->spool_rd = open(path, O_RDWR);          /* the child reads it and punches holes behind its reads */
+            sv->spool_stat = open(path, O_RDONLY);      /* the main thread's own descriptor, for INFO */
             unlink(path);
-            if (sv->spool_rd == -1) { close(sv->spool_wr); sv->spool_wr = -1; }
+            if (sv->spool_rd != -1) {
+                void *p = mmap(NULL, sizeof(redisAtomic size_t), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+                if (p == MAP_FAILED) { close(sv->spool_rd); sv->spool_rd = -1; }
+                else { sv->spool_committed = p; atomicSet(*sv->spool_committed, 0); }
+            }
+            if (sv->spool_rd == -1) {
+                close(sv->spool_wr); sv->spool_wr = -1;
+                if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
+            }
         }
         if (sv->spool_wr == -1)
             serverLog(LL_WARNING, "Hybrid BGSAVE: cannot create the spool file %s (%s): the pipe carries everything", path, strerror(errno));
@@ -2725,6 +2831,8 @@ void snapSaveChildDone(int exitcode, int bysignal) {
     snap_last_retained_peak = sv->retained_peak;
     atomicGet(sv->queued_peak, snap_last_queued_peak);
     atomicGet(sv->spool_bytes, snap_last_spool_bytes);
+    snapSaveSpoolBytes();   /* one last sample */
+    snap_last_spool_alloc_peak = sv->spool_alloc_peak;
     snap_last_inplace_writes = sv->inplace_writes;
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions (merges), joins, unregisters */

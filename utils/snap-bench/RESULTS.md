@@ -1602,3 +1602,31 @@ Raw: `run25.csv`, driver `~/run25.sh`. Run 18/21 recipe (`SYNC=1`, rdb-channel y
   than the same binary's BGSAVE, so nothing waited on the pipe in the first place). The spool carries 0.8-0.9 GB
   of it (the child drains the spool into the socket between big values), the queue peak drops to 15-18 MB, memory
   and latency are within noise. No regression, as TASK-1.30's AC3 asked.
+
+## Runs 26-28 (2026-10-01): the spool's true footprint (TASK-1.30, "reflect true memory consumption")
+
+The spool's pages are outside `used_memory` and RSS (page cache on disk, RAM on this tmpfs benchmark dir), so run 24's
+"extra 17 MB" hid about 1 GB. Three steps, each measured on mixed1m at 4 GB on the same host (`hybrid` only):
+
+| run | child behaviour | footprint measure | idle: spooled / footprint peak MB | 20k: spooled / peak | 50k: spooled / peak |
+|---|---|---|---|---|---|
+| 26 | pipe-first, holes punched 16 MB behind the reads | written minus first data offset | 258 / 258 | 1060 / 1060 | - |
+| 27 | plus: flush the spool after every big value | same | 323-330 / 307-314 | 1060 / 1044 | 1061-1063 / 1045-1047 |
+| 28 | same, hole punches aligned to 4 KB blocks | same | 337-350 / 61-62 | 1060-1061 / 60-64 | 1061-1065 / 59-70 |
+
+- **Run 26** measured no reduction because the child, with pipe-first alone, handled the queued big values back to back and
+  drained the spool only afterwards: the file held everything written in the meantime.
+- **Run 27** flushed the spool after each big value, yet the peak still read "written minus 16 MB": an strace of the child
+  showed the drains and punches happening as intended, so the *measure* was wrong. A hole punched to an unaligned byte
+  offset leaves the straddling 4 KB block allocated, and `SEEK_DATA` from the start of the file stops at the first such
+  block for good.
+- **Run 28**, punches aligned to blocks: the footprint peaks at 59-70 MB while 0.34-1.07 GB pass through, about one big
+  value's worth of scan output (the hashes take the child 0.85 s each, the scan thread produces about 70 MB/s). Save
+  times 21-25 s, as in run 24. Two cells show 34-41 ms worst PING: the main thread's `SEEK_DATA` walked the whole punched
+  prefix (a gigabyte of holes, page by page) on every INFO call; fixed by resuming from the previous frontier (run 29).
+- Found on the way, by this test coverage rather than by the benchmark: a torn message header read by the child while
+  the scan thread was still writing it (fixed: the scan thread publishes the committed spool length through a shared
+  page and the child never reads past it), and a crash in the hybrid child that predates the spool: the arena's 16 TB
+  range is not mapped in the child, the kernel reused those addresses for the child's own heap, and `zmalloc_is_nofork`
+  then routed a realloc of a child buffer to the parent-only arena (fixed: the child re-reserves the range PROT_NONE
+  right after the fork). The latter is what the 'converges under write load' test's occasional second save was.
