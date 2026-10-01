@@ -1315,6 +1315,7 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
 #define SNAP_MSG_ABORT  4
 #define SNAP_MSG_SPOOL  5     /* small channel: the next bytes of this stream sit in the spool (payload: offset, length) */
 #define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
+#define SNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
 #define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
 
 typedef struct snapMsgHdr {
@@ -2393,6 +2394,19 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             if (!small_ready && !big_ready) { errno = 0; err_op = "channel closed"; goto werr; }
             size_t backlog;
             atomicGet(sv->shared->small_queued, backlog);
+            if (!small_ready && big_ready && small_open && backlog >= SNAP_SMALL_BACKLOG) {
+                /* The parent holds a small backlog that the scan thread has
+                 * not pushed into the pipe yet (it pushes at its own
+                 * enqueues, about once a millisecond, a pipe's worth each
+                 * time). Wait for it briefly rather than start a big value:
+                 * run 30 showed the child falling to the next big value at
+                 * every such gap, the backlog growing to the bound for the
+                 * whole value and the scan thread parked (29-36 s under
+                 * writes against 21-24 with the spool). */
+                struct pollfd one = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
+                int r = poll(&one, 1, SNAP_SMALL_WAIT_MS);
+                if (r > 0 && (one.revents & POLLIN)) small_ready = 1;
+            }
             src = (small_ready && (backlog >= SNAP_SMALL_BACKLOG || !big_ready)) ? 0 : 1;
         }
         if (src == 1) {
