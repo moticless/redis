@@ -1584,3 +1584,21 @@ frees the pages. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; smal
   within one rep's noise of the pipe shape (31.5 against 29.9 idle, 31.3 against 30.7 at 20k, single reps on a dataset
   whose cells spread 29-33 s in earlier runs).
 - The remaining gap to max(scan, child) is small: 21-26 s against 19-20 s of scan CPU and 21-25 s of child CPU.
+
+## Run 25 (2026-10-01): full sync through the overflow spool, mixed1m at 4 GB, c7i.4xlarge
+
+Raw: `run25.csv`, driver `~/run25.sh`. Run 18/21 recipe (`SYNC=1`, rdb-channel yes, replica
+`--repl-diskless-load on-empty-db`), binary bc33196f5, 1 rep per cell.
+
+| rate | config | sync s | extra MB | parent +MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | wmax ms | spooled MB | queued peak MB |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| 0 | nospool | 16.2 | 19 | 9 | 10 | 0.24 | 8.8 | 6.6 | 15.5 | - | 0 | 16 |
+| 0 | overflow spool | 16.2 | 16 | 0 | 16 | 0.23 | 8.7 | 6.3 | 12.7 | - | 797 | 15 |
+| 20k | nospool | 17.0 | 708 | 24 | 691 | 4.0 | 8.9 | 6.5 | 11.7 | 15.4 | 0 | 25 |
+| 20k | overflow spool | 16.9 | 692 | 19 | 688 | 3.8 | 9.0 | 6.4 | 14.2 | 15.5 | 916 | 18 |
+
+- **A full sync is unchanged**: 16.2 s idle and 16.9-17.0 s at 20k writes/s either way, the replica's load time as
+  in runs 18 and 21 (the uncompressed stream a diskless-loading replica asks for makes the child three times faster
+  than the same binary's BGSAVE, so nothing waited on the pipe in the first place). The spool carries 0.8-0.9 GB
+  of it (the child drains the spool into the socket between big values), the queue peak drops to 15-18 MB, memory
+  and latency are within noise. No regression, as TASK-1.30's AC3 asked.
