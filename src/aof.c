@@ -1244,7 +1244,7 @@ void aof_background_fsync_and_close(int fd) {
 
 /* Kills an AOFRW child process if exists */
 void killAppendOnlyChild(void) {
-    int statloc;
+    int statloc = 0;
     /* No AOFRW child? return. */
     if (server.child_type != CHILD_TYPE_AOF) return;
     /* Kill AOFRW child, wait for child exit. */
@@ -1256,6 +1256,9 @@ void killAppendOnlyChild(void) {
     if (kill(server.child_pid,SIGUSR1) != -1) {
         while(waitpid(-1, &statloc, 0) != server.child_pid);
     }
+    /* Hybrid rewrite: no done handler runs on this path, so release the save
+     * object here (the next BGSAVE asserts on a leftover one). */
+    snapSaveChildDone(WIFEXITED(statloc) ? WEXITSTATUS(statloc) : 1, WIFSIGNALED(statloc) ? WTERMSIG(statloc) : 0);
     aofRemoveTempFile(server.child_pid);
     resetChildState();
     server.aof_rewrite_time_start = -1;

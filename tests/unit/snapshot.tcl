@@ -1896,6 +1896,23 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r config set appendonly no
     }
 
+    test {BGREWRITEAOF through the hybrid killed by 'appendonly no': the save is released, the next BGSAVE works} {
+        snap_fallback_dataset
+        set digest [debug_digest]
+        r config set rdb-key-save-delay 300
+        r config set appendonly yes   ;# starts the hybrid rewrite
+        wait_for_condition 100 20 {[s snap_save_in_progress] == 1} else { fail "hybrid rewrite not started" }
+        r config set appendonly no    ;# killAppendOnlyChild: no done handler runs on this path
+        assert_equal 0 [s snap_save_in_progress]
+        assert_equal 0 [s aof_rewrite_in_progress]
+        r config set rdb-key-save-delay 0
+        r bgsave
+        snap_wait_bgsave_done
+        assert_equal ok [s rdb_last_bgsave_status]
+        r debug reload nosave
+        assert_equal $digest [debug_digest]
+    }
+
     test {BGREWRITEAOF with bgsave-hybrid on and no preamble: the stock child, the arena is forkable for it, DONTFORK after, the AOF reloads} {
         r config set aof-use-rdb-preamble no
         snap_fallback_dataset
