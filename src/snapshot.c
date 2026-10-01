@@ -2012,8 +2012,14 @@ static int snapOutDrain(snapSave *sv, int mode, size_t target) {
             size_t q;
             atomicGet(sv->oq_bytes, q);
             if (q <= target) return 0;
-            if (snapScanAborted(sv->scan)) return -1;
         }
+        /* An aborted save must not wait for the child: the parent aborts
+         * before it kills the child (killRDBChild), and a child blocked on
+         * an rdb pipe nobody reads any more never drains our pipes (the
+         * 'all replicas drop during rdb pipe' test hung here once the big
+         * channel's 64 KB pipe was full of KVOBJ headers). What did not fit
+         * is moot; the child dies on SIGUSR1 or sees the pipes close. */
+        if (snapScanAborted(sv->scan)) return -1;
         struct pollfd pfd[2];
         int n = 0;
         if (rs == 1) pfd[n++] = (struct pollfd){ .fd = sv->pipe_wr, .events = POLLOUT, .revents = 0 };
@@ -2726,8 +2732,8 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     }
     /* Two pipes. The scan thread writes them non-blockingly and keeps what
      * does not fit in its own queues (bounded by bgsave-hybrid-max-queued-bytes);
-     * the child's read ends stay blocking. The small channel's pipe is
-     * deepened to 1 MB (best effort). */
+     * the child's read ends stay blocking. Both pipes are deepened to 1 MB
+     * (best effort). */
     int *ends[2] = { &sv->pipe_rd, &sv->big_rd };
     int *wends[2] = { &sv->pipe_wr, &sv->big_wr };
     for (int c = 0; c < 2; c++) {
@@ -2740,7 +2746,8 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
         *ends[c] = fds[0];
         *wends[c] = fds[1];
 #ifdef F_SETPIPE_SZ
-        if (c == 0) fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);
+        fcntl(fds[1], F_SETPIPE_SZ, 1 << 20);   /* best effort, both channels: a dataset of many fork-class keys
+                                                  * sends many small KVOBJ headers between two child reads */
 #endif
         if (fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) == -1) {
             serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));

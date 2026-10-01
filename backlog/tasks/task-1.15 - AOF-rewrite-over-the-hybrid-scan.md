@@ -5,7 +5,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-09-20 17:22'
-updated_date: '2026-10-01 15:45'
+updated_date: '2026-10-01 15:54'
 labels:
   - bgsave
   - persistence
@@ -32,10 +32,10 @@ Scope: hook rewriteAppendOnlyFileBackground into the snapshot.c orchestration; A
 <!-- AC:BEGIN -->
 - [ ] #1 BGREWRITEAOF with aof-use-rdb-preamble yes and no both produce a base file via the hybrid scan and the AOF loads to a keyspace identical to the fork-instant reference under the harness race workload
 - [ ] #2 With the preamble off, SELECT is emitted only on db change despite interleaved producers, verified with a multi-db dataset
-- [ ] #3 Multi-part AOF manifest and base/incr handling behave as today, covered by the existing AOF tcl tests
+- [x] #3 Multi-part AOF manifest and base/incr handling behave as today, covered by the existing AOF tcl tests
 - [ ] #4 Per-type AOF rewriters used by the background thread for SNAP_NOFORK keys are reviewed for main-thread-only state and the review is recorded in task notes
-- [ ] #5 Abort of an AOF rewrite mid-scan leaves the manifest and files consistent and the next rewrite succeeds
-- [ ] #6 Existing AOF and aof-multi-part test suites pass with the hybrid switch on
+- [x] #5 Abort of an AOF rewrite mid-scan leaves the manifest and files consistent and the next rewrite succeeds
+- [x] #6 Existing AOF and aof-multi-part test suites pass with the hybrid switch on
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -54,4 +54,6 @@ Tests: harness race workload with BGREWRITEAOF in both preamble modes, load the 
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-10-01 stage 1 implemented (preamble on): snapSaveBackgroundAof() in snapshot.c (snapSave.child_type, CHILD_TYPE_AOF: no RDB stats, redisFork(CHILD_TYPE_AOF), the child names temp-rewriteaof-<pid>.aof and renames to temp-rewriteaof-bg-<pid>.aof, aof_rewrite_incremental_fsync, CHILD_INFO_TYPE_AOF_COW_SIZE, no dir fsync); rewriteAppendOnlyFileBackground calls it when aof-use-rdb-preamble and the hybrid are on and every module handles the hybrid, after flushAppendOnlyFile/openNewIncrAofForAppend, and does the parent bookkeeping; killAppendOnlyChild calls snapSaveAbort(); backgroundRewriteDoneHandler calls snapSaveChildDone() first. Tests: the BGREWRITEAOF arena test split into preamble-on (hybrid path, arena DONTFORK, snap_saves +1) and preamble-off (stock fallback, arena forkable); the mutual-exclusion fallback-child test uses preamble off; a harness test runs BGREWRITEAOF under random writes, DEBUG LOADAOF equals the live digest, a killed child fails the rewrite and the next one works. All pass alone; whole unit, stock mode and the AOF suites with the feature on pending. Stage 2 (AOF command form, preamble off) not started.
+
+Stage 1 verified and committed (2026-10-01): unit/snapshot feature on and stock all pass; unit/aofrw, integration/aof and integration/aof-multi-part pass with --config bgsave-hybrid yes (AC3, AC6); the harness test covers the killed-child abort with the manifest intact and the next rewrite succeeding (AC5). AC1 is met for the preamble-on half; AC1's preamble-off half, AC2 and AC4 are stage 2 (AOF command form from the scan thread), left for a later session with the plan of record above.
 <!-- SECTION:NOTES:END -->
