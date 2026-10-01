@@ -255,7 +255,7 @@ hybrid on the same channel, Valkey's default fork-based sync; two reps each):
 
 Sync time is the replica's load time and the hybrid matches stock on it; what changes is what the
 primary pays while it runs: copy-on-write on the fork-class values only plus the scan thread's queue
-(16 MB at the default bound, measured in run 21: 60-130 MB when the bound was 128 MB), a fork stall the size of those values' page tables, and stock's write latency. The
+(50-100 MB for a few seconds, released at the end), a fork stall the size of those values' page tables, and stock's write latency. The
 replication stream buffered on the replica during a sync of this length is 23-33 MB, the number the
 spliced-stream option has to justify itself against. Valkey's fork-based sync is two to three times
 longer because it compresses the RDB and streams on one channel. Its forkless full sync, run from
@@ -278,49 +278,50 @@ of the scale and are in the repository.
 
 | writes/s | config | save s | fork stall ms | peak MB | extra MB | main CPU s | PING max ms | write p99 ms | write max ms |
 |---|---|---|---|---|---|---|---|---|---|
-| idle | Redis (fork) | 33.8 | 34 | 4109 | 2 | 0.5 | 31.3 | | |
-| idle | hybrid | 31.3 | 1.6 | 4030 | 2 | 0.4 | 1.8 | | |
-| idle | Valkey forkless | 36.1 | 0 | 3911 | 0.5 | 10.7 | 1.7 | | |
-| 20k | Redis (fork) | 35.1 | 34 | 6408 | 2380 | 7.7 | 30.0 | 0.60 | 34.5 |
-| 20k | hybrid | 31.5 | 1.6 | 4036 | 8 | 6.9 | 1.0 | 0.63 | 2.5 |
-| 20k | Valkey forkless | 46.0 | 0 | 3904 | 9 | 17.2 | 1.7 | 3.41 | 7.0 |
-| 50k | Redis (fork) | 35.6 | 38 | 7334 | 3306 | 13.9 | 36.1 | 0.45 | 39.5 |
-| 50k | hybrid | 29.3 | 1.6 | 4036 | 8 | 11.8 | 1.4 | 0.49 | 3.1 |
-| 50k | Valkey forkless | 41.9 | 0 | 3916 | 21 | 25.6 | 2.7 | 1.25 | 4.5 |
-| 50k, 20% hot | Redis (fork) | 35.3 | 40 | 6910 | 2882 | 14.5 | 38.4 | 0.33 | 41.3 |
-| 50k, 20% hot | hybrid | 29.7 | 1.6 | 4036 | 8 | 12.8 | 1.2 | 0.31 | 3.6 |
-| 50k, 20% hot | Valkey forkless | 41.0 | 0 | 3906 | 12 | 23.5 | 2.6 | 1.12 | 4.9 |
+| idle | Redis (fork) | 34.8 | 30 | 4029 | 1 | 0.5 | 27.9 |  |  |
+| idle | hybrid | 32.0 | 1.6 | 4030 | 2 | 0.4 | 1.3 |  |  |
+| idle | Valkey forkless | 36.5 | 0 | 3911 | 0 | 11.6 | 2.0 |  |  |
+| 20k | Redis (fork) | 34.8 | 31 | 6394 | 2366 | 7.4 | 29.6 | 0.52 | 32.1 |
+| 20k | hybrid | 32.1 | 1.6 | 4036 | 8 | 6.7 | 1.1 | 0.54 | 2.3 |
+| 20k | Valkey forkless | 45.8 | 0 | 3903 | 8 | 17.5 | 2.0 | 3.48 | 6.9 |
+| 50k | Redis (fork) | 35.4 | 32 | 7328 | 3300 | 15.0 | 32.6 | 0.37 | 34.1 |
+| 50k | hybrid | 30.8 | 1.6 | 4036 | 7 | 12.9 | 1.6 | 0.38 | 3.9 |
+| 50k | Valkey forkless | 43.8 | 0 | 3916 | 21 | 27.3 | 1.6 | 1.36 | 5.2 |
+| 50k, 20% hot | Redis (fork) | 36.1 | 33 | 6736 | 2708 | 15.2 | 32.7 | 0.31 | 34.1 |
+| 50k, 20% hot | hybrid | 31.3 | 1.6 | 4036 | 8 | 13.3 | 2.3 | 0.36 | 3.6 |
+| 50k, 20% hot | Valkey forkless | 40.2 | 0 | 3921 | 11 | 25.3 | 3.1 | 1.05 | 5.3 |
 
 To save 4 GB under 50k writes/s, stock Redis needs 7.3 GB: it copies 3.3 GB, over 80% of the
-dataset, in 36 seconds, and its 38 ms fork stall is the worst PING and the worst write of the
-run. The hybrid needs 4.0 GB, 8 MB more than it had, stalls for 1.6 ms, and finishes 6 seconds
-sooner. Forkless also holds memory, at 9-21 MB, but its save is 40-50% longer than ours, its main
-thread burns twice the CPU, and every write is 2-5x slower at p99. Nobody misses the offered rate
+dataset, in 35 seconds, and its 33 ms fork stall is the worst PING and the worst write of the
+run. The hybrid needs 4.0 GB, 7 MB more than it had, stalls for 1.6 ms, and finishes 5 seconds
+sooner. Forkless also holds memory, at 9-21 MB, but its save is 40% longer than ours, its main
+thread burns twice the CPU, and every write is 3-6x slower at p99. Nobody misses the offered rate
 on this dataset.
 
 ### Mixed (4.0 GB, 19.5 M keys: 45% of bytes in small values, 55% in 256k hash-table hashes of 9 KB)
 
 | writes/s | config | save s | fork stall ms | peak MB | extra MB | main CPU s | achieved/s | write p99 ms | write max ms |
 |---|---|---|---|---|---|---|---|---|---|
-| idle | Redis (fork) | 36.9 | 37 | 3979 | 2.5 | 0.5 | | | |
-| idle | hybrid | 18.7 | 17 | 3909 | 2 | 0.3 | | | |
-| idle | Valkey forkless | 40.3 | 0 | 3900 | 1 | 11.0 | | | |
-| 20k | Redis (fork) | 36.0 | 38 | 6223 | 2324 | 8.4 | 19995 | 0.63 | 39.1 |
-| 20k | hybrid | 23.3 | 19 | 4772 | 852 | 5.8 | 20000 | 0.65 | 20.1 |
-| 20k | Valkey forkless | 44.1 | 0 | 3828 | 7 | 15.8 | 18970 (95%) | 7.1 | 13.7 |
-| 50k | Redis (fork) | 37.4 | 42 | 7058 | 3148 | 14.8 | 49981 | 0.50 | 43.6 |
-| 50k | hybrid | 31.3 | 18 | 5492 | 1576 | 14.3 | 49995 | 0.40 | 20.9 |
-| 50k | Valkey forkless | 44.4 | 0 | 3861 | 16 | 23.6 | 46490 (93%) | 12.6 | 17.6 |
-| 50k, 20% hot | Redis (fork) | 36.0 | 43 | 5899 | 1988 | 14.8 | 49982 | 0.32 | 44.5 |
-| 50k, 20% hot | hybrid | 21.8 | 19 | 4416 | 506 | 9.6 | 49996 | 0.33 | 20.8 |
-| 50k, 20% hot | Valkey forkless | 45.3 | 0 | 3827 | 14 | 26.3 | 49203 | 0.91 | 16.9 |
+| idle | Redis (fork) | 36.9 | 32 | 3910 | 1 | 0.5 |  |  |  |
+| idle | hybrid | 19.6 | 17 | 3908 | 4 | 0.3 |  |  |  |
+| idle | Valkey forkless | 38.1 | 0 | 3901 | 1 | 11.4 |  |  |  |
+| 20k | Redis (fork) | 36.5 | 34 | 6250 | 2341 | 8.6 | 19996 | 0.52 | 34.6 |
+| 20k | hybrid | 20.1 | 17 | 4681 | 770 | 5.4 | 20000 | 0.56 | 19.2 |
+| 20k | Valkey forkless | 43.8 | 0 | 3820 | 7 | 17.0 | 18842 (94%) | 7.67 | 14.8 |
+| 50k | Redis (fork) | 38.8 | 36 | 7094 | 3172 | 14.6 | 49986 | 0.42 | 37.2 |
+| 50k | hybrid | 20.2 | 18 | 5254 | 1346 | 9.3 | 49995 | 0.43 | 20.8 |
+| 50k | Valkey forkless | 47.1 | 0 | 3853 | 16 | 25.3 | 46132 (92%) | 13.19 | 18.3 |
+| 50k, 20% hot | Redis (fork) | 38.9 | 35 | 5906 | 1999 | 14.0 | 49988 | 0.49 | 36.9 |
+| 50k, 20% hot | hybrid | 19.8 | 18 | 4416 | 506 | 8.6 | 49996 | 0.36 | 20.1 |
+| 50k, 20% hot | Valkey forkless | 43.9 | 0 | 3835 | 14 | 26.4 | 49228 (98%) | 0.90 | 17.8 |
 
 This is where the trade-off is visible. The 9 KB hashes have 96-byte field values, above Redis's
 64-byte `hash-max-listpack-value`, so they are hash tables, and a hash table is fork-class at any
-size. They pay copy-on-write when written: 0.5-1.6 GB for the hybrid against 2.0-3.1 GB for stock,
-with the stall halved and the save shortest in every cell, half of stock's when idle because the
-scan thread and the child work in parallel. Forkless pays nothing in memory for them, but its main
-thread works 1.6-2.7x harder, write p99 is 7-13 ms against 0.4-0.65, its saves are the longest,
+size. They pay copy-on-write when written: 0.5-1.3 GB for the hybrid against 2.0-3.2 GB for stock,
+with the stall halved and the save half of stock's in every cell, idle or not, because the scan
+thread and the child work in parallel and the child starts on a hash as soon as it is handed one.
+Forkless pays nothing in memory for them, but its main
+thread works 1.8-2.4x harder, write p99 is 7.7-13 ms against 0.4-0.6, its saves are the longest,
 and at 20k and 50k it is the only configuration that cannot keep up. The rest of the hybrid's gap
 is the encoding line moving: keep these hashes listpack-encoded (`hash-max-listpack-value 128`,
 cap 16 KB) and they join the small class with no code change; or admit small hash tables to the
@@ -329,20 +330,21 @@ yet.
 
 ### Hashes of a million fields (mixed1m: 19.2 M small keys plus 24 hashes of 1M fields; big1m: 36 such hashes and 32 sorted sets)
 
-The mixed1m rows are a later run of the three binaries on one host and day, with the hybrid's
-scan-thread queue in place (see below); the big1m rows are from the original run. Two reps each.
+All rows of the three tables above and below are from the three binaries on one host and day
+(2026-10-01), two reps each, with the hybrid in its final shape (two channels to the child, see
+section 9); the big1m rows are from the original run, where nothing changed for them.
 
 | dataset | writes/s | config | save s | fork stall ms | peak MB | extra MB | achieved/s | write p99 ms | write max ms | stalled s |
 |---|---|---|---|---|---|---|---|---|---|---|
-| mixed1m | 0 | Redis (fork) | 43.1 | 28-41 | 4073-4231 | 1-3 | - | - | - | - |
-| mixed1m | 0 | hybrid | 26.3-28.7 | 14 | 4255 | 136-158 | - | - | - | - |
-| mixed1m | 0 | Valkey forkless | 51.0-52.1 | 0 | 4008-4106 | 1 | - | - | - | - |
-| mixed1m | 20k | Redis (fork) | 40.9-43.3 | 29 | 6542 | 2469 | 19997 | 0.53 | 30 | 0 |
-| mixed1m | 20k | hybrid | 39.9-40.7 | 14 | 5319 | 1238 | 19999 | 0.57 | 16 | 0 |
-| mixed1m | 20k | Valkey forkless | 48.1-49.3 | 0 | 4011 | 3-4 | 15046 (75%) | 1.52 | 21,166-23,609 | 5-6 |
-| mixed1m | 50k | Redis (fork) | 43.8-44.2 | 31 | 7333 | 3260 | 49991 | 0.42-0.61 | 32 | 0 |
-| mixed1m | 50k | hybrid | 37.5-38.3 | 15 | 5796 | 1717 | 49998 | 0.40-0.53 | 17 | 0 |
-| mixed1m | 50k | Valkey forkless | 46.0-47.3 | 0 | 4015 | 8 | 38304 (77%) | 1.39 | 18,471-22,207 | 8-13 |
+| mixed1m | 0 | Redis (fork) | 39.8 | 29 | 4073 | 1 | - | - | - | - |
+| mixed1m | 0 | hybrid | 25.8-26.3 | 14 | 4151-4155 | 67-75 | - | - | - | - |
+| mixed1m | 0 | Valkey forkless | 49.7-53.7 | 0 | 4007-4105 | 0 | - | - | - | - |
+| mixed1m | 20k | Redis (fork) | 44.4-46.0 | 29-30 | 6604-6645 | 2532-2573 | 19997 | 0.52 | 30-31 | 0 |
+| mixed1m | 20k | hybrid | 21.9-25.2 | 15 | 4954-5015 | 875-939 | 19999 | 0.54 | 16 | 0 |
+| mixed1m | 20k | Valkey forkless | 44.9-49.6 | 0 | 4010 | 3 | 15269-15530 (77%) | 1.57 | 20,665-22,597 | 6-7 |
+| mixed1m | 50k | Redis (fork) | 43.6-45.0 | 31 | 7329-7344 | 3256-3271 | 49990 | 0.34-0.60 | 32-33 | 0 |
+| mixed1m | 50k | hybrid | 25.1-25.5 | 15 | 5625-5648 | 1552-1572 | 49998 | 0.46-0.63 | 18 | 0 |
+| mixed1m | 50k | Valkey forkless | 45.3-49.5 | 0 | 4015 | 8 | 37340-38458 (76%) | 1.41 | 22,335-23,892 | 10 |
 | big1m | 20k | Redis (fork) | 34.2 | 30-34 | 5749 | 1901 | 19995 | 0.67 | 30-36 | 0 |
 | big1m | 20k | hybrid | 35.6 | 26 | 5795 | 1946 | 19996 | 0.68 | 27 | 0 |
 | big1m | 20k | Valkey forkless | 34.7 | 0 | 3754 | 1 | 8532 (43%) | 0.64 | 33,946 | 5-7 |
@@ -352,14 +354,14 @@ scan-thread queue in place (see below); the big1m rows are from the original run
 
 Two things happen here. On big1m, where every byte is fork-class, the hybrid and stock are the
 same save on every column, as designed: nothing eligible, nothing gained, nothing lost, no mode
-to switch. On mixed1m the hybrid again pays copy-on-write for the hashes alone, half of stock's,
-with half the stall. The idle row shows what the two workers buy when the child is inside a 90 MB
-hash: the hybrid saves in 26-29 s where stock's single child needs 43 and forkless's single thread
-51-52, because the scan thread queues its output in memory instead of waiting for the child (the
-queue is the 136-158 MB of extra memory in that row, measured with the bound at 128 MB and
-released at the end; the default ships at 16 MB, where the same cells measure 37 s against 40-43
-for stock with 17 MB of extra memory, run 21). Under writes the gain narrows to 5-15%: the child's
-wall time then exceeds its CPU time by 10-15 s, for a reason not yet understood.
+to switch. On mixed1m the hybrid pays copy-on-write for the hashes alone, a third of stock's,
+with half the stall, and saves in 22-26 s at every write rate where stock's single child needs
+40-46 and forkless's single thread 45-54. That is what the two workers buy when the child is inside
+a 90 MB hash for most of a second: the scan thread keeps serializing small values into a bounded
+queue (the 67-75 MB of extra memory in the idle row, released at the end), and the child takes
+the queue whenever it has a backlog and the next hash when it does not, so neither waits for the
+other. Under writes the main thread hands the child every hash at the first write to it, and the
+same rule interleaves them with the queue instead of running them back to back.
 
 And forkless meets the value it cannot serialize atomically. A write that lands on the hash
 being saved waits until the whole 90 MB hash is written: 22 to 34 seconds at worst, up to 16
@@ -369,6 +371,9 @@ not. This is not a tuning problem. It is what "serialize each key atomically" me
 a million fields.
 
 ### One core (mixed, 4 GB, server and all its threads and children pinned to a single vCPU)
+
+Measured before the two-channel change (section 9); the single-core shape is unlikely to move, since
+the scan thread and the child cannot overlap on one core either way, but it has not been re-run.
 
 | writes/s | config | save s | fork stall ms | extra MB | achieved/s | write p99 ms | write max ms | stalled s |
 |---|---|---|---|---|---|---|---|---|
@@ -417,9 +422,10 @@ and `stop-writes-on-bgsave-error` behave as before, since a child still writes t
 `save-small-max-bytes` (default 4 KB) is the size line within the eligible encodings,
 `bgsave-hybrid-max-retained-bytes` (default 256 MB) bounds the memory a save may hold for buckets
 under the scan window before it is aborted and reported as failed, and
-`bgsave-hybrid-max-queued-bytes` (default 16 MB) bounds the records the scan thread may queue
-while the child is busy with a large value before it waits; 128 MB buys the full overlap on
-datasets of hundred-megabyte values. `allocator_allocated_nofork`
+`bgsave-hybrid-max-queued-bytes` (default 100 MB) bounds the records the scan thread may queue
+while the child is busy with a large value before it waits; one large value's worth of scan output
+has to fit for the two to overlap fully (about 50 MB for a 90 MB hash). The memory is held only
+while the child is behind, is released when the save ends, and is not counted towards maxmemory. `allocator_allocated_nofork`
 tells you, before any save, how much of your dataset the child will never see.
 
 ## 9. Where it stands
@@ -445,12 +451,16 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   encoding thresholds that feed it are untuned; the mixed dataset is the experiment.
 - **The scan thread** costs about one CPU-second per 260 MB save, on a core the fork child would
   otherwise have used.
-- **The two workers now overlap on huge fork-class values**, through a bounded in-memory queue in
-  front of the pipe: on mixed1m the idle save went from 38 s (scan plus child in series) to 22-25 s
-  (the child alone). The queue is memory the save holds while the child is behind, up to its own
-  bound, 16 MB by default and 128 MB for that measurement (at the default the idle save is 37 s, run 21),
-  released at the end; and under writes the gain is smaller, 41 s to 36-39 s, because the child's
-  wall time exceeds its CPU time there, which is not yet understood.
+- **The two workers overlap on huge fork-class values** through two channels from the scan thread
+  to the child: small values' buffers on one, large values' headers on the other, each in front of
+  a bounded in-memory queue (100 MB by default). The child drains the small backlog first and takes
+  a large value only when that backlog is low, so the queue holds about one large value's worth of
+  scan output and the scan thread never waits. On mixed1m the save went from 38 s (scan plus child
+  in series) to 22-26 s at every write rate, the child's own time; on mixed from 23-31 s under
+  writes to 19-20. The queue is memory the save holds while the child is behind, released at the
+  end and excluded from eviction accounting. A single value larger than the bound allows (about
+  200 MB here) parks the scan for its remainder; an optional unlinked spool file in the working
+  directory (`bgsave-hybrid-spool`, off by default) takes the overflow when that matters.
 
 ## 10. Conclusion
 
