@@ -1839,3 +1839,45 @@ big hashes last in scan order, see the run 22 correction).
   almost no page tables for the child to copy); worst write 2.0-4.3 ms against 32-34. Forkless is 35-47 s, with a main
   thread at 11.6-28.0 CPU-seconds and 1.3-3.5 ms p99 writes; 2-5 clients blocked at the peak even here.
 
+## Run 32 (2026-10-01): three-way on mixed (9 KB hashes) at 4 GB, uniform and 20% hot set, plus small at 50k hot, c7i.4xlarge
+
+Raw: `run32.csv` (HOT=1.0), `run32h.csv` (HOT=0.2), driver `~/run32.sh`, chained after run 31. Same binaries as run 31
+(`up` 0d6266f2d, `hybrid` bfaa21174 with the two channels and the 100 MB bound, `valkey-forkless` 06d35aca6). mixed scale
+16 (19.46M keys, 800k 50-byte strings, 200k small lists and sets, 256k hash-table hashes of 64 x 96-byte fields), rates
+0 / 20k / 50k uniform and 50k on a 20% hot set, 2 reps interleaved; small scale 13.5 at 50k on a 20% hot set, 2 reps.
+Run for the blog's mixed table, whose hybrid rows (run 12) predated the queue and the two channels. Values rep a / rep b.
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock upstream | 35.1* / 36.9 | 47 / 32 | 4 / 1 | 4 / 1 | 0.5 | 0 | 35.0 / 36.8 | 43.7 / 28.9 | - | - | - | - | 0 |
+| mixed | idle | hybrid | 19.3 / 19.8 | 17 | 4 / 3 | 3 / 2 | 0.3 | 19.0 / 19.6 | 16.9 / 17.0 | 13.0 / 13.9 | - | - | - | - | 0 |
+| mixed | idle | Valkey forkless | 39.1 / 37.1 | 0 | 1 | 0 | 11.1 / 11.7 | 36.8 / 35.0 | 0 | 1.6 / 1.8 | - | - | - | - | 0 |
+| mixed | 20k | stock upstream | 38.1 / 35.0 | 34 | 2389 / 2293 | 2387 / 2292 | 9.0 / 8.3 | 0 | 37.9 / 34.8 | 31.1 / 29.9 | 0.52 | 34 / 35 | 19996 | 0 | 0 |
+| mixed | 20k | hybrid | 20.4 / 19.7 | 18 / 17 | 780 / 761 | 773 / 752 | 5.4 / 5.3 | 20.2 / 19.4 | 16.9 / 18.5 | 14.3 / 15.5 | 0.55 / 0.56 | 20 / 19 | 19999 / 20000 | 0 | 0 |
+| mixed | 20k | Valkey forkless | 41.9 / 45.7 | 0 | 7 | 0 | 16.6 / 17.4 | 37.8 / 41.1 | 0 | 1.8 / 1.7 | 7.66 / 7.67 | 15 | 18864 / 18821 | 15 / 17 | 7 |
+| mixed | 50k | stock upstream | 38.5 / 39.1 | 36 | 3166 / 3177 | 3165 / 3174 | 16.1 / 13.1 | 0 | 38.4 / 38.9 | 32.0 / 36.2 | 0.26 / 0.59 | 37 | 49986 | 0 | 0 |
+| mixed | 50k | hybrid | 20.3 / 20.2 | 18 | 1343 / 1348 | 1335 / 1333 | 9.7 / 8.8 | 19.9 / 20.0 | 18.2 / 17.7 | 17.2 / 17.3 | 0.29 / 0.56 | 21 | 49995 | 0 | 0 |
+| mixed | 50k | Valkey forkless | 47.1 / 47.2 | 0 | 16 / 15 | 0 | 25.0 / 25.7 | 43.0 / 43.4 | 0 | 3.1 / 1.6 | 13.2 | 18 | 46119 / 46146 | 16 | 12 |
+| mixed | 50k hot 20% | stock upstream | 38.3 / 39.5 | 35 | 1996 / 2002 | 1993 / 2000 | 14.9 / 13.1 | 0 | 38.1 / 39.4 | 32.8 / 34.6 | 0.36 / 0.62 | 37 | 49988 / 49987 | 0 | 0 |
+| mixed | 50k hot 20% | hybrid | 20.3 / 19.4 | 18 | 506 | 498 / 495 | 8.5 / 8.7 | 20.0 / 19.2 | 17.1 / 19.1 | 15.5 / 14.2 | 0.44 / 0.27 | 20 | 49995 / 49996 | 0 | 0 |
+| mixed | 50k hot 20% | Valkey forkless | 44.0 / 43.8 | 0 | 13 / 14 | 0 | 26.4 / 26.5 | 41.6 / 41.2 | 0 | 1.5 | 0.85 / 0.94 | 17 / 18 | 49208 / 49248 | 3 | 12 |
+| small | 50k hot 20% | stock upstream | 33.6* / 36.2 | 53 / 33 | 782 / 2708 | 782 / 2708 | 9.8 / 15.2 | 0 | 33.5 / 36.0 | 52.6 / 32.7 | 0.58 / 0.31 | 56 / 34 | 49970 / 49986 | 0 | 0 |
+| small | 50k hot 20% | hybrid | 31.5 / 31.1 | 1.6 | 8 | 1 | 13.8 / 12.8 | 31.3 / 30.8 | 3.2 | 3.2 / 1.5 | 0.33 / 0.39 | 3.8 / 3.5 | 49999 | 0 | 0 |
+| small | 50k hot 20% | Valkey forkless | 40.7 / 39.7 | 0 | 10 / 12 | 0 | 25.4 / 25.3 | 39.0 / 39.1 | 0 | 2.5 / 3.7 | 1.10 / 1.00 | 6.0 / 4.6 | 49999 | 0 | 5 |
+
+\* first cell of the dataset, right after the live populate (the small hot stock cell also ran with a cold page cache:
+782 MB of CoW against 2708 in the cached rep).
+
+### Reading the run
+
+- **mixed: the hybrid saves in 19-20 s at every rate; stock 35-39, forkless 37-47.** Run 12 had the hybrid at 18.7 idle but
+  23-31 s under writes (pipe, no queue); the two channels make the under-writes cells equal to idle. Copy-on-write is the
+  hash tables only: 0.50-1.35 GB against stock's 2.0-3.2 GB; the fork stall 17-18 ms against 32-36; worst write 19-21 ms
+  (the stall) against 34-37.
+- **Forkless on 9 KB hash tables under writes**: 94% of the offered rate at 20k and 92% at 50k uniform, 15-17 stalled
+  seconds per save, 7-12 clients blocked, p99 7.7-13.2 ms against 0.3-0.6 for the others; at 50k on the hot set it
+  delivers 98% with a 0.85-0.94 ms p99 and 3 stalled seconds. Idle its save is 37-39 s with 11-12 CPU-seconds on the
+  main thread.
+- **small at 50k on the hot set**: hybrid 31.1-31.5 s with 8 MB extra, stock 36.2 s (cached rep) with 2.7 GB, forkless
+  39.7-40.7 s with 25 CPU-seconds on the main thread and 5 blocked clients.
+
