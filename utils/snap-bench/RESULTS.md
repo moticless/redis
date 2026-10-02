@@ -1881,3 +1881,41 @@ Run for the blog's mixed table, whose hybrid rows (run 12) predated the queue an
 - **small at 50k on the hot set**: hybrid 31.1-31.5 s with 8 MB extra, stock 36.2 s (cached rep) with 2.7 GB, forkless
   39.7-40.7 s with 25 CPU-seconds on the main thread and 5 blocked clients.
 
+## Run 33 (2026-10-02): one core, stock upstream vs the two-channel hybrid vs Valkey forkless, mixed at 4 GB, fresh c7i.4xlarge
+
+Raw: `run33.csv` (HOT=1.0), `run33h.csv` (HOT=0.2), driver `~/run33.sh` on the new instance (18.145.109.115). Server,
+scan thread and fork child pinned to vCPU 0 (`SERVER_CPUS="0"`), load on 4-7,12-15; `up` 0d6266f2d, `hybrid` 2fa3ad6a6
+(two channels, 100 MB bound; the spool removal that followed does not touch the measured path), `valkey-forkless`
+06d35aca6. mixed scale 16, rates 0 / 20k / 50k uniform and 50k on a 20% hot set, 2 reps interleaved. Run 15 was the
+previous one-core run (hybrid then with the plain pipe). Values rep a / rep b as ranges.
+
+| rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| idle | Redis (fork) | 46.0-47.3 | 34-43 | 1-4 | 1-4 | 0.4-0.5 | 0.0 | 45.5-46.7 | 37.1-42.4 | - | - | - | - | 0 |
+| idle | hybrid | 47.1-47.4 | 18 | 2-3 | 1 | 0.4 | 25.2 | 21.5-21.6 | 16.8-17.1 | - | - | - | - | 0 |
+| idle | Valkey forkless | 50.6-54.8 | 0 | 1 | 0 | 11.6-11.8 | 38.0-42.2 | 0.0 | 4.6-5.4 | - | - | - | - | 0 |
+| 20k | Redis (fork) | 52.0-55.6 | 36 | 2716-2778 | 2715-2777 | 7.8-8.6 | 0.0 | 44.3-47.0 | 33.9-35.9 | 3.09-3.12 | 37-38 | 19996 | 0 | 0 |
+| 20k | hybrid | 53.2-54.2 | 19-25 | 1373-1384 | 1364-1374 | 7.7-8.0 | 24.3-24.9 | 21.3-21.4 | 16.1-26.3 | 4.89-4.96 | 20-27 | 19998-19999 | 0 | 0 |
+| 20k | Valkey forkless | 64.4-65.5 | 0 | 8-9 | 0 | 18.5-18.8 | 42.8-43.4 | 0.0 | 3.8-4.3 | 11.98-12.72 | 23-25 | 17437-17624 (88%) | 34-37 | 7 |
+| 50k | Redis (fork) | 68.1-69.4 | 57-61 | 3320-3321 | 3316-3317 | 21.6-21.8 | 0.0 | 46.7-47.8 | 56.7-58.4 | 3.83-3.99 | 59-63 | 49974 | 0 | 0 |
+| 50k | hybrid | 60.4-60.8 | 33-34 | 1770-1771 | 1754-1755 | 16.0-16.1 | 23.6-23.9 | 21.0-21.1 | 33.3-34.5 | 6.24 | 36-37 | 49982 | 0 | 0 |
+| 50k | Valkey forkless | 67.8-69.6 | 0 | 26 | 0 | 24.6-25.0 | 41.8-43.2 | 0.0 | 4.3-4.9 | 18.74-18.81 | 27-35 | 44230-44384 (89%) | 44-47 | 12 |
+| 50k, 20% hot | Redis (fork) | 66.6-68.1 | 62-65 | 2065-2067 | 2061-2063 | 20.8-21.2 | 0.0 | 46.0-47.2 | 60.9-65.4 | 3.84-3.96 | 64-68 | 49971 | 0 | 0 |
+| 50k, 20% hot | hybrid | 59.6-59.9 | 33-36 | 530-531 | 520 | 14.9-15.0 | 23.5-24.0 | 21.2-21.4 | 34.4-36.3 | 5.94-6.02 | 35-39 | 49980-49984 | 0 | 0 |
+| 50k, 20% hot | Valkey forkless | 70.8-74.2 | 0 | 16 | 0 | 27.2-28.3 | 42.2-44.4 | 0.0 | 4.0-4.8 | 5.49-6.10 | 25-28 | 48677-48747 (97%) | 6 | 12 |
+
+### Reading the run
+
+- **On one core the hybrid's save-time win is gone, as in run 15, and the two channels change nothing there**: the
+  scan thread (23.5-25.2 CPU-seconds) and the child (21 s) take turns on the core, so idle 47.1-47.4 s against stock's
+  46.1-47.3 and forkless's 50.6-54.8; 20k 53.2-54.2 against 52.0-55.6; 50k 60.4-60.8 against 68.1-69.4, where stock's
+  child copying 3.3 GB of pages takes more of the core than our scan thread does; 50k on the hot set 59.6-59.9 against
+  66.6-68.1.
+- **What does not depend on cores holds**: copy-on-write 1.37-1.77 GB against stock's 2.72-3.32 GB uniform and 0.53
+  against 2.07 on the hot set; the fork stall 18-36 ms against 34-65; worst write 20-39 ms against 37-68.
+- **The scan thread competes with the main thread for the core**: write p99 4.9-6.2 ms against stock's 3.1-4.0, PING
+  p99 5.3-5.8 against 3.3-3.7. That is the one-core cost of the design.
+- **Forkless does not survive one core at this size**: 87-89% of the offered rate uniform (34-47 stalled seconds per
+  save, 7-12 clients blocked, p99 12-19 ms), 97% on the hot set with 6 stalled seconds; its main thread spends 18.5-28.3
+  CPU-seconds per save; saves of 64-74 s.
+

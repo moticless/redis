@@ -372,37 +372,34 @@ a million fields.
 
 ### One core (mixed, 4 GB, server and all its threads and children pinned to a single vCPU)
 
-Measured before the two-channel change (section 9); the single-core shape is unlikely to move, since
-the scan thread and the child cannot overlap on one core either way, but it has not been re-run.
-
 | writes/s | config | save s | fork stall ms | extra MB | achieved/s | write p99 ms | write max ms | stalled s |
 |---|---|---|---|---|---|---|---|---|
-| idle | Redis (fork) | 39.8 | 32-41 | 1-4 | | | | |
-| idle | hybrid | 42.0 | 17-19 | 1-2 | | | | |
-| idle | Valkey forkless | 49.5 | 0 | 1 | | | | |
-| 20k | Redis (fork) | 51.7 | 35-59 | 2708 | 19993 | 3.1 | 36-60 | 0 |
-| 20k | hybrid | 48.5 | 30-32 | 1317 | 19996 | 4.0 | 32-33 | 0 |
-| 20k | Valkey forkless | 58.0 | 0 | 8 | 17605 (88%) | 12.0 | 24 | 32-33 |
-| 50k | Redis (fork) | 62.9 | 46-64 | 3311 | 49975 | 3.7 | 48-66 | 0 |
-| 50k | hybrid | 63.2 | 27-33 | 1773 | 49986 | 3.2 | 29-35 | 0 |
-| 50k | Valkey forkless | 63.3 | 0 | 25 | 44131 (88%) | 18.4 | 162-165 | 32-35 |
-| 50k, 20% hot | Redis (fork) | 62.4 | 43-66 | 2061 | 49975 | 3.7 | 46-68 | 0 |
-| 50k, 20% hot | hybrid | 55.9 | 19-23 | 532 | 49992 | 4.7 | 21-26 | 0 |
-| 50k, 20% hot | Valkey forkless | 66.2 | 0 | 15 | 48650 (97%) | 7.0 | 25-28 | 6 |
+| idle | Redis (fork) | 46.0-47.3 | 34-43 | 1-4 |  |  |  |  |
+| idle | hybrid | 47.1-47.4 | 18 | 2-3 |  |  |  |  |
+| idle | Valkey forkless | 50.6-54.8 | 0 | 1 |  |  |  |  |
+| 20k | Redis (fork) | 52.0-55.6 | 36 | 2716-2778 | 19996 | 3.1 | 37-38 | 0 |
+| 20k | hybrid | 53.2-54.2 | 19-25 | 1373-1384 | 19998-19999 | 4.9-5.0 | 20-27 | 0 |
+| 20k | Valkey forkless | 64.4-65.5 | 0 | 8-9 | 17437-17624 (88%) | 12.0-12.7 | 23-25 | 34-37 |
+| 50k | Redis (fork) | 68.1-69.4 | 57-61 | 3320-3321 | 49974 | 3.8-4.0 | 59-63 | 0 |
+| 50k | hybrid | 60.4-60.8 | 33-34 | 1770-1771 | 49982 | 6.2 | 36-37 | 0 |
+| 50k | Valkey forkless | 67.8-69.6 | 0 | 26 | 44230-44384 (89%) | 18.7-18.8 | 27-35 | 44-47 |
+| 50k, 20% hot | Redis (fork) | 66.6-68.1 | 62-65 | 2065-2067 | 49971 | 3.8-4.0 | 64-68 | 0 |
+| 50k, 20% hot | hybrid | 59.6-59.9 | 33-36 | 530-531 | 49980-49984 | 5.9-6.0 | 35-39 | 0 |
+| 50k, 20% hot | Valkey forkless | 70.8-74.2 | 0 | 16 | 48677-48747 (97%) | 5.5-6.1 | 25-28 | 6 |
 
 The shape of a one-vCPU container. Two things change for the hybrid and one does not. The scan
 thread and the child now take turns on the core instead of overlapping, so our save-time win on
-this dataset is gone: 42 s idle against stock's 40, within noise under traffic. The scan thread
-also competes with the main thread for the core, which costs about a millisecond at the write p99
-when the main thread is lightly loaded, 4.0 against 3.1 ms at 20k; at 50k the order flips, since
-stock's child copying 3.3 GB of pages takes more of the core than our scan thread does. What does
-not change is memory and the stall: still half of stock's copy-on-write and half its fork stall,
-because neither depends on how many cores there are.
+this dataset is gone: 47 s idle against stock's 46 to 47, 53 to 54 against 52 to 56 at 20k, and
+8 seconds faster only at 50k, where stock's child copying 3.3 GB of pages takes more of the core
+than our scan thread does. The scan thread also competes with the main thread for the core, which
+costs one to two milliseconds at the write p99 (4.9 to 6.2 against 3.1 to 4.0 ms). What does not
+change is memory and the stall: half of stock's copy-on-write (a quarter on the hot set) and half
+its fork stall, because neither depends on how many cores there are.
 
 Forkless does not survive one core at this size. Its main thread owns the serialization and the
-commands, so it delivers 88% of the offered rate at 20k and at 50k, stalls writers for 32 to 35 of
-the save's 60 seconds, and posts a 165 ms worst write. Its PING p99 looks best of the three, at
-2.4 to 2.9 ms, because blocked writers do not answer pings.
+commands, so it delivers 87 to 89% of the offered rate at 20k and at 50k, stalls writers for 34
+to 47 of the save's 65 to 70 seconds, and posts a 12 to 19 ms p99. Its PING p99 looks best of the
+three, at 2.3 to 3.1 ms, because blocked writers do not answer pings.
 
 **Steady state.** With the feature on and no save running, the instruction count per SET is
 +0.01% and per GET +0.9% (callgrind): the cost of placing new values in the right arena.
