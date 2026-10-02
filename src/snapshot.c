@@ -687,7 +687,8 @@ struct snapScanCtx {
     redisAtomic uint8_t **state;    /* Per store: num_dicts slot states. */
     int *frozen;                    /* Per store: 1 while our guard is installed on it (snapScanFreeze() until its last slot completes). */
     long *pending;                  /* Per store: slots not yet DONE; the guard comes off at 0, before anyone may free the store. */
-    uint8_t **attached;             /* Per store: 1 per dict we paused and gave a bitmap/overlay (on demand). */
+    uint8_t **attached;             /* Per store, per dict: 0 untouched, 1 attached (bitmaps, overlay; may still grow), 2 attached and paused (under the window). */
+    long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
     struct snapGuardPriv { struct snapScanCtx *ctx; int s; } *guards;   /* Per store, the guard's privdata. */
 
     snapScanDispatchFn *dispatch;
@@ -946,19 +947,26 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
 }
 
 /* Main thread, inside a write section: give dict (s, didx) what the scan
- * needs from it, on demand (TASK-1.21.6): pause its layout, allocate its
- * bucket bitmaps, attach the overlay. Called by the guard on the first
- * structural write to a slot the thread has not finished, or on the first
- * access of any kind while the thread's window is on the dict. Returns the
- * overlay (NULL without one). */
-static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d) {
+ * needs from it, on demand (TASK-1.21.6): allocate its bucket bitmaps and
+ * attach the overlay; pause its layout only when the thread is on it
+ * (TASK-1.21.7, stage B). Called by the guard on the first structural write
+ * to a slot the thread has not finished, or on the first access of any kind
+ * while the thread's window is on the dict. A dict attached by a write but
+ * not reached yet keeps growing: the rehash hooks replicate its bitmap into
+ * the new table (bucket i of a table of n becomes buckets i + j*n of the
+ * table of k*n), and a shrink is refused for it (kvstore shrinkAllowed).
+ * Returns the overlay (NULL without one). */
+static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d, int pause) {
     if (!ctx->attached[s][didx]) {
         ctx->attached[s][didx] = 1;
-        dictPauseRehashing(d);
-        dictPauseAutoResize(d);
         snapScanBitmapAlloc(ctx, s, didx, d);
         if (ctx->has_ov)
             kvstoreOverlayAttach(ctx->stores[s], didx, &ctx->ov_hooks, ctx->ov_priv ? ctx->ov_priv[s] : NULL);
+    }
+    if (pause && ctx->attached[s][didx] != 2) {
+        ctx->attached[s][didx] = 2;
+        dictPauseRehashing(d);
+        dictPauseAutoResize(d);
     }
     if (!ctx->has_ov) return NULL;
     kvstoreDictMetaBase *meta = kvstoreGetDictMeta(ctx->stores[s], didx, 0);
@@ -980,9 +988,31 @@ static struct kvstoreDictOverlay *snapOverlayGuard(void *privdata, kvstore *kvs,
     snapFunnelOpen();
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d) return NULL;
-    if (!write && !snapWindowOnDict(d)) return NULL;   /* a read of a dict the thread is not reading */
-    return snapScanAttach(ctx, s, didx, d);
+    /* Pause as soon as the thread is on the dict (SCANNING covers the moment
+     * between the state change and its first window). A write to a dict the
+     * thread has not reached attaches it without pausing it. */
+    int pause = (st == SNAP_SLOT_SCANNING) || snapWindowOnDict(d);
+    if (!write && !pause) return NULL;   /* a read of a dict the thread is not reading */
+    return snapScanAttach(ctx, s, didx, d, pause);
 }
+
+/* The store-level snapshot hooks (kvstore.h): the guard above, and the
+ * stage B rehash and shrink hooks of attached dicts. */
+static void snapGuardRehashStarted(void *privdata, int didx, dict *d) {
+    struct snapGuardPriv *g = privdata;
+    snapScanDictRehashStarted(g->ctx, g->s, didx, d);
+}
+static void snapGuardRehashCompleted(void *privdata, int didx, dict *d) {
+    struct snapGuardPriv *g = privdata;
+    snapScanDictRehashCompleted(g->ctx, g->s, didx, d);
+}
+static int snapGuardShrinkAllowed(void *privdata, int didx) {
+    struct snapGuardPriv *g = privdata;
+    return g->ctx->attached[g->s][didx] == 0;   /* a bitmap cannot follow a merge of buckets */
+}
+static const kvstoreSnapHooks snap_guard_hooks = {
+    snapOverlayGuard, snapGuardRehashStarted, snapGuardRehashCompleted, snapGuardShrinkAllowed,
+};
 
 static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
     for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
@@ -1002,7 +1032,7 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
          * through the guard: nothing per non-empty dict here. */
     }
     if (ctx->pending[s] == 0) return;   /* nothing to scan in this store */
-    kvstoreSnapGuardSet(ctx->stores[s], snapOverlayGuard, &ctx->guards[s]);
+    kvstoreSnapGuardSet(ctx->stores[s], &snap_guard_hooks, &ctx->guards[s]);
     ctx->frozen[s] = 1;
 }
 
@@ -1018,14 +1048,73 @@ static void snapScanStoreDone(snapScanCtx *ctx, int s) {
 
 static void snapScanUnfreezeDict(snapScanCtx *ctx, int s, int didx) {
     if (!ctx->frozen[s]) return;
-    if (!ctx->attached[s][didx]) return;   /* never paused */
+    int was = ctx->attached[s][didx];
     ctx->attached[s][didx] = 0;
+    if (was != 2) return;   /* never paused */
     dict *d = kvstoreGetDict(ctx->stores[s], didx);
     if (d) {
         dictResumeRehashing(d);
         dictResumeAutoResize(d);
     }
 }
+
+/* Main thread, inside the dict operation that started an incremental
+ * rehash of an attached, unpaused dict (TASK-1.21.7 stage B): the new table
+ * has k times the buckets of the old one and the entries of old bucket i
+ * land in i + j*n, so its bitmap is k copies of the old one. */
+void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
+    if (!ctx || !ctx->attached[s] || !ctx->attached[s][didx]) return;
+    unsigned long size0 = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
+    struct snapBitmap *b0 = &ctx->bits[s][didx * 2], *b1 = &ctx->bits[s][didx * 2 + 1];
+    if (b1->b) {   /* should not happen: a rehash started over an unfinished one */
+        ctx->bitmap_bytes -= b1->bytes;
+        zfree(b1->b);
+        b1->b = NULL;
+        b1->bytes = 0;
+    }
+    if (size1 == 0) return;
+    size_t bytes1 = (size1 + 7) / 8;
+    uint8_t *nb = zcalloc(bytes1);
+    if (b0->b && size0) {
+        if (size1 >= size0 && (size1 % size0) == 0) {
+            if (size0 % 8 == 0) {
+                size_t bytes0 = size0 / 8;
+                for (size_t off = 0; off < bytes1; off += bytes0) memcpy(nb + off, b0->b, bytes0);
+            } else {
+                for (unsigned long i = 0; i < size1; i++) {
+                    unsigned long src = i & (size0 - 1);
+                    if ((b0->b[src >> 3] >> (src & 7)) & 1) nb[i >> 3] |= (uint8_t)(1u << (i & 7));
+                }
+            }
+        } else {
+            /* A shrink is refused for attached dicts (kvstore shrinkAllowed);
+             * a non-multiple growth cannot happen with power-of-two tables. */
+            debugServerAssert(0);
+        }
+    }
+    b1->bytes = bytes1;
+    __atomic_store_n(&b1->b, nb, __ATOMIC_RELEASE);
+    ctx->bitmap_bytes += bytes1;
+    ctx->dicts_grown++;
+}
+
+/* The rehash completed: the new table is the table. */
+void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
+    UNUSED(d);
+    if (!ctx || !ctx->attached[s] || !ctx->attached[s][didx]) return;
+    struct snapBitmap *b0 = &ctx->bits[s][didx * 2], *b1 = &ctx->bits[s][didx * 2 + 1];
+    if (!b1->b) return;   /* the dict was not attached when this rehash started: nothing to carry */
+    if (b0->b) {
+        ctx->bitmap_bytes -= b0->bytes;
+        zfree(b0->b);
+    }
+    __atomic_store_n(&b0->b, b1->b, __ATOMIC_RELEASE);
+    b0->bytes = b1->bytes;
+    b1->b = NULL;
+    b1->bytes = 0;
+}
+
+long snapScanDictsGrown(snapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
 
 /* Chain-walk callback on the scan thread: decode the entry and dispatch. */
 struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
@@ -1448,6 +1537,7 @@ int snapSaveIsAofRewrite(void) { return snap_save != NULL && !snap_save->aborted
 size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
 size_t snapSaveBitmapBytes(void) { return snap_save ? snapScanBitmapBytes(snap_save->scan) : 0; }
+long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(snap_save->scan) : 0; }
 
 size_t snapSaveQueuedBytes(void) {
     if (!snap_save) return 0;
@@ -1606,6 +1696,32 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
+    if (dictIsRehashing(d) && snapSlotGetState(sv->scan, s, didx) == SNAP_SLOT_PENDING) {
+        /* An unreached dict mid-rehash keeps rehashing (stage B): entries of
+         * old bucket i0 move to new buckets i0 + j*n at any step, so the unit
+         * the main thread emits and marks is the whole class, both tables.
+         * Marking a new bucket the old chain may still move into is what
+         * keeps the walker from reading those moved entries later. */
+        unsigned long n = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
+        unsigned long i0 = (table == 0) ? idx : (idx & (n - 1));
+        int owed = !snapScanBucketEmitted(sv->scan, s, didx, 0, i0);
+        for (unsigned long j = i0; !owed && j < size1; j += n) owed = !snapScanBucketEmitted(sv->scan, s, didx, 1, j);
+        if (!owed) {
+            sv->inplace_writes++;
+            server.stat_snap_inplace_writes++;
+            return KVSTORE_OV_INPLACE;
+        }
+        if (!snapScanBucketEmitted(sv->scan, s, didx, 0, i0)) {
+            if ((long)i0 >= d->rehashidx) snapSaveEmitBucket(sv, s, didx, d, 0, i0);   /* below rehashidx the chain moved already */
+            snapScanMarkBucketEmitted(sv->scan, s, didx, 0, i0);
+        }
+        for (unsigned long j = i0; j < size1; j += n) {
+            if (snapScanBucketEmitted(sv->scan, s, didx, 1, j)) continue;
+            snapSaveEmitBucket(sv, s, didx, d, 1, j);
+            snapScanMarkBucketEmitted(sv->scan, s, didx, 1, j);
+        }
+        return KVSTORE_OV_INPLACE;
+    }
     if (!snapBucketOwed(sv->scan, s, didx, d, table, idx, &pos)) {
         sv->inplace_writes++;
         server.stat_snap_inplace_writes++;
@@ -3100,21 +3216,38 @@ static void snapScanTests(int accurate) {
         char *k0 = snapTestKey(0, 0, 0);   /* store 0 dict 0 holds one key */
         dictEntryLink b = NULL;
         dictEntryLink l = kvstoreDictFindLink(stores[0], 0, k0, &b);
-        test_cond("scan: a write-intent lookup pauses the dict on demand and finds the key",
-                  l != NULL && d->pauserehash == 1 && d->pauseAutoResize == 1);
+        test_cond("scan: a write-intent lookup on an unreached dict attaches it (bitmap) without pausing it and finds the key",
+                  l != NULL && d->pauserehash == 0 && d->pauseAutoResize == 0 && snapScanBitmapBytes(ctx) > 0);
         zfree(k0);
-        /* The layout lock: neither the insert path nor the resize cron may
-         * touch a paused table. */
+        /* Stage B: an attached, unreached dict may grow, and its bitmap
+         * follows (bucket i of n -> i + j*n of k*n); it may not shrink. */
         dict *big = kvstoreGetDict(stores[0], 2);   /* 5000 keys */
+        while (dictIsRehashing(big)) dictRehash(big, 1000);   /* start from one table (it is not attached yet) */
         char *kb = snapTestKey(0, 2, 1);
         kvstoreDictFindLink(stores[0], 2, kb, &b);
         zfree(kb);
-        signed char exp0 = big->ht_size_exp[0], exp1 = big->ht_size_exp[1];
-        long ridx = big->rehashidx;
-        int r1 = dictExpandIfNeeded(big), r2 = dictShrinkIfNeeded(big);
-        test_cond("scan: dictExpandIfNeeded/dictShrinkIfNeeded are no-ops on a paused dict",
-                  r1 == DICT_ERR && r2 == DICT_ERR && big->ht_size_exp[0] == exp0 &&
-                  big->ht_size_exp[1] == exp1 && big->rehashidx == ridx);
+        unsigned long n0 = DICTHT_SIZE(big->ht_size_exp[0]);
+        snapScanMarkBucketEmitted(ctx, 0, 2, 0, 3);
+        snapScanMarkBucketEmitted(ctx, 0, 2, 0, n0 - 1);
+        size_t bm_before = snapScanBitmapBytes(ctx);
+        int r1 = dictExpand(big, n0 * 16);   /* allowed: not paused */
+        unsigned long n1 = DICTHT_SIZE(big->ht_size_exp[1]);
+        int ok = r1 == DICT_OK && dictIsRehashing(big) && n1 == n0 * 16 && snapScanBitmapBytes(ctx) > bm_before;
+        for (unsigned long j = 0; ok && j < 16; j++)
+            ok = snapScanBucketEmitted(ctx, 0, 2, 1, 3 + j * n0) && snapScanBucketEmitted(ctx, 0, 2, 1, n0 - 1 + j * n0) &&
+                 !snapScanBucketEmitted(ctx, 0, 2, 1, 4 + j * n0);
+        test_cond("scan: an unreached dict expands and its bitmap is replicated into the new table", ok);
+        while (dictIsRehashing(big)) dictRehash(big, 1000);   /* finish the rehash: the new bitmap becomes the table's */
+        test_cond("scan: after the rehash the carried bitmap is the dict's only one",
+                  snapScanBucketEmitted(ctx, 0, 2, 0, 3 + n0) && snapScanBucketEmitted(ctx, 0, 2, 0, n0 - 1 + 2 * n0) &&
+                  !snapScanBucketEmitted(ctx, 0, 2, 0, 4) && snapScanBitmapBytes(ctx) == bm_before - (n0 + 7) / 8 + (n1 + 7) / 8);
+        /* 5000 keys in 16 x their table: the fill ratio asks for a shrink, the snapshot refuses it. */
+        signed char exp_before = big->ht_size_exp[0];
+        int r2 = dictShrinkIfNeeded(big);
+        test_cond("scan: an attached dict refuses to shrink", r2 == DICT_ERR && !dictIsRehashing(big) && big->ht_size_exp[0] == exp_before);
+        /* The marks above named buckets that hold keys: clear them so the walk
+         * below dispatches every key (the thread skips marked buckets). */
+        memset(ctx->bits[0][2 * 2].b, 0, ctx->bits[0][2 * 2].bytes);
         snapFunnelClose();   /* the accesses above opened a section: "command end" */
     }
     test_cond("scan: snapScanStartThread() succeeds", snapScanStartThread(ctx) == C_OK);
@@ -3300,7 +3433,7 @@ static void snapScanTests(int accurate) {
     {
         dict *d = kvstoreGetDict(stores[1], 0);
         size_t none = snapScanBitmapBytes(ctx);
-        snapScanAttach(ctx, 1, 0, d);   /* what the guard does on the first write to the slot */
+        snapScanAttach(ctx, 1, 0, d, 0);   /* what the guard does on the first write to an unreached slot */
         size_t before = snapScanBitmapBytes(ctx);
         for (int t = 0; t < 2; t++)
             for (unsigned long i = 0; i < DICTHT_SIZE(d->ht_size_exp[t]); i++)
@@ -3339,7 +3472,7 @@ static void snapScanTests(int accurate) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
         int pos, p_ahead, p_after, p_other, p_behind;
         test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
-        snapScanAttach(ctx, 0, 3, d);               /* bitmap and pause, as the guard would */
+        snapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
         snapSlotSetState(ctx, 0, 3, SNAP_SLOT_SCANNING);
         snapWindowPublish(d, 0, 0, mid);            /* the thread reads [0, mid) */
         snapFunnelOpen();                           /* a command opens its write section */

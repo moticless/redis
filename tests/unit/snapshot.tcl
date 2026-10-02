@@ -1519,6 +1519,37 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             assert_equal ok [s rdb_last_bgsave_status]
         }
 
+        test {Hybrid BGSAVE harness (cluster mode): a slot written before the scan reaches it keeps growing; its bitmap follows the table} {
+            r flushall
+            r config set rdbcompression no
+            # a slot the walker reaches last (high index), non-empty at the fork
+            # instant so that it is a real slot of the save, not DONE at freeze
+            set tag ""
+            for {set i 0} {$i < 200} {incr i} {
+                if {[r cluster keyslot "{g$i}"] > 16000} { set tag "{g$i}"; break }
+            }
+            assert {$tag ne ""}
+            for {set i 0} {$i < 4} {incr i} { r set "$tag:seed$i" v }
+            populate 30000 cl: 20
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 150   ;# about 4.5 s for 30k keys: the high slot waits
+            r bgsave
+            snap_wait_save_started
+            # 600 keys into the unreached slot: its dict expands from 4 buckets
+            # several times while the save runs, with the fork-instant seeds
+            # still owed to the scan thread
+            for {set i 0} {$i < 600} {incr i} { r set "$tag:$i" v }
+            assert_equal 1 [s snap_save_in_progress]
+            assert {[s snap_save_grown_dicts] >= 1}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 0 [s snap_save_bitmap_bytes]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]   ;# the seeds, none of the 600
+            r config set rdbcompression yes
+        }
+
         test {Hybrid BGSAVE harness (cluster mode): randomized writers race the per-slot scan} {
             snap_race_iteration 400 0 0
         }

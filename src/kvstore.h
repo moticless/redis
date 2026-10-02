@@ -97,7 +97,20 @@ typedef struct kvstoreOverlayHooks {
  * read on a dict the scan thread is not reading). A NULL fn turns the guard
  * off; the fast path is then one load. */
 typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
-void kvstoreSnapGuardSet(kvstore *kvs, kvstoreSnapGuardFn *fn, void *privdata);
+/* The other snapshot hooks of a scanned store (TASK-1.21.7 stage B): a dict
+ * started or finished an incremental rehash (main thread, inside the dict
+ * operation; both tables are set up at 'started'), and whether a dict may
+ * shrink right now (a snapshot bitmap follows a split but not a merge). */
+typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);
+typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);
+typedef struct kvstoreSnapHooks {
+    kvstoreSnapGuardFn *guard;
+    kvstoreSnapRehashFn *rehash_started;
+    kvstoreSnapRehashFn *rehash_completed;
+    kvstoreSnapShrinkAllowedFn *shrink_allowed;
+} kvstoreSnapHooks;
+/* NULL hooks turn the snapshot off for the store. */
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
 void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
@@ -141,6 +154,7 @@ typedef struct kvstoreType {
 typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
     struct kvstoreDictOverlay *ov;  /* snapshot overlay while the dict is frozen (hybrid BGSAVE), else NULL */
+    int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
 } kvstoreDictMetaBase;
 
 #define KVSTORE_ALLOCATE_DICTS_ON_DEMAND (1<<0)

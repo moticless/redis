@@ -42,8 +42,8 @@ struct _kvstore {
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
     int ov_frozen;                         /* Frozen dicts: a snapshot overlay is attached to their metadata. */
     list *ov_dirty;                        /* Frozen dicts whose side table is (or was) non-empty (kvstoreDictOverlay *). */
-    kvstoreSnapGuardFn *snap_guard;        /* Non-NULL while a snapshot scan runs over this store. */
-    void *snap_guard_priv;
+    const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
+    void *snap_priv;
     void *metadata[];                      /* conditionally allocated based on "flags" */
 };
 
@@ -81,19 +81,19 @@ static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
 }
 
 static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
-    if (__builtin_expect(kvs->snap_guard == NULL, 1)) return NULL;
+    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
     kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
     if (ov) return ov;
-    return kvs->snap_guard(kvs->snap_guard_priv, kvs, didx, write);
+    return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
 #define ovGetR(kvs, didx) ovGet(kvs, didx, 0)
 #define ovGetW(kvs, didx) ovGet(kvs, didx, 1)
 
-void kvstoreSnapGuardSet(kvstore *kvs, kvstoreSnapGuardFn *fn, void *privdata) {
-    kvs->snap_guard = fn;
-    kvs->snap_guard_priv = privdata;
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
+    kvs->snap_hooks = hooks;
+    kvs->snap_priv = privdata;
 }
 
 /* A non-empty side table: reads must consult it. Writes always go through
@@ -501,6 +501,7 @@ static dict *createDictIfNeeded(kvstore *kvs, int didx) {
     if (d) return d;
 
     kvs->dicts[didx] = dictCreate(&kvs->dtype);
+    ((kvstoreDictMetaBase *)dictMetadata(kvs->dicts[didx]))->didx = didx;
     kvs->allocated_dicts++;
     return kvs->dicts[didx];
 }
@@ -548,6 +549,8 @@ static void kvstoreDictRehashingStarted(dict *d) {
     kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
     listAddNodeTail(kvs->rehashing, d);
     metadata->rehashing_node = listLast(kvs->rehashing);
+    if (kvs->snap_hooks && kvs->snap_hooks->rehash_started)
+        kvs->snap_hooks->rehash_started(kvs->snap_priv, metadata->didx, d);
 
     unsigned long long from, to;
     dictRehashingInfo(d, &from, &to);
@@ -565,10 +568,22 @@ static void kvstoreDictRehashingCompleted(dict *d) {
         listDelNode(kvs->rehashing, metadata->rehashing_node);
         metadata->rehashing_node = NULL;
     }
+    if (kvs->snap_hooks && kvs->snap_hooks->rehash_completed)
+        kvs->snap_hooks->rehash_completed(kvs->snap_priv, metadata->didx, d);
 
     unsigned long long from, to;
     dictRehashingInfo(d, &from, &to);
     kvs->overhead_hashtable_rehashing -= from;
+}
+
+/* A dict a running snapshot is attached to may grow (its per-bucket state
+ * splits one old bucket into k new ones) but not shrink (a merge has no
+ * bucket-wise answer); the snapshot answers per dict. */
+static int kvstoreDictShrinkAllowed(dict *d) {
+    kvstore *kvs = d->type->userdata;
+    if (!kvs->snap_hooks || !kvs->snap_hooks->shrink_allowed) return 1;
+    kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
+    return kvs->snap_hooks->shrink_allowed(kvs->snap_priv, metadata->didx);
 }
 
 /* Updates the bucket count for the given dictionary in a DB. It adds the new ht size
@@ -620,6 +635,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
         type->dictMetadataBytes : kvstoreDictBaseMetaSize;
     kvs->dtype.rehashingStarted = kvstoreDictRehashingStarted;
     kvs->dtype.rehashingCompleted = kvstoreDictRehashingCompleted;
+    kvs->dtype.shrinkAllowed = kvstoreDictShrinkAllowed;
     kvs->dtype.bucketChanged = kvstoreDictBucketChanged;
 
     kvs->num_dicts_bits = num_dicts_bits;
@@ -642,11 +658,9 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
 }
 
 void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
-    if (kvs->ov_frozen) {
-        for (int didx = 0; didx < kvs->num_dicts; didx++)
-            if (ovPeek(kvs, didx)) kvstoreOverlayRelease(kvs, didx);
-    }
     for (int didx = 0; didx < kvs->num_dicts; didx++) {
+        if ((kvs->ov_frozen) && (ovPeek(kvs, didx))) 
+            kvstoreOverlayRelease(kvs, didx);
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d)
             continue;

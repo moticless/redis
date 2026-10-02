@@ -702,6 +702,18 @@ Rehashing is paused and expansion forbidden for a frozen dict for the whole
 save (cron, `kvstoreExpand` and the insert path), so bucket indices are stable;
 a dict mid-rehash at freeze keeps both tables and the window names the table.
 
+Since TASK-1.21.7 stage B (2026-10-02) that lockout applies only to the dict the thread is on
+(its slot SCANNING or its window published): a slot dict that takes a write before the thread
+reaches it is attached (bitmaps, overlay) without being paused and keeps growing. The kvstore
+snapshot hooks (`kvstoreSnapHooks`: guard, `rehash_started`, `rehash_completed`,
+`shrink_allowed`) follow the table: with power-of-two sizes an entry of old bucket i lands in
+new bucket i + j*n, so the new table's bitmap is k copies of the old one, written at rehash
+start and carried over at completion; a shrink merges buckets and is refused for attached dicts
+(`dictType.shrinkAllowed`). Emit-ahead on such a dict mid-rehash emits and marks the whole bucket
+class, ht0[i] and ht1[i + j*n], so entries the rehash moves later land in marked buckets. In
+standalone mode the one dict is under the window from the start, so nothing changes there; in
+cluster mode the lockout rolls with the scan. `snap_save_grown_dicts` counts the remaps.
+
 ### 11.z.3 Comparison with the teammate's forkless-hybrid POC (yinon/forkless-hybrid, 2026-09-23)
 
 Same goal, and the same two tools: a MADV_DONTFORK jemalloc arena for small

@@ -249,6 +249,10 @@ unsigned long snapGetWindowBuckets(void);
  * Mark only buckets ahead of the published window, inside a write section. */
 void snapScanMarkBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
 int snapScanBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+/* Stage B (TASK-1.21.7): an attached, unreached dict grew or finished rehashing; its bitmap follows the table. */
+void snapScanDictRehashStarted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
+void snapScanDictRehashCompleted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
+long snapScanDictsGrown(snapScanCtx *ctx);
 size_t snapScanBitmapBytes(snapScanCtx *ctx);
 
 /* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
@@ -359,7 +363,8 @@ size_t snapSaveLastRetainedPeak(void);
  * forward to the child, buckets and keys the main thread emitted itself. */
 size_t snapSaveQueuedBytes(void);        /* main-thread queue plus the scan thread's outbound queue */
 size_t snapSaveLastQueuedPeak(void);     /* peak of the two queues over the last save */
-size_t snapSaveBitmapBytes(void);   /* bucket bitmaps of the running save, 0 when none runs */
+size_t snapSaveBitmapBytes(void);
+long snapSaveGrownDicts(void);           /* attached dicts that expanded during the save (stage B bitmap remaps) */   /* bucket bitmaps of the running save, 0 when none runs */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);
 

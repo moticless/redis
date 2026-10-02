@@ -3,9 +3,11 @@ id: TASK-1.21.7
 title: >-
   Cluster mode stage B: let written-but-unreached slot dicts grow during a save
   (bitmap remap on expand, shrink refused) and test slot migration during a save
-status: To Do
-assignee: []
+status: In Progress
+assignee:
+  - '@Claude'
 created_date: '2026-10-01 00:01'
+updated_date: '2026-10-02 18:50'
 labels:
   - bgsave
   - cluster
@@ -38,3 +40,9 @@ Motivation to build it: a hot slot on a long save (30-40 s mixed1m saves at 20-5
 - [ ] #3 Slot migration during a save: refused with a clear error or verified safe by a test; the choice is documented in spec section 11.z.1
 - [ ] #4 TSan and ASan runs of unit/snapshot clean with the remap in place
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-02, stage B implemented as the user described it: a slot dict the scan thread has not reached is attached by its first write (bitmaps, overlay) but NOT paused any more; only the dict under the thread's window (or whose slot is SCANNING) is paused, on the main thread's next access. The kvstore snapshot guard grew into kvstoreSnapHooks {guard, rehash_started, rehash_completed, shrink_allowed}; kvstoreDictRehashingStarted/Completed call them with the dict's index (new kvstoreDictMetaBase.didx). On rehash start the table-1 bitmap is k copies of the table-0 bitmap (old bucket i -> new buckets i + j*n; memcpy per copy when n is a multiple of 8, bit loop otherwise); on completion the table-1 bitmap becomes table 0's. Shrink is refused for attached dicts through a new optional dictType.shrinkAllowed checked by dictShrinkIfNeeded (a merge has no bucket-wise answer); cron resize/rehash and kvstoreExpand of paused dicts were already off during a child. Emit-ahead on a rehashing unreached dict emits and marks the whole bucket class (ht0[i0] if not yet moved, ht1[i0 + j*n] for all j) so entries the rehash moves later land in marked buckets. INFO snap_save_grown_dicts counts the remaps. Tests: C unit (write-intent lookup attaches without pausing; 16x expand replicates the marks into the new table; the carried bitmap is the table's after the rehash; shrink refused), tcl cluster test (a high slot with 4 fork-instant keys takes 600 writes during a slow save, snap_save_grown_dicts >= 1, reload equals the fork instant). C unit 168/168; unit/snapshot both modes running.
+<!-- SECTION:NOTES:END -->

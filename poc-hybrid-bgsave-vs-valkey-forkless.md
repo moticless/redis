@@ -44,7 +44,7 @@ cloning, blocked writers on in-use keys, no memory bound.
 | memory held during a save | child CoW on written big values; queue ≤ 100 MB; side table bounded by `bgsave-hybrid-max-retained-bytes` (abort at the hard mark) | references + in-use records + deleted-in-use objects; no bound, no abort on memory |
 | fork stall | proportional to fork-class page tables: 1.6 ms (small), 14-18 ms (mixed, mixed1m), 26-34 ms (big1m) | 0 |
 | main-thread cost | emit-ahead serialization under writes; cron drains; 0.3-16 CPU-s per save, which is the write load itself | feeder timer, cloning, blocking bookkeeping: 11-28 CPU-s per save, 1.6-2.7x ours under writes |
-| rehash during a save | frozen dicts: rehash paused, resize refused (lazily, on demand per dict) | rehash paused on the table and on HT-encoded values in use |
+| rehash during a save | only the dict under the scan thread's window is paused; a slot written before the thread reaches it keeps growing and its bitmap follows the table (shrink refused) | rehash paused on the table and on HT-encoded values in use |
 | consistency across dbs | frozen at the fork instant | epoch; SWAPDB keeps original db ids |
 | recovery after a failed save | child dies, overlay merges, nothing outlives the save | iterator terminated; a failed save blocks writes until resolved (`failed bgsave prevents writes` test) |
 | allocator requirement | 64-bit Linux + jemalloc for the arena (runs without it, no memory benefit) | none |

@@ -1776,6 +1776,7 @@ static int _dictExpandIfNeeded(dict *d) {
 int dictShrinkIfNeeded(dict *d) {
     /* Automatic resizing is disallowed (see dictExpandIfNeeded). */
     if (d->pauseAutoResize > 0) return DICT_ERR;
+    if (d->type->shrinkAllowed && !d->type->shrinkAllowed(d)) return DICT_ERR;
 
     /* Incremental rehashing already in progress. Return. */
     if (dictIsRehashing(d)) return DICT_OK;

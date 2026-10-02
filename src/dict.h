@@ -97,6 +97,7 @@ typedef struct dictType {
     void (*keyDestructor)(dict *d, void *key __stored_key);
     void (*valDestructor)(dict *d, void *obj);
     int (*resizeAllowed)(size_t moreMem, double usedRatio);
+    int (*shrinkAllowed)(dict *d);   /* optional: 0 forbids an automatic shrink of this dict right now (a snapshot bitmap cannot follow a merge of buckets) */
     /* Invoked at the start of dict initialization/rehashing (old and new ht are already created) */
     void (*rehashingStarted)(dict *d);
     /* Invoked at the end of dict initialization/rehashing of all the entries from old to new ht. Both ht still exists
