@@ -8,7 +8,7 @@ status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-01 11:04'
-updated_date: '2026-10-01 16:35'
+updated_date: '2026-10-02 12:19'
 labels:
   - hybrid-bgsave
   - performance
@@ -75,6 +75,8 @@ Implementation decisions (2026-10-01): (1) two pipes, one queue list per channel
 Committed 3406f4b4c. Verified: C unit 166/166; unit/snapshot feature on (220 s) and stock (250 s) all pass; ASan (255 s) and TSan (415 s, setarch -R, port 23111) all pass, no reports. AC2's test exercises the dependency path through bgsave-hybrid-tag-all with a stopped child (the order itself is not observable from the RDB without a parser; the test checks completion and reload equality). Run 30 started 11:31 UTC on the host (tree ~/redis-2ch, driver ~/run30.sh, CSVs ~/run30.csv and ~/run30s.csv). First cached idle cells: hybrid (100 MB, no spool) 26.2 s with parent +110 MB, hybrid-spool 27.0-27.2 s (+99-103 MB: the queue fills to the bound before anything spills), hybrid-q16 32.9 s (+7 MB): with a 16 MB bound the two channels alone do not give the overlap, one hash's worth of scan output (about 47 MB) has to fit. The first hybrid cell (33.2 s) ran right after the live populate, where the main dict is mid-rehash and the 24 hashes sit in table 1, visited last (run 22 correction): the bounded shape cannot overlap on that layout, the spool shape can; compare cached cells only.
 
 Regression found by the full feature-on suite (2026-10-01 evening) and fixed: integration/replication 'diskless all replicas drop during rdb pipe' hung. When the last replica drops, the parent calls killRDBChild -> snapSaveAbort (join the scan thread) BEFORE kill(SIGUSR1); the scan thread's aborted ThreadDone did snapOutDrain(SNAP_DRAIN_ALL) after queueing ABORT, which loops until both queues are written, but the child was blocked writing the rdb pipe nobody read any more and the big channel's 64 KB pipe was full of ~4000 small KVOBJ headers (10 KB string values are fork-class), so the abort never returned and the main thread hung. Before the two channels the single 1 MB pipe held those headers, which is why bc33196f5 passed. Fix: snapOutDrain returns -1 as soon as the scan is aborted in every waiting mode (the child dies on SIGUSR1 or sees the pipes close; what did not fit is moot), and both pipes are deepened to 1 MB. Verified: the five rdb-pipe tests pass; integration/replication, unit/snapshot both modes, TSan and ASan rerunning.
+
+2026-10-02: the user had the spool removed entirely (it was off by default and the two channels give the overlap without it): SNAP_MSG_SPOOL, the spool fds, the overflow branch, the marker, the child's segment reader and hole punching, the config bgsave-hybrid-spool, the four INFO fields, three tests, the redis.conf paragraph, the run.sh configs and the bench.py stats are gone; RESULTS.md keeps the history (runs 22-30b) and the spec keeps a one-paragraph note. TASK-1.29's inline syncs under writes to big keys lose the unbounded-buffer option; if needed it comes back as a separate task.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

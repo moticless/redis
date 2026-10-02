@@ -289,36 +289,15 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   has not opted in, the stock fork child does the rewrite as before (arena made forkable). The AOF command
   form from the scan thread (preamble off) is stage 2, not done.
 
-- **Spool file instead of the pipe for the bulk (TASK-1.30, 2026-10-01).** Run 22 showed the two halves
-  of a mixed1m save running in series: the child cannot read the pipe while it is inside a 90 MB hash,
-  the scan thread blocks after 16 MB, and whichever side starts first finishes before the other begins
-  (35-42 s against a 24 s overlap). With `bgsave-hybrid-spool yes` (default) the queue stays the primary
-  path and an unlinked `temp-snap-<pid>.spool` in the working directory takes the overflow (the user's
-  refinement, 2026-10-01): when a BUFFER message would push the queue past `bgsave-hybrid-max-queued-bytes`
-  the scan thread switches to appending BUFFER messages (header + payload, the same framing) to the spool
-  with blocking `write()`, and switches back to the queue once the child has drained it to half (run 23
-  showed that spooling everything cost small, where the child keeps up, 3 GB of file traffic and 10% of
-  scan CPU for nothing). KVOBJ, END and ABORT always take the pipe and the queue. The child alternates:
-  a pipe message when one is waiting (so the queue drains and big values start promptly), else the next
-  complete spool message from its own offset with `pread()` (a reader may see a partially written one:
-  it retries from the same offset); it polls the pipe for 5 ms when both are empty, and after END drains
-  the spool to its end. Both descriptors are opened before the fork and the name is unlinked at once;
-  the scan thread closes its end when it is done and the child's exit frees the pages (the parent's
-  close of a 1-3 GB unlinked file freed them on the main thread: 55-155 ms PING in run 23). On a tmpfs
-  working directory the spool is RAM outside `used_memory`; on disk it is page cache. The child punches
-  holes behind its reads (`fallocate(PUNCH_HOLE)`, 16 MB at a time; `posix_fadvise(DONTNEED)` where
-  unsupported), so the file's footprint is the unconsumed tail, not the whole save, and the final close
-  has little left to free. INFO reports that footprint as written bytes minus the first data offset of
-  the file (`lseek(SEEK_DATA)`: block counts would lie under delayed allocation) in `snap_save_spool_bytes`,
-  with `snap_last_save_spool_peak` its peak sampled by cron, next to what was written
-  (`snap_save_spool_written_bytes`, `snap_last_save_spool_bytes`); the benchmark records the peak as the
-  spool's true memory cost beside RSS. SELECTDB/RESIZEDB/SLOT_INFO tracking is unchanged. If the file
-  cannot be created the pipe carries everything, as before.
+- **Spool file (TASK-1.30, 2026-10-01; removed 2026-10-02).** An unlinked overflow file for the scan thread's output
+  was the first fix for the two halves of a save running in series (run 22); it gave the overlap (runs 23-29) but the
+  two channels below give the same without a file, and the user had it removed once run 30b confirmed that. The
+  history is in RESULTS.md runs 22-30b and in the TASK-1.30/1.31 records.
 - **Two channels and a small-first child (TASK-1.31, 2026-10-01, the user's design).** The single FIFO
   could not give the overlap under writes with a bounded queue: the main thread hands the child every
   big value at the first write to it, a FIFO child took them back to back for 21 s and the scan thread
   parked at the bound (run 17 at 128 MB: idle 26-29 s, writes 38-41). The scan thread now feeds two
-  pipes: the small channel carries the BUFFER messages (and SPOOL markers), the big channel KVOBJ, END
+  pipes: the small channel carries the BUFFER messages, the big channel KVOBJ, END
   and ABORT; one queue per channel, one bound (`bgsave-hybrid-max-queued-bytes`, default raised to
   100 MB) over both. The child polls both and takes the small channel while the parent reports a small
   backlog of 1 MB or more (a `MAP_SHARED` page the scan thread updates: the child sees only its 1 MB
@@ -331,10 +310,7 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   send 0; TASK-1.29 sets it for buffers carrying inline commands on big keys, which is what keeps a
   replica from applying a command before the record it modifies (`bgsave-hybrid-tag-all`, a debug
   config, sets it for every buffer). The queue is excluded from the eviction calculation
-  (`freeMemoryGetNotCountedMemory`), like the replication buffers. The spool is off by default and is
-  the overflow of the small channel when on: once spilling ends a SPOOL marker in the queue stands
-  for the spooled range (offset, length), so the child reads the spooled buffers at their place in
-  the stream and no shared committed offset is needed (the marker follows the writes).
+  (`freeMemoryGetNotCountedMemory`), like the replication buffers.
 
 ## 7. Correctness invariants (worst-first)
 1. **Total clone-on-write for owed keys.** A bg thread reads LIVE parent memory for every kvobj header
@@ -740,7 +716,7 @@ big values and owns the RDB. The split of responsibilities differs:
 | Write to an unsaved small key | pin: retain by refcount (immutable strings), type Dup copy, or pre-encoded bytes; memory held until the helper reaches the key (evicted keys jump the queue); two budgets, abort when exceeded | serialize the bucket's chain into the queue, then write in place; retention only for buckets inside the window being read |
 | "Already saved" | 2-bit alternating round in the kvobj header (took 2 of the 8 module metadata classes), recovery mode after a failed save | per-save bucket bitmap plus window position; nothing outlives the save |
 | Thread sync | one mutex and condvar; each side publishes the one object it reads; the main thread waits if the helper is reading that object | the main thread never waits; the scan thread waits for the open write section at each window boundary |
-| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | two pipes parent to child fed from bounded in-memory queues on the scan thread (non-blocking writes): a small channel (1 MB pipe) for the 64 KB buffers of small values, a big channel for big-value headers, END and ABORT; the child drains the small backlog first and takes a big value when it is low (TASK-1.31), so the two halves overlap with the queue at about one big value's worth; an optional spool file takes the small channel's overflow (TASK-1.30); `SELECTDB` only on change |
+| Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | two pipes parent to child fed from bounded in-memory queues on the scan thread (non-blocking writes): a small channel (1 MB pipe) for the 64 KB buffers of small values, a big channel for big-value headers, END and ABORT; the child drains the small backlog first and takes a big value when it is low (TASK-1.31), so the two halves overlap with the queue at about one big value's worth; `SELECTDB` only on change |
 | Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
 | Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
 | Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB, diskless sync and AOF rewrite with the RDB preamble through the hybrid child; the AOF command form (preamble off) is stock |

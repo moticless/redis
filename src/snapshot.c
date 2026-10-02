@@ -1313,7 +1313,6 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
 #define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
 #define SNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
 #define SNAP_MSG_ABORT  4
-#define SNAP_MSG_SPOOL  5     /* small channel: the next bytes of this stream sit in the spool (payload: offset, length) */
 #define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
 #define SNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
 #define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
@@ -1359,24 +1358,13 @@ struct snapSave {
     snapFlushedDb *flushed;    /* per store */
     int dbnum;
     /* Two channels to the child (TASK-1.31). The small channel carries the
-     * BUFFER messages (and SPOOL markers), the big channel KVOBJ, END and
+     * BUFFER messages, the big channel KVOBJ, END and
      * ABORT, so the child can drain the small backlog first and take a big
      * value only when that backlog is low: a bounded queue then never parks
      * the scan thread while the child is inside a big value. */
     int pipe_rd, pipe_wr;             /* small channel */
     int big_rd, big_wr;               /* big channel */
     snapShared *shared;
-    /* Spool (TASK-1.30, overflow only since TASK-1.31, off by default): when
-     * the small channel's queue is at its bound, BUFFER messages go to an
-     * unlinked file and a SPOOL marker in the queue stands for them, so the
-     * child reads the stream in production order. -1: no spool. */
-    int spool_wr, spool_rd;
-    int spool_stat;                   /* main thread: a descriptor of its own, for the footprint (SEEK_DATA) */
-    redisAtomic size_t spool_bytes;   /* written by the scan thread this save */
-    off_t spool_seg_off;              /* scan thread: where the open (unmarked) spool segment starts */
-    off_t spool_frontier;             /* main thread: first data offset found last time (holes grow from the start) */
-    size_t spool_alloc_peak;          /* main thread: peak of the file's allocated bytes (sampled) */
-    int spilling;                     /* scan thread: queue reached its bound, BUFFERs go to the spool until it drains to half */
     int tag_all;                      /* debug (bgsave-hybrid-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
@@ -1469,43 +1457,6 @@ size_t snapSaveQueuedBytes(void) {
     return n + o;
 }
 size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
-static size_t snap_last_spool_bytes = 0;        /* written over the last save */
-static size_t snap_last_spool_alloc_peak = 0;   /* peak footprint over the last save */
-size_t snapSaveSpoolWritten(void) {
-    if (!snap_save) return 0;
-    size_t n;
-    atomicGet(snap_save->spool_bytes, n);
-    return n;
-}
-/* Main thread: what the spool occupies right now, i.e. what the child has not
- * consumed yet (it punches holes behind its reads), from the file itself. On
- * tmpfs that is RAM, on disk it is page cache. Also tracks the peak. */
-size_t snapSaveSpoolBytes(void) {
-    snapSave *sv = snap_save;
-    if (!sv || sv->spool_stat == -1) return 0;
-    size_t written;
-    atomicGet(sv->spool_bytes, written);
-    /* The child punches holes from the start of the file up to what it has
-     * consumed: the first data offset is that frontier. (Block counts would
-     * lie on filesystems with delayed allocation, where dirty pages have no
-     * blocks yet.) */
-    /* Resume from the last frontier: a SEEK_DATA from 0 over a gigabyte of
-     * holes walks every page of them and cost 20-40 ms per INFO call on the
-     * main thread (run 27/28 PING). */
-    off_t first = lseek(sv->spool_stat, sv->spool_frontier, SEEK_DATA);
-    size_t n;
-    if (first < 0) {
-        if (errno == ENXIO) { sv->spool_frontier = (off_t)written; n = 0; }   /* nothing but holes past the frontier */
-        else n = written > (size_t)sv->spool_frontier ? written - (size_t)sv->spool_frontier : 0;
-    } else {
-        sv->spool_frontier = first;
-        n = (size_t)first < written ? written - (size_t)first : 0;
-    }
-    if (n > sv->spool_alloc_peak) sv->spool_alloc_peak = n;
-    return n;
-}
-size_t snapSaveLastSpoolBytes(void) { return snap_last_spool_bytes; }
-size_t snapSaveLastSpoolPeak(void) { return snap_last_spool_alloc_peak; }
 long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
 long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; }
 
@@ -1858,7 +1809,6 @@ void snapSaveCron(void) {
      * both threads. The abort below counts only what the main thread holds:
      * the scan thread's queue waits for the child instead of growing. */
     size_t all_queued = snapSaveQueuedBytes();
-    snapSaveSpoolBytes();   /* samples the spool's footprint peak */
     if (sv->retained_bytes + all_queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + all_queued;
     if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
         if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
@@ -1897,38 +1847,6 @@ static int snapReadAll(int fd, void *p, size_t n) {
         if (r == 0) { errno = 0; return -1; }   /* EOF */
         c += r;
         n -= r;
-    }
-    return 0;
-}
-
-/* Child: 'n' bytes of the spool at 'off', complete or not at all. 1 = got
- * them, 0 = not (all) written yet (the scan thread appends whole messages
- * with one write each, but a reader may observe a partial one), -1 = error. */
-static int snapSpoolPread(int fd, void *p, size_t n, off_t off) {
-    char *c = p;
-    size_t got = 0;
-    while (got < n) {
-        ssize_t r = pread(fd, c + got, n - got, off + got);
-        if (r < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        if (r == 0) return 0;
-        got += r;
-    }
-    return 1;
-}
-
-/* Scan thread: append a whole message to the spool (blocking). */
-static int snapSpoolWrite(snapSave *sv, const char *p, size_t n) {
-    while (n) {
-        ssize_t w = write(sv->spool_wr, p, n);
-        if (w < 0) {
-            if (errno == EINTR) continue;
-            return -1;
-        }
-        p += w;
-        n -= w;
     }
     return 0;
 }
@@ -2055,18 +1973,6 @@ static void snapOutClear(snapSave *sv) {
 static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
                        const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
 
-/* Scan thread: close the open spool segment with a SPOOL marker in the small
- * channel's queue, so the child reads the spooled buffers at their place in
- * the stream. Nothing to do if nothing was spooled since the last marker. */
-static int snapSpoolMarker(snapSave *sv) {
-    size_t total;
-    atomicGet(sv->spool_bytes, total);
-    if ((off_t)total <= sv->spool_seg_off) return 0;
-    uint64_t seg[2] = { (uint64_t)sv->spool_seg_off, (uint64_t)total - (uint64_t)sv->spool_seg_off };
-    sv->spool_seg_off = (off_t)total;
-    return snapSendMsg(sv, SNAP_MSG_SPOOL, -1, -1, seg, sizeof(seg), 0, 0);
-}
-
 /* Scan thread: queue a complete message (header + payload in 'm', owned by
  * the queue from here on) on its channel and push the pipes. Past the bound
  * the thread waits for the child rather than growing further; it never aborts
@@ -2083,42 +1989,6 @@ static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
             memcpy(&h, m, sizeof(h));
             h.robj_off = sv->kv_seq;
             memcpy(m, &h, sizeof(h));
-        }
-        if (sv->spool_wr != -1 && sv->oq_limit) {
-            /* Queue first, spool as the overflow: push the pipes, and if the
-             * small channel is at its bound (the child is inside a big value)
-             * send this and the following buffers to the spool, until the child
-             * has drained the queue to half; a marker then takes their place
-             * in the queue. On a dataset the child keeps up with nothing ever
-             * touches the file. */
-            if (snapOutDrain(sv, SNAP_DRAIN_TRY, 0) != 0) {
-                snapOutRecycle(sv, m);
-                snapScanRequestAbort(sv->scan);
-                return -1;
-            }
-            if (sv->spilling) {
-                if (sv->sq_bytes <= sv->oq_limit / 2) {
-                    sv->spilling = 0;
-                    if (snapSpoolMarker(sv) != 0) {
-                        snapOutRecycle(sv, m);
-                        return -1;
-                    }
-                }
-            } else if (sv->sq_bytes + sdsAllocSize(m) > sv->oq_limit) {
-                sv->spilling = 1;
-            }
-        }
-        if (sv->spilling) {   /* with a spool and no bound: for the whole save */
-            int rc = snapSpoolWrite(sv, m, n);
-            atomicIncr(sv->msgs_sent, 1);
-            atomicIncr(sv->bytes_sent, (long long)n);
-            atomicIncr(sv->spool_bytes, n);
-            snapOutRecycle(sv, m);
-            if (rc != 0) {
-                snapScanRequestAbort(sv->scan);
-                return -1;
-            }
-            return 0;
         }
     }
     if (big) {
@@ -2239,23 +2109,11 @@ static void snapSaveThreadDone(void *priv, int aborted) {
         snapOutDrain(sv, SNAP_DRAIN_ALL, 0);
     } else {
         snapStageFlush(sv);
-        /* Close the open spool segment (if any), then END with both channels'
-         * message counts: the child finishes when it has consumed them. */
-        if (sv->spool_wr != -1 && snapSpoolMarker(sv) != 0) {
+        /* END carries both channels' message counts: the child finishes when
+         * it has consumed them. */
+        if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, sv->kv_seq, sv->small_seq) == 0 &&
+            snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0)
             snapScanRequestAbort(sv->scan);
-        } else if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, sv->kv_seq, sv->small_seq) == 0 &&
-                   snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0) {
-            snapScanRequestAbort(sv->scan);
-        }
-    }
-    /* Our side of the spool is done: close it here, on this thread. The child
-     * holds the other descriptor, so the file's pages (a gigabyte for a large
-     * save) are released when the child exits, never by the main thread (the
-     * last close of an unlinked file frees them synchronously: run 23 saw a
-     * 56 ms PING spike from that in snapSaveFree). */
-    if (sv->spool_wr != -1) {
-        close(sv->spool_wr);
-        sv->spool_wr = -1;
     }
 }
 
@@ -2331,9 +2189,8 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         goto werr;
     }
 
-    /* Two channels (TASK-1.31). Small: BUFFER messages in production order,
-     * with SPOOL markers standing for ranges of the stream that overflowed to
-     * the spool file. Big: KVOBJ (one big value each), then END (or ABORT).
+    /* Two channels (TASK-1.31). Small: BUFFER messages in production order.
+     * Big: KVOBJ (one big value each), then END (or ABORT).
      * Policy: the small channel while the parent reports a backlog of at
      * least SNAP_SMALL_BACKLOG on it (or nothing waits on the big channel), a
      * big value otherwise. The bounded queue then never parks the scan thread
@@ -2347,8 +2204,6 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     int ended = 0;
     snapMsgHdr held;
     int have_held = 0;                 /* a BUFFER (in 'payload') waiting for big values */
-    off_t seg_off = 0, spool_punched = 0;
-    uint64_t seg_left = 0;             /* the open spool segment */
     for (;;) {
         snapMsgHdr h;
         int src;   /* 0 = small channel, 1 = big channel */
@@ -2360,35 +2215,6 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             }
             if (ended) { errno = EPROTO; err_op = "buffer depends on a big value that never comes"; goto werr; }
             src = 1;
-        } else if (seg_left) {
-            /* The next message of the small stream is in the spool: whole
-             * messages, all written before the marker was queued. */
-            if (seg_left < sizeof(h)) { errno = EPROTO; err_op = "spool segment"; goto werr; }
-            if (snapSpoolPread(sv->spool_rd, &h, sizeof(h), seg_off) != 1) { err_op = "spool read (header)"; goto werr; }
-            if (h.type != SNAP_MSG_BUFFER || sizeof(h) + h.len > seg_left) { errno = EPROTO; err_op = "spool segment"; goto werr; }
-            if (h.len > payload_cap) {
-                payload = zrealloc(payload, h.len);
-                payload_cap = h.len;
-            }
-            if (h.len && snapSpoolPread(sv->spool_rd, payload, h.len, seg_off + sizeof(h)) != 1) { err_op = "spool read (payload)"; goto werr; }
-            seg_off += sizeof(h) + h.len;
-            seg_left -= sizeof(h) + h.len;
-            /* Give the consumed range back as we go, so the file's footprint
-             * is the unconsumed tail, not the whole save: a hole on tmpfs or
-             * disk frees the pages; where holes are unsupported, drop the
-             * page cache instead. 16 MB at a time, whole blocks only (a
-             * straddling block would stay allocated and SEEK_DATA would stop
-             * at it for good). */
-            off_t punch_end = seg_off & ~(off_t)4095;
-            if (punch_end - spool_punched >= (off_t)(16 * 1024 * 1024)) {
-                off_t len = punch_end - spool_punched;
-#ifdef FALLOC_FL_PUNCH_HOLE
-                if (fallocate(sv->spool_rd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, spool_punched, len) != 0)
-#endif
-                    posix_fadvise(sv->spool_rd, spool_punched, len, POSIX_FADV_DONTNEED);
-                spool_punched = punch_end;
-            }
-            goto small_msg;
         } else if (ended && small_seen == small_total) {
             break;
         } else {
@@ -2416,7 +2242,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
                  * run 30 showed the child falling to the next big value at
                  * every such gap, the backlog growing to the bound for the
                  * whole value and the scan thread parked (29-36 s under
-                 * writes against 21-24 with the spool). */
+                 * writes against 21-24 with an unbounded overflow). */
                 struct pollfd one = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
                 int r = poll(&one, 1, SNAP_SMALL_WAIT_MS);
                 if (r > 0 && (one.revents & POLLIN)) small_ready = 1;
@@ -2462,21 +2288,12 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         /* Small channel, from the pipe. */
         if (snapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
         small_seen++;
-        if (h.type == SNAP_MSG_SPOOL) {
-            uint64_t seg[2];
-            if (h.len != sizeof(seg) || sv->spool_rd == -1) { errno = EPROTO; err_op = "spool marker"; goto werr; }
-            if (snapReadAll(sv->pipe_rd, seg, sizeof(seg)) != 0) { err_op = "channel read (payload)"; goto werr; }
-            seg_off = (off_t)seg[0];
-            seg_left = seg[1];
-            continue;
-        }
         if (h.type != SNAP_MSG_BUFFER) { errno = EPROTO; err_op = "unknown message"; goto werr; }
         if (h.len > payload_cap) {
             payload = zrealloc(payload, h.len);
             payload_cap = h.len;
         }
         if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
-    small_msg:
         if (h.robj_off > kv_written) {
             held = h;
             have_held = 1;
@@ -2580,8 +2397,6 @@ static void snapSaveChild(snapSave *sv) {
     snapChildReserveArenaRange();
     close(sv->pipe_wr);
     close(sv->big_wr);
-    if (sv->spool_wr != -1) { close(sv->spool_wr); sv->spool_wr = -1; }
-    if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
     if (sv->to_sockets) {
         if (sv->rdb_channel) {
             rioInitWithConnset(&sock, sv->conns, sv->numconns);
@@ -2658,9 +2473,6 @@ static void snapSaveFree(snapSave *sv) {
     if (sv->pipe_rd != -1) close(sv->pipe_rd);
     if (sv->big_wr != -1) close(sv->big_wr);
     if (sv->big_rd != -1) close(sv->big_rd);
-    if (sv->spool_wr != -1) close(sv->spool_wr);
-    if (sv->spool_rd != -1) close(sv->spool_rd);
-    if (sv->spool_stat != -1) close(sv->spool_stat);   /* the child punched the consumed ranges: little left to free */
     if (sv->shared) munmap(sv->shared, sizeof(snapShared));
     if (sv->sizes) {
         for (int j = 0; j < sv->dbnum; j++) {
@@ -2707,7 +2519,6 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
 
     snapSave *sv = zcalloc(sizeof(*sv));
     sv->pipe_rd = sv->pipe_wr = sv->big_rd = sv->big_wr = -1;
-    sv->spool_rd = sv->spool_wr = sv->spool_stat = -1;
     sv->dbnum = server.dbnum;
     sv->req = req;
     sv->rdbflags = rdbflags;
@@ -2775,26 +2586,6 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->oq_pool = listCreate();
     sv->oq_limit = server.bgsave_hybrid_max_queued_bytes;
     sv->tag_all = server.bgsave_hybrid_tag_all;
-    if (server.bgsave_hybrid_spool) {
-        /* Unlinked at once: both descriptors keep it alive, a crash leaves
-         * nothing behind. In the working directory, next to the temp RDB. */
-        char path[64];
-        snprintf(path, sizeof(path), "temp-snap-%d.spool", (int)getpid());
-        sv->spool_wr = open(path, O_WRONLY | O_CREAT | O_EXCL | O_APPEND, 0600);
-        if (sv->spool_wr != -1) {
-            sv->spool_rd = open(path, O_RDWR);          /* the child reads it and punches holes behind its reads */
-            sv->spool_stat = open(path, O_RDONLY);      /* the main thread's own descriptor, for INFO */
-            unlink(path);
-            if (sv->spool_rd == -1) {
-                close(sv->spool_wr); sv->spool_wr = -1;
-                if (sv->spool_stat != -1) { close(sv->spool_stat); sv->spool_stat = -1; }
-            }
-        }
-        if (sv->spool_wr == -1)
-            serverLog(LL_WARNING, "Hybrid BGSAVE: cannot create the spool file %s (%s): the queue waits at its bound instead", path, strerror(errno));
-        else if (!sv->oq_limit)
-            sv->spilling = 1;   /* no bound: every buffer goes to the spool, one marker at the end */
-    }
     snapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
@@ -2849,7 +2640,6 @@ static int snapSaveLaunch(snapSave *sv) {
     sv->pipe_rd = -1;
     close(sv->big_rd);
     sv->big_rd = -1;
-    if (sv->spool_rd != -1) { close(sv->spool_rd); sv->spool_rd = -1; }
     snap_save = sv;
     if (snapScanStartThread(sv->scan) != C_OK) {
         /* The child is waiting on the channel: kill it, unfreeze. */
@@ -3046,9 +2836,6 @@ void snapSaveChildDone(int exitcode, int bysignal) {
     }
     snap_last_retained_peak = sv->retained_peak;
     atomicGet(sv->queued_peak, snap_last_queued_peak);
-    atomicGet(sv->spool_bytes, snap_last_spool_bytes);
-    snapSaveSpoolBytes();   /* one last sample */
-    snap_last_spool_alloc_peak = sv->spool_alloc_peak;
     snap_last_inplace_writes = sv->inplace_writes;
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions (merges), joins, unregisters */

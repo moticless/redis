@@ -461,8 +461,7 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   in series) to 22-26 s at every write rate, the child's own time; on mixed from 23-31 s under
   writes to 19-20. The queue is memory the save holds while the child is behind, released at the
   end and excluded from eviction accounting. A single value larger than the bound allows (about
-  200 MB here) parks the scan for its remainder; an optional unlinked spool file in the working
-  directory (`bgsave-hybrid-spool`, off by default) takes the overflow when that matters.
+  200 MB here) parks the scan for its remainder.
 
 ## 10. Conclusion
 

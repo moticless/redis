@@ -3457,7 +3457,6 @@ standardConfig static_configs[] = {
     createBoolConfig("rdbcompression", NULL, MODIFIABLE_CONFIG, server.rdb_compression, 1, NULL, NULL),
     createBoolConfig("rdb-del-sync-files", NULL, MODIFIABLE_CONFIG, server.rdb_del_sync_files, 0, NULL, NULL),
     createBoolConfig("bgsave-hybrid", NULL, MODIFIABLE_CONFIG, server.bgsave_hybrid, 0, NULL, snapHybridConfigApply),
-    createBoolConfig("bgsave-hybrid-spool", NULL, MODIFIABLE_CONFIG, server.bgsave_hybrid_spool, 0, NULL, NULL),
     createBoolConfig("bgsave-hybrid-tag-all", NULL, DEBUG_CONFIG | MODIFIABLE_CONFIG, server.bgsave_hybrid_tag_all, 0, NULL, NULL),
     createBoolConfig("activerehashing", NULL, MODIFIABLE_CONFIG, server.activerehashing, 1, NULL, NULL),
     createBoolConfig("stop-writes-on-bgsave-error", NULL, MODIFIABLE_CONFIG, server.stop_writes_on_bgsave_err, 1, NULL, NULL),
