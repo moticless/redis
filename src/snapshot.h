@@ -364,7 +364,8 @@ size_t snapSaveLastRetainedPeak(void);
 size_t snapSaveQueuedBytes(void);        /* main-thread queue plus the scan thread's outbound queue */
 size_t snapSaveLastQueuedPeak(void);     /* peak of the two queues over the last save */
 size_t snapSaveBitmapBytes(void);
-long snapSaveGrownDicts(void);           /* attached dicts that expanded during the save (stage B bitmap remaps) */   /* bucket bitmaps of the running save, 0 when none runs */
+long snapSaveGrownDicts(void);
+long snapOverlayLeftovers(void);         /* overlays of an earlier save met and released (should stay 0) */           /* attached dicts that expanded during the save (stage B bitmap remaps) */   /* bucket bitmaps of the running save, 0 when none runs */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);
 

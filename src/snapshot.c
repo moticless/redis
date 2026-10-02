@@ -689,6 +689,7 @@ struct snapScanCtx {
     long *pending;                  /* Per store: slots not yet DONE; the guard comes off at 0, before anyone may free the store. */
     uint8_t **attached;             /* Per store, per dict: 0 untouched, 1 attached (bitmaps, overlay; may still grow), 2 attached and paused (under the window). */
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
+    uint64_t gen;                   /* this save's generation: stamps the overlays it attaches (kvstore leftovers check) */
     struct snapGuardPriv { struct snapScanCtx *ctx; int s; } *guards;   /* Per store, the guard's privdata. */
 
     snapScanDispatchFn *dispatch;
@@ -912,6 +913,8 @@ static inline uint8_t snapSlotGetState(snapScanCtx *ctx, int s, int didx) {
     return st;
 }
 
+static uint64_t snap_scan_gen = 0;   /* generation of the last scan context created */
+
 snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata)
@@ -938,6 +941,7 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
         ctx->slots_total += ctx->num_dicts[s];
     }
     ctx->window_buckets = snap_window_buckets;
+    ctx->gen = ++snap_scan_gen;
     ctx->ring = zmalloc(sizeof(uint64_t) * (ctx->slots_total ? ctx->slots_total : 1));
     ctx->dispatch = dispatch;
     ctx->slot_done = slot_done;
@@ -1032,7 +1036,7 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
          * through the guard: nothing per non-empty dict here. */
     }
     if (ctx->pending[s] == 0) return;   /* nothing to scan in this store */
-    kvstoreSnapGuardSet(ctx->stores[s], &snap_guard_hooks, &ctx->guards[s]);
+    kvstoreSnapGuardSet(ctx->stores[s], &snap_guard_hooks, &ctx->guards[s], ctx->gen);
     ctx->frozen[s] = 1;
 }
 
@@ -1041,7 +1045,7 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
  * replaces the store right after, before snapScanRelease() runs. */
 static void snapScanStoreDone(snapScanCtx *ctx, int s) {
     if (!ctx->frozen[s]) return;
-    kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL);
+    kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL, 0);
     ctx->frozen[s] = 0;
     if (ctx->store_done) ctx->store_done(ctx->privdata, s);
 }
@@ -1537,6 +1541,14 @@ int snapSaveIsAofRewrite(void) { return snap_save != NULL && !snap_save->aborted
 size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
 size_t snapSaveBitmapBytes(void) { return snap_save ? snapScanBitmapBytes(snap_save->scan) : 0; }
+/* Overlays of an earlier save met and released by a kvstore access: zero is
+ * the only right answer, anything else names a release path that did not run. */
+long snapOverlayLeftovers(void) {
+    long n = 0;
+    if (snap_in_hybrid_child) return 0;   /* the kvstores live in the arena, not mapped here (crash report INFO) */
+    for (int j = 0; j < server.dbnum; j++) n += kvstoreOverlayLeftovers(server.db[j].keys);
+    return n;
+}
 long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(snap_save->scan) : 0; }
 
 size_t snapSaveQueuedBytes(void) {
@@ -3727,6 +3739,42 @@ static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink) {
     (*(long *)priv)++;
 }
 
+/* An overlay carries the generation of the save that attached it; one met
+ * under another generation is a leftover and is released on the spot. */
+static void snapOverlayLeftoverTest(void) {
+    dictType noval = KvstoreDictTestType;
+    noval.no_value = 1;
+    noval.keyCompare = snapTestKeyCompare;
+    kvstore *stores[1];
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstore *ks = stores[0];
+    for (int i = 0; i < 100; i++) serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
+    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    st->inserted[0][0] = 100;
+    struct ovTestCounters cnt = {0, 0, 0};
+    void *privs[1] = { &cnt };
+    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL, NULL };
+    snapScanSetOverlay(ctx, &hooks, privs);
+    test_cond("leftover: start", snapScanStart(ctx) == C_OK);
+    char *k = snapTestKey(0, 0, 1);
+    dictEntryLink b = NULL;
+    kvstoreDictFindLink(ks, 0, k, &b);   /* a write-intent lookup attaches the overlay, stamped with this save */
+    test_cond("leftover: the overlay is attached and counts as current", kvstoreOverlayIsFrozen(ks, 0) && kvstoreOverlayLeftovers(ks) == 0);
+    snapFunnelClose();
+    /* Simulate a release path that did not run: the save is gone (guard off,
+     * generation 0) but the overlay is still on the dict. */
+    kvstoreSnapGuardSet(ks, NULL, NULL, 0);
+    kvstoreDictFindLink(ks, 0, k, &b);
+    test_cond("leftover: the next access releases the stale overlay and counts it",
+              !kvstoreOverlayIsFrozen(ks, 0) && kvstoreOverlayLeftovers(ks) == 1);
+    zfree(k);
+    snapScanRelease(ctx);
+    kvstoreRelease(ks);
+    zfree(st);
+}
+
 static void snapOverlayTests(int abort_variant) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
@@ -3891,6 +3939,7 @@ int snapshotTest(int argc, char **argv, int flags) {
     snapNoforkFree(fb);
     /* The background scan and the keyspace overlay do not depend on the arena. */
     snapScanTests(accurate);
+    snapOverlayLeftoverTest();
     snapOverlayTests(0);
     snapOverlayTests(1);
     test_report();
@@ -4064,6 +4113,7 @@ int snapshotTest(int argc, char **argv, int flags) {
 
     snapPlacementTests();
     snapScanTests(accurate);
+    snapOverlayLeftoverTest();
     snapOverlayTests(0);
     snapOverlayTests(1);
 

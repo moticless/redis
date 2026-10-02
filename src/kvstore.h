@@ -109,8 +109,13 @@ typedef struct kvstoreSnapHooks {
     kvstoreSnapRehashFn *rehash_completed;
     kvstoreSnapShrinkAllowedFn *shrink_allowed;
 } kvstoreSnapHooks;
-/* NULL hooks turn the snapshot off for the store. */
-void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
+/* NULL hooks turn the snapshot off for the store. 'gen' is the save's
+ * generation: every overlay attached from here on is stamped with it, and an
+ * overlay met with another generation is a leftover of an earlier save (a
+ * release path that did not run): it is released on the spot and counted in
+ * kvstoreOverlayLeftovers(). */
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata, uint64_t gen);
+long kvstoreOverlayLeftovers(kvstore *kvs);
 void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */

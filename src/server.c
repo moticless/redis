@@ -6886,6 +6886,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "snap_last_save_queued_peak:%zu\r\n", snapSaveLastQueuedPeak(),
             "snap_save_bitmap_bytes:%zu\r\n", snapSaveBitmapBytes(),
             "snap_save_grown_dicts:%ld\r\n", snapSaveGrownDicts(),
+            "snap_overlay_leftovers:%ld\r\n", snapOverlayLeftovers(),
             "snap_save_main_buckets:%lld\r\n", snapSaveMainBuckets(),
             "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
             "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,

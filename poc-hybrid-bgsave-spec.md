@@ -714,6 +714,12 @@ class, ht0[i] and ht1[i + j*n], so entries the rehash moves later land in marked
 standalone mode the one dict is under the window from the start, so nothing changes there; in
 cluster mode the lockout rolls with the scan. `snap_save_grown_dicts` counts the remaps.
 
+Every overlay is stamped with the save's generation (`kvstoreSnapGuardSet(..., gen)`, the scan
+context's `gen`): an access that meets an overlay of another generation treats it as a leftover of
+a save whose release path did not run, applies what it holds to the real dict, drops it and counts
+it in `snap_overlay_leftovers` (the user's suggestion, 2026-10-02). Zero is the only right value;
+the per-save bitmaps and attach flags live in the scan context and cannot outlive it.
+
 ### 11.z.3 Comparison with the teammate's forkless-hybrid POC (yinon/forkless-hybrid, 2026-09-23)
 
 Same goal, and the same two tools: a MADV_DONTFORK jemalloc arena for small

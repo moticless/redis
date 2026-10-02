@@ -44,6 +44,8 @@ struct _kvstore {
     list *ov_dirty;                        /* Frozen dicts whose side table is (or was) non-empty (kvstoreDictOverlay *). */
     const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
     void *snap_priv;
+    uint64_t snap_gen;                     /* generation of the running save (0: none); overlays carry it */
+    long ov_leftovers;                     /* overlays of an earlier generation met and released */
     void *metadata[];                      /* conditionally allocated based on "flags" */
 };
 
@@ -64,6 +66,7 @@ typedef struct kvstoreDictOverlay {
     long adds;                  /* temp entries whose key is not in the frozen dict */
     long tombs;                 /* frozen keys hidden by a tombstone (and not re-added) */
     kvstoreOverlayHooks h;
+    uint64_t gen;               /* the save generation that attached it (kvstore.snap_gen then) */
     int unlink_frozen;          /* the pending two-phase unlink targets the frozen dict */
     listNode *dirty_node;       /* node in kvs->ov_dirty while the side table may be non-empty */
     void *privdata;
@@ -74,26 +77,44 @@ typedef struct kvstoreDictOverlay {
  * go through: the attached overlay, or whatever the snapshot guard decides
  * (it may attach one now). One load when no snapshot runs; the dict pointer
  * every caller loads anyway. */
+void kvstoreOverlayRelease(kvstore *kvs, int didx);
+
+/* The overlay attached to dict didx if it belongs to the running save; an
+ * overlay of another generation is a leftover (some release path did not
+ * run): apply what it holds to the real dict and drop it, so no access ever
+ * trusts stale snapshot state. */
+static kvstoreDictOverlay *ovCurrent(kvstore *kvs, dict *d, int didx) {
+    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    if (__builtin_expect(ov == NULL || ov->gen == kvs->snap_gen, 1)) return ov;
+    kvs->ov_leftovers++;
+    kvstoreOverlayRelease(kvs, didx);
+    return NULL;
+}
+
 static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
     if (__builtin_expect(kvs->ov_frozen == 0, 1)) return NULL;
     dict *d = kvs->dicts[didx];
-    return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
+    return d ? ovCurrent(kvs, d, didx) : NULL;
 }
 
 static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
-    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
+    if (__builtin_expect(kvs->snap_hooks == NULL && kvs->ov_frozen == 0, 1)) return NULL;
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
-    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    kvstoreDictOverlay *ov = ovCurrent(kvs, d, didx);
     if (ov) return ov;
+    if (kvs->snap_hooks == NULL) return NULL;
     return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
+
+long kvstoreOverlayLeftovers(kvstore *kvs) { return kvs->ov_leftovers; }
 #define ovGetR(kvs, didx) ovGet(kvs, didx, 0)
 #define ovGetW(kvs, didx) ovGet(kvs, didx, 1)
 
-void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata, uint64_t gen) {
     kvs->snap_hooks = hooks;
     kvs->snap_priv = privdata;
+    kvs->snap_gen = hooks ? gen : 0;
 }
 
 /* A non-empty side table: reads must consult it. Writes always go through
@@ -214,6 +235,7 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
     ov->state = dictCreate(&ov->state_type);
     ov->h = *hooks;
     ov->privdata = privdata;
+    ov->gen = kvs->snap_gen;
     meta->ov = ov;
     kvs->ov_frozen++;
 }
@@ -411,7 +433,8 @@ long kvstoreOverlayPending(kvstore *kvs) {
 /* Owner thread, after the scan of this dict is complete: apply whatever is
  * left in the side table and unfreeze the dict. */
 void kvstoreOverlayRelease(kvstore *kvs, int didx) {
-    kvstoreDictOverlay *ov = ovPeek(kvs, didx);
+    dict *d = kvs->ov_frozen ? kvs->dicts[didx] : NULL;
+    kvstoreDictOverlay *ov = d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;   /* raw: a leftover is released here too */
     if (!ov) return;
     long left = ovDrainOne(kvs, ov, 1);
     assert(left == 0);
@@ -421,7 +444,6 @@ void kvstoreOverlayRelease(kvstore *kvs, int didx) {
     ov->temp_type.keyDestructor = NULL;
     dictRelease(ov->temp);
     dictRelease(ov->state);
-    dict *d = kvs->dicts[didx];
     ((kvstoreDictMetaBase *)dictMetadata(d))->ov = NULL;
     zfree(ov);
     kvs->ov_frozen--;

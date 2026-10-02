@@ -46,7 +46,7 @@ cloning, blocked writers on in-use keys, no memory bound.
 | main-thread cost | emit-ahead serialization under writes; cron drains; 0.3-16 CPU-s per save, which is the write load itself | feeder timer, cloning, blocking bookkeeping: 11-28 CPU-s per save, 1.6-2.7x ours under writes |
 | rehash during a save | only the dict under the scan thread's window is paused; a slot written before the thread reaches it keeps growing and its bitmap follows the table (shrink refused) | rehash paused on the table and on HT-encoded values in use |
 | consistency across dbs | frozen at the fork instant | epoch; SWAPDB keeps original db ids |
-| recovery after a failed save | child dies, overlay merges, nothing outlives the save | iterator terminated; a failed save blocks writes until resolved (`failed bgsave prevents writes` test) |
+| recovery after a failed save | child dies, overlay merges, nothing outlives the save; overlays carry the save's generation, so a leftover one is recognised and released on the next access | iterator terminated; a failed save blocks writes until resolved (`failed bgsave prevents writes` test) |
 | allocator requirement | 64-bit Linux + jemalloc for the arena (runs without it, no memory benefit) | none |
 | switchable at runtime | `bgsave-hybrid` immutable at startup (arena placement) | `forkless-infrastructure-enabled` immutable; `bgsave-default-method fork|forkless` modifiable |
 | knobs | `save-small-max-bytes` 4 KB, `bgsave-hybrid-max-queued-bytes` 100 MB, `bgsave-hybrid-max-retained-bytes` 256 MB | none beyond the two above; pool and queue sizes are compile-time |
