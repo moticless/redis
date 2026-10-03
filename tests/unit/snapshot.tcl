@@ -1168,7 +1168,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_wait_save_started
             set child [get_child_pid 0]
             exec kill -STOP $child
-            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            wait_for_condition 300 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }   ;# 15 s: rdb-key-save-delay sleeps stretch under a loaded suite
             # maxmemory a little above what the dataset and the server need:
             # the queue alone would put used_memory past it
             set queued [s snap_save_queued_bytes]
@@ -1213,7 +1213,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             # writes to the big hashes hand them to the child at once (emitted
             # ahead): every later buffer depends on them
             for {set i 0} {$i < 100} {incr i} { r hset tgh:[expr {$i % 4}] new$i v }
-            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            wait_for_condition 300 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }   ;# 15 s: rdb-key-save-delay sleeps stretch under a loaded suite
             exec kill -CONT $child
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
@@ -1443,7 +1443,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_wait_save_started
             set child [get_child_pid 0]
             exec kill -STOP $child
-            wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+            wait_for_condition 300 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }   ;# 15 s: rdb-key-save-delay sleeps stretch under a loaded suite
             after 200   ;# the scan thread is in its bound wait now
             set t0 [clock milliseconds]
             r flushall
@@ -1488,7 +1488,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
                 snap_wait_save_started
                 set child [get_child_pid 0]
                 exec kill -STOP $child
-                wait_for_condition 100 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }
+                wait_for_condition 300 50 {[s snap_save_queued_bytes] >= 1000000} else { exec kill -CONT $child; fail "queue did not fill" }   ;# 15 s: rdb-key-save-delay sleeps stretch under a loaded suite
                 after 200
                 # The stopped child holds this connection's socket open (a fork
                 # child inherits the client sockets), so a reply would never
@@ -1548,6 +1548,32 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             r debug reload nosave
             assert_equal $digest [debug_digest]   ;# the seeds, none of the 600
             r config set rdbcompression yes
+        }
+
+        test {Hybrid BGSAVE harness (cluster mode): keys written into a slot empty at the fork instant never reach the snapshot} {
+            r flushall
+            populate 30000 cl: 20
+            # a high slot (the walker reaches it last) with no key at the fork
+            # instant: its dict does not exist yet, nothing in it is owed
+            set tag ""
+            for {set i 0} {$i < 400} {incr i} {
+                set slot [r cluster keyslot "{e$i}"]
+                if {$slot > 16000 && [r cluster countkeysinslot $slot] == 0} { set tag "{e$i}"; break }
+            }
+            assert {$tag ne ""}
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 150   ;# about 4.5 s for 30k keys
+            r bgsave
+            snap_wait_save_started
+            for {set i 0} {$i < 300} {incr i} { r set "$tag:$i" v }
+            assert_equal 1 [s snap_save_in_progress]
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            assert_equal 0 [s snap_save_leftovers]
+            r debug reload nosave
+            assert_equal $digest [debug_digest]   ;# the 30k, none of the 300
+            assert_equal 0 [r exists "$tag:0"]
         }
 
         test {Hybrid BGSAVE harness (cluster mode): randomized writers race the per-slot scan} {

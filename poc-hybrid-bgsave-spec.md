@@ -127,10 +127,25 @@ kept in §11.y for history.
 waiting for the main thread to release it) or `DONE` (released: side table applied, dict unfrozen).
 The scan thread advances the state, the main thread reads it with an atomic load.
 
-**Freeze (on demand since TASK-1.21.6, 2026-10-01).** At save start, on the main thread and before
-the fork: mark the slots that are empty right now `DONE` and install the store's *snapshot guard*
-(`kvstoreSnapGuardSet`). Nothing is paused or allocated per dict: in cluster mode that was a 3-5 ms
-stall for 16,384 slot dicts (as long as a stock fork), now below the 1 ms latency-monitor threshold.
+**Freeze (on demand since TASK-1.21.6, 2026-10-01; per-dict state since TASK-1.21.8, 2026-10-03).**
+At save start, on the main thread and before the fork: install the store's *snapshot guard*
+(`kvstoreSnapGuardSet`) on every non-empty store. Nothing is visited, paused or allocated per dict:
+in cluster mode the 2026-10-01 version still walked the 16,384 slots to mark the empty ones `DONE`
+and kept three per-slot arrays in the scan context; now the freeze is O(stores). The per-dict state
+lives in the dict's own kvstore metadata: a word `(generation << 8) | state` and a pointer to the
+save's per-dict struct (`kvstoreDictSnap`: the two bucket bitmaps, the overlay, the pause flag),
+attached on first touch and freed when the dict completes. A dict whose word does not carry the
+running save's generation is *untouched since the fork instant*: the main thread reads it as
+`PENDING` when it is non-empty and as `DONE` when it is empty (every post-fork add stamps the dict
+first, so an unstamped dict holds only fork-instant content), and a dict allocated during the save
+is stamped `DONE` at creation (`dict_created` hook). The thread's pass over the store's dict pointers
+claims each unstamped dict with a compare-and-swap to `SCANNING` and walks whatever it holds; the
+main thread's stamp is the same exchange, so whichever side touches the dict first decides and the
+other reads the verdict. Empty dicts are not freed while the hooks are set (the thread reads the
+pointers); the deferred frees run when the store's guard comes off. A store is complete when the
+thread has passed its last dict and every dict it claimed has completed; at abort the main thread
+completes the dict the thread was reading and then the store's list of attached dicts, so no sweep
+over the slots remains anywhere.
 The guard runs on every kvstore access to a dict that has no overlay while the scan runs: it returns
 nothing for `SCANNED`/`DONE` slots; otherwise it opens the write section (reads included, since a find
 may step a rehash and the thread may claim the dict at any moment) and *attaches* on a structural
@@ -411,7 +426,8 @@ surfaced, not worked around.
 - The scan thread never reads a mutable main-thread global: `rdb-key-save-delay`
   (CONFIG SET reaches it through an apply hook), `maxmemory-policy` and
   `rdb-compression` are frozen per save; the LRU clock is computed, not read.
-- Slots empty at the freeze instant are DONE immediately and never frozen.
+- Slots empty at the freeze instant are never scanned: unstamped and empty means DONE to the main
+  thread, and a dict created during the save is stamped DONE at creation (TASK-1.21.8).
 - See `poc-hybrid-bgsave-m1-report.md` for the M1 evidence and go/no-go.
 
 ### 11.y Per-key scan generation (2026-09-21; superseded by 11.z)
@@ -512,10 +528,11 @@ matching set-at-link: the window cannot move under it. Cost: two seq_cst
 operations per write section, only while a hybrid save is active. Possible
 later optimisation: an asymmetric fence (`membarrier`) on the walker side.
 
-**Bitmap lifecycle.** Allocated at freeze for every frozen table (one bit per
-bucket, about 256 KB for 2M buckets), written with atomic byte ops so a window
-boundary inside a byte is race-free, freed when the save ends or aborts. Nothing
-about a save survives it, so there is no generation to wrap and no trust rule.
+**Bitmap lifecycle.** Allocated when the save first touches the dict (one bit per
+bucket of each table it has then, about 256 KB for 2M buckets; in the dict's
+metadata since TASK-1.21.8), written with atomic byte ops so a window
+boundary inside a byte is race-free, freed when the dict completes or the save
+aborts. The dict's generation stamp says whether the state is this save's.
 `kvBits.save_gen` and the byte-wide kvBits atomics of §11.y are removed; kvBits
 returns to the upstream layout.
 
@@ -655,8 +672,8 @@ pieces of shared state, all lock-free:
    closes when the outermost command returns, at `beforeSleep`, and when a
    module thread releases the GIL. Links into a frozen dict are never held
    across a section boundary.
-3. **The per-save bucket bitmaps**, one bit per bucket of every frozen table,
-   allocated at freeze and freed when the slot completes.
+3. **The per-save bucket bitmaps**, one bit per bucket of every table of a
+   dict the save touched, allocated at attach and freed when the slot completes.
 
 **Handshake.** After publishing a new window the thread loads the counter
 (seq_cst). If it is odd it waits until the value changes, then reads the
@@ -714,11 +731,12 @@ class, ht0[i] and ht1[i + j*n], so entries the rehash moves later land in marked
 standalone mode the one dict is under the window from the start, so nothing changes there; in
 cluster mode the lockout rolls with the scan. `snap_save_grown_dicts` counts the remaps.
 
-Every overlay is stamped with the save's generation (`kvstoreSnapGuardSet(..., gen)`, the scan
-context's `gen`): an access that meets an overlay of another generation treats it as a leftover of
-a save whose release path did not run, applies what it holds to the real dict, drops it and counts
-it in `snap_overlay_leftovers` (the user's suggestion, 2026-10-02). Zero is the only right value;
-the per-save bitmaps and attach flags live in the scan context and cannot outlive it.
+Every dict the save touches is stamped with the save's generation (`kvstoreSnapGuardSet(..., gen)`,
+the scan context's `gen`; the user's suggestion, 2026-10-02, extended to all per-dict state on
+2026-10-03): an access that meets save state of another generation treats it as a leftover of a
+save whose release path did not run, applies what its side table holds to the real dict, frees the
+bitmaps, resumes the layout and counts it in `snap_save_leftovers`; `kvstoreEmpty` and
+`kvstoreRelease` do the same for whatever is still attached. Zero is the only right value.
 
 ### 11.z.3 Comparison with the teammate's forkless-hybrid POC (yinon/forkless-hybrid, 2026-09-23)
 

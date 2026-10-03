@@ -151,7 +151,10 @@ void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
 
 /* Slot (kvstore dict) states, monotonic: PENDING -> SCANNING -> SCANNED -> DONE.
  * A slot is "owed" to the snapshot (main-thread writes must go through
- * clone-on-write into the temp dict) while its state is not DONE. */
+ * clone-on-write into the temp dict) while its state is not DONE. The state
+ * lives in the dict's own metadata next to the save generation that stamped
+ * it (kvstore.h kvstoreDictMetaBase.snap_word): a dict without this save's
+ * stamp is untouched since the fork instant. */
 #define SNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
 #define SNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */
 #define SNAP_SLOT_SCANNED  2   /* Fully dispatched; waiting for the main-thread merge. */
@@ -177,15 +180,15 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata);
 
-/* Main thread. Marks the dicts that are empty right now DONE, installs the
- * snapshot guard on every store (kvstore.h) and spawns the scan thread; the
- * other slots start PENDING. Nothing is paused or allocated per dict: a dict
- * is paused and gets its bucket bitmaps and overlay on demand, at the first
- * structural write to it or when the thread's window is on it. Returns C_OK
- * or C_ERR (nothing frozen on error). From this point until
- * snapScanRelease() every main-thread write to an owed dict goes through the
- * overlay hooks: in place once the snapshot holds the bucket, to the side
- * table while the thread reads it. */
+/* Main thread. Installs the snapshot guard on every non-empty store
+ * (kvstore.h) and spawns the scan thread. Nothing is visited, paused or
+ * allocated per dict: a dict is stamped with the save's generation, gets its
+ * bucket bitmaps and overlay, and is paused, on demand: at the first
+ * structural write to it, when the thread's window is on it, or when the
+ * thread's pass reaches it. Returns C_OK or C_ERR (nothing frozen on error).
+ * From this point until snapScanRelease() every main-thread write to an owed
+ * dict goes through the overlay hooks: in place once the snapshot holds the
+ * bucket, to the side table while the thread reads it. */
 int snapScanStart(snapScanCtx *ctx);
 
 /* Main thread. Handles slots the thread finished since the last call: for
@@ -242,8 +245,9 @@ int snapWindowCoversKey(dict *d, const void *key);
 void snapSetWindowBuckets(unsigned long n);
 unsigned long snapGetWindowBuckets(void);
 
-/* Per-save bucket bitmaps: one bit per bucket of every frozen table,
- * allocated at freeze, freed when the slot completes. A set bit means the
+/* Per-save bucket bitmaps: one bit per bucket of every table of a dict the
+ * save touched, allocated when the dict is attached (in its metadata,
+ * kvstoreDictSnap), freed when the slot completes. A set bit means the
  * bucket's chain was already emitted into the snapshot by the main thread
  * (ahead of the window, spec 11.z); the scan thread skips such buckets.
  * Mark only buckets ahead of the published window, inside a write section. */
@@ -263,7 +267,9 @@ size_t snapScanBitmapBytes(snapScanCtx *ctx);
 void *snapOverlayCloneKey(void *privdata, int didx, void *orig, int *value_shared);
 void snapOverlayFreeOriginal(void *privdata, int didx, void *orig, int value_shared);
 
-/* Cheap, lock-free state queries usable on every write path. */
+/* Cheap, lock-free state queries usable on every write path. A dict the
+ * save has not touched reads PENDING (DONE once the scan ended or for a
+ * store that holds nothing of the fork instant). */
 int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx);
 
@@ -294,7 +300,8 @@ int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 /* 1 when called from the scan thread. */
 int snapOnScanThread(void);
 
-/* Progress for INFO / tests. */
+/* Progress for INFO / tests: dicts allocated at freeze in the scanned
+ * stores, dicts the thread passed, dicts finished (completed or skipped). */
 void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched);
 

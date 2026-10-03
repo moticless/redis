@@ -103,23 +103,42 @@ typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore 
  * shrink right now (a snapshot bitmap follows a split but not a merge). */
 typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);
 typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);
+/* A dict was just allocated in a store under a save (main thread, before the
+ * dict is published): it holds nothing of the fork instant. */
+typedef void (kvstoreSnapDictCreatedFn)(void *privdata, int didx, dict *d);
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;
     kvstoreSnapRehashFn *rehash_started;
     kvstoreSnapRehashFn *rehash_completed;
     kvstoreSnapShrinkAllowedFn *shrink_allowed;
+    kvstoreSnapDictCreatedFn *dict_created;
 } kvstoreSnapHooks;
 /* NULL hooks turn the snapshot off for the store. 'gen' is the save's
- * generation: every overlay attached from here on is stamped with it, and an
- * overlay met with another generation is a leftover of an earlier save (a
+ * generation (never 0): the per-dict save state (kvstoreDictSnap, and the
+ * state word next to it) is valid only while the dict's stamp equals it.
+ * State met under another generation is a leftover of an earlier save (a
  * release path that did not run): it is released on the spot and counted in
- * kvstoreOverlayLeftovers(). */
+ * kvstoreSnapLeftovers(). While hooks are set, empty dicts are not freed
+ * (the scan thread reads dict pointers of the store); the deferred frees run
+ * when the hooks come off. */
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata, uint64_t gen);
-long kvstoreOverlayLeftovers(kvstore *kvs);
-void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);
+long kvstoreSnapLeftovers(kvstore *kvs);
+/* The save state of dict didx: allocate it (stamped by the caller first) or
+ * release it (bitmaps, overlay, pause). The first dict of the store that
+ * still has one, for the sweep that ends a save. */
+struct kvstoreDictSnap *kvstoreDictSnapAttach(kvstore *kvs, int didx);
+void kvstoreDictSnapRelease(kvstore *kvs, int didx);
+dict *kvstoreSnapFirstDict(kvstore *kvs);
+/* Bytes of bucket bitmaps attached to the store's dicts: the snapshot
+ * accounts what it allocates, the release subtracts what it frees. */
+void kvstoreSnapBitmapAccount(kvstore *kvs, long delta);
+size_t kvstoreSnapBitmapBytes(kvstore *kvs);
+/* The dict pointer with acquire semantics, for the scan thread (the main
+ * thread publishes new dicts with release). */
+dict *kvstoreGetDictAcquire(kvstore *kvs, int didx);
+void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);   /* needs the save state attached */
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
-void kvstoreOverlayRelease(kvstore *kvs, int didx); /* apply the rest, unfreeze */
 long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */
 void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);
 
@@ -153,13 +172,32 @@ typedef struct kvstoreType {
     void (*onDictEmpty)(kvstore *kvs, int didx);
 } kvstoreType;
 
+/* What a running snapshot save (hybrid BGSAVE) keeps per dict, allocated the
+ * first time the save touches the dict (a write before the scan thread
+ * reached it, or the thread's window on it) and freed when the dict's scan
+ * completes. Meaningful only while the dict's stamp (kvstoreDictMetaBase
+ * snap_word) carries the running save's generation. */
+typedef struct kvstoreDictSnap {
+    uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
+                                   bucket's fork-instant chain ahead of the scan thread (snapshot.c);
+                                   main thread stores (release), scan thread loads (acquire) */
+    size_t bytes[2];
+    struct kvstoreDictOverlay *ov;  /* side table while writes meet the thread's window, else NULL */
+    int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
+    listNode *node;             /* kvs->snap_dicts */
+} kvstoreDictSnap;
+
 /* Basic metadata allocated per dict.
  * If additional metadata needed, embed this structure as the first member
  * in a new, larger structure. */
 typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
-    struct kvstoreDictOverlay *ov;  /* snapshot overlay while the dict is frozen (hybrid BGSAVE), else NULL */
     int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
+    uint64_t snap_word;         /* (save generation << 8) | per-save state (snapshot.h SNAP_SLOT_*);
+                                   written by both threads with __atomic builtins. A stamp of another
+                                   generation means this save has not touched the dict. */
+    kvstoreDictSnap *snap;      /* NULL until the save touches the dict; main thread stores (release),
+                                   scan thread loads (acquire) */
 } kvstoreDictMetaBase;
 
 #define KVSTORE_ALLOCATE_DICTS_ON_DEMAND (1<<0)
