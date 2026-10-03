@@ -1099,7 +1099,7 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
  * replaces the store right after, before snapScanRelease() runs. */
 static void snapScanStoreDone(snapScanCtx *ctx, int s) {
     if (!ctx->frozen[s]) return;
-    serverAssert(kvstoreSnapFirstDict(ctx->stores[s]) == NULL);
+    serverAssert(kvstoreSnapAttached(ctx->stores[s]) == 0);
     kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL, 0);
     ctx->frozen[s] = 0;
     if (ctx->store_done) ctx->store_done(ctx->privdata, s);
@@ -1364,7 +1364,9 @@ int snapScanHandleCompletions(snapScanCtx *ctx) {
 
 /* Main thread, the thread joined or never started: complete what the save
  * still holds as aborted (the dict the thread was reading, then every dict
- * attached ahead of it), then every store. Nothing is owed after this. */
+ * attached ahead of it: a pass over the store's dicts, only when some are
+ * attached, until the count is down), then every store. Nothing is owed
+ * after this. */
 static void snapScanFinishAll(snapScanCtx *ctx) {
     int64_t cur;
     atomicGet(ctx->cur_slot, cur);
@@ -1374,9 +1376,11 @@ static void snapScanFinishAll(snapScanCtx *ctx) {
     }
     for (int s = 0; s < ctx->num_stores; s++) {
         if (!ctx->frozen[s]) continue;
-        dict *d;
-        while ((d = kvstoreSnapFirstDict(ctx->stores[s])) != NULL)
-            snapScanCompleteSlot(ctx, s, snapMeta(d)->didx, 1);
+        kvstore *kvs = ctx->stores[s];
+        for (int didx = 0; kvstoreSnapAttached(kvs) > 0 && didx < ctx->num_dicts[s]; didx++) {
+            dict *d = kvstoreGetDict(kvs, didx);
+            if (d && snapMeta(d)->snap) snapScanCompleteSlot(ctx, s, didx, 1);
+        }
         snapScanStoreDone(ctx, s);
     }
     ctx->ended = 1;

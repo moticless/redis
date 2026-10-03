@@ -124,11 +124,12 @@ typedef struct kvstoreSnapHooks {
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata, uint64_t gen);
 long kvstoreSnapLeftovers(kvstore *kvs);
 /* The save state of dict didx: allocate it (stamped by the caller first) or
- * release it (bitmaps, overlay, pause). The first dict of the store that
- * still has one, for the sweep that ends a save. */
+ * release it (bitmaps, overlay, pause). How many dicts of the store have
+ * one, for the sweep that ends an aborted save (and the assertion that a
+ * completed store has none). */
 struct kvstoreDictSnap *kvstoreDictSnapAttach(kvstore *kvs, int didx);
 void kvstoreDictSnapRelease(kvstore *kvs, int didx);
-dict *kvstoreSnapFirstDict(kvstore *kvs);
+int kvstoreSnapAttached(kvstore *kvs);
 /* Bytes of bucket bitmaps attached to the store's dicts: the snapshot
  * accounts what it allocates, the release subtracts what it frees. */
 void kvstoreSnapBitmapAccount(kvstore *kvs, long delta);
@@ -184,7 +185,6 @@ typedef struct kvstoreDictSnap {
     size_t bytes[2];
     struct kvstoreDictOverlay *ov;  /* side table while writes meet the thread's window, else NULL */
     int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
-    listNode *node;             /* kvs->snap_dicts */
 } kvstoreDictSnap;
 
 /* Basic metadata allocated per dict.

@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-02 22:53'
-updated_date: '2026-10-03 09:26'
+updated_date: '2026-10-03 10:26'
 labels:
   - bgsave
   - cluster
@@ -67,6 +67,8 @@ Why: removes three 16384-entry arrays per db and the O(slots) freeze and release
 2026-10-03: TSan (setarch -R, MALLOC=libc) and ASan runs of unit/snapshot with the feature on: 69 ok each, 'All tests passed without errors', no sanitizer reports. C unit 184/184 after adding the kvstoreEmpty leftover case to snapOverlayLeftoverTest. Full feature-on suite started.
 
 2026-10-03: full feature-on suite (164 units, 8 clients): one failure, 'FLUSHALL while the scan thread waits at the queue bound': wait_for_condition 'queue did not fill' timed out after 5 s under the loaded suite (rdb-key-save-delay sleeps stretch); the test passed alone 3/3 before and after raising the four queue-fill waits to 15 s. Everything else green (unit/snapshot hybrid 75 and stock 75, C unit 184, TSan and ASan clean).
+
+2026-10-03 follow-up (user review): the attached-dict list is gone. kvstore keeps an attached count (fast path, 'completed store has nothing attached' assertion); leftovers are released from the dict type's onDictRelease (before the tables are cleared) and inline in kvstoreEmpty's loop; the abort sweep passes over the store's dicts only while the count is non-zero. First run caught by ASan: the overlay's temp dict copies the store's dictType and inherited onDictRelease, reading metadata it does not have; fixed by nulling onDictRelease (and shrinkAllowed) on the copy. Verified: C unit 184/184, unit/snapshot hybrid 75 and stock 75, TSan 69 and ASan 69 clean.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

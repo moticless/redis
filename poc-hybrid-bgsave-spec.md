@@ -144,8 +144,11 @@ main thread's stamp is the same exchange, so whichever side touches the dict fir
 other reads the verdict. Empty dicts are not freed while the hooks are set (the thread reads the
 pointers); the deferred frees run when the store's guard comes off. A store is complete when the
 thread has passed its last dict and every dict it claimed has completed; at abort the main thread
-completes the dict the thread was reading and then the store's list of attached dicts, so no sweep
-over the slots remains anywhere.
+completes the dict the thread was reading and then, only while the store's attached count is
+non-zero, passes over the store's dicts for the ones writes attached ahead of the thread. That pass
+is the one remaining O(slots) loop, on the rare abort path; the regular save never runs one. Save
+state still attached when a dict is released or its store emptied is a leftover, released from the
+dict's `onDictRelease` (before its tables are cleared) or inline in `kvstoreEmpty`, and counted.
 The guard runs on every kvstore access to a dict that has no overlay while the scan runs: it returns
 nothing for `SCANNED`/`DONE` slots; otherwise it opens the write section (reads included, since a find
 may step a rehash and the thread may claim the dict at any moment) and *attaches* on a structural

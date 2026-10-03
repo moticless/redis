@@ -40,7 +40,7 @@ struct _kvstore {
     unsigned long long bucket_count;       /* Total number of buckets in this kvstore across dictionaries. */
     fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
-    list *snap_dicts;                      /* Dicts with save state attached (dict *), see kvstoreDictSnap. */
+    int snap_attached;                     /* Dicts with save state attached (kvstoreDictSnap in their metadata). */
     list *ov_dirty;                        /* Frozen dicts whose side table is (or was) non-empty (kvstoreDictOverlay *). */
     const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
     void *snap_priv;
@@ -79,8 +79,9 @@ typedef struct kvstoreDictOverlay {
  * or whatever the snapshot guard decides (it may attach one now). One load
  * when no snapshot runs; the dict pointer every caller loads anyway. */
 static void freeDictIfNeeded(kvstore *kvs, int didx);
+static void kvstoreDictOnRelease(dict *d);
 
-static inline int snapAttached(kvstore *kvs) { return kvs->snap_dicts && listLength(kvs->snap_dicts); }
+static inline int snapAttached(kvstore *kvs) { return kvs->snap_attached; }
 
 static inline uint64_t snapGenOf(dict *d) {
     return __atomic_load_n(&((kvstoreDictMetaBase *)dictMetadata(d))->snap_word, __ATOMIC_RELAXED) >> 8;
@@ -135,9 +136,7 @@ kvstoreDictSnap *kvstoreDictSnapAttach(kvstore *kvs, int didx) {
     kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
     assert(meta->snap == NULL);
     kvstoreDictSnap *sn = zcalloc(sizeof(*sn));
-    if (!kvs->snap_dicts) kvs->snap_dicts = listCreate();
-    listAddNodeTail(kvs->snap_dicts, d);
-    sn->node = listLast(kvs->snap_dicts);
+    kvs->snap_attached++;
     __atomic_store_n(&meta->snap, sn, __ATOMIC_RELEASE);
     return sn;
 }
@@ -145,10 +144,7 @@ kvstoreDictSnap *kvstoreDictSnapAttach(kvstore *kvs, int didx) {
 void kvstoreSnapBitmapAccount(kvstore *kvs, long delta) { kvs->snap_bitmap_bytes += delta; }
 size_t kvstoreSnapBitmapBytes(kvstore *kvs) { return kvs->snap_bitmap_bytes; }
 
-dict *kvstoreSnapFirstDict(kvstore *kvs) {
-    if (!snapAttached(kvs)) return NULL;
-    return listNodeValue(listFirst(kvs->snap_dicts));
-}
+int kvstoreSnapAttached(kvstore *kvs) { return kvs->snap_attached; }
 
 dict *kvstoreGetDictAcquire(kvstore *kvs, int didx) {
     return __atomic_load_n(&kvs->dicts[didx], __ATOMIC_ACQUIRE);
@@ -259,6 +255,8 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
     ov->temp_type.rehashingCompleted = NULL;
     ov->temp_type.bucketChanged = NULL;
     ov->temp_type.dictMetadataBytes = NULL;
+    ov->temp_type.onDictRelease = NULL;   /* no metadata: nothing for the leftover check to read */
+    ov->temp_type.shrinkAllowed = NULL;
     ov->temp_type.userdata = ov;
     if (kvs->dtype.keyDestructor) ov->temp_type.keyDestructor = ovTempKeyDestructor;
     ov->temp = dictCreate(&ov->temp_type);
@@ -495,7 +493,7 @@ void kvstoreDictSnapRelease(kvstore *kvs, int didx) {
         dictResumeRehashing(d);
         dictResumeAutoResize(d);
     }
-    listDelNode(kvs->snap_dicts, sn->node);
+    kvs->snap_attached--;
     ((kvstoreDictMetaBase *)dictMetadata(d))->snap = NULL;
     zfree(sn);
     /* The real dict may have become empty (all tombstones). */
@@ -717,6 +715,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     kvs->dtype.dictMetadataBytes = type->dictMetadataBytes ?
         type->dictMetadataBytes : kvstoreDictBaseMetaSize;
     kvs->dtype.rehashingStarted = kvstoreDictRehashingStarted;
+    kvs->dtype.onDictRelease = kvstoreDictOnRelease;
     kvs->dtype.rehashingCompleted = kvstoreDictRehashingCompleted;
     kvs->dtype.shrinkAllowed = kvstoreDictShrinkAllowed;
     kvs->dtype.bucketChanged = kvstoreDictBucketChanged;
@@ -740,22 +739,27 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     return kvs;
 }
 
-/* Save state still attached when the store is emptied or released is a
- * leftover (the save that owned it is gone): release and count it. */
-static void snapReleaseAll(kvstore *kvs) {
-    dict *d;
-    while ((d = kvstoreSnapFirstDict(kvs)) != NULL) {
-        kvs->snap_leftovers++;
-        kvstoreDictSnapRelease(kvs, ((kvstoreDictMetaBase *)dictMetadata(d))->didx);
-    }
+/* Save state still attached when the dict is emptied or released is a
+ * leftover (the save that owned it is gone): release and count it. The
+ * release path runs this from the dict's onDictRelease, before the tables
+ * are cleared, so the side table is applied to a dict that still exists. */
+static void snapReleaseLeftover(kvstore *kvs, dict *d) {
+    kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
+    if (!metadata->snap) return;
+    kvs->snap_leftovers++;
+    kvstoreDictSnapRelease(kvs, metadata->didx);
+}
+
+static void kvstoreDictOnRelease(dict *d) {
+    snapReleaseLeftover(d->type->userdata, d);
 }
 
 void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
-    snapReleaseAll(kvs);
     for (int didx = 0; didx < kvs->num_dicts; didx++) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d)
             continue;
+        snapReleaseLeftover(kvs, d);
         kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
         if (metadata->rehashing_node)
             metadata->rehashing_node = NULL;
@@ -778,7 +782,6 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
 }
 
 void kvstoreRelease(kvstore *kvs) {
-    snapReleaseAll(kvs);
     for (int didx = 0; didx < kvs->num_dicts; didx++) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d)
@@ -793,7 +796,6 @@ void kvstoreRelease(kvstore *kvs) {
 
     listRelease(kvs->rehashing);
     if (kvs->ov_dirty) listRelease(kvs->ov_dirty);
-    if (kvs->snap_dicts) listRelease(kvs->snap_dicts);
     if (kvs->dict_sizes)
         fwTreeDestroy(kvs->dict_sizes);
 
