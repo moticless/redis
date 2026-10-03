@@ -219,6 +219,10 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r config set rdb-key-save-delay 3000   ;# 2000 keys x 3 ms: about 6 s
             r bgsave
             wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            # the layout is locked once the thread is on the dict (stage B lets
+            # an unreached dict grow): wait for its first dispatched key, which
+            # a slow start (sanitizer builds) can otherwise delay past the adds
+            wait_for_condition 100 50 {[s snap_save_keys_nofork] + [s snap_save_keys_fork] >= 1} else { fail "scan thread did not reach the dict" }
             # far more adds than an expand needs: with the layout locked the
             # table must not grow or start rehashing while the thread reads it
             for {set i 0} {$i < 6000} {incr i} { r set grow:$i x }

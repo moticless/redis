@@ -37,7 +37,8 @@ typedef struct _kvstoreIterator {
     long long didx;
     long long next_didx;
     dictIterator di;
-    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = temp dict (ADDs) */
+    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = side table (ADDs) */
+    struct { int slot, chain; dictEntry *next; } ov_cur;   /* side-table position in phase 1 */
 } kvstoreIterator;
 
 /* Structure for kvstore dict iterator that allows iterating the corresponding dict. */
@@ -45,7 +46,8 @@ typedef struct _kvstoreDictIterator {
     kvstore *kvs;
     long long didx;
     dictIterator di;
-    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = temp dict (ADDs) */
+    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = side table (ADDs) */
+    struct { int slot, chain; dictEntry *next; } ov_cur;   /* side-table position in phase 1 */
 } kvstoreDictIterator;
 
 /* ---- Snapshot overlay: the in-window side table (hybrid BGSAVE) -------------
@@ -62,9 +64,12 @@ typedef struct _kvstoreDictIterator {
  * substituted, plus adds); while it is empty they are plain dict reads.
  * kvstoreOverlayDrain() applies the side table to the real dict on the owner
  * thread for every key whose bucket the snapshot no longer reads ('drainable'),
- * kvstoreOverlayRelease() applies whatever is left and unfreezes the dict once
- * its scan is complete. The overlay lives in the dict's metadata
- * (kvstoreDictMetaBase.ov). */
+ * kvstoreDictSnapRelease() applies whatever is left and unfreezes the dict
+ * once its scan is complete. The overlay hangs off the dict's save state
+ * (kvstoreDictSnap.ov). The side table is a fixed array of per-bucket chains
+ * of ordinary dict entries (TASK-1.21.9): a key's chain is its hash modulo the
+ * array size, four chains per slot tell a clone whose value is still the
+ * original's, a deep clone or add, and the tombstones of each kind apart. */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
 /* Called at the start of every main-thread write operation on a frozen dict
@@ -141,7 +146,7 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
 long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */
-void kvstoreOverlayStats(kvstore *kvs, int didx, long *temp_entries, long *adds, long *tombstones);
+void kvstoreOverlayStats(kvstore *kvs, int didx, long *side_entries, long *adds, long *tombstones);
 
 typedef int (kvstoreScanShouldSkipDict)(dict *d, int didx);
 typedef int (kvstoreExpandShouldSkipDictIndex)(int didx);

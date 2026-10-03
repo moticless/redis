@@ -317,6 +317,14 @@ void dictFreeStats(dictStats *stats);
 dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
 dictEntry *dictEncodeKeyAsEntry(dict *d, void *key);
+/* Detached entries for a side chain outside the tables (kvstore overlay):
+ * allocated entries of the dict's own kind ({next, key} first, never the
+ * bare-key form), so a pointer to one inside such a chain is a valid
+ * dictEntryLink for dictGetKey()/dictGetKV()/dictSetKeyAtLink(..., 0) and
+ * dictGetNext() walks the chain. The dict is only the type's owner. */
+dictEntry *dictEntryCreateDetached(dict *d, void *key __stored_key, dictEntry *next);
+void dictEntryFreeDetached(dict *d, dictEntry *de, int freeKey);   /* the node, and the key through the destructor when asked */
+dictEntryLink dictEntryNextLink(dictEntry *de);                    /* &next of an allocated entry */
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 
 void dictSetKey(dict *d, dictEntry* de, void *key __stored_key);

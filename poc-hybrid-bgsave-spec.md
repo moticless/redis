@@ -196,10 +196,24 @@ protection: their bucket was emitted or walked before the command ran, and the t
 to a bucket. Keys with module metadata, module-type values and everything larger than
 `save-small-max-bytes` are SNAP_FORK and serialized by the child from the kvobj copy (§5).
 
-**The side table** (TASK-1.21.3, 2026-09-30; `kvstoreDictOverlay`, reachable from the dict's
-metadata `kvstoreDictMetaBase.ov`) holds the clones, adds and tombstones of keys written while their
-bucket was inside the window. **Reads during a save** consult it first while it is non-empty and are
-plain dict reads otherwise (`ovActive`), so a frozen dict with nothing pending costs a read nothing.
+**The side table** (TASK-1.21.3, 2026-09-30; `kvstoreDictOverlay`, reachable from the dict's save
+state `kvstoreDictSnap.ov`) holds the clones, adds and tombstones of keys written while their
+bucket was inside the window. Since TASK-1.21.9 (2026-10-03, the user's design) it is a fixed array
+of 1024 slots of chains of ordinary dict entries, a key's slot being its hash modulo 1024 (the low
+bits of its bucket index in either table, so entries of the previous window and the current one, or
+of the whole-dict window at claim time, share the array without colliding on correctness); the
+array is allocated on the first deferred write and freed with the overlay, so only the dict under
+the window ever carries one (32 KB per dict). Four chains per slot
+stand for the entry's state, no per-entry flag: `LIVE` (deep clones and adds), `SHARED` (clones whose
+value allocation is still the original's), `TOMB` and `TOMB_SHARED` (tombstones, whose key is the
+borrowed frozen original; the shared kind remembers that the clone's release took the value with
+it, since the async delete path frees the clone outside the overlay). A key is in at most one chain;
+a position in a chain is an ordinary `dictEntryLink`, so the links handed to callers need no
+translation and `dictSetKeyAtLink` replaces a clone's key in place. This replaced the earlier pair of
+dicts (`temp` for clones and adds, `state` for tombstone and shared flags, a cloned `dictType` with
+callbacks nulled) and their second hash and key compare per operation. **Reads during a save**
+consult it first while it is non-empty and are plain dict reads otherwise (`ovActive`), so a frozen
+dict with nothing pending costs a read nothing.
 It is tiny: run 7 measured 0.6-11 MB of retained clones at 20-50k writes/s on a 300 MB dataset,
 against 5-17 MB for the slot-lifetime overlay and 135-232 MB of child copy-on-write for a stock
 fork; run 19 measured at most 1 MB.
@@ -210,7 +224,8 @@ no caller holds a link there) and once per cron tick, the main thread applies ev
 bucket is now behind the window (`snapOverlayDrainable`: position `BEHIND`, or the dict `SCANNED`):
 a clone replaces its original at the link and the original is freed (SNAP_NOFORK memory: DONTFORK,
 so the free is CoW-free), a tombstoned original is unlinked and freed, an add is inserted
-(`kvstoreOverlayDrain`, over the store's list of dirty overlays only). The drain is skipped while the
+(`kvstoreOverlayDrain`, over the store's list of dirty overlays only; the pass walks the array's
+chains and applies each entry to the bucket its key hashes to, no rehash). The drain is skipped while the
 window has not moved since the last one. **Release.** When the thread publishes `SCANNED` for a
 dict, the main thread (from the event loop, `snapScanHandleCompletions`) applies whatever is left
 (normally nothing), resumes rehashing and auto-resize, frees the bitmap and marks the dict `DONE`
@@ -600,10 +615,10 @@ Left over, in the order I would do it:
    write section and per cron tick for buckets the window has passed; slot
    completion is a release (no merge, no `hybrid-merge` event); reads take the
    stock path while the side table is empty; the overlay lives in the dict's
-   metadata (`kvstoreDictMetaBase.ov`, the home TASK-1.21.6 attaches on
-   demand). Kept as is: the temp dict + state dict pair as the side table's
-   representation (a working, sanitizer-clean structure; measured cost about
-   nothing), and in-window deletes still clone the key only to tombstone it.
+   save state (`kvstoreDictSnap.ov`, the home TASK-1.21.6 attaches on
+   demand). The temp dict + state dict pair was kept until TASK-1.21.9
+   (2026-10-03) replaced it with the per-bucket chain array described in §4;
+   in-window deletes still clone the key only to tombstone it.
 3. Cost trims: `dictKeyBucket()` hashes the key a second time per write
    during a save (reuse the lookup's hash); `snapSendMsg` does two `write()`s
    per message (writev); the walker's `snapWalkerQuiesce` spins with

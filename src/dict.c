@@ -1080,6 +1080,28 @@ dictEntry *dictGetNext(const dictEntry *de) {
     return de->next;
 }
 
+/* Detached side-chain entries (dict.h). */
+dictEntry *dictEntryCreateDetached(dict *d, void *key __stored_key, dictEntry *next) {
+    if (d->type->no_value) return createEntryNoValue(d, key, next);
+    dictEntry *entry = d->type->nofork_alloc ? zmalloc_nofork(sizeof(*entry)) : zmalloc(sizeof(*entry));
+    assert(entryIsNormal(entry));
+    entry->key = key;
+    entry->v.val = NULL;
+    entry->next = next;
+    return entry;
+}
+
+void dictEntryFreeDetached(dict *d, dictEntry *de, int freeKey) {
+    assert(!entryIsKey(de));
+    if (freeKey) dictFreeKey(d, de);
+    zfree(decodeMaskedPtr(de));
+}
+
+dictEntryLink dictEntryNextLink(dictEntry *de) {
+    assert(!entryIsKey(de));
+    return &de->next;
+}
+
 /* Returns a pointer to the 'next' field in the entry or NULL if the entry
  * doesn't have a next field. */
 static dictEntryLink dictGetNextLink(dictEntry *de) {
