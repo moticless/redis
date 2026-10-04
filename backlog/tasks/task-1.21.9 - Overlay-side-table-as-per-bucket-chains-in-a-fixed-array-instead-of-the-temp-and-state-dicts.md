@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-03 10:26'
-updated_date: '2026-10-04 11:20'
+updated_date: '2026-10-04 18:53'
 labels:
   - bgsave
 milestone: m-3
@@ -67,6 +67,8 @@ Final shape (user, 2026-10-03): three chain heads per slot instead of one chain 
 2026-10-03: full feature-on suite (164 units + solo tail, 8 clients): all passed. A first run was cut off at 144/164 by a laptop restart with no failures until then.
 
 2026-10-04 benchmark (run 34, RESULTS.md): three-way on a fresh c7i.4xlarge, mixed1m/mixed/small at 4 GB, 0/20k/50k (+ mixed 50k on a 20% hot set), 2 reps. Hybrid 0c4e68488 matches runs 31/32 cell by cell after the instance's 5-10% offset (stock and Valkey slower by the same); hybrid-to-stock ratio unchanged (mixed1m 50k 0.59 vs 0.57, mixed 50k 0.50 vs 0.52, small 50k 0.84 vs 0.87); memory, CPU split, latency and achieved rate the same. No regression from TASK-1.21.8/1.21.9. One hard-mark abort on small 50k rep a: the main thread's emit-ahead queue (about 265 MB = 50k/s x 31 s x 170 B) sits at the 256 MiB mark by construction of that cell; the other reps and run 31 passed under it by a hair. Policy limit noted in RESULTS.md with options (higher default, forward main-thread records while the thread waits at its bound, or defer to the side table instead of aborting).
+
+2026-10-04 run 35 (same instance as run 34, A/B interleaved per cell, mixed1m 20k and 50k, 3 reps): run 31's hybrid binary bfaa21174 25.6 / 25.8 / 24.0 s at 20k and 27.2 s (x3) at 50k against the current d2a464f34 at 23.5 / 27.4 / 26.1 s and 25.8 s. The two binaries are equal within the spread on one host, the old one as slow here as run 34 measured; run 34's 10-13% gap to run 31 under writes is the host (every binary slower, no steal or throttling, identical bytes written per save), not TASK-1.21.8/1.21.9.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary

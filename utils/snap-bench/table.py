@@ -35,9 +35,17 @@ def cell(vals, nd):
 
 def main(argv):
     files, labels = [], dict(LABELS)
-    for a in argv:
-        if a.startswith("--label"):
-            k, v = a.split("=", 1)[0].split(" ", 1)[1] if " " in a else a.split("=", 1)[0][8:], a.split("=", 1)[1]
+    args = list(argv)
+    while args:
+        a = args.pop(0)
+        if a == "--label":                      # --label name=text
+            k, v = args.pop(0).split("=", 1)
+            labels[k.strip()] = v
+        elif a.startswith("--label="):           # --label=name=text
+            k, v = a[len("--label="):].split("=", 1)
+            labels[k.strip()] = v
+        elif a.startswith("--label "):           # one argument "--label name=text"
+            k, v = a[len("--label "):].split("=", 1)
             labels[k.strip()] = v
         else:
             files.append(a)

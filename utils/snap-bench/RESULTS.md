@@ -2006,3 +2006,25 @@ save time and memory as in run 34 and run 31 (30.6 / 31.0 s there), write p99 0.
 | dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | small | 50k | hybrid (0c4e68488 + mq_bytes fix) | 31.9 / 33.8 / 32.8 | 2 | 8 | 1 | 14.4 / 15.2 / 14.6 | 31.7 / 33.5 / 32.6 | 3.2 | 1.1 / 1.7 / 1.0 | 0.3 / 0.3 / 0.3 | 5 / 4 / 3 | 49999 | 0.0 | 0 |
+
+
+## Run 35 (2026-10-04): A/B on one host, run 31's hybrid binary against the current one, mixed1m 20k and 50k
+
+Raw: `run35.csv`, driver `~/run35.sh` on the run 34 instance (18.145.208.145). `hybrid-before` = bfaa21174, the binary of runs
+31/32, built from `git archive` on this host; `hybrid` = d2a464f34 (TASK-1.21.8, 1.21.9 and the TASK-1.32 counter fix). mixed1m
+scale 16 from a fresh populate, 20k and 50k writes/s at HOT=1.0, 3 reps interleaved per cell. **Question:** run 34's hybrid rows
+were 10-13% slower than run 31's under writes while idle rows were 3% slower and stock and Valkey 2-9% slower everywhere; host or
+code? **Answer: host.** On this host the run 31 binary is as slow as run 34 measured (25.6 / 25.8 / 24.0 s at 20k, 27.2 s three
+times at 50k against run 31's 21.9 / 25.2 and 25.1 / 25.5 on 2026-10-01), and the current binary is equal within the spread at
+20k and 1.1 s faster at 50k. Every save of both binaries wrote the same 2,896,000,433 bytes (the child's work does not depend on
+the write rate; it only runs slower when the main thread's copy-on-write and emit-ahead traffic compete with it for memory
+bandwidth, which this host has less of to spare: no steal, no throttling, THP madvise, 4-6 GB/s to tmpfs, a 16-vCPU slice of a
+shared machine). Nothing in TASK-1.21.8, 1.21.9 or 1.32 costs save time; run 34's cross-day comparisons should be read with the
+host offset, as the run 34 notes already do.
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | 20k | hybrid bfaa21174 (run 31 binary) | 25.6 / 25.8 / 24.0 | 20 / 18 / 21 | 939 | 913 | 6.0 / 6.5 / 5.8 | 21.1 | 25.2 / 25.5 / 23.8 | 17.8 | 0.7 | 21 / 20 / 23 | 19998 | 0.0 | 0 |
+| mixed1m | 20k | hybrid d2a464f34 (current) | 23.5 / 27.4 / 26.1 | 15 / 15 / 16 | 916 / 992 / 975 | 871 / 972 / 938 | 6.2 / 6.9 / 6.8 | 21.1 / 21.7 / 22.5 | 23.3 / 27.1 / 25.8 | 11.5 / 2.1 / 15.6 | 0.7 | 16 / 16 / 18 | 19999 | 0.0 | 0 |
+| mixed1m | 50k | hybrid bfaa21174 (run 31 binary) | 27.2 | 17 / 19 / 16 | 1595 | 1554 | 12.1 | 21.5 / 21.5 / 19.6 | 27.0 | 14.3 / 17.5 / 14.6 | 0.4 / 0.3 / 0.3 | 19 / 21 / 19 | 49997 | 0.0 | 0 |
+| mixed1m | 50k | hybrid d2a464f34 (current) | 26.1 | 16 / 16 / 17 | 1581 | 1535 | 11.6 | 21.7 | 25.9 | 13.1 / 12.4 / 16.9 | 0.3 / 0.4 / 0.4 | 19 | 49997 | 0.0 | 0 |
