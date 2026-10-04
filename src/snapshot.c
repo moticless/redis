@@ -1743,7 +1743,10 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
                 sv->mstage_slot = didx;
             }
             sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
-            atomicIncr(sv->mq_bytes, sdslen(sv->mscratch));
+            /* mq_bytes counts the stage when it is handed over as a message
+             * (snapSaveQueuePushLocked); counting the records here as well
+             * made the figure drift by the whole emitted volume (run 34's
+             * false hard-mark abort, TASK-1.32). */
             if (sdslen(sv->mstage) >= SNAP_STAGE_BYTES) snapSaveMainStageFlushLocked(sv);
             pthread_mutex_unlock(&sv->mq_lock);
         }

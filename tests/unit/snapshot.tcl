@@ -1008,6 +1008,39 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal $ref [debug_digest]
         }
 
+        test {Hybrid BGSAVE harness: the main thread's emit-ahead queue drains as the walker moves; its byte count does not drift with the emitted volume} {
+            r flushall
+            r config set rdbcompression no
+            r debug populate 200000 ea 60
+            set ref [debug_digest]
+            r config set rdb-key-save-delay 40   ;# 200k keys x 40 us: about 8 s
+            set aborts0 [s snap_hard_mark_aborts]
+            r bgsave
+            snap_wait_save_started
+            # 100k overwrites spread over the dataset, almost all ahead of the
+            # walker: each emits its fork-instant chain into the main thread's
+            # queue, which the walker forwards at every window boundary
+            set rd [redis_deferring_client]
+            for {set i 0} {$i < 100000} {incr i} { $rd set ea:[expr {($i * 7919) % 200000}] [string repeat y 60] }
+            for {set i 0} {$i < 100000} {incr i} { $rd read }
+            $rd close
+            assert {[s snap_save_main_keys] > 50000}
+            assert_equal 1 [s snap_save_in_progress]
+            # with the writes over, the queue empties within a few windows:
+            # before TASK-1.32 the figure stayed at the whole emitted volume
+            # (about 7 MB here, 268 MB in run 34) and tripped the hard mark
+            wait_for_condition 100 50 {[s snap_save_queued_bytes] < 1000000} else {
+                fail "queued bytes stuck at [s snap_save_queued_bytes] after the writes stopped"
+            }
+            assert_equal $aborts0 [s snap_hard_mark_aborts]
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            r config set rdbcompression yes
+        }
+
         test {Hybrid BGSAVE harness: a stalled child fills the scan thread's queue up to the bound, the thread waits, the save completes} {
             r flushall
             # rdb compression would shrink the repeated values to a few bytes

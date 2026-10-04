@@ -1942,16 +1942,14 @@ against 49.7 / 53.7).
 
 **One hard-mark abort** (the only one of the run): small 50k, hybrid, rep a. 31 s into the save the server logged
 `0 bytes retained plus 268450621 queued for the child, past bgsave-hybrid-max-retained-bytes (268435456): aborting the save`.
-The "queued" figure is the main thread's emit-ahead queue alone (the hard mark counts the retained originals plus that queue;
-the scan thread's queue, bounded at 100 MB by `bgsave-hybrid-max-queued-bytes`, waits for the child instead of growing and is
-not counted). The thread forwards the main thread's records at its window boundaries, and while it waits at its own bound
-(the child writes the 3.1 GB at the tmpfs' pace) nothing forwards them, so the emit-ahead output of the whole save piles up:
-50k writes/s x 31 s x about 170 bytes per fork-instant chain is about 265 MB, which is the 256 MiB mark to within a few
-percent by construction of this cell; this rep crossed it by 15 KB, rep b (33.6 s) and run 31's two reps (30.6 / 31.0 s) stayed
-under it by as little. Not a regression of the day's commits but a limit worth naming: on a write-heavy small-value dataset the
-mark caps (write rate x save time) at about 256 MB of emit-ahead records when the child is the bottleneck. Options: a higher
-default for the mark, forwarding the main thread's records while the thread waits at its bound (same bytes, held either way),
-or deferring in-window-style to the side table once the queue is at the mark instead of aborting.
+**The figure was an accounting drift, not memory (TASK-1.32, found 2026-10-04):** `snapSaveEmitBucket` counted every record it
+appended to the main thread's staging buffer in `mq_bytes`, and the hand-over of the stage as a message counted the whole stage
+again; the walker's forwarding subtracted once, so the counter grew by the total volume the main thread emitted ahead of the
+walker (50k writes/s x 31 s x about 170 bytes per fork-instant chain is about 265 MB) while the queue itself was being forwarded
+and drained at every window boundary as designed. Run 31's identical cell computed to just under the 256 MiB mark, this rep to
+15 KB over it. The drift dates from 3da2cd28a0 (2026-09-22): until the fix, INFO `snap_save_queued_bytes` and
+`snap_last_save_queued_peak` overreported by the emitted volume and eviction's not-counted memory included it. Fixed by counting
+the stage once, at hand-over; regression test in unit/snapshot; the cell rerun as run 34b below.
 
 ### mixed1m (4.0 GB)
 
@@ -1997,3 +1995,14 @@ or deferring in-window-style to the side table once the queue is at the mark ins
 | small | 50k | stock upstream | 38.5 | 38 / 35 | 3359 | 3359 | 16.1 | 0.0 | 38.2 | 36.9 / 32.6 | 0.3 / 0.4 | 40 / 37 | 49985 | 0.0 | 0 |
 | small | 50k | hybrid (0c4e68488) (err,ok) | 31.1 / 33.6 | 2 | 8 | 1 | 14.2 / 15.3 | 31.2 / 33.4 | 3.0 / 3.2 | 3.5 / 0.8 | 0.3 | 6 / 4 | 49999 | 0.0 | 0 |
 | small | 50k | Valkey forkless | 44.3 | 0 | 21 | 0 | 29.6 | 43.9 | 0.0 | 3.8 / 2.9 | 1.2 / 1.1 | 5 / 5 | 49999 | 0.0 | 5 |
+
+
+## Run 34b (2026-10-04): the small 50k hybrid cell again with the queue byte-count fix (TASK-1.32), same instance
+
+Raw: `run34b.csv`, driver `~/run34b.sh`: `~/redis-hyb` rebuilt with the `mq_bytes` fix (the stage counted once, at hand-over),
+small scale 13.5 from the cached dataset, 50k writes/s at HOT=1.0, 3 reps, hybrid only. All three saves `ok`, no hard-mark abort;
+save time and memory as in run 34 and run 31 (30.6 / 31.0 s there), write p99 0.3 ms, nothing blocked.
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | 50k | hybrid (0c4e68488 + mq_bytes fix) | 31.9 / 33.8 / 32.8 | 2 | 8 | 1 | 14.4 / 15.2 / 14.6 | 31.7 / 33.5 / 32.6 | 3.2 | 1.1 / 1.7 / 1.0 | 0.3 / 0.3 / 0.3 | 5 / 4 / 3 | 49999 | 0.0 | 0 |
