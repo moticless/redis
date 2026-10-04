@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start each binary with identical flags (pinned to cores 0-7), run bench.py (snapload.py traffic), stop it.
 #   run.sh <csv> [rates] [datasets] [scale] [reps]
-# CFGS env: space-separated subset of "base up up-1ch hybrid hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
+# CFGS env: space-separated subset of "base up up-1ch up-nocomp hybrid hybrid-nocomp hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
 # Parity: small-value cap pinned to 4096 B on both POCs (ours save-small-max-bytes, theirs forkless-string-max);
 # retained-memory budgets left at each POC's default (ours 256 MB hard mark, theirs unlimited) and recorded in the CSV.
 cd "$(dirname "$0")"
@@ -39,6 +39,8 @@ for cfg in ${CFGS:-base hybrid}; do
     base)            start base "$BASE" ;;
     up)              start up "$UP" ;;
     hybrid)          start hybrid "$HYB" --bgsave-hybrid yes ;;
+    hybrid-nocomp)   start hybrid-nocomp "$HYB" --bgsave-hybrid yes --rdbcompression no ;;   # where does the serializer's time go: LZF or the rest
+    up-nocomp)       start up-nocomp "$UP" --rdbcompression no ;;
     hybrid-q16)      start hybrid-q16 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 16mb ;;
     hybrid-q2)       start hybrid-q2 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 2mb ;;
     hybrid-1ch)      start hybrid-1ch "$HYB" --bgsave-hybrid yes --repl-rdb-channel no ;;   # diskless sync on one connection (parent relays the child's pipe)

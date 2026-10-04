@@ -2028,3 +2028,49 @@ host offset, as the run 34 notes already do.
 | mixed1m | 20k | hybrid d2a464f34 (current) | 23.5 / 27.4 / 26.1 | 15 / 15 / 16 | 916 / 992 / 975 | 871 / 972 / 938 | 6.2 / 6.9 / 6.8 | 21.1 / 21.7 / 22.5 | 23.3 / 27.1 / 25.8 | 11.5 / 2.1 / 15.6 | 0.7 | 16 / 16 / 18 | 19999 | 0.0 | 0 |
 | mixed1m | 50k | hybrid bfaa21174 (run 31 binary) | 27.2 | 17 / 19 / 16 | 1595 | 1554 | 12.1 | 21.5 / 21.5 / 19.6 | 27.0 | 14.3 / 17.5 / 14.6 | 0.4 / 0.3 / 0.3 | 19 / 21 / 19 | 49997 | 0.0 | 0 |
 | mixed1m | 50k | hybrid d2a464f34 (current) | 26.1 | 16 / 16 / 17 | 1581 | 1535 | 11.6 | 21.7 | 25.9 | 13.1 / 12.4 / 16.9 | 0.3 / 0.4 / 0.4 | 19 | 49997 | 0.0 | 0 |
+
+
+## Run 36 (2026-10-04): where the serializer's time goes, rdbcompression yes against no, idle saves, same instance
+
+Raw: `run36.csv` (mixed1m), `run36s.csv` (small), driver `~/run36.sh` on the run 34 instance; `hybrid` = d2a464f34, `up` =
+0d6266f2d, each with the default `rdbcompression yes` and with `--rdbcompression no` (run.sh configs `hybrid-nocomp`, `up-nocomp`),
+idle saves, 2 reps interleaved. **Question:** the hybrid's save time is the longer of two single-threaded serializers (the child on
+mixed1m: 24 hashes of 1M fields in 25-28 s; the thread on small: 18.9M keys in 31-35 s; both on mixed), about 1M keys or fields
+per second per core. What is that second spent on? **Answer: LZF.** Every value here is 50-100 random bytes, so every save wrote
+the same 2,896,000,433 bytes with compression on and off: each LZF attempt failed and the writer kept the raw bytes, and the
+attempts were about two thirds of the serializer's CPU on both sides. Without compression the thread does 1.8M small keys per
+second and the child the 24 big hashes in 8.6 s.
+
+| dataset | config | save s, rdbcompression yes | save s, rdbcompression no | ratio |
+|---|---|---|---|---|
+| mixed1m | hybrid | 26.9 / 28.4 | 9.6 | 2.9x |
+| mixed1m | stock upstream | 42.0 / 48.4 | 19.3 | 2.3x |
+| small | hybrid | 32.1 / 34.7 | 10.3 | 3.2x |
+| small | stock upstream | 35.3 / 38.1 | 14.8 / 13.9 | 2.4x |
+
+Consequences. (1) The hybrid's edge grows without compression (mixed1m 0.50 of stock against 0.64 with it): the child's share, the
+big hashes, was the most compression-heavy part, and the hybrid already splits the compression two ways while stock cannot.
+(2) On data that compresses the attempts are not wasted but cost the same, so the lever on save time is more serializers (a second
+scan thread, or a second child for the big values), not cheaper per-key code: the pipeline is CPU-bound on compression and would
+scale almost linearly. (3) Independent of the hybrid, `rdbSaveLzfStringObject` tries LZF on every value of 20 bytes or more and
+keeps the raw bytes when it does not shrink; an adaptive skip (give up after a run of failures per object, or sample a few values
+first) would save most of this on incompressible data for stock and hybrid alike. (4) The benchmark datasets being incompressible
+is also why the stock CoW and the hybrid's retained figures are as large as they are per key: nothing shrinks in the file.
+
+### mixed1m
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | idle | hybrid | 26.9 / 28.4 | 15 | 80 / 92 | 7 / 2 | 0.4 / 0.4 | 20.9 / 19.5 | 25.7 | 11.2 / 12.8 | - | - | - | - | 0 |
+| mixed1m | idle | hybrid, rdbcompression no | 9.6 | 23 / 20 | 44 | 16 / 20 | 0.2 / 0.2 | 9.1 | 8.6 | 22.0 / 17.4 | - | - | - | - | 0 |
+| mixed1m | idle | stock upstream | 42.0 / 48.4 | 30 | 1 | 1 | 0.6 / 0.7 | -0.0 / 0.0 | 41.8 / 48.3 | 29.1 / 30.8 | - | - | - | - | 0 |
+| mixed1m | idle | stock upstream, rdbcompression no | 19.3 | 38 | 0 | 0 | 0.3 | 0.0 | 19.2 | 38.3 / 35.9 | - | - | - | - | 0 |
+
+### small
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | idle | hybrid | 32.1 / 34.7 | 2 / 2 | 5 / 2 | 5 / 1 | 0.5 | 31.9 / 34.5 | 3.2 | 3.0 / 1.3 | - | - | - | - | 0 |
+| small | idle | hybrid, rdbcompression no | 10.3 | 2 | 1 | 1 | 0.2 / 0.1 | 10.1 | 2.7 | 1.1 / 1.1 | - | - | - | - | 0 |
+| small | idle | stock upstream | 35.3 / 38.1 | 31 | 1 | 1 | 0.5 / 0.6 | -0.0 / 0.0 | 35.2 / 38.0 | 28.5 | - | - | - | - | 0 |
+| small | idle | stock upstream, rdbcompression no | 14.8 / 13.9 | 31 | 0 | 0 | 0.2 / 0.2 | 0.0 | 14.7 / 13.8 | 27.5 | - | - | - | - | 0 |
