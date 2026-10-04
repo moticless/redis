@@ -7,7 +7,7 @@ status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-03 10:26'
-updated_date: '2026-10-03 12:29'
+updated_date: '2026-10-04 11:20'
 labels:
   - bgsave
 milestone: m-3
@@ -65,6 +65,8 @@ Final shape (user, 2026-10-03): three chain heads per slot instead of one chain 
 2026-10-03: unit/snapshot hybrid 75 and stock 75 ok; ASan 69 ok clean; TSan 68 ok + one failure, 'keyspace dicts keep their bucket layout during a save': under TSan's slow thread start the 6000 adds ran before the thread claimed the dict, so stage B let the table grow (correct, but not what the test asserted; the same failure appeared on the first TSan run of the day, before any of today's changes). The test now waits for the thread's first dispatched key before the adds; passed 2/2 under TSan. Full feature-on suite running.
 
 2026-10-03: full feature-on suite (164 units + solo tail, 8 clients): all passed. A first run was cut off at 144/164 by a laptop restart with no failures until then.
+
+2026-10-04 benchmark (run 34, RESULTS.md): three-way on a fresh c7i.4xlarge, mixed1m/mixed/small at 4 GB, 0/20k/50k (+ mixed 50k on a 20% hot set), 2 reps. Hybrid 0c4e68488 matches runs 31/32 cell by cell after the instance's 5-10% offset (stock and Valkey slower by the same); hybrid-to-stock ratio unchanged (mixed1m 50k 0.59 vs 0.57, mixed 50k 0.50 vs 0.52, small 50k 0.84 vs 0.87); memory, CPU split, latency and achieved rate the same. No regression from TASK-1.21.8/1.21.9. One hard-mark abort on small 50k rep a: the main thread's emit-ahead queue (about 265 MB = 50k/s x 31 s x 170 B) sits at the 256 MiB mark by construction of that cell; the other reps and run 31 passed under it by a hair. Policy limit noted in RESULTS.md with options (higher default, forward main-thread records while the thread waits at its bound, or defer to the side table instead of aborting).
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
