@@ -1919,3 +1919,81 @@ previous one-core run (hybrid then with the plain pipe). Values rep a / rep b as
   save, 7-12 clients blocked, p99 12-19 ms), 97% on the hot set with 6 stalled seconds; its main thread spends 18.5-28.3
   CPU-seconds per save; saves of 64-74 s.
 
+
+
+## Run 34 (2026-10-04): three-way after the per-dict save state and the side-chain table (TASK-1.21.8/1.21.9), mixed1m, mixed and small at 4 GB, c7i.4xlarge
+
+Raw: `run34.csv` (mixed1m), `run34m.csv` (mixed, HOT=1.0), `run34mh.csv` (mixed, 50k on a 20% hot set), `run34s.csv` (small);
+driver `~/run34.sh` on a fresh instance (18.145.208.145), tables from `table.py`. `up` = upstream 0d6266f2d, `hybrid` = 0c4e68488
+(TASK-1.21.8: per-dict save state stamped with the generation, no per-slot arrays, no freeze pass; TASK-1.21.9: side table as an
+array of per-bucket chains of dict entries; otherwise run 31's two-channel hybrid), `valkey-forkless` = Valkey 06d35aca6
+`--forkless-infrastructure-enabled yes --bgsave-default-method forkless`. Same recipe as runs 31/32: scale 16 for mixed1m and
+mixed, 13.5 for small, rates 0 / 20k / 50k at HOT=1.0 plus mixed 50k at HOT=0.2, 2 reps interleaved per cell, server on vCPUs
+0-3,8-11, load on 4-7,12-15. Values rep a / rep b (one value when the reps agree within 5%). The first rep of each dataset runs
+right after a live populate and is slower for every binary.
+
+**Purpose:** confirm that the three structural commits of 2026-10-03 (643bc2c21, afae47fb1, 0c4e68488), all on the write path
+during a save, cost nothing measurable. **Result:** the hybrid rows match runs 31/32 cell by cell once the instance's own offset
+is taken out: this instance is 5-10% slower for every binary (stock mixed1m 50k 44.1 / 50.4 s against 43.6 / 45.0 s on 2026-10-01,
+Valkey 50.3 / 47.3 against 45.3 / 49.5), and the hybrid-to-stock ratio is unchanged (mixed1m 50k 0.59 against 0.57, mixed 50k 0.50
+against 0.52, small 50k 0.84 against 0.87). Memory, CPU split, write latency and achieved rate are the same as before; main-thread
+CPU is up 15-20% for stock and hybrid alike (the instance). Valkey forkless on mixed1m is slower than on 2026-10-01 (56.5 s idle
+against 49.7 / 53.7).
+
+**One hard-mark abort** (the only one of the run): small 50k, hybrid, rep a. 31 s into the save the server logged
+`0 bytes retained plus 268450621 queued for the child, past bgsave-hybrid-max-retained-bytes (268435456): aborting the save`.
+The "queued" figure is the main thread's emit-ahead queue alone (the hard mark counts the retained originals plus that queue;
+the scan thread's queue, bounded at 100 MB by `bgsave-hybrid-max-queued-bytes`, waits for the child instead of growing and is
+not counted). The thread forwards the main thread's records at its window boundaries, and while it waits at its own bound
+(the child writes the 3.1 GB at the tmpfs' pace) nothing forwards them, so the emit-ahead output of the whole save piles up:
+50k writes/s x 31 s x about 170 bytes per fork-instant chain is about 265 MB, which is the 256 MiB mark to within a few
+percent by construction of this cell; this rep crossed it by 15 KB, rep b (33.6 s) and run 31's two reps (30.6 / 31.0 s) stayed
+under it by as little. Not a regression of the day's commits but a limit worth naming: on a write-heavy small-value dataset the
+mark caps (write rate x save time) at about 256 MB of emit-ahead records when the child is the bottleneck. Options: a higher
+default for the mark, forwarding the main thread's records while the thread waits at its bound (same bytes, held either way),
+or deferring in-window-style to the side table once the queue is at the mark instead of aborting.
+
+### mixed1m (4.0 GB)
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | idle | stock upstream | 42.6 / 48.0 | 42 / 31 | 5 / 1 | 5 / 1 | 0.6 / 0.7 | 0.0 | 42.5 / 48.0 | 37.6 / 29.1 | - | - | - | - | 0 |
+| mixed1m | idle | hybrid (0c4e68488) | 27.6 / 26.2 | 15 | 85 / 74 | 2 / 7 | 0.4 | 20.2 | 25.3 | 12.0 | - | - | - | - | 0 |
+| mixed1m | idle | Valkey forkless | 56.5 | 0 | 1 | 0 | 13.1 / 12.3 | 48.2 | 0.0 | 2.4 / 2.7 | - | - | - | - | 0 |
+| mixed1m | 20k | stock upstream | 49.3 / 43.2 | 31 / 39 | 2642 / 2500 | 2643 / 2498 | 11.3 / 9.6 | 0.0 | 49.1 / 43.0 | 31.5 / 36.9 | 0.7 | 32 / 40 | 19996 | 0.0 | 0 |
+| mixed1m | 20k | hybrid (0c4e68488) | 25.6 / 27.4 | 18 | 968 | 950 | 6.2 / 6.8 | 19.3 / 21.8 | 25.4 / 27.2 | 17.4 / 15.9 | 0.7 | 20 | 19998 | 0.0 | 0 |
+| mixed1m | 20k | Valkey forkless | 48.6 / 51.9 | 0 | 4 / 5 | 0 | 15.7 | 45.2 / 49.8 | 0.0 | 2.1 / 1.8 | 1.6 / 1.4 | 19701 / 23218 | 15707 | 11.0 / 6.0 | 9 |
+| mixed1m | 50k | stock upstream | 44.1 / 50.4 | 32 / 42 | 3283 | 3280 | 17.8 / 20.2 | 0.0 / -0.0 | 43.9 / 50.2 | 28.6 / 39.3 | 0.3 / 0.3 | 34 / 44 | 49987 | 0.0 | 0 |
+| mixed1m | 50k | hybrid (0c4e68488) | 27.9 | 18 / 17 | 1606 | 1570 | 12.4 | 22.6 / 21.3 | 27.7 | 13.8 | 0.4 / 0.4 | 20 / 19 | 49996 | 0.0 | 0 |
+| mixed1m | 50k | Valkey forkless | 50.3 / 47.3 | 0 | 8 / 7 | 0 | 20.1 | 49.8 / 45.0 | 0.0 | 1.7 | 1.6 | 24566 / 21294 | 36926 / 39365 | 10.0 / 9.0 | 16 |
+
+### mixed (4.0 GB, 9 KB hashes), uniform and 20% hot set
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock upstream | 39.8 | 42 / 33 | 3 / 1 | 3 / 1 | 0.6 | -0.0 / 0.0 | 39.8 | 37.5 / 29.8 | - | - | - | - | 0 |
+| mixed | idle | hybrid (0c4e68488) | 20.6 | 18 | 5 / 2 | 2 / 3 | 0.3 / 0.3 | 20.3 | 19.6 | 15.0 / 13.5 | - | - | - | - | 0 |
+| mixed | idle | Valkey forkless | 39.7 / 45.3 | 0 | 0 / 1 | 0 | 11.6 / 12.8 | 37.2 / 42.3 | 0.0 | 2.0 | - | - | - | - | 0 |
+| mixed | 20k | stock upstream | 41.9 | 35 / 39 | 2492 | 2492 | 9.9 | 0.0 | 41.7 | 34.2 / 39.0 | 0.7 | 37 / 40 | 19996 | 0.0 | 0 |
+| mixed | 20k | hybrid (0c4e68488) | 19.9 / 21.7 | 18 | 764 / 813 | 756 / 807 | 5.6 | 19.6 / 21.5 | 19.6 / 18.6 | 15.7 / 17.4 | 0.7 | 20 | 19999 | 0.0 | 0 |
+| mixed | 20k | Valkey forkless | 52.0 | 0 | 8 | 0 | 19.0 | 46.1 | 0.0 | 1.9 | 8.0 / 7.6 | 15 | 18804 | 19.0 | 7 |
+| mixed | 50k | stock upstream | 43.0 | 37 | 3216 | 3213 | 18.1 | 0.0 / -0.0 | 42.8 | 36.1 / 34.2 | 0.3 / 0.4 | 39 | 49986 | 0.0 | 0 |
+| mixed | 50k | hybrid (0c4e68488) | 21.4 | 20 | 1380 | 1367 | 10.1 / 11.2 | 20.4 / 21.6 | 21.2 | 19.7 / 18.5 | 0.4 / 0.3 | 22 | 49994 | 0.0 | 0 |
+| mixed | 50k | Valkey forkless | 49.7 | 0 | 16 / 17 | 0 | 26.3 | 45.9 | 0.0 | 1.5 / 3.6 | 13.8 | 18 | 46084 | 17.0 / 18.0 | 12 |
+| mixed | 50k hot 0.2 | stock upstream | 42.9 | 46 / 40 | 2018 | 2015 | 17.5 | 0.0 | 42.7 | 43.2 / 37.6 | 0.4 | 47 / 42 | 49982 | 0.0 | 0 |
+| mixed | 50k hot 0.2 | hybrid (0c4e68488) | 19.7 / 21.4 | 18 | 505 | 496 | 8.9 / 9.8 | 19.0 / 21.1 | 19.6 / 21.1 | 19.5 | 0.3 / 0.4 | 20 / 21 | 49995 | 0.0 | 0 |
+| mixed | 50k hot 0.2 | Valkey forkless | 47.0 / 49.8 | 0 | 14 / 15 | 0 | 28.2 / 30.3 | 44.2 / 46.9 | 0.0 | 1.4 / 1.4 | 0.9 | 18 | 49114 | 3.0 / 4.0 | 12 |
+
+### small (4.1 GB)
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | idle | stock upstream | 35.0 | 46 / 32 | 3 / 1 | 3 / 1 | 0.5 / 0.5 | 0.0 | 34.9 | 42.4 / 31.4 | - | - | - | - | 0 |
+| small | idle | hybrid (0c4e68488) | 32.6 / 35.5 | 2 | 2 | 1 | 0.4 / 0.5 | 32.4 / 35.4 | 3.2 | 1.1 / 1.6 | - | - | - | - | 0 |
+| small | idle | Valkey forkless | 38.2 | 0 | 1 / 0 | 0 | 12.0 | 37.4 | 0.0 | 1.9 | - | - | - | - | 0 |
+| small | 20k | stock upstream | 39.2 | 32 | 2504 | 2505 | 8.5 | 0.0 | 39.1 | 32.9 | 0.7 | 33 | 19994 | 0.0 | 0 |
+| small | 20k | hybrid (0c4e68488) | 34.6 | 2 | 8 | 1 | 7.7 | 34.4 | 3.5 | 11.7 / 2.9 | 0.7 | 2 / 3 | 20000 | 0.0 | 0 |
+| small | 20k | Valkey forkless | 50.1 | 0 | 10 | 0 | 18.9 | 45.2 | 0.0 | 1.9 / 1.6 | 3.5 | 7 | 19982 | 0.0 | 2 |
+| small | 50k | stock upstream | 38.5 | 38 / 35 | 3359 | 3359 | 16.1 | 0.0 | 38.2 | 36.9 / 32.6 | 0.3 / 0.4 | 40 / 37 | 49985 | 0.0 | 0 |
+| small | 50k | hybrid (0c4e68488) (err,ok) | 31.1 / 33.6 | 2 | 8 | 1 | 14.2 / 15.3 | 31.2 / 33.4 | 3.0 / 3.2 | 3.5 / 0.8 | 0.3 | 6 / 4 | 49999 | 0.0 | 0 |
+| small | 50k | Valkey forkless | 44.3 | 0 | 21 | 0 | 29.6 | 43.9 | 0.0 | 3.8 / 2.9 | 1.2 / 1.1 | 5 / 5 | 49999 | 0.0 | 5 |
