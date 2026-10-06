@@ -399,8 +399,6 @@ static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
     if (kvs->snap_hooks == NULL) return NULL;
     return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
-#define ovGetR(kvs, didx) ovGet(kvs, didx, 0)
-#define ovGetW(kvs, didx) ovGet(kvs, didx, 1)
 
 /* A non-empty side table: reads must consult it. Writes always go through
  * the overlay of a frozen dict (ovGet), whatever the side table holds. */
@@ -408,14 +406,30 @@ static inline int ovActive(kvstoreDictOverlay *ov) {
     return ov && (ov->entries || ov->tombs);
 }
 
+/* The interception points of kvstore.c. Every public entry point that
+ * touches a dict's content starts with exactly one of these three (grep
+ * them to list every place the snapshot may step in):
+ *   ovRead(kvs, didx)    reads and enumeration: the overlay only while its
+ *                        side table is non-empty, a plain dict read otherwise;
+ *   ovWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
+ *                        attached through the guard on first touch;
+ *   ovFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
+static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
+    kvstoreDictOverlay *ov = ovGet(kvs, didx, 0);
+    return ovActive(ov) ? ov : NULL;
+}
+static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
+static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
+
 /* kvsoverlay.c, for the enumeration and the public wrappers in kvstore.c. */
 unsigned long ovDictSize(kvstore *kvs, int didx);
 dictEntry *ovMapFrozenEntry(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry *de);
 int ovSideEntryIsAdd(kvstore *kvs, int didx, dictEntry *te);
 void ovCursorInit(kvstoreDictOverlay *ov, ovCursor *c);
 dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c);
-struct ovScanCtx { kvstore *kvs; kvstoreDictOverlay *ov; dictScanFunction *fn; void *priv; };
-void ovScanCb(void *p, const dictEntry *de, dictEntry **plink);
+unsigned long long ovScan(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
+                          dictScanFunction *scan_cb, void *privdata);
+dictEntry *ovIteratorNext(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);
 dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
 unsigned int ovGetSomeKeys(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
 /* The overlay halves of the hot kvstore entry points: out of line so the

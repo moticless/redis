@@ -461,11 +461,57 @@ void kvstoreDictSnapRelease(kvstore *kvs, int didx) {
  * Enumeration through the overlay
  * ========================================================================== */
 
-void ovScanCb(void *p, const dictEntry *de, dictEntry **plink) {
+struct ovScanCtx { kvstore *kvs; kvstoreDictOverlay *ov; dictScanFunction *fn; void *priv; };
+static void ovScanCb(void *p, const dictEntry *de, dictEntry **plink) {
     (void)plink;
     struct ovScanCtx *c = p;
     dictEntry *m = ovMapFrozenEntry(c->kvs, c->ov, (dictEntry *)de);
     if (m) c->fn(c->priv, m, NULL);
+}
+
+/* kvstoreScan over a frozen dict with a non-empty side table: the frozen
+ * dict through the overlay (tombstones skipped, clones substituted), then
+ * the ADDs with the final batch. Returns the dict cursor. */
+unsigned long long ovScan(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
+                          dictScanFunction *scan_cb, void *privdata)
+{
+    struct ovScanCtx sctx = { kvs, ov, scan_cb, privdata };
+    unsigned long long next = (d && dictSize(d)) ? dictScan(d, cursor, ovScanCb, &sctx) : 0;
+    if (next == 0 && ov->adds) {
+        ovCursor c;
+        dictEntry *te;
+        ovCursorInit(ov, &c);
+        while ((te = ovCursorNext(ov, &c)) != NULL)
+            if (ovSideEntryIsAdd(kvs, didx, te)) scan_cb(privdata, te, NULL);
+    }
+    return next;
+}
+
+/* One step of kvstoreIteratorNext / kvstoreDictIteratorNext over a frozen
+ * dict with a non-empty side table: 'di' iterates the frozen dict (phase 0,
+ * tombstoned entries skipped, clones handed out in place of their
+ * originals), then 'cur' the side table (phase 1, ADDs only). NULL once
+ * both are exhausted. */
+dictEntry *ovIteratorNext(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur) {
+    for (;;) {
+        dictEntry *de;
+        if (*phase == 1) de = ovCursorNext(ov, cur);
+        else de = di->d ? dictNext(di) : NULL;
+        if (!de) {
+            if (*phase == 0 && di->d) {
+                ovCursorInit(ov, cur);
+                *phase = 1;
+                continue;
+            }
+            return NULL;
+        }
+        if (*phase == 0) {
+            dictEntry *m = ovMapFrozenEntry(kvs, ov, de);
+            if (m) return m;
+            continue;   /* tombstoned */
+        }
+        if (ovSideEntryIsAdd(kvs, didx, de)) return de;   /* a clone was handed out in phase 0 */
+    }
 }
 
 /* Random entry of a frozen dict: sample the real dict (mapping through the
