@@ -28,7 +28,8 @@
 
 static dict *createDictIfNeeded(kvstore *kvs, int didx);
 static void freeDictIfNeeded(kvstore *kvs, int didx);
-static void kvstoreDictOnRelease(dict *d);
+static void detachDict(kvstore *kvs, int didx, int moving);
+static void kvstoreRetain(kvstore *kvs);
 
 /**********************************/
 /*** Helpers **********************/
@@ -91,11 +92,11 @@ static dict *createDictIfNeeded(kvstore *kvs, int didx) {
     if (d) return d;
 
     d = dictCreate(&kvs->dtype);
-    ((kvstoreDictMetaBase *)dictMetadata(d))->didx = didx;
-    /* Under a save: stamp it before the scan thread can see it (it reads the
-     * pointer with acquire). */
-    if (kvs->snap_hooks && kvs->snap_hooks->dict_created) kvs->snap_hooks->dict_created(kvs->snap_priv, didx, d);
-    __atomic_store_n(&kvs->dicts[didx], d, __ATOMIC_RELEASE);
+    kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
+    meta->didx = didx;
+    meta->refcount = 1;   /* the store's (TASK-1.37) */
+    kvstoreRetain(kvs);   /* the dict's, on its store */
+    kvs->dicts[didx] = d;
     kvs->allocated_dicts++;
     return d;
 }
@@ -110,24 +111,17 @@ static dict *createDictIfNeeded(kvstore *kvs, int didx) {
 static void freeDictIfNeeded(kvstore *kvs, int didx) {
     if (!(kvs->flags & KVSTORE_FREE_EMPTY_DICTS) ||
         !kvstoreGetDict(kvs, didx) ||
-        ovPeek(kvs, didx) ||
         kvstoreDictSize(kvs, didx) != 0 ||
         kvstoreDictIsRehashingPaused(kvs, didx))
         return;
-    /* Under a save the scan thread may be reading this dict's pointer and
-     * stamp: keep it; kvstoreSnapGuardSet(NULL) frees what was deferred. */
-    if (kvs->snap_hooks) {
-        kvs->snap_free_deferred = 1;
-        return;
-    }
 
     /* Use callback if provided to check if dict can be freed */
     if (kvs->type->canFreeDict && !kvs->type->canFreeDict(kvs, didx))
         return;
 
-    dictRelease(kvs->dicts[didx]);
-    kvs->dicts[didx] = NULL;
-    kvs->allocated_dicts--;
+    /* Logically empty. A save still reading its fork-instant content keeps
+     * it, detached; the slot gets a fresh dict on the next add (TASK-1.37). */
+    detachDict(kvs, didx, 0);
 }
 
 void kvstoreFreeDictIfNeeded(kvstore *kvs, int didx) {
@@ -147,6 +141,7 @@ void kvstoreFreeDictIfNeeded(kvstore *kvs, int didx) {
 static void kvstoreDictRehashingStarted(dict *d) {
     kvstore *kvs = d->type->userdata;
     kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
+    if (metadata->detached) return;   /* a holder keeps it, the store does not (TASK-1.37) */
     listAddNodeTail(kvs->rehashing, d);
     metadata->rehashing_node = listLast(kvs->rehashing);
     if (kvs->snap_hooks && kvs->snap_hooks->rehash_started)
@@ -164,6 +159,7 @@ static void kvstoreDictRehashingStarted(dict *d) {
 static void kvstoreDictRehashingCompleted(dict *d) {
     kvstore *kvs = d->type->userdata;
     kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
+    if (metadata->detached) return;
     if (metadata->rehashing_node) {
         listDelNode(kvs->rehashing, metadata->rehashing_node);
         metadata->rehashing_node = NULL;
@@ -191,6 +187,7 @@ static int kvstoreDictShrinkAllowed(dict *d) {
  * sum of buckets for a DB. */
 static void kvstoreDictBucketChanged(dict *d, long long delta) {
     kvstore *kvs = d->type->userdata;
+    if (((kvstoreDictMetaBase *)dictMetadata(d))->detached) return;
     kvs->bucket_count += delta;
 }
 
@@ -234,11 +231,11 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     kvs->dtype.dictMetadataBytes = type->dictMetadataBytes ?
         type->dictMetadataBytes : kvstoreDictBaseMetaSize;
     kvs->dtype.rehashingStarted = kvstoreDictRehashingStarted;
-    kvs->dtype.onDictRelease = kvstoreDictOnRelease;
     kvs->dtype.rehashingCompleted = kvstoreDictRehashingCompleted;
     kvs->dtype.shrinkAllowed = kvstoreDictShrinkAllowed;
     kvs->dtype.bucketChanged = kvstoreDictBucketChanged;
 
+    kvs->refcount = 1;   /* the owner's; every dict adds one */
     kvs->num_dicts_bits = num_dicts_bits;
     kvs->num_dicts = 1 << kvs->num_dicts_bits;
     kvs->dicts = dtype->nofork_alloc ? zcalloc_nofork(sizeof(dict*) * kvs->num_dicts)
@@ -258,19 +255,64 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     return kvs;
 }
 
-/* Save state still attached when the dict is emptied or released is a
- * leftover (the save that owned it is gone): release and count it. The
- * release path runs this from the dict's onDictRelease, before the tables
- * are cleared, so the side table is applied to a dict that still exists. */
-static void snapReleaseLeftover(kvstore *kvs, dict *d) {
-    kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
-    if (!metadata->snap) return;
-    kvs->snap_leftovers++;
-    kvstoreDictSnapRelease(kvs, metadata->didx);
+/* ---- References (TASK-1.37, kvstore.h) ---- */
+
+static void kvstoreRetain(kvstore *kvs) { __atomic_add_fetch(&kvs->refcount, 1, __ATOMIC_RELAXED); }
+
+/* The last holder frees the struct; the arrays and lists went with
+ * kvstoreRelease (a detached dict needs only the dictType and the counters
+ * its callbacks touch). */
+static void kvstoreUnref(kvstore *kvs) {
+    if (__atomic_sub_fetch(&kvs->refcount, 1, __ATOMIC_ACQ_REL) == 0) zfree(kvs);
 }
 
-static void kvstoreDictOnRelease(dict *d) {
-    snapReleaseLeftover(d->type->userdata, d);
+static inline kvstoreDictMetaBase *dictMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
+
+dict *kvstoreDictRetain(kvstore *kvs, int didx) {
+    dict *d = kvs->dicts[didx];
+    if (d) __atomic_add_fetch(&dictMeta(d)->refcount, 1, __ATOMIC_RELAXED);
+    return d;
+}
+
+void kvstoreDictUnref(dict *d) {
+    if (__atomic_sub_fetch(&dictMeta(d)->refcount, 1, __ATOMIC_ACQ_REL) != 0) return;
+    kvstore *kvs = d->type->userdata;
+    assert(dictMeta(d)->snap == NULL);   /* a save releases its state before its reference */
+    dictRelease(d);
+    kvstoreUnref(kvs);
+}
+
+int kvstoreDictRefcount(dict *d) { return __atomic_load_n(&dictMeta(d)->refcount, __ATOMIC_RELAXED); }
+int kvstoreDictDetached(dict *d) { return dictMeta(d)->detached; }
+int kvstoreRefcount(kvstore *kvs) { return __atomic_load_n(&kvs->refcount, __ATOMIC_RELAXED); }
+
+/* Take dict didx out of the store's slot table and drop the store's
+ * reference ('moving': the caller re-attaches the dict elsewhere and keeps
+ * the reference). A dict that lives on (moved, or held by a save) takes its
+ * layout bookkeeping out of the store now, off the rehashing list first of
+ * all (the cron must not touch it any more), and is cut loose from the
+ * save's side-table bookkeeping of this store; a dict only a save still
+ * holds is marked detached so the dict callbacks skip the store for it
+ * from here on. The key count is the caller's business. */
+static void detachDict(kvstore *kvs, int didx, int moving) {
+    dict *d = kvs->dicts[didx];
+    kvstoreDictMetaBase *meta = dictMeta(d);
+    kvs->dicts[didx] = NULL;
+    kvs->allocated_dicts--;
+    int held = kvstoreDictRefcount(d) > 1;
+    if (held || moving) {
+        if (meta->rehashing_node) {
+            listDelNode(kvs->rehashing, meta->rehashing_node);
+            meta->rehashing_node = NULL;
+            unsigned long long from, to;
+            dictRehashingInfo(d, &from, &to);
+            kvs->overhead_hashtable_rehashing -= from;
+        }
+        kvs->bucket_count -= dictBuckets(d);
+        ovDetachFromStore(d);
+        if (held) meta->detached = 1;
+    }
+    if (!moving) kvstoreDictUnref(d);
 }
 
 void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
@@ -278,7 +320,12 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d)
             continue;
-        snapReleaseLeftover(kvs, d);
+        if (kvstoreDictRefcount(d) > 1) {
+            /* A save reads it: hand it over instead of emptying it (TASK-1.37). */
+            detachDict(kvs, didx, 0);
+            if (kvs->type->onDictEmpty) kvs->type->onDictEmpty(kvs, didx);
+            continue;
+        }
         kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
         if (metadata->rehashing_node)
             metadata->rehashing_node = NULL;
@@ -309,7 +356,7 @@ void kvstoreRelease(kvstore *kvs) {
         if (metadata->rehashing_node)
             metadata->rehashing_node = NULL;
         if (kvs->type->onDictEmpty) kvs->type->onDictEmpty(kvs, didx);
-        dictRelease(d);
+        kvstoreDictUnref(d);   /* a dict a save still holds lives on, with the struct (TASK-1.37) */
     }
     zfree(kvs->dicts);
 
@@ -318,7 +365,7 @@ void kvstoreRelease(kvstore *kvs) {
     if (kvs->dict_sizes)
         fwTreeDestroy(kvs->dict_sizes);
 
-    zfree(kvs);
+    kvstoreUnref(kvs);
 }
 
 unsigned long long int kvstoreSize(kvstore *kvs) {
@@ -390,7 +437,7 @@ unsigned long long kvstoreScan(kvstore *kvs, unsigned long long cursor,
 
     int skip = !d || (skip_cb && skip_cb(d, didx));
     if (!skip && ov) {
-        _cursor = ovScan(kvs, didx, ov, d, cursor, scan_cb, privdata);
+        _cursor = ovScan(kvs, ov, d, cursor, scan_cb, privdata);
     } else if (!skip) {
         _cursor = dictScan(d, cursor, scan_cb, privdata);
         /* In dictScan, scan_cb may delete entries (e.g., in active expire case). */
@@ -590,7 +637,12 @@ int kvstoreNumDicts(kvstore *kvs) {
     return kvs->num_dicts;
 }
 
-/* Move dict from one kvstore to another. */
+/* Move dict from one kvstore to another. The dict's logical size moves with
+ * it (what the source counted for it, side-table adds and tombstones
+ * included). A dict a save is reading is moved as it is, its save state
+ * with it: the save keeps reading the fork-instant layout, applies or drops
+ * its side table when it completes the slot, and the dict stays out of the
+ * destination's layout bookkeeping until then (TASK-1.37). */
 void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     assert(kvs->num_dicts > didx);
     assert(kvs->num_dicts == dst->num_dicts);
@@ -598,27 +650,31 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
 
     dict *d = kvs->dicts[didx];
     if (d == NULL) return;
+    kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
+    long long lsize = kvstoreDictSize(kvs, didx);
 
     /* Adjust source kvstore */
-    kvs->allocated_dicts -= 1;
-    cumulativeKeyCountAdd(kvs, didx, -((long long)dictSize(d)));
-    kvstoreDictBucketChanged(d, -((long long) dictBuckets(d)));
-    /* If rehashing, stop it. */
-    if (dictIsRehashing(d))
-        kvstoreDictRehashingCompleted(d);
-    /* Clear dict from source kvstore and create a new one if needed */
-    kvs->dicts[didx] = NULL;
+    kvs->key_count -= lsize;
+    if (lsize) kvs->non_empty_dicts--;
+    if (kvs->num_dicts > 1) fwTreeUpdate(kvs->dict_sizes, didx, -lsize);
+    detachDict(kvs, didx, 1);
     if (!(kvs->flags & (KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS)))
         createDictIfNeeded(kvs, didx);
 
     /* Move dict to destination kvstore */
+    d->type = &dst->dtype;
+    kvstoreRetain(dst);
+    kvstoreUnref(kvs);
     dst->dicts[didx] = d;
-    dst->dicts[didx]->type = &dst->dtype;
     dst->allocated_dicts += 1;
-    cumulativeKeyCountAdd(dst, didx, dictSize(d));
-    kvstoreDictBucketChanged(d, dictBuckets(d));
-    if (dictIsRehashing(dst->dicts[didx]))
-        kvstoreDictRehashingStarted(dst->dicts[didx]);
+    dst->key_count += lsize;
+    if (lsize) dst->non_empty_dicts++;
+    if (dst->num_dicts > 1) fwTreeUpdate(dst->dict_sizes, didx, lsize);
+    if (!meta->detached) {
+        kvstoreDictBucketChanged(d, dictBuckets(d));
+        if (dictIsRehashing(d))
+            kvstoreDictRehashingStarted(d);
+    }
 }
 
 /* Returns kvstore iterator that can be used to iterate through sub-dictionaries.
@@ -673,7 +729,7 @@ int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it) {
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
     for (;;) {
         kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? ovRead(kvs_it->kvs, kvs_it->didx) : NULL;
-        dictEntry *de = ov ? ovIteratorNext(kvs_it->kvs, kvs_it->didx, ov, &kvs_it->di, &kvs_it->ov_phase, (ovCursor *)&kvs_it->ov_cur)
+        dictEntry *de = ov ? ovIteratorNext(kvs_it->kvs, ov, &kvs_it->di, &kvs_it->ov_phase, (ovCursor *)&kvs_it->ov_cur)
                            : (kvs_it->di.d ? dictNext(&kvs_it->di) : NULL);
         if (de) return de;
         /* No current dict or reached the end of the dictionary.
@@ -788,7 +844,7 @@ dictEntry *kvstoreDictIteratorNext(kvstoreDictIterator *kvs_di)
     /* The dict may be deleted during the iteration process, so here need to check for NULL. */
     if (!kvs_di->di.d) return NULL;
     kvstoreDictOverlay *ov = ovRead(kvs_di->kvs, kvs_di->didx);
-    if (ov) return ovIteratorNext(kvs_di->kvs, kvs_di->didx, ov, &kvs_di->di, &kvs_di->ov_phase, (ovCursor *)&kvs_di->ov_cur);
+    if (ov) return ovIteratorNext(kvs_di->kvs, ov, &kvs_di->di, &kvs_di->ov_phase, (ovCursor *)&kvs_di->ov_cur);
     if (!kvstoreGetDict(kvs_di->kvs, kvs_di->didx)) return NULL;
     return dictNext(&kvs_di->di);
 }
@@ -816,7 +872,7 @@ dictEntry *kvstoreDictGetFairRandomKey(kvstore *kvs, int didx)
 unsigned int kvstoreDictGetSomeKeys(kvstore *kvs, int didx, dictEntry **des, unsigned int count)
 {
     kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (ov) return ovGetSomeKeys(kvs, didx, ov, des, count);
+    if (ov) return ovGetSomeKeys(kvs, ov, des, count);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return 0;
@@ -880,7 +936,7 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
 
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
     kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(kvs, didx, ov, key);
+    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(kvs, ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;

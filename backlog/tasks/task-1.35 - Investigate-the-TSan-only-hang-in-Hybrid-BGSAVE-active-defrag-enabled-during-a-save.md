@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-05 10:27'
+updated_date: '2026-10-05 10:33'
 labels:
   - tsan
   - flaky
@@ -31,3 +32,9 @@ Seen once on 2026-10-05 while verifying TASK-1.34 (a pure code move): the TSan b
 - [ ] #2 Root cause identified: a real main-thread/scan-thread wait cycle, or a TSan artefact (document which); fix or a documented test adjustment
 - [ ] #3 unit/snapshot under TSan passes 3 consecutive full runs
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-05: three full TSan runs of unit/snapshot on the same binary (.scratch/tsan at 76cab4e6f): run 1 hung in the defrag test (harness default timeout, logs lost), runs 2 and 3 passed with --timeout 600 --dont-clean and no ThreadSanitizer output. Reproduction rate so far 1/3; the loop in AC1 should keep --dont-clean and attach gdb on the IN PROGRESS client report.
+<!-- SECTION:NOTES:END -->

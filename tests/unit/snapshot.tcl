@@ -1607,7 +1607,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            assert_equal 0 [s snap_save_leftovers]
+            assert_equal 0 [s snap_retained_dicts]
             r debug reload nosave
             assert_equal $digest [debug_digest]   ;# the 30k, none of the 300
             assert_equal 0 [r exists "$tag:0"]
@@ -1618,6 +1618,56 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
         }
     }
 }
+
+# TASK-1.37: the save holds a reference on every fork-instant slot dict. The
+# background trim of atomic slot migration moves the migrated slots' dicts out
+# of the keyspace (kvstoreMoveDict) and frees them on BIO; under a save those
+# dicts stay with the save until their slot completes, and the dump holds the
+# fork instant. The source's own snapshot for the migration is a child, so the
+# trim can only meet a save that started during the streaming phase: the fail
+# point below holds the source in that phase.
+proc snap_all_slots_to_node0 {masters} {
+    R 0 cluster addslotsrange 0 16383
+}
+start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no cluster-node-timeout 60000}} {
+    if {[snap_hybrid_supported]} {
+        test {Hybrid BGSAVE harness (cluster mode): slots trimmed by atomic slot migration during a save stay in the dump, the save frees them when it passes them} {
+            set nkeys 3000
+            for {set i 0} {$i < $nkeys} {incr i} { R 0 set "key:$i" v }
+            assert_equal $nkeys [R 0 dbsize]
+            # Hold the source in the streaming phase (after its snapshot child exited) ...
+            R 0 debug asm-failpoint migrate-main-channel handoff-prep
+            set task_id [R 1 CLUSTER MIGRATION IMPORT 0 8191]
+            wait_for_condition 1000 10 {
+                [regexp {state send-(bulk-and-)?stream} [R 0 CLUSTER MIGRATION STATUS ID $task_id]] &&
+                [status [Rn 0] rdb_bgsave_in_progress] == 0 && [status [Rn 0] snap_save_in_progress] == 0
+            } else { fail "the migration did not reach the streaming phase: [R 0 CLUSTER MIGRATION STATUS ID $task_id]" }
+            # ... start a slow hybrid save there, then let the migration hand off and trim.
+            R 0 config set rdb-key-save-delay 2000   ;# about 6 s for 3000 keys
+            R 0 bgsave
+            wait_for_condition 100 50 {[status [Rn 0] snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            R 0 debug asm-failpoint "" ""
+            wait_for_asm_done
+            assert_equal 1 [status [Rn 0] snap_save_in_progress]   ;# the trim landed under the save
+            assert_equal 0 [R 0 cluster countkeysinslot [R 0 cluster keyslot "key:0"]]
+            set moved [R 1 dbsize]
+            assert {$moved > 0 && $moved < $nkeys}
+            R 0 config set rdb-key-save-delay 0
+            wait_for_condition 300 100 {
+                [status [Rn 0] rdb_bgsave_in_progress] == 0 && [status [Rn 0] snap_save_in_progress] == 0
+            } else { fail "hybrid bgsave did not finish" }
+            assert_equal ok [status [Rn 0] rdb_last_bgsave_status]
+            assert {[status [Rn 0] snap_retained_dicts] > 0}   ;# dicts the trim let go of before the save passed them
+            assert_equal 0 [count_log_message 0 "crashed by signal"]
+            # The dump is the fork instant: every key, the migrated slots included.
+            set dump [file join [lindex [R 0 config get dir] 1] [lindex [R 0 config get dbfilename] 1]]
+            set out [exec src/redis-check-rdb $dump]
+            assert {[regexp {(\d+) keys read} $out -> read]}
+            assert_equal $nkeys $read
+            assert_equal [expr {$nkeys - $moved}] [R 0 dbsize]
+        }
+    }
+} snap_all_slots_to_node0
 
 # ---------------------------------------------------------------------------
 # Arena fork visibility (TASK-1.22): stock fork children (AOF rewrite, diskless

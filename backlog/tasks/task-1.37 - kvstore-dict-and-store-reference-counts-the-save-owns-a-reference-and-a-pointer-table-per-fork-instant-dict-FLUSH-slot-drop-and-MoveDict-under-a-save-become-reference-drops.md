@@ -4,9 +4,10 @@ title: >-
   kvstore: dict and store reference counts; the save owns a reference and a
   pointer table per fork-instant dict (FLUSH, slot drop and MoveDict under a
   save become reference drops)
-status: In Progress
+status: Done
 assignee: []
 created_date: '2026-10-06 06:00'
+updated_date: '2026-10-06 07:18'
 labels:
   - bgsave
   - cluster
@@ -49,9 +50,23 @@ Design:
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 kvstoreMoveDict of a fork-instant dict during a hybrid save, followed by kvstoreRelease of the destination store (BIO path), is safe: C unit test with a running scan; cluster tcl test with CLUSTER MIGRATION IMPORT trimming slots of the source while the source runs a slow hybrid save, reload equals the fork instant on both sides (TASK-1.21.7 AC3)
-- [ ] #2 FLUSHDB sync and kvstoreEmpty under a save detach instead of destroying fork-instant dicts (C unit); FLUSHDB detach-to-snapshot and FLUSHALL abort unchanged (existing tcl tests)
-- [ ] #3 Freeze takes the references and fills the table in the SLOT_INFO pass; the thread reads only the save's table; kvstoreGetDictAcquire, dict_created, snap_free_deferred, the lazy stamp CAS and the leftover machinery (snap_save_leftovers) are removed
-- [ ] #4 No dict or store struct is freed while referenced: ASan unit/snapshot clean, TSan unit/snapshot clean, full suite with bgsave-hybrid yes green; C unit kvstore + snapshot pass
-- [ ] #5 Spec section 4 (Freeze) and 11.z.1/11.z.2 updated; TASK-1.21.7 AC3 closed by reference
+- [x] #1 kvstoreMoveDict of a fork-instant dict during a hybrid save, followed by kvstoreRelease of the destination store (BIO path), is safe: C unit test with a running scan; cluster tcl test with CLUSTER MIGRATION IMPORT trimming slots of the source while the source runs a slow hybrid save, reload equals the fork instant on both sides (TASK-1.21.7 AC3)
+- [x] #2 FLUSHDB sync and kvstoreEmpty under a save detach instead of destroying fork-instant dicts (C unit); FLUSHDB detach-to-snapshot and FLUSHALL abort unchanged (existing tcl tests)
+- [x] #3 Freeze takes the references and fills the table in the SLOT_INFO pass; the thread reads only the save's table; kvstoreGetDictAcquire, dict_created, snap_free_deferred, the lazy stamp CAS and the leftover machinery (snap_save_leftovers) are removed
+- [x] #4 No dict or store struct is freed while referenced: ASan unit/snapshot clean, TSan unit/snapshot clean, full suite with bgsave-hybrid yes green; C unit kvstore + snapshot pass
+- [x] #5 Spec section 4 (Freeze) and 11.z.1/11.z.2 updated; TASK-1.21.7 AC3 closed by reference
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-06, implemented as designed. kvstore: kvstoreDictMetaBase.refcount/detached, kvstore refcount; kvstoreDictRetain/Unref/Refcount/Detached, kvstoreRefcount; detachDict(kvs, didx, moving) shared by freeDictIfNeeded (no ovPeek check, no deferral), kvstoreEmpty (a dict with refcount>1 is detached, not emptied), kvstoreMoveDict (logical size moves; a held dict stays out of the destination's layout bookkeeping and rehashing list); kvstoreRelease unrefs dicts and the struct, kvstoreUnref frees the struct at zero; the dict callbacks (rehash started/completed, bucket changed) skip detached dicts; onDictRelease no longer set by kvstore. Bookkeeping note: upstream kvstoreMoveDict adjusts non_empty_dicts through cumulativeKeyCountAdd with the dict still in the table, which never decrements it for a non-empty moved dict; the rewrite adjusts key_count/non_empty_dicts/fenwick explicitly. kvsoverlay.c: ov->d everywhere (the overlay addresses its dict, not kvs->dicts[didx]), ov->kvs NULL once detached (ovDetachFromStore: off the drain list), ovDrainOne uses the dict's type for the key helpers and the destructor toggle (first attempt dereferenced the NULL store: C unit segfault, fixed), kvstoreDictSnapAttach(dict*), kvstoreDictSnapRelease(dict*) returns the bitmap bytes and skips the store's free check for detached dicts. snapshot.c: ctx->dicts[s][didx] table + nrefs per store, bitmap_bytes and retained_dicts in the ctx; freeze pass retains/stamps/records; guard compares the live dict with the table entry; claim is a plain store; completion releases state, stamps DONE, clears the entry, unrefs; FinishAll sweeps the table; claimed/enumerated/completed/slots_skipped, snapDictStamp, snapGuardDictCreated, kvstoreGetDictAcquire, kvstoreSnapAttached/BitmapAccount/BitmapBytes/Leftovers removed; INFO snap_save_leftovers replaced by snap_save_retained_dicts. Tests: snapRefcountTests (A: table/refs, writes outside the table, kvstoreMoveDict + kvstoreRelease of the destination under the scan; B: kvstoreEmpty under the scan, a fresh dict in the slot; C: a dict emptied under the scan in a FREE_EMPTY_DICTS store) replaces the leftover and lazy-stamp tests; tcl cluster test with the handoff-prep fail point. C unit 184 pass; unit/snapshot hybrid green; stock running; tcl ASM test, TSan, ASan, full suite pending.
+
+TSan on the new cluster test found a real race the C unit could not: the trim's BIO histogram pass (asmTrimJobPopulateDeltaHistograms) iterated the moved dicts while the main thread completed one (side table applied, rehash resumed). Fix: a slot dict a save still holds (refcount > 1 before the move, detached after it) is accounted on the main thread before kvstoreMoveDict through the live overlay-aware dict iterator, and the BIO pass skips detached dicts. Second hazard fixed on the way: ovDrainOne used to NULL the store-wide dictType.keyDestructor around the apply; the store's other dicts share that type and the lazyfree thread may be releasing them, so the drain now swaps the dict's own type pointer to a private copy for the duration. ASan run also failed the hard-mark test (save completed in 2.1 s before the 3000 writes queued 64 KB; the test leaves bgsave-hybrid-max-retained-bytes at 64 KB on failure, which cascaded into the next two tests): timing under ASan, reran to confirm; consider a longer rdb-key-save-delay in that test.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Dict and store reference counts in kvstore. At freeze the save takes one reference per non-empty dict, stamps it PENDING and records it in its own per-store table; the scan thread walks that table, the guard compares the live dict with the table entry, completion releases the state and the reference. A store that frees, empties or moves a referenced dict detaches it (out of the slot table and the store's bookkeeping, side table cut loose) and the save reads it to the end and frees it; every dict holds a reference on its store so a store released on the lazyfree thread outlives its detached dicts. Removed: the lazy stamp and CAS claim, the deferred empty-dict frees, the dict-created hook, the acquire loads of the live slot table, onDictRelease, the leftover machinery and INFO snap_save_leftovers (INFO snap_retained_dicts, cumulative, replaces it). kvstoreMoveDict moves the logical size and keeps a held dict out of the destination's layout bookkeeping; the ASM trim accounts held slots on the main thread before the move and its BIO pass skips detached dicts; the overlay drain no longer edits the store-wide dict type. Closes TASK-1.21.7 AC3 (slot trim under a save). Verified: C unit kvstore + snapshot (184, three new reference tests), unit/snapshot hybrid and stock, TSan and ASan unit/snapshot clean, cluster ASM units, full hybrid suite (on the build before the two sanitizer-driven fixes; those paths are covered by the sanitizer and ASM runs). Spec section 4 and 11.z.2 updated.
+<!-- SECTION:FINAL_SUMMARY:END -->

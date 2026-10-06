@@ -3075,6 +3075,42 @@ static asmTrimJob *asmTrimJobCreate(slotRangeArray *slots, uint64_t client_id, i
     return job;
 }
 
+/* One trimmed key into the job's histogram deltas (either thread, the job
+ * is private to the trim). */
+static void asmTrimJobAccountKv(asmTrimJob *trim_job, kvobj *kv) {
+    if (!kv) return;
+    int64_t *keysizes_row = keysizesHistRow(trim_job->bg->delta_keysizes_hist, kv->type);
+    if (!keysizes_row) return; /* untracked type, e.g. OBJ_MODULE */
+
+    size_t len = getObjectLength(kv);
+    int size_bin = (len == 0) ? 0 : log2ceil(len) + 1; /* Only strings can be empty */
+    debugServerAssert(size_bin < MAX_KEYSIZES_BINS);
+    keysizes_row[size_bin]++;
+
+    if (server.memory_tracking_enabled) {
+        int64_t *allocsizes_row = keysizesHistRow(trim_job->bg->delta_allocsizes_hist, kv->type);
+        size_t alloc_size = kvobjAllocSize(kv);
+        int alloc_bin = (alloc_size == 0) ? 0 : log2ceil(alloc_size) + 1;
+        debugServerAssert(alloc_bin < MAX_KEYSIZES_BINS);
+        allocsizes_row[alloc_bin]++;
+    }
+}
+
+/* Main thread, before a slot dict is moved out: a dict a running hybrid save
+ * still reads (TASK-1.37) goes to the BIO thread's kvstore with the save's
+ * reference on it, the save's thread keeps reading it and the main thread
+ * completes it there, so the BIO pass below leaves it alone. Its keys are
+ * accounted here instead, through the live (overlay-aware) view. */
+static void asmTrimJobAccountHeldSlot(asmTrimJob *trim_job, int slot) {
+    dict *d = kvstoreGetDict(server.db[0].keys, slot);
+    if (!d || kvstoreDictRefcount(d) == 1) return;
+    kvstoreDictIterator it;
+    kvstoreInitDictSafeIterator(&it, server.db[0].keys, slot);
+    dictEntry *de;
+    while ((de = kvstoreDictIteratorNext(&it)) != NULL) asmTrimJobAccountKv(trim_job, dictGetKV(de));
+    kvstoreResetDictIterator(&it);
+}
+
 /* Populate the histogram deltas while the detached slot dictionaries are
  * owned by the BIO thread. The completion callback applies these deltas in
  * the main thread before freeing the trim job. */
@@ -3082,30 +3118,17 @@ static void asmTrimJobPopulateDeltaHistograms(kvstore *kvs, void *userdata) {
     asmTrimJob *trim_job = userdata;
     serverAssert(trim_job && trim_job->bg);
 
-    kvstoreIterator kvs_it;
-    kvstoreIteratorInit(&kvs_it, kvs);
-    dictEntry *de;
-
-    while ((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
-        kvobj *kv = dictGetKV(de);
-        if (!kv) continue;
-        int64_t *keysizes_row = keysizesHistRow(trim_job->bg->delta_keysizes_hist, kv->type);
-        if (!keysizes_row) continue; /* untracked type, e.g. OBJ_MODULE */
-
-        size_t len = getObjectLength(kv);
-        int size_bin = (len == 0) ? 0 : log2ceil(len) + 1; /* Only strings can be empty */
-        debugServerAssert(size_bin < MAX_KEYSIZES_BINS);
-        keysizes_row[size_bin]++;
-
-        if (server.memory_tracking_enabled) {
-            int64_t *allocsizes_row = keysizesHistRow(trim_job->bg->delta_allocsizes_hist, kv->type);
-            size_t alloc_size = kvobjAllocSize(kv);
-            int alloc_bin = (alloc_size == 0) ? 0 : log2ceil(alloc_size) + 1;
-            debugServerAssert(alloc_bin < MAX_KEYSIZES_BINS);
-            allocsizes_row[alloc_bin]++;
-        }
+    for (int didx = 0; didx < kvstoreNumDicts(kvs); didx++) {
+        dict *d = kvstoreGetDict(kvs, didx);
+        /* A dict a hybrid save still holds was accounted on the main thread
+         * before the move; the save's thread reads it right now. */
+        if (!d || kvstoreDictDetached(d)) continue;
+        kvstoreDictIterator it;
+        kvstoreInitDictSafeIterator(&it, kvs, didx);
+        dictEntry *de;
+        while ((de = kvstoreDictIteratorNext(&it)) != NULL) asmTrimJobAccountKv(trim_job, dictGetKV(de));
+        kvstoreResetDictIterator(&it);
     }
-    kvstoreIteratorReset(&kvs_it);
 }
 
 /* Complete a background trim in the main thread after lazyfree finishes.
@@ -3187,6 +3210,7 @@ static void asmTriggerBackgroundTrim(asmTrimJob *job) {
     for (int i = 0; i < slots->num_ranges; i++) {
         for (int slot = slots->ranges[i].start; slot <= slots->ranges[i].end; slot++) {
             total_keys += kvstoreDictSize(server.db[0].keys, slot);
+            asmTrimJobAccountHeldSlot(job, slot);
             kvstoreMoveDict(server.db[0].keys, keys, slot);
             kvstoreMoveDict(server.db[0].expires, expires, slot);
             estoreMoveEbuckets(server.db[0].subexpires, subexpires, slot);

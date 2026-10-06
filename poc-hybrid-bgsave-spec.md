@@ -127,28 +127,29 @@ kept in §11.y for history.
 waiting for the main thread to release it) or `DONE` (released: side table applied, dict unfrozen).
 The scan thread advances the state, the main thread reads it with an atomic load.
 
-**Freeze (on demand since TASK-1.21.6, 2026-10-01; per-dict state since TASK-1.21.8, 2026-10-03).**
-At save start, on the main thread and before the fork: install the store's *snapshot guard*
-(`kvstoreSnapGuardSet`) on every non-empty store. Nothing is visited, paused or allocated per dict:
-in cluster mode the 2026-10-01 version still walked the 16,384 slots to mark the empty ones `DONE`
-and kept three per-slot arrays in the scan context; now the freeze is O(stores). The per-dict state
-lives in the dict's own kvstore metadata: a word `(generation << 8) | state` and a pointer to the
-save's per-dict struct (`kvstoreDictSnap`: the two bucket bitmaps, the overlay, the pause flag),
-attached on first touch and freed when the dict completes. A dict whose word does not carry the
-running save's generation is *untouched since the fork instant*: the main thread reads it as
-`PENDING` when it is non-empty and as `DONE` when it is empty (every post-fork add stamps the dict
-first, so an unstamped dict holds only fork-instant content), and a dict allocated during the save
-is stamped `DONE` at creation (`dict_created` hook). The thread's pass over the store's dict pointers
-claims each unstamped dict with a compare-and-swap to `SCANNING` and walks whatever it holds; the
-main thread's stamp is the same exchange, so whichever side touches the dict first decides and the
-other reads the verdict. Empty dicts are not freed while the hooks are set (the thread reads the
-pointers); the deferred frees run when the store's guard comes off. A store is complete when the
-thread has passed its last dict and every dict it claimed has completed; at abort the main thread
-completes the dict the thread was reading and then, only while the store's attached count is
-non-zero, passes over the store's dicts for the ones writes attached ahead of the thread. That pass
-is the one remaining O(slots) loop, on the rare abort path; the regular save never runs one. Save
-state still attached when a dict is released or its store emptied is a leftover, released from the
-dict's `onDictRelease` (before its tables are cleared) or inline in `kvstoreEmpty`, and counted.
+**Freeze (on demand since TASK-1.21.6, 2026-10-01; per-dict state since TASK-1.21.8, 2026-10-03;
+references since TASK-1.37, 2026-10-06).** At save start, on the main thread and before the fork, one
+pass per non-empty store: every non-empty dict gets one *reference* (`kvstoreDictRetain`, a count in the
+dict's kvstore metadata next to the one its store holds), its word stamped `(generation, PENDING)`, and
+its pointer recorded in the save's own per-store table; then the store's *snapshot guard*
+(`kvstoreSnapGuardSet`) goes on. Nothing is paused or allocated per dict (in cluster mode this is the
+same O(16,384) walk `snapSaveCreate` already makes for the per-slot key counts of `SLOT_INFO`). The rest
+of the per-dict state lives in the dict's own kvstore metadata (`kvstoreDictSnap`: the two bucket
+bitmaps, the overlay, the pause flag), attached on first touch and freed when the dict completes. The
+thread walks the save's table, never the live slot table: a live dict that is not the table's entry for
+its slot (created or swapped in since the fork instant, or the slot completed) holds nothing of the
+save, and the guard leaves it alone without a stamp. The store may free, empty or move a table dict
+meanwhile: `freeDictIfNeeded`, `kvstoreEmpty` and `kvstoreMoveDict` *detach* a dict another holder
+references (out of the slot table and the store's bookkeeping, off the rehashing list, its side table
+cut loose from the store), and the save, holding its reference, reads it to the end and releases it
+when its slot completes; the dict is freed by the last holder. Every dict holds a reference on its
+store (its `dictType` lives there), so a store released on the lazyfree thread (an ASM trim's
+temporary kvstore, a flushed db) outlives its detached dicts; the two counts are atomic for that
+reason only, no per-command path touches them. A store is complete when every entry of its table has
+completed; at abort the main thread completes the dict the thread was reading and then the remaining
+table entries, a pointer per slot. There are no leftovers any more: the save releases every state it
+attached before the guard comes off, and `INFO snap_retained_dicts` counts, across saves, the table dicts
+whose store let go before the save passed them.
 The guard runs on every kvstore access to a dict that has no overlay while the scan runs: it returns
 nothing for `SCANNED`/`DONE` slots; otherwise it opens the write section (reads included, since a find
 may step a rehash and the thread may claim the dict at any moment) and *attaches* on a structural
@@ -444,8 +445,8 @@ surfaced, not worked around.
 - The scan thread never reads a mutable main-thread global: `rdb-key-save-delay`
   (CONFIG SET reaches it through an apply hook), `maxmemory-policy` and
   `rdb-compression` are frozen per save; the LRU clock is computed, not read.
-- Slots empty at the freeze instant are never scanned: unstamped and empty means DONE to the main
-  thread, and a dict created during the save is stamped DONE at creation (TASK-1.21.8).
+- Slots empty at the freeze instant are never scanned: they are not in the save's table, nor is a
+  dict created during the save (TASK-1.21.8, TASK-1.37).
 - See `poc-hybrid-bgsave-m1-report.md` for the M1 evidence and go/no-go.
 
 ### 11.y Per-key scan generation (2026-09-21; superseded by 11.z)
@@ -749,12 +750,26 @@ class, ht0[i] and ht1[i + j*n], so entries the rehash moves later land in marked
 standalone mode the one dict is under the window from the start, so nothing changes there; in
 cluster mode the lockout rolls with the scan. `snap_save_grown_dicts` counts the remaps.
 
-Every dict the save touches is stamped with the save's generation (`kvstoreSnapGuardSet(..., gen)`,
-the scan context's `gen`; the user's suggestion, 2026-10-02, extended to all per-dict state on
-2026-10-03): an access that meets save state of another generation treats it as a leftover of a
-save whose release path did not run, applies what its side table holds to the real dict, frees the
-bitmaps, resumes the layout and counts it in `snap_save_leftovers`; `kvstoreEmpty` and
-`kvstoreRelease` do the same for whatever is still attached. Zero is the only right value.
+Every dict the save holds is stamped with the save's generation (the scan context's `gen`; the user's
+suggestion, 2026-10-02). Until TASK-1.37 (2026-10-06) an access that met save state of another
+generation treated it as a leftover of a save whose release path did not run and counted it in
+`snap_save_leftovers`; with the save holding a reference on every fork-instant dict and releasing each
+state itself, no state can outlive its save, and that machinery (the lazy stamp, the deferred frees of
+empty dicts, `onDictRelease`, the leftover count) is gone.
+
+**Slot migration during a save (TASK-1.21.7 AC3, closed by TASK-1.37).** The source's snapshot for an
+atomic slot migration is a replication-style save, so it waits for a running save's child; what can
+meet a hybrid save is the *trim* of a migration whose streaming phase the save started in: the
+background trim moves the migrated slots' dicts out with `kvstoreMoveDict` into temporary kvstores
+freed on the lazyfree thread. Before the references that was a use-after-free for the scan thread;
+now the moved dicts stay with the save (their state follows them, their side table is cut loose from
+the source store), the save serializes their fork-instant content and frees them when their slots
+complete, and the dump holds the fork instant. The trim's keysize-histogram pass on the lazyfree thread
+leaves those dicts alone (they are accounted on the main thread before the move, through the live
+view): two threads never touch one dict. C unit (`snapRefcountTests`: a move under a running
+scan followed by the destination store's release, a `kvstoreEmpty` under the scan, a dict that
+empties under the scan) and a cluster harness test (the source held in the streaming phase by the
+`handoff-prep` fail point while a slow save starts, then handoff and trim under it).
 
 ### 11.z.3 Comparison with the teammate's forkless-hybrid POC (yinon/forkless-hybrid, 2026-09-23)
 

@@ -33,44 +33,27 @@
  * Per-dict save state
  * ========================================================================== */
 
-long kvstoreSnapLeftovers(kvstore *kvs) { return kvs->snap_leftovers; }
-
-void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata, uint64_t gen) {
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
     kvs->snap_hooks = hooks;
     kvs->snap_priv = privdata;
-    kvs->snap_gen = hooks ? gen : 0;
-    if (!hooks && kvs->snap_free_deferred) {
-        kvs->snap_free_deferred = 0;
-        for (int didx = 0; didx < kvs->num_dicts; didx++) kvstoreFreeDictIfNeeded(kvs, didx);
-    }
 }
 
-kvstoreDictSnap *kvstoreDictSnapAttach(kvstore *kvs, int didx) {
-    dict *d = kvs->dicts[didx];
-    assert(d != NULL);   /* only an existing dict; it stays alive while the state is attached */
+kvstoreDictSnap *kvstoreDictSnapAttach(dict *d) {
     kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
     assert(meta->snap == NULL);
     kvstoreDictSnap *sn = zcalloc(sizeof(*sn));
-    kvs->snap_attached++;
     __atomic_store_n(&meta->snap, sn, __ATOMIC_RELEASE);
     return sn;
-}
-
-void kvstoreSnapBitmapAccount(kvstore *kvs, long delta) { kvs->snap_bitmap_bytes += delta; }
-size_t kvstoreSnapBitmapBytes(kvstore *kvs) { return kvs->snap_bitmap_bytes; }
-
-int kvstoreSnapAttached(kvstore *kvs) { return kvs->snap_attached; }
-
-dict *kvstoreGetDictAcquire(kvstore *kvs, int didx) {
-    return __atomic_load_n(&kvs->dicts[didx], __ATOMIC_ACQUIRE);
 }
 
 /* ==========================================================================
  * Side table
  * ========================================================================== */
 
+/* The store's list of side tables to drain. A detached overlay (ov->kvs NULL)
+ * is on no list: nothing reaches it until the save releases it. */
 static void ovMarkDirty(kvstore *kvs, kvstoreDictOverlay *ov) {
-    if (ov->dirty_node) return;
+    if (ov->dirty_node || !kvs) return;
     if (!kvs->ov_dirty) kvs->ov_dirty = listCreate();
     listAddNodeTail(kvs->ov_dirty, ov);
     ov->dirty_node = listLast(kvs->ov_dirty);
@@ -92,9 +75,8 @@ static inline const void *ovStoredKey2Key(kvstore *kvs, const void *stored) {
     return kvs->dtype.keyFromStoredKey ? kvs->dtype.keyFromStoredKey(stored) : stored;
 }
 
-static inline int ovFrozenHas(kvstore *kvs, int didx, const void *key) {
-    dict *d = kvs->dicts[didx];
-    return d && dictFind(d, key) != NULL;
+static inline int ovFrozenHas(kvstoreDictOverlay *ov, const void *key) {
+    return dictFind(ov->d, key) != NULL;
 }
 
 /* Logical key-count bookkeeping for a frozen dict: the real dict size does not
@@ -115,8 +97,7 @@ static inline ovSlot *ovSlotOf(kvstore *kvs, kvstoreDictOverlay *ov, const void 
         size_t bytes = sizeof(ovSlot) * OV_SLOTS;
         ov->slots = kvs->dtype.nofork_alloc ? zcalloc_nofork(bytes) : zcalloc(bytes);
     }
-    dict *d = kvs->dicts[ov->didx];
-    return &ov->slots[dictGetHash(d, key) & OV_SLOT_MASK];
+    return &ov->slots[dictGetHash(ov->d, key) & OV_SLOT_MASK];
 }
 
 /* The link of 'key' in chain 'chain' of 'slot', or NULL. */
@@ -151,7 +132,7 @@ static dictEntryLink ovSideFind(kvstore *kvs, kvstoreDictOverlay *ov, const void
 static dictEntryLink ovChainPush(kvstore *kvs, kvstoreDictOverlay *ov, int chain, void *kv) {
     ovSlot *slot = ovSlotOf(kvs, ov, ovStoredKey2Key(kvs, kv));
     dictEntryLink head = &slot->heads[chain];
-    *head = dictEntryCreateDetached(kvs->dicts[ov->didx], kv, *head);
+    *head = dictEntryCreateDetached(ov->d, kv, *head);
     return head;
 }
 
@@ -197,9 +178,9 @@ static inline void ovEnter(kvstoreDictOverlay *ov) {
  * ovEnter() (the answer is only stable inside a write section). Without a
  * prepare hook the overlay is pure clone-on-write. */
 static inline int ovPrepare(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
-    dict *d = kvs->dicts[didx];
-    if (!d || !ov->h.prepare) return KVSTORE_OV_DEFER;
-    return ov->h.prepare(ov->privdata, didx, d, key);
+    (void)kvs;
+    if (!ov->h.prepare) return KVSTORE_OV_DEFER;
+    return ov->h.prepare(ov->privdata, didx, ov->d, key);
 }
 
 /* Is 'bucket' (a link handed out as a bucket) one of dict d's own buckets? */
@@ -220,6 +201,7 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
     kvstoreDictOverlay *ov = zcalloc(sizeof(*ov));
     ov->kvs = kvs;
     ov->didx = didx;
+    ov->d = d;
     ov->h = *hooks;
     ov->privdata = privdata;
     sn->ov = ov;
@@ -243,8 +225,7 @@ static dictEntryLink ovEnsureClone(kvstore *kvs, int didx, kvstoreDictOverlay *o
     int chain;
     dictEntryLink link = ovSideFind(kvs, ov, key, &chain);
     if (link) return OV_IS_TOMB(chain) ? NULL : link;
-    dict *d = kvs->dicts[didx];
-    dictEntry *fe = d ? dictFind(d, key) : NULL;
+    dictEntry *fe = dictFind(ov->d, key);
     if (!fe) return NULL;
     int shared = 0;
     void *clone = ov->h.clone(ov->privdata, didx, dictGetKey(fe), &shared);
@@ -265,10 +246,10 @@ static dictEntryLink ovSideInsert(kvstore *kvs, int didx, kvstoreDictOverlay *ov
     dictEntryLink tlink = ovSideFind(kvs, ov, key, &tchain);
     if (tlink) {
         assert(OV_IS_TOMB(tchain));   /* a present key is never inserted twice */
-        dictEntryFreeDetached(kvs->dicts[didx], ovChainUnlink(tlink), 0);   /* borrowed key */
+        dictEntryFreeDetached(ov->d, ovChainUnlink(tlink), 0);   /* borrowed key */
         ov->tombs--;
         if (tchain == OV_TOMB_SHARED) chain = OV_SHARED;
-    } else if (!ovFrozenHas(kvs, didx, key)) {
+    } else if (!ovFrozenHas(ov, key)) {
         ov->adds++;
     }
     dictEntryLink link = ovChainPush(kvs, ov, chain, kv);
@@ -283,9 +264,8 @@ static dictEntryLink ovSideInsert(kvstore *kvs, int didx, kvstoreDictOverlay *ov
  * returned for the caller to free (with or without its key). */
 static dictEntry *ovSideRemove(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntryLink link, int chain, const void *key) {
     assert(!OV_IS_TOMB(chain));
-    dict *d = kvs->dicts[didx];
     if (!key) key = ovEntryKey(kvs, *link);
-    dictEntry *fe = d ? dictFind(d, key) : NULL;
+    dictEntry *fe = dictFind(ov->d, key);
     if (fe) {
         ovChainPush(kvs, ov, chain == OV_SHARED ? OV_TOMB_SHARED : OV_TOMB, dictGetKey(fe));
         ov->tombs++;
@@ -301,10 +281,8 @@ static dictEntry *ovSideRemove(kvstore *kvs, int didx, kvstoreDictOverlay *ov, d
 /* Free a side-table entry the store no longer references, running the
  * store's key destructor against the real dict (per-dict accounting lands
  * where the adds were counted). */
-static void ovEntryFreeWithKey(kvstore *kvs, int didx, dictEntry *de) {
-    dict *d = kvs->dicts[didx];
-    assert(d != NULL);
-    dictEntryFreeDetached(d, de, kvs->dtype.keyDestructor != NULL);
+static void ovEntryFreeWithKey(kvstoreDictOverlay *ov, dictEntry *de) {
+    dictEntryFreeDetached(ov->d, de, ov->d->type->keyDestructor != NULL);
 }
 
 /* Logical size of dict didx (frozen or not). */
@@ -326,8 +304,8 @@ dictEntry *ovMapFrozenEntry(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry *de)
 }
 
 /* Is this side-table entry an ADD (key absent from the frozen dict)? */
-int ovSideEntryIsAdd(kvstore *kvs, int didx, dictEntry *te) {
-    return !ovFrozenHas(kvs, didx, ovEntryKey(kvs, te));
+int ovSideEntryIsAdd(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry *te) {
+    return !ovFrozenHas(ov, ovEntryKey(kvs, te));
 }
 
 /* Owner thread: apply one LIVE or SHARED entry to the real dict. A clone
@@ -371,32 +349,53 @@ static void ovApplyTomb(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d,
  * the entries were created, so the dict is used directly here. */
 static long ovDrainOne(kvstore *kvs, kvstoreDictOverlay *ov, int force) {
     int didx = ov->didx;
-    dict *d = kvs->dicts[didx];
-    assert(d != NULL);
+    dict *d = ov->d;
+    /* The key helpers want a store for the dict type's key functions: the
+     * store the dict is in now (alive, the dict holds a reference on it)
+     * when the overlay was cut loose from its own (kvs NULL). */
+    kvstore *tkvs = kvs ? kvs : (kvstore *)d->type->userdata;
     if (ov->slots && (ov->entries || ov->tombs)) {
-        void (*saved_destructor)(dict *, void *) = kvs->dtype.keyDestructor;
-        kvs->dtype.keyDestructor = NULL;
+        /* Originals are released through free_orig (header-only when the
+         * clone owns the value): the dict's destructor is kept out of the
+         * way through a private copy of its type, not by editing the store's
+         * type, which its other dicts share (and the lazyfree thread may be
+         * releasing them right now). */
+        dictType *saved_type = d->type;
+        dictType quiet = *saved_type;
+        quiet.keyDestructor = NULL;
+        d->type = &quiet;
         for (int si = 0; si < OV_SLOTS; si++) {
             ovSlot *slot = &ov->slots[si];
             for (int chain = 0; chain < OV_CHAINS; chain++) {
                 dictEntryLink link = &slot->heads[chain];
                 while (*link) {
-                    const void *key = ovEntryKey(kvs, *link);
+                    const void *key = ovEntryKey(tkvs, *link);
                     if (!force && !(ov->h.drainable && ov->h.drainable(ov->privdata, didx, d, key))) {
                         link = dictEntryNextLink(*link);
                         continue;
                     }
                     /* The applied entry leaves the chain: 'link' now holds its successor. */
-                    if (OV_IS_TOMB(chain)) ovApplyTomb(kvs, didx, ov, d, link, chain);
-                    else ovApplySide(kvs, didx, ov, d, link, chain);
+                    if (OV_IS_TOMB(chain)) ovApplyTomb(tkvs, didx, ov, d, link, chain);
+                    else ovApplySide(tkvs, didx, ov, d, link, chain);
                 }
             }
         }
-        kvs->dtype.keyDestructor = saved_destructor;
+        d->type = saved_type;
     }
     long left = ov->entries + ov->tombs;
-    if (left == 0) ovMarkClean(kvs, ov);
+    if (left == 0 && kvs) ovMarkClean(kvs, ov);
     return left;
+}
+
+/* The dict leaves its store (kvstore.c detachDict: freed while a save holds
+ * it, emptied, moved): nothing reaches its side table through the store any
+ * more. Off the drain list; the overlay only waits for the save's release. */
+void ovDetachFromStore(dict *d) {
+    kvstoreDictSnap *sn = ((kvstoreDictMetaBase *)dictMetadata(d))->snap;
+    if (!sn || !sn->ov) return;
+    kvstoreDictOverlay *ov = sn->ov;
+    if (ov->kvs) ovMarkClean(ov->kvs, ov);
+    ov->kvs = NULL;
 }
 
 long kvstoreOverlayDrain(kvstore *kvs) {
@@ -426,35 +425,41 @@ long kvstoreOverlayPending(kvstore *kvs) {
 
 /* Owner thread, after the scan of this dict is complete: apply whatever is
  * left in the side table and drop it. */
-static void ovRelease(kvstore *kvs, kvstoreDictOverlay *ov) {
-    long left = ovDrainOne(kvs, ov, 1);
+static void ovRelease(kvstoreDictOverlay *ov) {
+    long left = ovDrainOne(ov->kvs, ov, 1);   /* applied to the dict itself; its holder decides what becomes of it */
     assert(left == 0);
-    ovMarkClean(kvs, ov);
+    if (ov->kvs) ovMarkClean(ov->kvs, ov);
     zfree(ov->slots);
     zfree(ov);
 }
 
-/* Owner thread: the save is finished with dict didx (its scan completed, the
- * save was aborted, or the state is a leftover): side table applied, bitmaps
- * freed, layout unpaused, state gone. Whatever the generation. */
-void kvstoreDictSnapRelease(kvstore *kvs, int didx) {
-    dict *d = kvs->dicts[didx];
-    kvstoreDictSnap *sn = d ? ((kvstoreDictMetaBase *)dictMetadata(d))->snap : NULL;
-    if (!sn) return;
-    if (sn->ov) ovRelease(kvs, sn->ov);
+/* Owner thread: the save is finished with the dict (its scan completed or
+ * the save was aborted): side table applied, bitmaps freed (their bytes
+ * returned), layout unpaused, state gone. The dict may have left its store
+ * meanwhile (detached, or moved to another store): the state follows the
+ * dict, so this works wherever it is. */
+size_t kvstoreDictSnapRelease(dict *d) {
+    kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
+    kvstoreDictSnap *sn = meta->snap;
+    if (!sn) return 0;
+    if (sn->ov) ovRelease(sn->ov);
+    size_t bytes = 0;
     for (int t = 0; t < 2; t++) {
         zfree(sn->bits[t]);
-        kvs->snap_bitmap_bytes -= sn->bytes[t];
+        bytes += sn->bytes[t];
     }
     if (sn->paused) {
         dictResumeRehashing(d);
         dictResumeAutoResize(d);
     }
-    kvs->snap_attached--;
-    ((kvstoreDictMetaBase *)dictMetadata(d))->snap = NULL;
+    __atomic_store_n(&meta->snap, NULL, __ATOMIC_RELEASE);
     zfree(sn);
-    /* The real dict may have become empty (all tombstones). */
-    kvstoreFreeDictIfNeeded(kvs, didx);
+    /* The real dict may have become empty (all tombstones): its store, if it
+     * still holds it, may drop it now (the save's reference keeps the dict
+     * alive until the caller lets go). */
+    kvstore *kvs = d->type->userdata;
+    if (!meta->detached && kvs->dicts[meta->didx] == d) kvstoreFreeDictIfNeeded(kvs, meta->didx);
+    return bytes;
 }
 
 /* ==========================================================================
@@ -472,7 +477,7 @@ static void ovScanCb(void *p, const dictEntry *de, dictEntry **plink) {
 /* kvstoreScan over a frozen dict with a non-empty side table: the frozen
  * dict through the overlay (tombstones skipped, clones substituted), then
  * the ADDs with the final batch. Returns the dict cursor. */
-unsigned long long ovScan(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
+unsigned long long ovScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
                           dictScanFunction *scan_cb, void *privdata)
 {
     struct ovScanCtx sctx = { kvs, ov, scan_cb, privdata };
@@ -482,7 +487,7 @@ unsigned long long ovScan(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *
         dictEntry *te;
         ovCursorInit(ov, &c);
         while ((te = ovCursorNext(ov, &c)) != NULL)
-            if (ovSideEntryIsAdd(kvs, didx, te)) scan_cb(privdata, te, NULL);
+            if (ovSideEntryIsAdd(kvs, ov, te)) scan_cb(privdata, te, NULL);
     }
     return next;
 }
@@ -492,7 +497,7 @@ unsigned long long ovScan(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *
  * tombstoned entries skipped, clones handed out in place of their
  * originals), then 'cur' the side table (phase 1, ADDs only). NULL once
  * both are exhausted. */
-dictEntry *ovIteratorNext(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur) {
+dictEntry *ovIteratorNext(kvstore *kvs, kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur) {
     for (;;) {
         dictEntry *de;
         if (*phase == 1) de = ovCursorNext(ov, cur);
@@ -510,14 +515,14 @@ dictEntry *ovIteratorNext(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictIt
             if (m) return m;
             continue;   /* tombstoned */
         }
-        if (ovSideEntryIsAdd(kvs, didx, de)) return de;   /* a clone was handed out in phase 0 */
+        if (ovSideEntryIsAdd(kvs, ov, de)) return de;   /* a clone was handed out in phase 0 */
     }
 }
 
 /* Random entry of a frozen dict: sample the real dict (mapping through the
  * overlay, retrying on tombstones) and fall back to the temp dict. */
 dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair) {
-    dict *d = kvs->dicts[didx];
+    dict *d = ov->d;
     if (ovDictSize(kvs, didx) == 0) return NULL;
     if (d && dictSize(d)) {
         for (int tries = 0; tries < 16; tries++) {
@@ -547,9 +552,9 @@ dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fai
 
 /* Some keys of a frozen dict: sample the real dict through the overlay, then
  * adds from a random slot onwards (clones were sampled through the originals). */
-unsigned int ovGetSomeKeys(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntry **des, unsigned int count) {
+unsigned int ovGetSomeKeys(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry **des, unsigned int count) {
     unsigned int n = 0;
-    dict *d = kvs->dicts[didx];
+    dict *d = ov->d;
     if (d && dictSize(d)) {
         unsigned int got = dictGetSomeKeys(d, des, count);
         for (unsigned int i = 0; i < got; i++) {
@@ -564,7 +569,7 @@ unsigned int ovGetSomeKeys(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictE
             ovSlot *slot = &ov->slots[(start + k) & OV_SLOT_MASK];
             for (int chain = OV_LIVE; chain <= OV_SHARED && n < count; chain++)
                 for (dictEntry *te = slot->heads[chain]; te && n < count; te = dictGetNext(te))
-                    if (ovSideEntryIsAdd(kvs, didx, te)) des[n++] = te;
+                    if (ovSideEntryIsAdd(kvs, ov, te)) des[n++] = te;
         }
     }
     return n;
@@ -576,13 +581,12 @@ unsigned int ovGetSomeKeys(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictE
 
 /* Overlay (frozen slot) halves of the hot kvstore entry points: out of line so
  * the common path stays as small as it was and keeps being inlined. */
-dictEntry *ovDictFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key) {
+dictEntry *ovDictFind(kvstore *kvs, kvstoreDictOverlay *ov, void *key) {
     /* Read: the logical keyspace, no cloning. */
     int chain;
     dictEntryLink link = ovSideFind(kvs, ov, key, &chain);
     if (link) return OV_IS_TOMB(chain) ? NULL : *link;
-    dict *d = kvs->dicts[didx];
-    return d ? dictFind(d, key) : NULL;
+    return dictFind(ov->d, key);
 }
 
 /* Write-intent lookup (see kvstoreDictFindLink in kvstore.c for the contract). */
@@ -603,7 +607,7 @@ dictEntryLink ovDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, voi
      * a bucket it is reading right now is cloned on first touch (a miss
      * returns the side table's chain head so the insertion lands there). */
     if (ovPrepare(kvs, didx, ov, key) == KVSTORE_OV_INPLACE)
-        return dictFindLink(kvs->dicts[didx], key, bucket);
+        return dictFindLink(ov->d, key, bucket);
     link = ovEnsureClone(kvs, didx, ov, key);
     if (link) return link;
     if (bucket) *bucket = &ovSlotOf(kvs, ov, key)->heads[OV_LIVE];
@@ -612,7 +616,7 @@ dictEntryLink ovDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, voi
 
 void ovDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, dictEntryLink *link, int newItem) {
     ovEnter(ov);
-    dict *d = kvs->dicts[didx];
+    dict *d = ov->d;
     const void *key = (kv && kvs->dtype.keyFromStoredKey) ? kvs->dtype.keyFromStoredKey(kv) : kv;
     if (!newItem) {
         /* Replacing the key of an existing entry: with a link it is a store
@@ -654,7 +658,7 @@ dictEntry *ovDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *ke
     if (link && !OV_IS_TOMB(chain)) { if (existing) *existing = *link; return NULL; }
     if (!link) {   /* not tombstoned: the frozen dict may hold it */
         if (ovPrepare(kvs, didx, ov, lkey) == KVSTORE_OV_INPLACE) {
-            dictEntry *ret = dictAddRaw(kvs->dicts[didx], key, existing);
+            dictEntry *ret = dictAddRaw(ov->d, key, existing);
             if (ret) ovKeyCountAdd(kvs, didx, 1);
             return ret;
         }
@@ -673,7 +677,7 @@ dictEntryLink ovDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOverla
     dictEntryLink link = ovSideFind(kvs, ov, key, &chain);
     if (!link) {
         if (ovPrepare(kvs, didx, ov, key) == KVSTORE_OV_INPLACE) {
-            dictEntryLink l = dictTwoPhaseUnlinkFind(kvs->dicts[didx], key, table_index);
+            dictEntryLink l = dictTwoPhaseUnlinkFind(ov->d, key, table_index);
             if (l) ov->unlink_frozen = 1;
             return l;
         }
@@ -698,14 +702,14 @@ void ovDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *ov,
     if (ov->unlink_frozen) {
         /* Second phase of an in-place unlink (see ovDictTwoPhaseUnlinkFind). */
         ov->unlink_frozen = 0;
-        dictTwoPhaseUnlinkFree(kvs->dicts[didx], link, table_index);
+        dictTwoPhaseUnlinkFree(ov->d, link, table_index);
         ovKeyCountAdd(kvs, didx, -1);
         return;
     }
     if (link && *link) {
         /* Bookkeeping first: the key pointer dies with the side entry. */
         dictEntry *de = ovSideRemove(kvs, didx, ov, link, table_index, key);
-        ovEntryFreeWithKey(kvs, didx, de);
+        ovEntryFreeWithKey(ov, de);
     }
 }
 
@@ -715,7 +719,7 @@ int ovDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key
     dictEntryLink link = ovSideFind(kvs, ov, key, &chain);
     if (!link) {
         if (ovPrepare(kvs, didx, ov, key) == KVSTORE_OV_INPLACE) {
-            int ret = dictDelete(kvs->dicts[didx], key);
+            int ret = dictDelete(ov->d, key);
             if (ret == DICT_OK) ovKeyCountAdd(kvs, didx, -1);
             return ret;
         }
@@ -728,6 +732,6 @@ int ovDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key
         return DICT_ERR;
     }
     dictEntry *de = ovSideRemove(kvs, didx, ov, link, chain, key);
-    ovEntryFreeWithKey(kvs, didx, de);
+    ovEntryFreeWithKey(ov, de);
     return DICT_OK;
 }

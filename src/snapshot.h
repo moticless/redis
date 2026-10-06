@@ -257,6 +257,7 @@ int snapScanBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, 
 void snapScanDictRehashStarted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
 void snapScanDictRehashCompleted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
 long snapScanDictsGrown(snapScanCtx *ctx);
+long snapScanRetainedDicts(snapScanCtx *ctx);
 size_t snapScanBitmapBytes(snapScanCtx *ctx);
 
 /* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
@@ -372,7 +373,7 @@ size_t snapSaveQueuedBytes(void);        /* main-thread queue plus the scan thre
 size_t snapSaveLastQueuedPeak(void);     /* peak of the two queues over the last save */
 size_t snapSaveBitmapBytes(void);
 long snapSaveGrownDicts(void);
-long snapOverlayLeftovers(void);         /* overlays of an earlier save met and released (should stay 0) */           /* attached dicts that expanded during the save (stage B bitmap remaps) */   /* bucket bitmaps of the running save, 0 when none runs */
+long snapSaveRetainedDicts(void);        /* fork-instant dicts their store let go of before a save completed them (freed by the save); cumulative */
 long long snapSaveMainBuckets(void);
 long long snapSaveMainKeys(void);
 
