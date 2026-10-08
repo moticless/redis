@@ -2074,3 +2074,91 @@ is also why the stock CoW and the hybrid's retained figures are as large as they
 | small | idle | hybrid, rdbcompression no | 10.3 | 2 | 1 | 1 | 0.2 / 0.1 | 10.1 | 2.7 | 1.1 / 1.1 | - | - | - | - | 0 |
 | small | idle | stock upstream | 35.3 / 38.1 | 31 | 1 | 1 | 0.5 / 0.6 | -0.0 / 0.0 | 35.2 / 38.0 | 28.5 | - | - | - | - | 0 |
 | small | idle | stock upstream, rdbcompression no | 14.8 / 13.9 | 31 | 0 | 0 | 0.2 / 0.2 | 0.0 | 14.7 / 13.8 | 27.5 | - | - | - | - | 0 |
+
+## Run 37 (2026-10-06): fragmentation when small values turn big, two arenas vs one, laptop
+
+Question (user): does the DONTFORK arena add fragmentation when values cross the 4 KB cap and move to the default arena,
+and does active defrag recover it? Script `frag.py <binary> <port> <label> [server args]` (`CONVERT=set|append`): 300k
+keys of 3 KB strings (all under the cap), then 30% of the keys converted in pairs (one replaced by a 6 KB value, so it
+crosses the cap and moves to the default arena; the other deleted) so the data bytes stay equal, then `activedefrag yes`
+(ignore-bytes 1, threshold-lower 1, cycle 25-75) until the frag counters stop moving. INFO memory 12 s after each step,
+plus after MEMORY PURGE. Laptop, hybrid = 44a1bb220 (`--bgsave-hybrid yes`, DEBUG_ASSERTIONS build: memory layout
+identical), stock = upstream 0d6266f2d.
+
+**Conversion by SET (exact-size allocation in both binaries), the fair comparison:**
+
+| step | hybrid used_memory | hybrid RSS | hybrid frag bytes (of which nofork) | stock used_memory | stock RSS | stock frag bytes |
+|---|---|---|---|---|---|---|
+| A populated | 894 MB | 914 MB | 0.7 (0.5) | 894 MB | 915 MB | 0.7 |
+| B 45k pairs converted | 892 MB | 1177 MB (+29%) | 258.8 (258.5) | 892 MB | 1173 MB (+28%) | 258.7 |
+| C after defrag (25 s both) | 893 MB | 922 MB (+0.9%) | 6.8 (6.5) | 893 MB | 921 MB (+0.7%) | 6.4 |
+
+- **Identical with one arena or two.** 258 MB of holes in both: 90k freed 3 KB slots (45k deleted, 45k moved out of the
+  small class), none of whose slabs empties under a random 30% removal. In the hybrid every hole is in the nofork arena
+  (`allocator_frag_bytes_nofork` 258.5 of 258.8).
+- **Defrag recovers both equally**: same 25 s, same hit/miss counts (163k hits, 1.55 M misses, 116k key hits), frag
+  down to 6-7 MB in both, RSS back to within 1% of the start. The nofork arena shrank from 886 to 635 MB active.
+- The 30% RSS growth is the conversion itself (the converted bytes become holes until defrag or new small allocations
+  reuse them), not a two-arena effect.
+
+**Conversion by APPEND (the first variant)** gave the same frag bytes (258.8 vs 258.7) and the same defrag outcome, but
+stock's used_memory rose by 262 MB and stayed there (RSS +38% before defrag, +11% after): APPEND on a 3 KB sds grows it
+greedily to a 12 KB allocation, while the hybrid's cap crossing re-allocates the value at its exact size in the default
+arena. That is an sds effect of the test's choice of command, so the SET variant is the one to compare.
+
+- `allocator_resident_nofork` reads 0 in INFO: not populated; worth fixing before the field is relied on.
+
+## Run 38 (2026-10-07): diskless full sync with the primary on one core, upstream vs hybrid vs Valkey fork, mixed and mixed1m at 4 GB, fresh c7i.4xlarge
+
+Raw: `run38.csv`, driver `run38.sh` (fresh instance at 54.183.184.38). Run 18's recipe with the primary confined to one
+vCPU: server, scan thread and fork child on vCPU 0 (`SERVER_CPUS="0"`, sibling vCPU 8 idle), the fresh replica and the
+load on 4-7,12-15, `SYNC=1`, `--repl-diskless-load on-empty-db` on the replica, rdb channel on (stock's default; the
+hybrid child on the same connection). `up` = 0d6266f2d, `hybrid` = 44a1bb220 (TASK-1.37 reference counts; the save path
+is run 34's two-channel shape), `valkey-fork` = 06d35aca6 with its default single-channel fork-based diskless sync.
+mixed and mixed1m at scale 16, 2 reps interleaved; `small` skipped (nothing forkable there, run 33 covers scan thread
+versus main thread on one core). Values rep a / rep b where they differ by more than 5%. Every sync ended with the
+replica's dbsize equal to the primary's; no hard-mark aborts.
+
+| dataset | rate | config | sync s | fork ms | extra MB | parent +MB | CoW MB | primary COB MB | replica buf MB | main cpu s | scan cpu s | child cpu s | ops | wp99 ms | wmax ms | full syncs |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock upstream | 12.8 | 38 / 32 | 2 / 0 | 0 | 2 / 0 | 0 | 1 | 0.2 / 0.1 | 0.0 / 0.0 | 11.2 | - | - | - | 1 |
+| mixed | idle | hybrid | 13.5 | 16 | 12 / 14 | 10 / 12 | 2 | 0 | 1 | 0.1 / 0.1 | 9.5 | 3.6 | - | - | - | 1 |
+| mixed | idle | Valkey fork | 35.7 | 37 / 29 | 1 | 0 | 1 | 0 | 0 | 1.9 | 0.0 / 0.0 | 33.7 | - | - | - | 1 |
+| mixed | 20k | stock upstream | 16.1 | 35 | 1436 | 2 | 1434 | 0 | 36 | 3.0 / 3.2 | 0.0 | 13.0 / 12.2 | 19998 | 1.70 / 1.83 | 35.9 | 1 |
+| mixed | 20k | hybrid | 15.1 | 17 | 626 | 9 / 12 | 618 | 0 | 34 | 2.4 | 9.3 | 3.5 | 20000 | 2.48 | 17.5 | 1 |
+| mixed | 20k | Valkey fork | 41.1 | 30 | 2566 | 94 | 2474 | 80 | 0 | 8.2 | 0.0 / 0.0 | 33.1 | 19998 | 0.93 | 31.1 | 1 |
+| mixed | 50k | stock upstream | 18.1 / 19.7 | 35 / 38 | 2620 | 2 / 3 | 2618 | 0 | 101 / 110 | 6.8 / 7.3 | 0.0 / 0.0 | 11.7 / 12.6 | 49992 | 2.38 | 36.5 / 39.3 | 1 |
+| mixed | 50k | hybrid | 19.4 | 19 | 1316 | 16 / 14 | 1306 | 0 | 108 | 6.4 | 9.8 | 3.6 | 49994 | 3.13 | 21.3 | 1 |
+| mixed | 50k | Valkey fork | 139.2 | 95 | 3870 | 264 | 2829 | 245 | 0 | 42.7 | 0.0 | 39.0 / 36.9 | 49925 | 1.67 | 98.5 | 3 |
+| mixed1m | idle | stock upstream | 18.9 / 17.9 | 43 / 30 | 2 / 0 | 0 | 2 / 0 | 0 | 1 | 0.2 / 0.2 | 0.0 / -0.0 | 15.2 | - | - | - | 1 |
+| mixed1m | idle | hybrid | 18.2 | 15 | 50 | 35 / 45 | 15 / 6 | 0 | 1 | 0.2 | 9.1 | 6.4 | - | - | - | 1 |
+| mixed1m | idle | Valkey fork | 40.8 / 44.1 | 43 / 29 | 1 | 0 | 1 | 0 | 0 | 2.3 | 0.0 | 38.6 / 41.9 | - | - | - | 1 |
+| mixed1m | 20k | stock upstream | 19.4 | 31 | 1560 | 2 / 1 | 1560 | 0 | 37 | 3.6 | 0.0 | 15.0 | 19998 | 1.75 | 31.9 | 1 |
+| mixed1m | 20k | hybrid | 20.7 | 16 | 810 | 60 / 46 | 799 | 0 | 40 | 3.5 | 9.4 / 10.0 | 6.7 | 19999 | 2.29 / 2.60 | 16.9 | 1 |
+| mixed1m | 20k | Valkey fork | 54.1 | 31 | 2875 | 105 | 2772 | 91 | 0 | 10.5 | 0.0 | 43.8 | 19998 | 1.10 | 32.5 | 1 |
+
+### Reading the run
+
+- **Sync time stays the replica's load time, even with the primary on one core.** mixed 12.8 s stock against 13.5 s
+  hybrid idle, 16.1 against 15.1 at 20k, 18.1-19.7 against 19.4 at 50k; mixed1m 17.9-18.9 against 18.2 idle and 19.4
+  against 20.7 at 20k. The core is saturated in both cases (stock: child 11-15 CPU-s plus the write load; hybrid: scan
+  thread 9.1-10.0 plus child 3.5-6.7 plus the write load) and the syncs come out within a second or two of each other,
+  with run 18's 8-core times 2-3 s shorter. Run 33's one-core BGSAVE result holds for syncs: the hybrid's parallelism is
+  gone, its memory and stall gains are not.
+- **Primary memory during the sync is half of stock's.** 0.63 GB against 1.44 GB (mixed 20k), 1.32 against 2.62 (mixed
+  50k), 0.81 against 1.56 (mixed1m 20k): copy-on-write on the fork-class values only, with a 9-60 MB queue on top. Fork
+  stall 15-19 ms against 31-43, worst write 17-21 ms against 32-39.
+- **The scan thread's one-core cost lands on write p99**: 2.5 against 1.7-1.8 ms (mixed 20k), 3.1 against 2.4 (50k),
+  2.3-2.6 against 1.75 (mixed1m 20k); PING p99 3.8-5.5 against 3.3-3.6 ms. Same shape and size as run 33 (+1-2 ms).
+  The offered rate is delivered in every cell.
+- **The replica-side buffer grows with the longer sync**: 34-40 MB at 20k, 101-110 MB at 50k, against 23-33 MB in run
+  18. Still a few percent of the dataset; TASK-1.29's case remains long syncs at high write rates.
+- **Valkey's single-channel fork sync fails the 50k cell on one core.** Its main thread relays the child's RDB to the
+  socket and holds the replication stream in the replica's output buffer; on one core the relay and the 50k writes share
+  the core with the child, the sync stretches, the buffer reaches 245 MB (the default 256 MB hard limit, sampled every
+  second), the replica is dropped and resyncs: 3 full syncs per cell, 138-140 s to a replica up, 42.7 CPU-s on the main
+  thread, 3.9 GB extra memory, a 95 ms fork stall and a 98 ms worst write. The classic "output buffer limit reached
+  during sync" failure the rdb channel moves to the replica. At 20k it holds: 41-54 s syncs, 80-91 MB in the output
+  buffer, 2.6-2.9 GB of copy-on-write.
+- Caveat as in runs 15 and 33: one P-core with its SMT sibling idle is a generous "one CPU"; a one-vCPU cgroup on a
+  busy host is tighter.
