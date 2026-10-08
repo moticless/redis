@@ -1,4 +1,5 @@
-# fork() less, not forkless: Redis BGSAVE without the copy-on-write bill
+# fork() less, not forkless: Innovative Redis BGSAVE without the CoW bill
+ 
 
 *Draft, 2026-09-26. Numbers are from the snapshot-hybrid-bgsave branch (POC), measured on an
 EC2 c7i.4xlarge against Redis unstable 0d6266f2d and Valkey unstable 06d35aca6. See
@@ -41,8 +42,8 @@ time:
 - **Serialization-unfriendly encodings.** Listpacks, intsets and short strings can be copied as
   a blob; hash tables, skiplists, quicklists and streams cannot be read while they change. A
   forkless design must lock the whole key for the whole serialization or redesign every encoding.
-- **Big values.** A key must be serialized atomically. For a 50-byte string that is nothing. For
-  a 100 MB hash the serializer holds the key for the whole duration and any client that wants to
+- **Big keys.** A key must be serialized atomically. For a 50-byte string that is nothing. For
+  a 100 MB hash the serializer holds the key for the whole duration and all the clients that wants to
   write it must be blocked, or the value copied first. In Valkey the all related writers enters a blocked
   state until the key is done; a Lua script that did not declare its keys cannot be blocked that
   way and stalls the whole server instead. On our 4 GB datasets with 1M-field hashes, a write that
@@ -67,7 +68,11 @@ reason we did not take that road.
 
 Forkless is the right answer for small values. The trouble starts with the values it cannot serialize atomically. A
 hash of a million fields is about 90 MB, and every client that writes to it while the saver holds
-it waits until the whole hash is written: 20 to 35 seconds in our runs. Whether that is acceptable
+it waits until the whole hash is written: 20 to 35 seconds in our runs. That shape is not exotic.
+A typical dataset is millions of small keys and a handful of big ones, and the big ones are the
+busiest: the sorted set that is the leaderboard, the hash or set that serves as a secondary index.
+A few keys like that carry a large share of the writes, so blocking writers on big keys blocks
+exactly the traffic the application cares about most. Whether that is acceptable
 depends on the data. And data changes: a keyspace that is all small values today grows one large
 hash behind next quarter's feature. A snapshot mechanism should absorb that seamlessly, without
 anyone having to notice which keys crossed a size line. Forkless cannot, and the decision is made
@@ -229,7 +234,13 @@ primary. It also composes with Redis 8's rdb-channel sync, where the child write
 dedicated connection while the parent streams the backlog from the snapshot offset on the main one.
 That moves the stream buffer from the primary to the replica, which is loading into an otherwise
 empty process, so the primary sees no copy-on-write on small values and no output-buffer growth,
-with no new protocol.
+with no new protocol. The same two-channel design carries Redis 8.2's atomic slot migration: the
+source forks and ships the slot snapshot on an rdb channel while streaming the slots' live writes
+on the main one. That snapshot is a replication save, so in cluster mode it is a hybrid save too,
+with the same cost profile. The one new interaction is the trim at the end of a migration, which
+moves the migrated slot dicts out of the keyspace while a hybrid save started earlier may still be
+reading them; the save holds a reference on every dict it froze, so the dicts stay with it until
+the scan passes and the dump keeps the fork instant.
 
 The buffer still exists, on one side or the other, and it grows with write rate times sync
 duration. Valkey's forkless full sync removes it with a good idea: the primary splices the
@@ -262,6 +273,14 @@ longer because it compresses the RDB and streams on one channel. Its forkless fu
 the open pull request on the same cells, does hold the primary to 1-13 MB of extra memory, and takes
 36-50 s per sync with 11-17 CPU-seconds on the main thread; on the million-field hashes it delivers
 92% of the offered writes with a worst write near one second.
+
+With the primary confined to one core, the shape of a one-vCPU container, the sync still takes the
+replica's load time: 15 to 21 s for stock and the hybrid alike on the mixed datasets at 20k and 50k
+writes/s, within a second or two of each other. The primary's extra memory halves as before (0.6 GB
+against 1.4 GB at 20k on mixed), the fork stall and worst write halve, and write p99 pays the scan
+thread's share of the core, about one millisecond. Valkey's single-channel fork sync does not
+survive the 50k cell on one core: the main thread relays the RDB and buffers the stream, the
+buffer reaches its 256 MB limit, the replica is dropped, and three full syncs take 139 s.
 
 ## 7. Benchmark
 
