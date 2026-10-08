@@ -312,16 +312,26 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   the separate 128 MB default halves that for a few seconds of save time).
 - Diskless full sync: the fork writes the replica socket instead of a file. AOF rewrite: same scan,
   AOF encoders.
-- **AOF rewrite with the RDB preamble (TASK-1.15 stage 1, 2026-10-01).** `aof-use-rdb-preamble yes` (the
-  default) makes the base file an RDB, so `rewriteAppendOnlyFileBackground` hands the rewrite to the hybrid
-  save (`snapSaveBackgroundAof`): the AOF is flushed and the new INCR file opened as today, then the freeze
+- **AOF rewrite (TASK-1.15; stage 1 2026-10-01, stage 2 2026-10-08).** `rewriteAppendOnlyFileBackground`
+  hands every BGREWRITEAOF to the hybrid save (`snapSaveBackgroundAof`); with `aof-use-rdb-preamble yes` (the
+  default) the base file is an RDB, without it the same producers write AOF command form (below): the AOF is flushed and the new INCR file opened as today, then the freeze
   and fork are the instant the INCR file's history starts; the child is `CHILD_TYPE_AOF`, writes
   `temp-rewriteaof-<pid>.aof` and renames it to `temp-rewriteaof-bg-<pid>.aof`, the name
   `backgroundRewriteDoneHandler` and `aofRemoveTempFile` expect, and the stock done handler does the manifest
   work after `snapSaveChildDone` released the save; `killAppendOnlyChild` calls `snapSaveAbort` as
-  `killRDBChild` does. The arena stays DONTFORK for this child. Without the preamble, or with a module that
-  has not opted in, the stock fork child does the rewrite as before (arena made forkable). The AOF command
-  form from the scan thread (preamble off) is stage 2, not done.
+  `killRDBChild` does. The arena stays DONTFORK for this child. Only a module that has not opted in sends the
+  rewrite to the stock fork child as before (arena made forkable).
+  **Command form (stage 2, preamble off):** `snapSave.aof_cmd_form` switches the one record writer shared by
+  the three producers (`snapSaveWriteRecord`: main-thread emit-ahead, scan thread, child KVOBJ) from
+  `rdbSaveKeyValuePair` to `rewriteObject`, the per-key sequence of `rewriteAppendOnlyFileRio` (per-type
+  rewriter, PEXPIREAT, BLESS, module key metadata). Framing, channels and queues are unchanged. The child
+  writes the prologue `rewriteAppendOnlyFileHeader` (timestamp annotation, functions) instead of the RDB
+  header, no footer, and `snapChildSelect` emits `SELECT <db>` on a db change only, whatever order the
+  producers' records arrive in (no RESIZEDB, no SLOT_INFO). Keys in slots an atomic slot migration is
+  trimming: stock's command-form rewriter skips them, the hybrid keeps the fork instant, as its RDB does
+  (TASK-1.37). The rewriters the scan thread runs (string, listpack list/set/zset/hash, listpackEx field
+  TTLs, intset) read only the value and write only the rio; streams, modules, hash tables, quicklists,
+  skiplists and template hashes are fork class and stay in the child.
 
 - **Spool file (TASK-1.30, 2026-10-01; removed 2026-10-02).** An unlinked overflow file for the scan thread's output
   was the first fix for the two halves of a save running in series (run 22); it gave the overlap (runs 23-29) but the
@@ -419,7 +429,7 @@ surfaced, not worked around.
   replication keeps the stock path holds only for main-thread paths (SAVE, DEBUG RELOAD). A
   startup-only config `bgsave-hybrid` (default `no`) gates the arena and all placement. With it on,
   disk-based replication works through the hybrid BGSAVE file; diskless sync (TASK-1.14) and AOF
-  rewrite with the RDB preamble (TASK-1.15) run through the hybrid too; the AOF command form is M2 (§9).
+  rewrite in both base-file formats (TASK-1.15) run through the hybrid too.
 - **listpackEx.** The `listpackEx` struct is arena-born and never moved (its `ExpireMeta` is linked
   into the db's ebuckets). A LISTPACK_EX key is served by the background thread whenever its struct
   is in the arena, regardless of size. The struct's `meta` is written by ebuckets and read by
@@ -788,7 +798,7 @@ big values and owns the RDB. The split of responsibilities differs:
 | Pipes and framing | three pipes (work, data, status); one `SELECTDB` per record; the child relays parent frames only when its work pipe blocks or at the end; 64 KB pipes, 10 ms poll | two pipes parent to child fed from bounded in-memory queues on the scan thread (non-blocking writes): a small channel (1 MB pipe) for the 64 KB buffers of small values, a big channel for big-value headers, END and ABORT; the child drains the small backlog first and takes a big value when it is low (TASK-1.31), so the two halves overlap with the queue at about one big value's worth; `SELECTDB` only on change |
 | Mode | `bgsave-mode fork|hybrid|forkless` switchable at runtime by flipping the arena's madvise over a registry of up to 8192 extents; a fully fork-free mode too | `bgsave-hybrid` immutable at startup |
 | Rehash/resize during a save | unconstrained (the child has a frozen copy) | frozen dicts locked (rehash paused, no resize) |
-| Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB, diskless sync and AOF rewrite with the RDB preamble through the hybrid child; the AOF command form (preamble off) is stock |
+| Replication, AOF | disk and diskless replication through the relay; no AOF in non-fork modes | disk RDB, diskless sync and AOF rewrite (RDB preamble or command form) through the hybrid child |
 | Tests | 15 tcl suites, C unit tests, a python fault-injection harness for the arena | one tcl suite with a randomized race harness, C unit tests, TSan/ASan runs |
 
 Where theirs is ahead: runtime mode switching, replication coverage,

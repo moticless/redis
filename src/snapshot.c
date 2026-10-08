@@ -1518,7 +1518,8 @@ struct snapSave {
     int tag_all;                      /* debug (bgsave-hybrid-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
-    int child_type;            /* CHILD_TYPE_RDB (BGSAVE, full sync) or CHILD_TYPE_AOF (rewrite with the RDB preamble, TASK-1.15) */
+    int child_type;            /* CHILD_TYPE_RDB (BGSAVE, full sync) or CHILD_TYPE_AOF (BGREWRITEAOF, TASK-1.15) */
+    int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs (stage 2) */
     char *filename;
     rdbSaveInfo rsi;
     int has_rsi;
@@ -1667,6 +1668,17 @@ static void snapSaveMainStageFlushLocked(snapSave *sv) {
     sv->mstage = sdsempty();
 }
 
+/* One record of 'kv' in the save's format, from any producer (main thread,
+ * scan thread, child): the RDB key-value pair, or for an AOF rewrite without
+ * the preamble the command form rewriteAppendOnlyFileRio writes per key
+ * (per-type rewriter, PEXPIREAT, BLESS, module key metadata). 0 on success. */
+static int snapSaveWriteRecord(snapSave *sv, rio *r, kvobj *kv, int dbid) {
+    robj key;
+    initStaticStringObject(key, kvobjGetKey(kv));
+    if (sv->aof_cmd_form) return rewriteObject(r, &key, kv, dbid, kvobjGetExpire(kv)) == C_OK ? 0 : -1;
+    return rdbSaveKeyValuePair(r, &key, kv, kvobjGetExpire(kv), dbid) == -1 ? -1 : 0;
+}
+
 /* Main thread: serialize the whole chain of bucket (table, idx) of dict d of
  * slot (s, didx) as it is now, i.e. still at its fork-instant state (no key of
  * a not yet emitted bucket ahead of the thread was ever written in place). */
@@ -1689,9 +1701,7 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
             rio r;
             sdsclear(sv->mscratch);
             rioInitWithBuffer(&r, sv->mscratch);
-            robj key;
-            initStaticStringObject(key, kvobjGetKey(kv));
-            if (rdbSaveKeyValuePair(&r, &key, kv, kvobjGetExpire(kv), s) == -1)
+            if (snapSaveWriteRecord(sv, &r, kv, s) != 0)
                 serverPanic("Hybrid BGSAVE: failed to serialize a key on the main thread");
             sv->mscratch = r.io.buffer.ptr;
             pthread_mutex_lock(&sv->mq_lock);
@@ -2258,8 +2268,6 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
     } else {
         rio r;
         rioInitWithBuffer(&r, sv->stage);
-        robj key;
-        initStaticStringObject(key, kvobjGetKey(kv));
         int delay;
         atomicGet(sv->key_save_delay, delay);
         while (delay > 0 && !snapScanAborted(sv->scan)) {
@@ -2267,7 +2275,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
             debugDelay(slice);
             delay -= slice;
         }
-        if (rdbSaveKeyValuePair(&r, &key, kv, kvobjGetExpire(kv), s) == -1) {
+        if (snapSaveWriteRecord(sv, &r, kv, s) != 0) {
             serverLog(LL_WARNING, "Hybrid BGSAVE: failed to serialize a key on the scan thread");
             snapScanRequestAbort(sv->scan);
         }
@@ -2307,6 +2315,18 @@ static void snapSaveThreadDone(void *priv, int aborted) {
 /* ---- child ---- */
 
 static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_db, int *cur_slot) {
+    if (sv->aof_cmd_form) {
+        /* AOF command form: SELECT on a db change only, whatever the order the
+         * producers' records arrive in; no sizes, no slot info. */
+        if (dbid != *cur_db) {
+            static const char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
+            if (rioWrite(rdb, selectcmd, sizeof(selectcmd) - 1) == 0) return -1;
+            if (rioWriteBulkLongLong(rdb, dbid) == 0) return -1;
+            *cur_db = dbid;
+        }
+        *cur_slot = slot;
+        return 0;
+    }
     if (dbid != *cur_db) {
         if (rdbSaveType(rdb, RDB_OPCODE_SELECTDB) == -1) return -1;
         if (rdbSaveLen(rdb, dbid) == -1) return -1;
@@ -2371,7 +2391,10 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         if (rioWrite(rdb, "$EOF:", 5) == 0 || rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0 ||
             rioWrite(rdb, "\r\n", 2) == 0) { err_op = "eof mark"; goto werr; }
     }
-    if (rdbSaveRioHeader(sv->req, rdb, &error, sv->rdbflags, sv->has_rsi ? &sv->rsi : NULL) == C_ERR) {
+    if (sv->aof_cmd_form) {
+        /* Timestamp annotation and the functions, as rewriteAppendOnlyFileRio starts. */
+        if (rewriteAppendOnlyFileHeader(rdb) == C_ERR) { err_op = "rewriteAppendOnlyFileHeader"; goto werr; }
+    } else if (rdbSaveRioHeader(sv->req, rdb, &error, sv->rdbflags, sv->has_rsi ? &sv->rsi : NULL) == C_ERR) {
         err_op = "rdbSaveRioHeader";
         goto werr;
     }
@@ -2458,10 +2481,8 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
              * pointer is the parent's address, relocate it into our copy. */
             if (kv->encoding == OBJ_ENCODING_EMBSTR)
                 kv->ptr = bigbuf + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
-            robj key;
-            initStaticStringObject(key, kvobjGetKey(kv));
             size_t before = rdb->processed_bytes;
-            if (rdbSaveKeyValuePair(rdb, &key, kv, kvobjGetExpire(kv), h.dbid) == -1) { err_op = "rdbSaveKeyValuePair"; goto werr; }
+            if (snapSaveWriteRecord(sv, rdb, kv, h.dbid) != 0) { err_op = "record"; goto werr; }
             key_counter++;
             kv_written++;
             /* As the stock child does after each key: drop the value's pages from
@@ -2493,7 +2514,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         if ((msgs++ & 1023) == 0) {
             long long now = mstime();
             if (now - info_updated_time >= 1000) {
-                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, "RDB");
+                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, sv->child_type == CHILD_TYPE_AOF ? "AOF rewrite" : "RDB");
                 info_updated_time = now;
             }
         }
@@ -2503,7 +2524,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     zfree(payload);
     payload = NULL;
 
-    if (rdbSaveRioFooter(sv->req, rdb, &error) == C_ERR) { err_op = "rdbSaveRioFooter"; goto werr; }
+    if (!sv->aof_cmd_form && rdbSaveRioFooter(sv->req, rdb, &error) == C_ERR) { err_op = "rdbSaveRioFooter"; goto werr; }
     if (out) {
         if (rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) { err_op = "eof mark"; goto werr; }
         if (rioFlush(rdb) == 0) { err_op = "flush"; goto werr; }
@@ -2837,7 +2858,8 @@ static int snapSaveLaunch(snapSave *sv) {
         sv->ae_registered = 1;
     }
     if (sv->child_type == CHILD_TYPE_AOF) {
-        serverLog(LL_NOTICE, "Hybrid AOF rewrite started by pid %ld (scan thread streams the RDB base file to the child)", (long)childpid);
+        serverLog(LL_NOTICE, "Hybrid AOF rewrite started by pid %ld (scan thread streams the %s base file to the child)",
+                  (long)childpid, sv->aof_cmd_form ? "AOF" : "RDB");
     } else {
         serverLog(LL_NOTICE, "Hybrid background saving started by pid %ld (scan thread streams to the child)", (long)childpid);
         server.rdb_save_time_start = time(NULL);
@@ -2845,8 +2867,10 @@ static int snapSaveLaunch(snapSave *sv) {
     return C_OK;
 }
 
-/* BGREWRITEAOF with the RDB preamble (TASK-1.15): the base file is an RDB, so
- * the hybrid scan and child write it. The caller (rewriteAppendOnlyFileBackground)
+/* BGREWRITEAOF (TASK-1.15): the hybrid scan and child write the base file, an
+ * RDB with aof-use-rdb-preamble (stage 1) or AOF commands without it (stage 2;
+ * same producers and channels, each record in command form and the child
+ * emits SELECT on db change). The caller (rewriteAppendOnlyFileBackground)
  * has flushed the AOF and opened the new INCR file, so the fork instant below
  * is where the INCR file's history starts; backgroundRewriteDoneHandler does
  * the manifest work on the temp file the child leaves behind, as for the stock
@@ -2856,6 +2880,7 @@ int snapSaveBackgroundAof(void) {
     snapSave *sv = snapSaveCreate(SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
     if (!sv) return C_ERR;
     sv->child_type = CHILD_TYPE_AOF;
+    sv->aof_cmd_form = !server.aof_use_rdb_preamble;
     return snapSaveLaunch(sv);   /* the child names its own temp file */
 }
 

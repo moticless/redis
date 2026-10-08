@@ -2438,7 +2438,11 @@ int rewriteHashObject(rio *r, robj *key, robj *o, int dbid) {
     hashTypeIterator hi;
     long long count = 0, items = hashTypeLength(o, 0);
 
-    int isHFE = hashTypeGetMinExpire(o, 0) != EB_EXPIRE_TIME_INVALID;
+    /* Decide from the hash's own content (accurate), not from the ExpireMeta
+     * registered in the db's ebuckets: a hybrid BGREWRITEAOF serializes the
+     * fork-instant original of a hash written during the rewrite, whose meta
+     * the live clone took over (the scan thread, TASK-1.15 stage 2). */
+    int isHFE = hashTypeGetMinExpire(o, 1) != EB_EXPIRE_TIME_INVALID;
     hashTypeInitIterator(&hi, o);
 
     int isTmpl = (o->encoding == OBJ_ENCODING_TMPL_LP ||
@@ -3029,6 +3033,20 @@ int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime) {
     return C_OK;
 }
 
+/* What a command-form AOF base file starts with, before any key: the
+ * timestamp annotation (if enabled) and the functions. Shared with the hybrid
+ * AOF rewrite child (snapshot.c), whose keys arrive from the scan thread. */
+int rewriteAppendOnlyFileHeader(rio *aof) {
+    /* Record timestamp at the beginning of rewriting AOF. */
+    if (server.aof_timestamp_enabled) {
+        sds ts = genAofTimestampAnnotationIfNeeded(1);
+        if (rioWrite(aof,ts,sdslen(ts)) == 0) { sdsfree(ts); return C_ERR; }
+        sdsfree(ts);
+    }
+    if (rewriteFunctions(aof) == 0) return C_ERR;
+    return C_OK;
+}
+
 int rewriteAppendOnlyFileRio(rio *aof) {
     dictEntry *de;
     int j;
@@ -3037,14 +3055,7 @@ int rewriteAppendOnlyFileRio(rio *aof) {
     unsigned long long skipped = 0;
     kvstoreIterator kvs_it;
 
-    /* Record timestamp at the beginning of rewriting AOF. */
-    if (server.aof_timestamp_enabled) {
-        sds ts = genAofTimestampAnnotationIfNeeded(1);
-        if (rioWrite(aof,ts,sdslen(ts)) == 0) { sdsfree(ts); goto werr; }
-        sdsfree(ts);
-    }
-
-    if (rewriteFunctions(aof) == 0) goto werr;
+    if (rewriteAppendOnlyFileHeader(aof) == C_ERR) goto werr;
 
     for (j = 0; j < server.dbnum; j++) {
         char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
@@ -3257,12 +3268,12 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
-    /* Hybrid BGSAVE (TASK-1.15): with the RDB preamble the base file is an
-     * RDB, written by the hybrid scan thread and child like a BGSAVE; the INCR
-     * file opened above takes the writes from the fork instant on. Without
-     * the preamble, or with a module that has not opted in, the stock child
-     * below does the rewrite (the arena is made forkable for it). */
-    if (server.aof_use_rdb_preamble && snapHybridEnabled()) {
+    /* Hybrid BGSAVE (TASK-1.15): the base file is written by the hybrid scan
+     * thread and child like a BGSAVE, as an RDB with the preamble or in AOF
+     * command form without it; the INCR file opened above takes the writes
+     * from the fork instant on. With a module that has not opted in, the
+     * stock child below does the rewrite (the arena is made forkable for it). */
+    if (snapHybridEnabled()) {
         if (moduleAllModulesHandleHybridBgsave()) {
             if (snapSaveBackgroundAof() != C_OK) {
                 server.aof_lastbgrewrite_status = C_ERR;

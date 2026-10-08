@@ -3720,6 +3720,7 @@ int aofRewriteLimited(void);
 void updateCurIncrAofEndOffset(void);
 void updateReplOffsetAndResetEndOffset(void);
 int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime);
+int rewriteAppendOnlyFileHeader(rio *aof);
 
 /* Child info */
 void openChildInfoPipe(void);
