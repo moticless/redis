@@ -67,16 +67,15 @@ static int getAndClearDictIndexFromCursor(kvstore *kvs, unsigned long long *curs
     return didx;
 }
 
-/* Updates binary index tree (Fenwick tree), updates key count for a given dict */
-static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
+/* Updates the key count, the non-empty dict count and the binary index tree
+ * (Fenwick tree) for a change of 'delta' keys in dict didx whose logical size
+ * is now 'after' (kvstore.h). The dict became non-empty when it had none
+ * before and empty when it has none now. */
+void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after) {
     kvs->key_count += delta;
-
-    dict *d = kvstoreGetDict(kvs, didx);
-    size_t dsize = dictSize(d);
-    /* Increment if dsize is 1 and delta is positive (first element inserted, dict becomes non-empty).
-     * Decrement if dsize is 0 (dict becomes empty). */
-    int non_empty_dicts_delta = (dsize == 1 && delta > 0) ? 1 : (dsize == 0) ? -1 : 0;
-    kvs->non_empty_dicts += non_empty_dicts_delta;
+    unsigned long before = (unsigned long)((long)after - delta);
+    if (before == 0 && after > 0) kvs->non_empty_dicts++;
+    else if (before > 0 && after == 0) kvs->non_empty_dicts--;
 
     /* BIT does not need to be calculated when there's only one dict. */
     if (kvs->num_dicts == 1)
@@ -84,6 +83,11 @@ static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
 
     /* Update the BIT */
     fwTreeUpdate(kvs->dict_sizes, didx, delta);
+}
+
+/* The real dict changed by 'delta' keys. */
+static void cumulativeKeyCountAdd(kvstore *kvs, int didx, long delta) {
+    kvstoreKeyCountAdd(kvs, didx, delta, dictSize(kvstoreGetDict(kvs, didx)));
 }
 
 /* Create the dict if it does not exist and return it. */
@@ -277,7 +281,7 @@ dict *kvstoreDictRetain(kvstore *kvs, int didx) {
 void kvstoreDictUnref(dict *d) {
     if (__atomic_sub_fetch(&dictMeta(d)->refcount, 1, __ATOMIC_ACQ_REL) != 0) return;
     kvstore *kvs = d->type->userdata;
-    assert(dictMeta(d)->snap == NULL);   /* a save releases its state before its reference */
+    assert(dictMeta(d)->ov == NULL && dictMeta(d)->ext == NULL);   /* a save releases its state before its reference */
     dictRelease(d);
     kvstoreUnref(kvs);
 }
@@ -654,9 +658,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     long long lsize = kvstoreDictSize(kvs, didx);
 
     /* Adjust source kvstore */
-    kvs->key_count -= lsize;
-    if (lsize) kvs->non_empty_dicts--;
-    if (kvs->num_dicts > 1) fwTreeUpdate(kvs->dict_sizes, didx, -lsize);
+    kvstoreKeyCountAdd(kvs, didx, -lsize, 0);
     detachDict(kvs, didx, 1);
     if (!(kvs->flags & (KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS)))
         createDictIfNeeded(kvs, didx);
@@ -667,9 +669,7 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     kvstoreUnref(kvs);
     dst->dicts[didx] = d;
     dst->allocated_dicts += 1;
-    dst->key_count += lsize;
-    if (lsize) dst->non_empty_dicts++;
-    if (dst->num_dicts > 1) fwTreeUpdate(dst->dict_sizes, didx, lsize);
+    kvstoreKeyCountAdd(dst, didx, lsize, lsize);
     if (!meta->detached) {
         kvstoreDictBucketChanged(d, dictBuckets(d));
         if (dictIsRehashing(d))

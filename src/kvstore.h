@@ -64,9 +64,9 @@ typedef struct _kvstoreDictIterator {
  * substituted, plus adds); while it is empty they are plain dict reads.
  * kvstoreOverlayDrain() applies the side table to the real dict on the owner
  * thread for every key whose bucket the snapshot no longer reads ('drainable'),
- * kvstoreDictSnapRelease() applies whatever is left and unfreezes the dict
- * once its scan is complete. The overlay hangs off the dict's save state
- * (kvstoreDictSnap.ov). The side table is a fixed array of per-bucket chains
+ * kvstoreOverlayRelease() applies whatever is left and unfreezes the dict
+ * once its scan is complete. The overlay hangs off the dict's metadata
+ * (kvstoreDictMetaBase.ov). The side table is a fixed array of per-bucket chains
  * of ordinary dict entries: a key's chain is its hash modulo the
  * array size, four chains per slot tell a clone whose value is still the
  * original's, a deep clone or add, and the tombstones of each kind apart. */
@@ -132,8 +132,7 @@ int kvstoreDictDetached(dict *d);                   /* out of its store's slot t
 int kvstoreRefcount(kvstore *kvs);                  /* the owner plus one per allocated dict */
 /* The save state of a dict: allocate it, or release it (side table applied,
  * bitmaps freed and their bytes returned, layout resumed). */
-struct kvstoreDictSnap *kvstoreDictSnapAttach(dict *d);
-size_t kvstoreDictSnapRelease(dict *d);
+void kvstoreOverlayRelease(dict *d);   /* the dict's scan is complete or the save aborted: side table applied, overlay gone */
 void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);   /* needs the save state attached */
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
@@ -169,31 +168,20 @@ typedef struct kvstoreType {
     void (*onDictEmpty)(kvstore *kvs, int didx);
 } kvstoreType;
 
-/* What a running snapshot save (hybrid BGSAVE) keeps per dict, allocated the
- * first time the save touches the dict (a write before the scan thread
- * reached it, or the thread's window on it) and freed when the dict's scan
- * completes. Meaningful only while the dict's stamp (kvstoreDictMetaBase
- * snap_word) carries the running save's generation. */
-typedef struct kvstoreDictSnap {
-    uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
-                                   bucket's fork-instant chain ahead of the scan thread (snapshot.c);
-                                   main thread stores (release), scan thread loads (acquire) */
-    size_t bytes[2];
-    struct kvstoreDictOverlay *ov;  /* side table while writes meet the thread's window, else NULL */
-    int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
-} kvstoreDictSnap;
-
 /* Basic metadata allocated per dict.
  * If additional metadata needed, embed this structure as the first member
  * in a new, larger structure. */
 typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
     int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
-    uint64_t snap_word;         /* (save generation << 8) | per-save state (snapshot.h SNAP_SLOT_*);
-                                   written by both threads with __atomic builtins. A stamp of another
-                                   generation means this save has not touched the dict. */
-    kvstoreDictSnap *snap;      /* NULL until the save touches the dict; main thread stores (release),
-                                   scan thread loads (acquire) */
+    /* The extension slot: owned by whatever extends the store's dicts (today the
+     * hybrid BGSAVE's save state, snapshot.c). The store never reads these two
+     * fields; the extension stamps the word and allocates and frees the state,
+     * with __atomic builtins where two threads meet. 0 / NULL when none. */
+    uint64_t ext_word;
+    void *ext;
+    struct kvstoreDictOverlay *ov;  /* the dict's side table while it is frozen (kvsoverlay.c), else NULL;
+                                   main thread stores (release), scan thread loads (acquire) */
     int refcount;               /* holders: the owning store, a running save; atomic */
     int detached;               /* out of the store's slot table, kept by a holder: the dict callbacks
                                    skip the store's bookkeeping for it */
@@ -361,16 +349,15 @@ typedef struct ovCursor { int slot; int chain; dictEntry *next; } ovCursor;
 static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
     if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
     dict *d = kvs->dicts[didx];
-    kvstoreDictSnap *sn = d ? ((kvstoreDictMetaBase *)dictMetadata(d))->snap : NULL;
-    return sn ? sn->ov : NULL;
+    return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
 }
 
 static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
     if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
-    kvstoreDictSnap *sn = ((kvstoreDictMetaBase *)dictMetadata(d))->snap;
-    if (sn && sn->ov) return sn->ov;
+    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    if (ov) return ov;
     return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
 
@@ -394,6 +381,11 @@ static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
 }
 static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
 static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
+
+/* kvstore.c: the one place the store's key count, non-empty count and
+ * cumulative-size tree change. 'after' is the dict's logical size after the
+ * change (the real size, or the overlay's logical size for a frozen dict). */
+void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);
 
 /* kvsoverlay.c, for the enumeration and the public wrappers in kvstore.c. */
 unsigned long ovDictSize(kvstore *kvs, int didx);

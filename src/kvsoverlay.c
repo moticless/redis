@@ -38,14 +38,6 @@ void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *priv
     kvs->snap_priv = privdata;
 }
 
-kvstoreDictSnap *kvstoreDictSnapAttach(dict *d) {
-    kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
-    assert(meta->snap == NULL);
-    kvstoreDictSnap *sn = zcalloc(sizeof(*sn));
-    __atomic_store_n(&meta->snap, sn, __ATOMIC_RELEASE);
-    return sn;
-}
-
 /* ==========================================================================
  * Side table
  * ========================================================================== */
@@ -82,12 +74,7 @@ static inline int ovFrozenHas(kvstoreDictOverlay *ov, const void *key) {
 /* Logical key-count bookkeeping for a frozen dict: the real dict size does not
  * change, so derive the empty/non-empty transition from the logical size. */
 static void ovKeyCountAdd(kvstore *kvs, int didx, long delta) {
-    kvs->key_count += delta;
-    unsigned long lsize = ovDictSize(kvs, didx);
-    int non_empty_dicts_delta = (lsize == 1 && delta > 0) ? 1 : (lsize == 0 && delta < 0) ? -1 : 0;
-    kvs->non_empty_dicts += non_empty_dicts_delta;
-    if (kvs->num_dicts == 1) return;
-    fwTreeUpdate(kvs->dict_sizes, didx, delta);
+    kvstoreKeyCountAdd(kvs, didx, delta, ovDictSize(kvs, didx));
 }
 
 /* ---- Side-table chains ---- */
@@ -196,15 +183,15 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
 {
     dict *d = kvs->dicts[didx];
     assert(d != NULL);   /* only an existing dict can be frozen; it stays alive while frozen */
-    kvstoreDictSnap *sn = ((kvstoreDictMetaBase *)dictMetadata(d))->snap;
-    assert(sn != NULL && sn->ov == NULL);
+    kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
+    assert(meta->ov == NULL);
     kvstoreDictOverlay *ov = zcalloc(sizeof(*ov));
     ov->kvs = kvs;
     ov->didx = didx;
     ov->d = d;
     ov->h = *hooks;
     ov->privdata = privdata;
-    sn->ov = ov;
+    __atomic_store_n(&meta->ov, ov, __ATOMIC_RELEASE);
 }
 
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx) {
@@ -384,9 +371,8 @@ static long ovDrainOne(kvstore *kvs, kvstoreDictOverlay *ov, int force) {
  * it, emptied, moved): nothing reaches its side table through the store any
  * more. Off the drain list; the overlay only waits for the save's release. */
 void ovDetachFromStore(dict *d) {
-    kvstoreDictSnap *sn = ((kvstoreDictMetaBase *)dictMetadata(d))->snap;
-    if (!sn || !sn->ov) return;
-    kvstoreDictOverlay *ov = sn->ov;
+    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    if (!ov) return;
     if (ov->kvs) ovMarkClean(ov->kvs, ov);
     ov->kvs = NULL;
 }
@@ -427,32 +413,21 @@ static void ovRelease(kvstoreDictOverlay *ov) {
 }
 
 /* Owner thread: the save is finished with the dict (its scan completed or
- * the save was aborted): side table applied, bitmaps freed (their bytes
- * returned), layout unpaused, state gone. The dict may have left its store
- * meanwhile (detached, or moved to another store): the state follows the
- * dict, so this works wherever it is. */
-size_t kvstoreDictSnapRelease(dict *d) {
+ * the save was aborted) and has released its own state: the side table is
+ * applied and the overlay goes. The dict may have left its store meanwhile
+ * (detached, or moved to another store): the overlay follows the dict, so
+ * this works wherever it is. */
+void kvstoreOverlayRelease(dict *d) {
     kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
-    kvstoreDictSnap *sn = meta->snap;
-    if (!sn) return 0;
-    if (sn->ov) ovRelease(sn->ov);
-    size_t bytes = 0;
-    for (int t = 0; t < 2; t++) {
-        zfree(sn->bits[t]);
-        bytes += sn->bytes[t];
-    }
-    if (sn->paused) {
-        dictResumeRehashing(d);
-        dictResumeAutoResize(d);
-    }
-    __atomic_store_n(&meta->snap, NULL, __ATOMIC_RELEASE);
-    zfree(sn);
+    kvstoreDictOverlay *ov = meta->ov;
+    if (!ov) return;
+    ovRelease(ov);
+    __atomic_store_n(&meta->ov, NULL, __ATOMIC_RELEASE);
     /* The real dict may have become empty (all tombstones): its store, if it
      * still holds it, may drop it now (the save's reference keeps the dict
      * alive until the caller lets go). */
     kvstore *kvs = d->type->userdata;
     if (!meta->detached && kvs->dicts[meta->didx] == d) kvstoreFreeDictIfNeeded(kvs, meta->didx);
-    return bytes;
 }
 
 /* ==========================================================================

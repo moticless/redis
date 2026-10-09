@@ -134,7 +134,7 @@ void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
  * bucket first when it is ahead of the scan thread's window, divert into the
  * dict's side table while the window is on it, in place once it is behind). The state
  * lives in the dict's own metadata next to the save generation that stamped
- * it (kvstore.h kvstoreDictMetaBase.snap_word): a dict without this save's
+ * it (the kvstore extension slot, kvstoreDictMetaBase.ext_word): a dict without this save's
  * stamp is untouched since the fork instant. */
 #define SNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
 #define SNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */

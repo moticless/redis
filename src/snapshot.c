@@ -636,7 +636,7 @@ struct snapScanCtx {
     redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), SNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
     int ended;                      /* Main thread: every store completed; nothing is owed any more. */
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
-    uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.snap_word) */
+    uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
     struct snapGuardPriv { struct snapScanCtx *ctx; int s; } *guards;   /* Per store, the guard's privdata. */
 
     snapScanDispatchFn *dispatch;
@@ -781,7 +781,7 @@ static int snapWindowOnDict(dict *d) {
     return snap_win[seq & 1].d == d;
 }
 
-/* ---- Per-dict save state (kvstore.h: kvstoreDictMetaBase.snap_word, kvstoreDictSnap) ----
+/* ---- Per-dict save state (the kvstore extension slot: kvstoreDictMetaBase.ext_word / ext) ----
  *
  * At freeze the main thread takes one reference on every non-empty dict of
  * a scanned store, stamps it (generation, PENDING) and records it in the
@@ -799,10 +799,22 @@ static int snapWindowOnDict(dict *d) {
 #define SNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
 
 static inline kvstoreDictMetaBase *snapMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
-static inline uint64_t snapWordLoad(dict *d) { return __atomic_load_n(&snapMeta(d)->snap_word, __ATOMIC_ACQUIRE); }
-static inline void snapWordStore(dict *d, uint64_t w) { __atomic_store_n(&snapMeta(d)->snap_word, w, __ATOMIC_RELEASE); }
+static inline uint64_t snapWordLoad(dict *d) { return __atomic_load_n(&snapMeta(d)->ext_word, __ATOMIC_ACQUIRE); }
+static inline void snapWordStore(dict *d, uint64_t w) { __atomic_store_n(&snapMeta(d)->ext_word, w, __ATOMIC_RELEASE); }
 /* The attached state, either thread (the main thread publishes it with release). */
-static inline kvstoreDictSnap *snapStateOf(dict *d) { return __atomic_load_n(&snapMeta(d)->snap, __ATOMIC_ACQUIRE); }
+/* What the save keeps per dict in the kvstore extension slot, allocated the
+ * first time the save touches the dict (a write before the scan thread
+ * reached it, or the thread's window on it) and freed when the dict's scan
+ * completes. Meaningful only while the dict's word carries this save's
+ * generation. The side table lives next to it (kvstoreDictMetaBase.ov). */
+typedef struct snapDictState {
+    uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
+                                   bucket's fork-instant chain ahead of the scan thread; main thread
+                                   stores (release), scan thread loads (acquire) */
+    size_t bytes[2];
+    int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
+} snapDictState;
+static inline snapDictState *snapStateOf(dict *d) { return __atomic_load_n(&snapMeta(d)->ext, __ATOMIC_ACQUIRE); }
 
 /* The save's table of fork-instant dicts (filled at freeze, one reference
  * each). Entries are cleared at completion, on the main thread, after the
@@ -834,13 +846,13 @@ static void snapScanClaim(snapScanCtx *ctx, dict *d) {
     snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNING));
 }
 
-/* ---- Per-save bucket bitmaps (in kvstoreDictSnap) ---- */
+/* ---- Per-save bucket bitmaps (in snapDictState) ---- */
 
 static inline uint8_t *snapScanBitmap(snapScanCtx *ctx, int s, int didx, int table) {
     /* Attached on demand by the main thread while the thread may be
      * reading: acquire pairs with the release stores in snapScanBitmapAlloc. */
     dict *d = snapTableDict(ctx, s, didx);
-    kvstoreDictSnap *sn = d ? snapStateOf(d) : NULL;
+    snapDictState *sn = d ? snapStateOf(d) : NULL;
     if (!sn) return NULL;
     return __atomic_load_n(&sn->bits[table], __ATOMIC_ACQUIRE);
 }
@@ -863,7 +875,7 @@ size_t snapScanBitmapBytes(snapScanCtx *ctx) {
     return ctx ? ctx->bitmap_bytes : 0;
 }
 
-static void snapScanBitmapAlloc(snapScanCtx *ctx, kvstoreDictSnap *sn, dict *d) {
+static void snapScanBitmapAlloc(snapScanCtx *ctx, snapDictState *sn, dict *d) {
     for (int t = 0; t < 2; t++) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[t]);
         if (size == 0) continue;
@@ -945,9 +957,10 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
  * shrinkAllowed). Returns the overlay (NULL without one). */
 static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d, int pause) {
     serverAssert(snapDictStateOf(ctx, d) != SNAP_SLOT_DONE);
-    kvstoreDictSnap *sn = snapMeta(d)->snap;   /* main thread: the only writer of the pointer */
+    snapDictState *sn = snapMeta(d)->ext;   /* main thread: the only writer of the pointer */
     if (!sn) {
-        sn = kvstoreDictSnapAttach(d);
+        sn = zcalloc(sizeof(*sn));
+        __atomic_store_n(&snapMeta(d)->ext, sn, __ATOMIC_RELEASE);
         snapScanBitmapAlloc(ctx, sn, d);
         if (ctx->has_ov)
             kvstoreOverlayAttach(ctx->stores[s], didx, &ctx->ov_hooks, ctx->ov_priv ? ctx->ov_priv[s] : NULL);
@@ -957,7 +970,7 @@ static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int di
         dictPauseRehashing(d);
         dictPauseAutoResize(d);
     }
-    return sn->ov;
+    return snapMeta(d)->ov;
 }
 
 /* kvstore snapshot guard (kvstore.h): every access to a dict without an
@@ -999,7 +1012,7 @@ static void snapGuardRehashCompleted(void *privdata, int didx, dict *d) {
 static int snapGuardShrinkAllowed(void *privdata, int didx) {
     struct snapGuardPriv *g = privdata;
     dict *d = kvstoreGetDict(g->ctx->stores[g->s], didx);
-    return !d || snapMeta(d)->snap == NULL;   /* a bitmap cannot follow a merge of buckets */
+    return !d || snapMeta(d)->ext == NULL;   /* a bitmap cannot follow a merge of buckets */
 }
 static const kvstoreSnapHooks snap_guard_hooks = {
     snapOverlayGuard, snapGuardRehashStarted, snapGuardRehashCompleted, snapGuardShrinkAllowed,
@@ -1049,9 +1062,9 @@ static void snapScanStoreDone(snapScanCtx *ctx, int s) {
  * land in i + j*n, so its bitmap is k copies of the old one. */
 /* The dict's state if this save attached one (a leftover of another save is
  * not ours to touch; the main thread's access releases it). */
-static kvstoreDictSnap *snapScanOwnState(snapScanCtx *ctx, dict *d) {
+static snapDictState *snapScanOwnState(snapScanCtx *ctx, dict *d) {
     if (!ctx) return NULL;
-    kvstoreDictSnap *sn = snapMeta(d)->snap;
+    snapDictState *sn = snapMeta(d)->ext;
     if (!sn || SNAP_WORD_GEN(snapWordLoad(d)) != ctx->gen) return NULL;
     return sn;
 }
@@ -1059,7 +1072,7 @@ static kvstoreDictSnap *snapScanOwnState(snapScanCtx *ctx, dict *d) {
 void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
-    kvstoreDictSnap *sn = snapScanOwnState(ctx, d);
+    snapDictState *sn = snapScanOwnState(ctx, d);
     if (!sn) return;
     unsigned long size0 = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
     if (sn->bits[1]) {   /* should not happen: a rehash started over an unfinished one */
@@ -1099,7 +1112,7 @@ void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
 void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
-    kvstoreDictSnap *sn = snapScanOwnState(ctx, d);
+    snapDictState *sn = snapScanOwnState(ctx, d);
     if (!sn || !sn->bits[1]) return;   /* the dict was not attached when this rehash started: nothing to carry */
     if (sn->bits[0]) {
         ctx->bitmap_bytes -= sn->bytes[0];
@@ -1254,6 +1267,30 @@ static inline void snapScanRequestAbort(snapScanCtx *ctx) {
     atomicSetWithSync(ctx->abort, 1);
 }
 
+/* Owner thread: the save is finished with the dict (its scan completed or
+ * the save was aborted). The dict's side table is applied and released by the
+ * kvstore overlay; the bitmaps are freed (their bytes returned) and the
+ * layout unpaused here. The dict may have left its store meanwhile: the state
+ * follows the dict, so this works wherever it is. */
+static size_t snapScanStateRelease(dict *d) {
+    snapDictState *sn = snapMeta(d)->ext;
+    size_t bytes = 0;
+    if (sn) {
+        for (int t = 0; t < 2; t++) {
+            zfree(sn->bits[t]);
+            bytes += sn->bytes[t];
+        }
+        if (sn->paused) {
+            dictResumeRehashing(d);
+            dictResumeAutoResize(d);
+        }
+        __atomic_store_n(&snapMeta(d)->ext, NULL, __ATOMIC_RELEASE);
+        zfree(sn);
+    }
+    kvstoreOverlayRelease(d);
+    return bytes;
+}
+
 /* Main thread: finish one slot (release the side table and bitmaps, resume
  * the layout, slot-done hook, publish DONE). */
 static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
@@ -1264,7 +1301,7 @@ static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted)
      * freed here. */
     dict *d = snapTableDict(ctx, s, didx);
     serverAssert(d != NULL);
-    ctx->bitmap_bytes -= kvstoreDictSnapRelease(d);
+    ctx->bitmap_bytes -= snapScanStateRelease(d);
     snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_DONE));
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
     if (kvstoreDictRefcount(d) == 1) { ctx->retained_dicts++; snap_stat_retained_dicts++; }   /* the save outlived the store's hold on it */
@@ -3447,7 +3484,7 @@ static void snapScanTests(int accurate) {
         test_cond("scan: an attached dict refuses to shrink", r2 == DICT_ERR && !dictIsRehashing(big) && big->ht_size_exp[0] == exp_before);
         /* The marks above named buckets that hold keys: clear them so the walk
          * below dispatches every key (the thread skips marked buckets). */
-        kvstoreDictSnap *bsn = ((kvstoreDictMetaBase *)dictMetadata(big))->snap;
+        snapDictState *bsn = ((kvstoreDictMetaBase *)dictMetadata(big))->ext;
         memset(bsn->bits[0], 0, bsn->bytes[0]);
         snapFunnelClose();   /* the accesses above opened a section: "command end" */
     }
