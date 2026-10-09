@@ -353,7 +353,12 @@ typedef uint64_t RedisModuleTimerID;
  * while a module that registers a data type, aux callbacks or such an event
  * handler is loaded without this flag, hybrid saves fall back to the stock
  * fork child (INFO snap_hybrid_blocked_by names it). In the hybrid child those
- * APIs refuse (NULL / 0 / error) and log instead of faulting. */
+ * APIs refuse (NULL / 0 / error) and log instead of faulting. The declaration
+ * also covers: module-owned state keeps no pointer into Redis-owned key memory
+ * (a RedisModule_StringDMA result, a RedisModuleKey) that a save callback
+ * dereferences, and keys are mutated only through a handle opened with
+ * REDISMODULE_WRITE, from a module thread only under the GIL. Full contract:
+ * docs/hybrid-bgsave.md, section 7. */
 #define REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE    (1<<4)
 
 /* Next option flag, must be updated when adding new module flags above!

@@ -1,5 +1,5 @@
 /*
- * snapshot.c - Hybrid BGSAVE (design: poc-hybrid-bgsave-spec.md; API: snapshot.h).
+ * snapshot.c - Hybrid BGSAVE (design: docs/hybrid-bgsave.md; API: snapshot.h).
  *
  * A hybrid save splits the keyspace by value class. SNAP_NOFORK values (every
  * kvobj header, the keyspace hash tables and single-allocation values up to

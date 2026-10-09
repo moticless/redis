@@ -4,8 +4,7 @@
  * maps, value placement, the scan engine (bucket windows and write sections),
  * the keyspace overlay callbacks and the save entry points (BGSAVE, diskless
  * sync, AOF rewrite). The overview of one save is at the top of snapshot.c;
- * the design is in poc-hybrid-bgsave-spec.md. All functions are prefixed
- * "snap".
+ * the design is in docs/hybrid-bgsave.md. All functions are prefixed "snap".
  *
  * Copyright (c) 2026-Present, Redis Ltd.
  * All rights reserved.
