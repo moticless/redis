@@ -469,7 +469,7 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
 
     /* Try LZF compression - under 20 bytes it's unable to compress even
      * aaaaaaaaaaaaaaaaaa so skip it */
-    int compression = snapOnScanThread() ? snapScanRdbCompression() : server.rdb_compression;
+    int compression = snapRdbCfgGet().compression;
     if (compression && len > 20) {
         n = rdbSaveLzfStringObject(rdb,s,len);
         if (n == -1) return -1;
@@ -1350,7 +1350,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                  * fork-instant original may be rewritten by the main thread
                  * (ebuckets bookkeeping), so compute the min TTL from the
                  * listpack itself there. */
-                uint64_t minExpire = hashTypeGetMinExpire(o, snapOnScanThread());
+                uint64_t minExpire = hashTypeGetMinExpire(o, snapRdbCfgGet().on_scan);
                 /* if invalid time then save 0 */
                 if (minExpire == EB_EXPIRE_TIME_INVALID)
                     minExpire = 0;
@@ -1692,11 +1692,11 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
-    /* The hybrid scan thread uses the policy frozen at save start (CONFIG SET
-     * may change the live one) and a clock it computes itself (LRU_CLOCK reads
-     * server.hz, which dynamic-hz adjusts on the main thread). */
-    int on_scan = snapOnScanThread();
-    int policy = on_scan ? snapScanMaxmemoryPolicy() : server.maxmemory_policy;
+    /* Hybrid BGSAVE: the scan thread serializes with the configuration frozen
+     * at save start and its own LRU clock (snapRdbCfg). */
+    snapRdbCfg cfg = snapRdbCfgGet();
+    int on_scan = cfg.on_scan;
+    int policy = cfg.maxmemory_policy;
     int savelru = policy & MAXMEMORY_FLAG_LRU;
     int savelfu = policy & MAXMEMORY_FLAG_LFU;
 
@@ -1741,11 +1741,9 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     if (rdbSaveStringObject(rdb,key) == -1) return -1;
     if (rdbSaveObject(rdb,val,key,dbid) == -1) return -1;
 
-    /* Delay return if required (for testing). Not on the hybrid scan thread,
-     * which applies its own atomic copy of the delay (snapshot.c) because the
-     * main thread may change the config while it runs, and not while the
-     * main thread serializes a bucket for the snapshot. */
-    if (!snapOnScanThread() && !snapMainEmitting() && server.rdb_key_save_delay)
+    /* Delay return if required (for testing); not in the hybrid save's own
+     * serialization contexts (snapRdbCfg). */
+    if (cfg.apply_key_save_delay && server.rdb_key_save_delay)
         debugDelay(server.rdb_key_save_delay);
 
     return 1;

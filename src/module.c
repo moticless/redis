@@ -4159,7 +4159,20 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
     return (retval == C_OK) ? REDISMODULE_OK : REDISMODULE_ERR;
 }
 
-static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit);
+/* Module APIs that read the keyspace, refused inside the hybrid BGSAVE child
+ * (which has no keyspace mapped); each is logged once per child. */
+typedef enum {
+    MODULE_HYBRID_GUARD_KEYEXISTS = 0,
+    MODULE_HYBRID_GUARD_OPENKEY,
+    MODULE_HYBRID_GUARD_GETEXPIRE,
+    MODULE_HYBRID_GUARD_DBSIZE,
+    MODULE_HYBRID_GUARD_RANDOMKEY,
+    MODULE_HYBRID_GUARD_SCAN,
+    MODULE_HYBRID_GUARD_SCANKEY,
+    MODULE_HYBRID_GUARD_CALL,
+    MODULE_HYBRID_GUARD_COUNT
+} moduleHybridGuardApi;
+static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardApi api);
 
 /* Check if a key exists, without affecting its last access time.
  *
@@ -4168,7 +4181,7 @@ static int moduleHybridChildGuard(struct RedisModule *module, const char *api, u
  * calling RM_CloseKey on the opened key.
  */
 int RM_KeyExists(RedisModuleCtx *ctx, robj *keyname) {
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_KeyExists", 1u << 0)) return 0;
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_KEYEXISTS)) return 0;
     kvobj *kv = lookupKeyReadWithFlags(ctx->client->db, keyname, LOOKUP_NOTOUCH);
     return (kv != NULL);
 }
@@ -4219,7 +4232,7 @@ RedisModuleKey *RM_OpenKey(RedisModuleCtx *ctx, robj *keyname, int mode) {
     RedisModuleKey *kp;
     kvobj *kv;
     int flags = 0;
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_OpenKey", 1u << 1)) return NULL;
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_OPENKEY)) return NULL;
     flags |= (mode & REDISMODULE_OPEN_KEY_NOTOUCH? LOOKUP_NOTOUCH: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NONOTIFY? LOOKUP_NONOTIFY: 0);
     flags |= (mode & REDISMODULE_OPEN_KEY_NOSTATS? LOOKUP_NOSTATS: 0);
@@ -4354,7 +4367,7 @@ int RM_UnlinkKey(RedisModuleKey *key) {
  * If no TTL is associated with the key or if the key is empty,
  * REDISMODULE_NO_EXPIRE is returned. */
 mstime_t RM_GetExpire(RedisModuleKey *key) {
-    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, "RedisModule_GetExpire", 1u << 2)) return REDISMODULE_NO_EXPIRE;
+    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, MODULE_HYBRID_GUARD_GETEXPIRE)) return REDISMODULE_NO_EXPIRE;
     mstime_t expire = kvobjGetExpire(key->kv);
     if (expire == -1 || key->kv == NULL)
         return REDISMODULE_NO_EXPIRE;
@@ -4691,13 +4704,13 @@ void RM_ResetDataset(int restart_aof, int async) {
 
 /* Returns the number of keys in the current db. */
 unsigned long long RM_DbSize(RedisModuleCtx *ctx) {
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_DbSize", 1u << 3)) return 0;
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_DBSIZE)) return 0;
     return dbSize(ctx->client->db);
 }
 
 /* Returns a name of a random key, or NULL if current db is empty. */
 RedisModuleString *RM_RandomKey(RedisModuleCtx *ctx) {
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_RandomKey", 1u << 4)) return NULL;
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_RANDOMKEY)) return NULL;
     robj *key = dbRandomKey(ctx->client->db);
     autoMemoryAdd(ctx,REDISMODULE_AM_STRING,key);
     return key;
@@ -6941,7 +6954,7 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     if (ctx->module) ctx->module->in_call++;
 
     /* Hybrid BGSAVE child: no keyspace to run commands against. */
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_Call", 1u << 7)) {
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_CALL)) {
         errno = EPERM;
         if (error_as_call_replies) {
             sds msg = sdsnew("the hybrid BGSAVE child has no keyspace; save callbacks must not call commands");
@@ -7810,14 +7823,24 @@ const char *moduleHybridBgsaveBlockedBy(void) {
 /* Hybrid BGSAVE child: the keyspace is not mapped there, so a module save
  * callback that reaches for it is refused instead of faulting. Logged once
  * per API per child. Returns 1 when the caller must refuse. */
-static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit) {
-    static unsigned logged = 0;
+static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardApi api) {
+    static const char *const names[MODULE_HYBRID_GUARD_COUNT] = {
+        [MODULE_HYBRID_GUARD_KEYEXISTS] = "RedisModule_KeyExists",
+        [MODULE_HYBRID_GUARD_OPENKEY]   = "RedisModule_OpenKey",
+        [MODULE_HYBRID_GUARD_GETEXPIRE] = "RedisModule_GetExpire",
+        [MODULE_HYBRID_GUARD_DBSIZE]    = "RedisModule_DbSize",
+        [MODULE_HYBRID_GUARD_RANDOMKEY] = "RedisModule_RandomKey",
+        [MODULE_HYBRID_GUARD_SCAN]      = "RedisModule_Scan",
+        [MODULE_HYBRID_GUARD_SCANKEY]   = "RedisModule_ScanKey",
+        [MODULE_HYBRID_GUARD_CALL]      = "RedisModule_Call",
+    };
+    static unsigned logged = 0;   /* one bit per api, this child only */
     if (!snapInHybridChild()) return 0;
-    if (!(logged & bit)) {
-        logged |= bit;
+    if (!(logged & (1u << api))) {
+        logged |= 1u << api;
         serverLog(LL_WARNING, "Module %s called %s inside the hybrid BGSAVE child, which has no keyspace: refused. "
                               "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE).",
-                  module ? module->name : "?", api);
+                  module ? module->name : "?", names[api]);
     }
     return 1;
 }
@@ -12388,7 +12411,7 @@ void RM_ScanCursorDestroy(RedisModuleScanCursor *cursor) {
  * memory, so it may make sense to just operate on the current key when
  * possible during the iteration, given that this is safe. */
 int RM_Scan(RedisModuleCtx *ctx, RedisModuleScanCursor *cursor, RedisModuleScanCB fn, void *privdata) {
-    if (moduleHybridChildGuard(ctx->module, "RedisModule_Scan", 1u << 5)) {
+    if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_SCAN)) {
         cursor->done = 1;
         errno = EPERM;
         return 0;
@@ -12500,7 +12523,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
         errno = EINVAL;
         return 0;
     }
-    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, "RedisModule_ScanKey", 1u << 6)) {
+    if (moduleHybridChildGuard(key->ctx ? key->ctx->module : NULL, MODULE_HYBRID_GUARD_SCANKEY)) {
         cursor->done = 1;
         errno = EPERM;
         return 0;
@@ -13865,7 +13888,7 @@ int moduleOnLoad(int (*onload)(void *, void **, int), const char *path, void *ha
         ACLRecomputeCommandBitsFromCommandRulesAllUsers();
     }
     if (path) serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
-    if (server.bgsave_hybrid && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) &&
+    if (snapHybridEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) &&
         moduleHasSaveCallbacks(ctx.module))
         serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE: "
                               "hybrid BGSAVE falls back to the fork child while it is loaded", ctx.module->name);

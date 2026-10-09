@@ -726,8 +726,16 @@ static __thread int snap_on_scan_thread = 0;
 static __thread int snap_scan_maxmemory_policy = 0;
 static __thread int snap_scan_rdb_compression = 0;
 int snapOnScanThread(void) { return snap_on_scan_thread; }
-int snapScanMaxmemoryPolicy(void) { return snap_scan_maxmemory_policy; }
-int snapScanRdbCompression(void) { return snap_scan_rdb_compression; }
+static __thread int snap_main_emitting = 0;   /* main thread: inside an emit-ahead serialization */
+
+snapRdbCfg snapRdbCfgGet(void) {
+    snapRdbCfg c;
+    c.on_scan = snap_on_scan_thread;
+    c.compression = c.on_scan ? snap_scan_rdb_compression : server.rdb_compression;
+    c.maxmemory_policy = c.on_scan ? snap_scan_maxmemory_policy : server.maxmemory_policy;
+    c.apply_key_save_delay = !c.on_scan && !snap_main_emitting;
+    return c;
+}
 
 /* ---- Bucket window and write sections (see snapshot.h) ------------------ */
 
@@ -1584,8 +1592,6 @@ typedef struct snapQueuedMsg {
 } snapQueuedMsg;
 /* Thread-local: set by the main thread around a bucket emission; rdb.c reads
  * it on whichever thread serializes (the scan thread's copy is always 0). */
-static __thread int snap_main_emitting = 0;
-int snapMainEmitting(void) { return snap_main_emitting; }
 
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 static size_t snap_last_retained_peak = 0;

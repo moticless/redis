@@ -293,6 +293,22 @@ int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
 /* 1 when called from the scan thread. */
 int snapOnScanThread(void);
 
+/* The RDB serializer's configuration, read through one call (rdb.c). On the
+ * main thread these are the live server values; on the scan thread the copies
+ * frozen at save start, since the main thread may change the live ones while
+ * the thread runs, and the LRU clock is computed by the thread itself
+ * (LRU_CLOCK reads server.hz, which dynamic-hz adjusts on the main thread).
+ * The key-save delay applies only in stock contexts: the scan thread applies
+ * its own atomic copy and the main thread's emit-ahead must not slow the
+ * command that triggered it. */
+typedef struct snapRdbCfg {
+    int on_scan;                 /* serializing on the scan thread */
+    int compression;             /* rdbcompression */
+    int maxmemory_policy;
+    int apply_key_save_delay;    /* rdb-key-save-delay applies here */
+} snapRdbCfg;
+snapRdbCfg snapRdbCfgGet(void);
+
 /* Progress for INFO / tests: dicts allocated at freeze in the scanned
  * stores, dicts the thread passed, dicts finished (completed or skipped). */
 void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
@@ -359,7 +375,6 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv);
 int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
 /* 1 while the main thread serializes a bucket for the snapshot (rdb.c skips
  * the rdb-key-save-delay there: it is meant to slow the scan thread). */
-int snapMainEmitting(void);
 
 long long snapSaveInplaceWrites(void);
 long long snapSaveLastInplaceWrites(void);
@@ -369,11 +384,6 @@ long long snapSaveLastInplaceWrites(void);
 void snapSaveCron(void);
 /* CONFIG SET rdb-key-save-delay apply hook: reaches the running scan thread. */
 void snapSaveSetKeySaveDelay(int usec);
-/* Configuration the serializer consults, frozen at save start for the scan
- * thread (the main thread may CONFIG SET them meanwhile). Valid on the scan
- * thread only; rdb.c uses them when snapOnScanThread(). */
-int snapScanMaxmemoryPolicy(void);
-int snapScanRdbCompression(void);
 /* Bytes the overlay currently keeps alive for the running save (replaced or
  * tombstoned originals), the peak of the last completed save, and the
  * hard-mark abort counter. */
