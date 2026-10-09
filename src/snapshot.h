@@ -304,10 +304,30 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
  * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);   /* diskless full sync through the hybrid child */
-int snapInHybridChild(void);      /* 1 in the hybrid save child (no keyspace mapped) */
-void snapHybridFallbackLog(void);
 int snapSaveBackgroundAof(void);  /* BGREWRITEAOF through the hybrid scan: an RDB base with the preamble, AOF command form without */
+int snapInHybridChild(void);      /* 1 in the hybrid save child (no keyspace mapped) */
+
+/* The one decision whether a save takes the hybrid path, for every consumer
+ * of a fork-based snapshot (rdbSaveBackground, startBgsaveForReplication,
+ * rewriteAppendOnlyFileBackground): the switch is on, the request has
+ * keyspace content (functions-only and slot-snapshot transfers keep the
+ * stock child) and every relevant module has opted in (otherwise the fallback
+ * is logged once per blocking module). Returns C_OK when the hybrid save
+ * started, C_ERR when it was taken and failed to start, SNAP_NOT_TAKEN when
+ * the caller must run the stock fork child. */
+#define SNAP_SAVE_RDB     0   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
+#define SNAP_SAVE_SOCKETS 1   /* diskless full sync: the replicas' sockets (rsi) */
+#define SNAP_SAVE_AOF     2   /* BGREWRITEAOF: the AOF base file */
+#define SNAP_NOT_TAKEN    1
+int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 int snapSaveInProgress(void);
+/* INFO, DEBUG and the crash report: server.c and debug.c call these and
+ * carry no field or subcommand of the feature themselves. */
+sds snapInfoMemory(sds info);                     /* appends the arena fields to INFO memory */
+sds snapInfoPersistence(sds info);                /* appends the save fields to INFO persistence */
+size_t snapSaveKeysProcessed(size_t stock);       /* current_save_keys_processed during a hybrid save */
+int snapDebugCommand(struct client *c);           /* DEBUG SNAP-*: 1 when handled */
+const char *const *snapCrashReportInfoSections(void);   /* in the hybrid child: the INFO sections that are safe; else NULL */
 /* FLUSHDB and SWAPDB during a save. A store is a kvstore the
  * save is scanning, identified by the db id it had at the fork instant. */
 int snapSaveOwnsKvstore(kvstore *kvs);

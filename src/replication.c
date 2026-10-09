@@ -1145,16 +1145,9 @@ int startBgsaveForReplication(int mincapa, int req) {
     if (rsiptr) {
         if (socket_target) {
             /* Hybrid BGSAVE: the child streams the replicas from the scan
-             * thread's channel. Functions-only and slots snapshots keep the
-             * stock child (redisFork() maps the arena for it). */
-            if (snapHybridEnabled() && !(req & (SLAVE_REQ_RDB_EXCLUDE_DATA | SLAVE_REQ_SLOTS_SNAPSHOT)) &&
-                moduleAllModulesHandleHybridBgsave()) {
-                retval = snapSaveToSlavesSockets(req, rsiptr);
-            } else {
-                if (snapHybridEnabled() && !(req & (SLAVE_REQ_RDB_EXCLUDE_DATA | SLAVE_REQ_SLOTS_SNAPSHOT)))
-                    snapHybridFallbackLog();
-                retval = rdbSaveToSlavesSockets(req,rsiptr);
-            }
+             * thread's channels; the stock child when snapshot.c declines. */
+            retval = snapSaveTryStart(SNAP_SAVE_SOCKETS, req, NULL, rsiptr, 0);
+            if (retval == SNAP_NOT_TAKEN) retval = rdbSaveToSlavesSockets(req,rsiptr);
         } else {
             /* Keep the page cache since it'll get used soon */
             retval = rdbSaveBackground(req, server.rdb_filename, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE);

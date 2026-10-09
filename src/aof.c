@@ -3224,6 +3224,18 @@ werr:
  *    4d) persist AOF manifest file
  *    4e) Delete the history files use bio
  */
+/* The parent's bookkeeping once a rewrite child (stock or hybrid) started:
+ * the rewrite is no longer scheduled, its start time is now, and the
+ * command-duration estimate restarts from the commands going into the new
+ * INCR file (the old value is kept in case the rewrite fails and the old
+ * AOF remains). */
+static void aofRewriteStarted(void) {
+    server.aof_rewrite_scheduled = 0;
+    server.aof_rewrite_time_start = time(NULL);
+    aof_cmd_duration_at_rewrite = server.aof_cmd_duration;
+    server.aof_cmd_duration = 0;
+}
+
 int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
@@ -3268,27 +3280,21 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
-    /* Hybrid BGSAVE: the base file is written by the hybrid scan
-     * thread and child like a BGSAVE, as an RDB with the preamble or in AOF
-     * command form without it; the INCR file opened above takes the writes
-     * from the fork instant on. With a module that has not opted in, the
-     * stock child below does the rewrite (the arena is made forkable for it). */
-    if (snapHybridEnabled()) {
-        if (moduleAllModulesHandleHybridBgsave()) {
-            if (snapSaveBackgroundAof() != C_OK) {
-                server.aof_lastbgrewrite_status = C_ERR;
-                serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");
-                return C_ERR;
-            }
-            serverLog(LL_NOTICE,
-                "Background append only file rewriting started by pid %ld (hybrid)", (long) server.child_pid);
-            server.aof_rewrite_scheduled = 0;
-            server.aof_rewrite_time_start = time(NULL);
-            aof_cmd_duration_at_rewrite = server.aof_cmd_duration;
-            server.aof_cmd_duration = 0;
-            return C_OK;
-        }
-        snapHybridFallbackLog();
+    /* Hybrid BGSAVE: the base file is written by the hybrid scan thread and
+     * child like a BGSAVE, as an RDB with the preamble or in AOF command
+     * form without it; the INCR file opened above takes the writes from the
+     * fork instant on. The stock child below runs when snapshot.c declines. */
+    int hybrid = snapSaveTryStart(SNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, 0);
+    if (hybrid == C_ERR) {
+        server.aof_lastbgrewrite_status = C_ERR;
+        serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");
+        return C_ERR;
+    }
+    if (hybrid == C_OK) {
+        serverLog(LL_NOTICE,
+            "Background append only file rewriting started by pid %ld (hybrid)", (long) server.child_pid);
+        aofRewriteStarted();
+        return C_OK;
     }
 
     if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
@@ -3317,12 +3323,7 @@ int rewriteAppendOnlyFileBackground(void) {
         }
         serverLog(LL_NOTICE,
             "Background append only file rewriting started by pid %ld",(long) childpid);
-        server.aof_rewrite_scheduled = 0;
-        server.aof_rewrite_time_start = time(NULL);
-        /* Restart the estimate from commands going into the new INCR.
-         * Remember the old value in case rewrite fails and old AOF remains. */
-        aof_cmd_duration_at_rewrite = server.aof_cmd_duration;
-        server.aof_cmd_duration = 0;
+        aofRewriteStarted();
         return C_OK;
     }
     return C_OK; /* unreached */

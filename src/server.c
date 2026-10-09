@@ -6826,31 +6826,19 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "mem_aof_buffer:%zu\r\n", mh->aof_buffer,
             "mem_allocator:%s\r\n", ZMALLOC_LIB,
             "mem_overhead_db_hashtable_rehashing:%zu\r\n", mh->overhead_db_hashtable_rehashing,
-            "allocator_allocated_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_allocated,
-            "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
-            "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
-            "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
-            "snap_nofork_arena_available:%d\r\n", snapArenaAvailable(),
-            "snap_nofork_arena_forkable:%d\r\n", snapArenaForkable(),
-            "snap_nofork_va_reserved:%zu\r\n", snapArenaVaReserved(),
-            "snap_nofork_va_used:%zu\r\n", snapArenaVaUsed(),
             "active_defrag_running:%d\r\n", server.active_defrag_running,
             "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
             "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
+        info = snapInfoMemory(info);
         freeMemoryOverheadData(mh);
     }
 
     /* Persistence */
     if (all_sections || (dictFind(section_dict,"persistence") != NULL)) {
-        long snap_slots_total = 0, snap_slots_done = 0;
-        long long snap_keys_nofork = 0, snap_keys_fork = 0, snap_bytes_sent = 0;
-        snapSaveProgress(&snap_slots_total, &snap_slots_done, &snap_keys_nofork, &snap_keys_fork, &snap_bytes_sent);
         if (sections++) info = sdscat(info,"\r\n");
         /* Hybrid BGSAVE: the child only sees SNAP_FORK keys; progress is what
          * the scan thread and the main thread have dispatched so far. */
-        size_t save_keys_processed = server.stat_current_save_keys_processed;
-        if (snapSaveInProgress())
-            save_keys_processed = (size_t)(snap_keys_nofork + snap_keys_fork + snapSaveMainKeys());
+        size_t save_keys_processed = snapSaveKeysProcessed(server.stat_current_save_keys_processed);
         double fork_perc = 0;
         if (server.stat_module_progress) {
             fork_perc = server.stat_module_progress * 100;
@@ -6873,28 +6861,6 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "current_save_keys_total:%zu\r\n", server.stat_current_save_keys_total,
             "rdb_changes_since_last_save:%lld\r\n", server.dirty,
             "rdb_bgsave_in_progress:%d\r\n", server.child_type == CHILD_TYPE_RDB,
-            "snap_save_in_progress:%d\r\n", snapSaveInProgress(),
-            "snap_save_slots_total:%ld\r\n", snap_slots_total,
-            "snap_save_slots_done:%ld\r\n", snap_slots_done,
-            "snap_save_keys_nofork:%lld\r\n", snap_keys_nofork,
-            "snap_save_keys_fork:%lld\r\n", snap_keys_fork,
-            "snap_save_bytes_sent:%lld\r\n", snap_bytes_sent,
-            "snap_save_retained_bytes:%zu\r\n", snapSaveRetainedBytes(),
-            "snap_save_side_entries:%ld\r\n", snapSaveSideEntries(),
-            "snap_last_save_retained_peak:%zu\r\n", snapSaveLastRetainedPeak(),
-            "snap_save_queued_bytes:%zu\r\n", snapSaveQueuedBytes(),
-            "snap_last_save_queued_peak:%zu\r\n", snapSaveLastQueuedPeak(),
-            "snap_save_bitmap_bytes:%zu\r\n", snapSaveBitmapBytes(),
-            "snap_save_grown_dicts:%ld\r\n", snapSaveGrownDicts(),
-            "snap_retained_dicts:%ld\r\n", snapSaveRetainedDicts(),
-            "snap_save_main_buckets:%lld\r\n", snapSaveMainBuckets(),
-            "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
-            "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
-            "snap_saves:%lld\r\n", server.stat_snap_saves,
-            "snap_hybrid_blocked_by:%s\r\n", moduleHybridBgsaveBlockedBy(),
-            "snap_save_inplace_writes:%lld\r\n", snapSaveInplaceWrites(),
-            "snap_last_save_inplace_writes:%lld\r\n", snapSaveLastInplaceWrites(),
-            "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes,
             "rdb_last_save_time:%jd\r\n", (intmax_t)server.lastsave,
             "rdb_last_bgsave_status:%s\r\n", (server.lastbgsave_status == C_OK) ? "ok" : "err",
             "rdb_last_bgsave_time_sec:%jd\r\n", (intmax_t)server.rdb_save_time_last,
@@ -6921,6 +6887,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "backup_in_progress:%d\r\n", backupIsInProgress(),
             "module_fork_in_progress:%d\r\n", server.child_type == CHILD_TYPE_MODULE,
             "module_fork_last_cow_size:%zu\r\n", server.stat_module_cow_bytes));
+        info = snapInfoPersistence(info);
 
         if (server.aof_enabled) {
             info = sdscatprintf(info, FMTARGS(

@@ -42,6 +42,7 @@
 
 #include "server.h"
 #include "snapshot.h"
+#include "fmtargs.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
@@ -91,7 +92,7 @@ int snapInHybridChild(void) { return snap_in_hybrid_child; }
 /* Main thread: a hybrid save was requested but a loaded module has not
  * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE; the stock child runs
  * instead. Logged when the blocking module changes, not on every save. */
-void snapHybridFallbackLog(void) {
+static void snapHybridFallbackLog(void) {
     static sds last = NULL;
     const char *who = moduleHybridBgsaveBlockedBy();
     if (last && !strcmp(last, who)) return;
@@ -1619,6 +1620,128 @@ size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
 long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
 long long snapSaveMainKeys(void) { return snap_save ? snap_save->main_keys : 0; }
 
+/* ---- INFO, DEBUG and the crash report (server.c, debug.c call these) ---- */
+
+/* INFO memory: the arena's allocator statistics (sampled by cron next to the
+ * default arena's) and its fork visibility. */
+sds snapInfoMemory(sds info) {
+    return sdscatprintf(info, FMTARGS(
+        "allocator_allocated_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_allocated,
+        "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
+        "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
+        "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
+        "snap_nofork_arena_available:%d\r\n", snapArenaAvailable(),
+        "snap_nofork_arena_forkable:%d\r\n", snapArenaForkable(),
+        "snap_nofork_va_reserved:%zu\r\n", snapArenaVaReserved(),
+        "snap_nofork_va_used:%zu\r\n", snapArenaVaUsed()));
+}
+
+/* current_save_keys_processed during a hybrid save: the child sees only the
+ * SNAP_FORK keys, so the figure is what the scan thread and the main thread
+ * dispatched so far; 'stock' otherwise. */
+size_t snapSaveKeysProcessed(size_t stock) {
+    if (!snapSaveInProgress()) return stock;
+    long slots_total, slots_done;
+    long long keys_nofork, keys_fork, bytes_sent;
+    snapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
+    return (size_t)(keys_nofork + keys_fork + snapSaveMainKeys());
+}
+
+/* INFO persistence: the running save's progress and queues, the last save's
+ * peaks and the counters across saves. */
+sds snapInfoPersistence(sds info) {
+    long slots_total = 0, slots_done = 0;
+    long long keys_nofork = 0, keys_fork = 0, bytes_sent = 0;
+    snapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
+    return sdscatprintf(info, FMTARGS(
+        "snap_save_in_progress:%d\r\n", snapSaveInProgress(),
+        "snap_save_slots_total:%ld\r\n", slots_total,
+        "snap_save_slots_done:%ld\r\n", slots_done,
+        "snap_save_keys_nofork:%lld\r\n", keys_nofork,
+        "snap_save_keys_fork:%lld\r\n", keys_fork,
+        "snap_save_bytes_sent:%lld\r\n", bytes_sent,
+        "snap_save_retained_bytes:%zu\r\n", snapSaveRetainedBytes(),
+        "snap_save_side_entries:%ld\r\n", snapSaveSideEntries(),
+        "snap_last_save_retained_peak:%zu\r\n", snapSaveLastRetainedPeak(),
+        "snap_save_queued_bytes:%zu\r\n", snapSaveQueuedBytes(),
+        "snap_last_save_queued_peak:%zu\r\n", snapSaveLastQueuedPeak(),
+        "snap_save_bitmap_bytes:%zu\r\n", snapSaveBitmapBytes(),
+        "snap_save_grown_dicts:%ld\r\n", snapSaveGrownDicts(),
+        "snap_retained_dicts:%ld\r\n", snapSaveRetainedDicts(),
+        "snap_save_main_buckets:%lld\r\n", snapSaveMainBuckets(),
+        "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
+        "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
+        "snap_saves:%lld\r\n", server.stat_snap_saves,
+        "snap_hybrid_blocked_by:%s\r\n", moduleHybridBgsaveBlockedBy(),
+        "snap_save_inplace_writes:%lld\r\n", snapSaveInplaceWrites(),
+        "snap_last_save_inplace_writes:%lld\r\n", snapSaveLastInplaceWrites(),
+        "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes));
+}
+
+/* The INFO sections a crash report may generate inside the hybrid save
+ * child, which has no keyspace mapped (memory, keyspace, keysizes and hotkeys
+ * would fault); NULL in every other process, meaning "all". */
+const char *const *snapCrashReportInfoSections(void) {
+    static const char *const keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
+                                       "cpu", "module_list", "errorstats", "cluster", NULL};
+    return snapInHybridChild() ? keep : NULL;
+}
+
+static redisDb *snapDebugDbArg(client *c) {
+    if (c->argc == 2) return c->db;
+    long long dbid;
+    if (getLongLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return NULL;
+    if (dbid < 0 || dbid >= server.dbnum) {
+        addReplyError(c, "Out of range database");
+        return NULL;
+    }
+    return &server.db[dbid];
+}
+
+/* DEBUG SNAP-PLACEMENT [dbid] | SNAP-DRIFT [dbid] | SNAP-WINDOW-BUCKETS [n].
+ * Returns 1 when the subcommand was one of these (and replied), 0 otherwise. */
+int snapDebugCommand(client *c) {
+    const char *sub = c->argv[1]->ptr;
+    if (!strcasecmp(sub, "snap-placement") && (c->argc == 2 || c->argc == 3)) {
+        redisDb *db = snapDebugDbArg(c);
+        if (!db) return 1;
+        snapPlacementStats st;
+        snapPlacementScan(db, &st);
+        addReplyMapLen(c, 11);
+        addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
+        addReplyBulkCString(c, "dict_tables_in_arena"); addReplyLongLong(c, st.dict_tables_in_arena);
+        addReplyBulkCString(c, "dict_tables_outside"); addReplyLongLong(c, st.dict_tables_outside);
+        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, snapArenaAvailable());
+        addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
+        addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);
+        addReplyBulkCString(c, "class_nofork"); addReplyLongLong(c, st.class_nofork);
+        addReplyBulkCString(c, "class_fork"); addReplyLongLong(c, st.class_fork);
+        addReplyBulkCString(c, "drift_nofork_outside"); addReplyLongLong(c, st.drift_nofork_outside);
+        addReplyBulkCString(c, "drift_fork_inside"); addReplyLongLong(c, st.drift_fork_inside);
+        addReplyBulkCString(c, "violations"); addReplyLongLong(c, st.violations);
+        return 1;
+    }
+    if (!strcasecmp(sub, "snap-drift") && (c->argc == 2 || c->argc == 3)) {
+        redisDb *db = snapDebugDbArg(c);
+        if (db) snapPlacementDriftReply(c, db, 50);
+        return 1;
+    }
+    if (!strcasecmp(sub, "snap-window-buckets") && (c->argc == 2 || c->argc == 3)) {
+        if (c->argc == 3) {
+            long long n;
+            if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return 1;
+            if (n < 1 || n > (1LL << 30)) {
+                addReplyError(c, "Out of range");
+                return 1;
+            }
+            snapSetWindowBuckets((unsigned long)n);
+        }
+        addReplyLongLong(c, (long long)snapGetWindowBuckets());
+        return 1;
+    }
+    return 0;
+}
+
 /* ---- Bucket position and main-thread emission (emit-ahead) ---- */
 
 static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
@@ -2882,6 +3005,23 @@ int snapSaveBackgroundAof(void) {
     sv->child_type = CHILD_TYPE_AOF;
     sv->aof_cmd_form = !server.aof_use_rdb_preamble;
     return snapSaveLaunch(sv);   /* the child names its own temp file */
+}
+
+int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    if (!snapHybridEnabled()) return SNAP_NOT_TAKEN;
+    /* A functions-only or slots-only transfer has no keyspace content for
+     * the scan thread; the stock child serves it (redisFork maps the arena). */
+    if (req & (SLAVE_REQ_RDB_EXCLUDE_DATA | SLAVE_REQ_SLOTS_SNAPSHOT)) return SNAP_NOT_TAKEN;
+    if (!moduleAllModulesHandleHybridBgsave()) {
+        snapHybridFallbackLog();   /* a module's save callbacks need the keyspace */
+        return SNAP_NOT_TAKEN;
+    }
+    switch (kind) {
+    case SNAP_SAVE_RDB:     return snapSaveBackground(req, filename, rsi, rdbflags);
+    case SNAP_SAVE_SOCKETS: return snapSaveToSlavesSockets(req, rsi);
+    case SNAP_SAVE_AOF:     return snapSaveBackgroundAof();
+    }
+    serverPanic("unknown hybrid save kind %d", kind);
 }
 
 int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {

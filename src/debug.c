@@ -687,54 +687,8 @@ NULL
             return;
         server.cluster_drop_packet_filter = packet_type;
         addReply(c,shared.ok);
-    } else if (!strcasecmp(c->argv[1]->ptr,"snap-placement") && (c->argc == 2 || c->argc == 3)) {
-        redisDb *db = c->db;
-        if (c->argc == 3) {
-            long dbid;
-            if (getLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return;
-            if (dbid < 0 || dbid >= server.dbnum) {
-                addReplyError(c, "Out of range database");
-                return;
-            }
-            db = &server.db[dbid];
-        }
-        snapPlacementStats st;
-        snapPlacementScan(db, &st);
-        addReplyMapLen(c, 11);
-        addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
-        addReplyBulkCString(c, "dict_tables_in_arena"); addReplyLongLong(c, st.dict_tables_in_arena);
-        addReplyBulkCString(c, "dict_tables_outside"); addReplyLongLong(c, st.dict_tables_outside);
-        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, snapArenaAvailable());
-        addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
-        addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);
-        addReplyBulkCString(c, "class_nofork"); addReplyLongLong(c, st.class_nofork);
-        addReplyBulkCString(c, "class_fork"); addReplyLongLong(c, st.class_fork);
-        addReplyBulkCString(c, "drift_nofork_outside"); addReplyLongLong(c, st.drift_nofork_outside);
-        addReplyBulkCString(c, "drift_fork_inside"); addReplyLongLong(c, st.drift_fork_inside);
-        addReplyBulkCString(c, "violations"); addReplyLongLong(c, st.violations);
-    } else if (!strcasecmp(c->argv[1]->ptr,"snap-drift") && (c->argc == 2 || c->argc == 3)) {
-        redisDb *db = c->db;
-        if (c->argc == 3) {
-            long long dbid;
-            if (getLongLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return;
-            if (dbid < 0 || dbid >= server.dbnum) {
-                addReplyError(c, "Out of range database");
-                return;
-            }
-            db = &server.db[dbid];
-        }
-        snapPlacementDriftReply(c, db, 50);
-    } else if (!strcasecmp(c->argv[1]->ptr,"snap-window-buckets") && (c->argc == 2 || c->argc == 3)) {
-        if (c->argc == 3) {
-            long long n;
-            if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return;
-            if (n < 1 || n > (1LL << 30)) {
-                addReplyError(c, "Out of range");
-                return;
-            }
-            snapSetWindowBuckets((unsigned long)n);
-        }
-        addReplyLongLong(c, (long long)snapGetWindowBuckets());
+    } else if (snapDebugCommand(c)) {
+        /* SNAP-PLACEMENT, SNAP-DRIFT, SNAP-WINDOW-BUCKETS: replied by snapshot.c */
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         kvobj *kv;
         char *strenc;
@@ -2344,14 +2298,11 @@ void logServerInfo(void) {
     int all = 0, everything = 0;
     robj *argv[16];
     int argc = 0;
-    if (snapInHybridChild()) {
-        /* The keyspace kvstores live in the DONTFORK arena, which is not
-         * mapped in the hybrid save child: the memory, keyspace, keysizes and
-         * hotkeys sections would fault inside this handler and leave the
-         * reduced report. */
+    const char *const *keep = snapCrashReportInfoSections();
+    if (keep) {
+        /* The hybrid save child has no keyspace mapped: only the sections
+         * that do not read it are safe inside this handler. */
         serverLogRaw(LL_WARNING|LL_RAW, "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n");
-        char *keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
-                        "cpu", "module_list", "errorstats", "cluster", NULL};
         for (int i = 0; keep[i]; i++) argv[argc++] = createStringObject(keep[i], strlen(keep[i]));
     } else {
         argv[argc++] = createStringObject("all", strlen("all"));

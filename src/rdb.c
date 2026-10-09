@@ -2266,15 +2266,11 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid BGSAVE: every kvobj header lives in the DONTFORK arena, so a
-     * fork child cannot walk the keyspace; the snapshot.c path scans on a
-     * parent thread and streams to the child. Functions-only saves have no
-     * keyspace content and keep the stock path. */
-    if (snapHybridEnabled() && !(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
-        if (moduleAllModulesHandleHybridBgsave())
-            return snapSaveBackground(req, filename, rsi, rdbflags);
-        snapHybridFallbackLog();   /* a module's save callbacks need the keyspace: stock child */
-    }
+    /* Hybrid BGSAVE: the scan thread and its child write the file; the
+     * stock child below runs only when snapshot.c declines (switch off,
+     * functions-only request, or a module without the opt-in). */
+    int hybrid = snapSaveTryStart(SNAP_SAVE_RDB, req, filename, rsi, rdbflags);
+    if (hybrid != SNAP_NOT_TAKEN) return hybrid;
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
