@@ -3,10 +3,11 @@ id: TASK-1.40
 title: >-
   Hybrid BGSAVE review cleanup: dead code, stale comments and config docs
   describing the replaced design
-status: In Progress
+status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-09 22:22'
+updated_date: '2026-10-09 22:38'
 labels:
   - hybrid-bgsave
   - cleanup
@@ -42,10 +43,22 @@ Candidates identified (verify each before removing): snapSaveIsAofRewrite (no ca
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 grep for 'temp dict', 'merge', 'M1', 'TASK-', 'run [0-9]', 'spec 11', 'stage [12]', 'Stage B' in src/snapshot.c, src/snapshot.h, src/kvsoverlay.c, src/kvstore.c, src/kvstore.h, src/dict.c, src/dict.h and the core hook sites returns only text that is accurate for the current design, and no task IDs or run numbers remain in src or redis.conf
-- [ ] #2 Dead symbols listed in the description are removed where verification confirms no caller, the build has no new warnings, and unit/snapshot plus redis-server test snapshot pass
-- [ ] #3 The file header of snapshot.c and the two banners give an accurate map of the current design (classes, on-demand freeze and fork, scan thread with bucket window, funnel outcomes, two channels, child ordering, completion and abort) and point to the design doc
-- [ ] #4 redis.conf entries for bgsave-hybrid and bgsave-hybrid-max-retained-bytes match the implementation (runtime switch, refusal while a child runs, module fallback, retention and queued-bytes accounting)
-- [ ] #5 Misattached or duplicated doc comments in config.c, keymeta.c, module.c and rdb.c are repaired; the module API doc generator still finds RM_KeyExists's comment
-- [ ] #6 Blog section 9 and spec sections that still describe the temp-dict design are corrected or marked superseded (full spec rewrite is the design-doc task)
+- [x] #1 grep for 'temp dict', 'merge', 'M1', 'TASK-', 'run [0-9]', 'spec 11', 'stage [12]', 'Stage B' in src/snapshot.c, src/snapshot.h, src/kvsoverlay.c, src/kvstore.c, src/kvstore.h, src/dict.c, src/dict.h and the core hook sites returns only text that is accurate for the current design, and no task IDs or run numbers remain in src or redis.conf
+- [x] #2 Dead symbols listed in the description are removed where verification confirms no caller, the build has no new warnings, and unit/snapshot plus redis-server test snapshot pass
+- [x] #3 The file header of snapshot.c and the two banners give an accurate map of the current design (classes, on-demand freeze and fork, scan thread with bucket window, funnel outcomes, two channels, child ordering, completion and abort) and point to the design doc
+- [x] #4 redis.conf entries for bgsave-hybrid and bgsave-hybrid-max-retained-bytes match the implementation (runtime switch, refusal while a child runs, module fallback, retention and queued-bytes accounting)
+- [x] #5 Misattached or duplicated doc comments in config.c, keymeta.c, module.c and rdb.c are repaired; the module API doc generator still finds RM_KeyExists's comment
+- [x] #6 Blog section 9 and spec sections that still describe the temp-dict design are corrected or marked superseded (full spec rewrite is the design-doc task)
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+2026-10-09 done in one pass (scratchpad cleanup140.py). Kept on purpose: snapScanKeyIsOwed (used by the unit tests; moves to the tests under TASK-1.41), the snapWalkerQuiesce function name (comments now say 'scan thread'; renaming functions was out of scope), dict.c/dict.h comments that point at snapshot.c as the user of a generic primitive, and 'merge' where it means a hash-table bucket merge or VMA merge. The blog's section 9 fix is in the working tree together with the user's own uncommitted blog edits and was not committed. The file header points to the spec until TASK-1.42's document exists. Verified: build without warnings, redis-server test snapshot 184 passed, unit/snapshot 81 ok.
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Review cleanup of the hybrid BGSAVE sources, no behavior change. The snapshot.c file header is now an accurate overview of one save (classes, on-demand freeze and fork, scan thread with bucket windows, funnel outcomes, two channels, child ordering, completion and abort) and a map of the file's sections; the scan-engine and orchestration banners and the snapshot.h section comments describe the current window / side-table / emit-ahead design instead of the replaced temp-dict-and-merge one; log lines say "drained" where the overlay is drained. Task IDs, run numbers, spec section numbers and milestone or stage names are gone from src. Dead code removed: snapSaveIsAofRewrite, snapSdsFree/snapLpFree/snapIntsetFree/snapListpackExFree, kvstoreOverlayStats, dictEncodeKeyAsEntry, a duplicate snapScanSlotState declaration, and the dangling ovTombstoneInPlace reference. Misattached doc comments in config.c (applyBind), keymeta.c (keyMetaClassCreate) and module.c (RM_KeyExists, forward declaration moved above its doc) repaired; rdb.c's duplicated key-save-delay comment merged. redis.conf: bgsave-hybrid documented as a runtime switch refused while a child runs, with the module fallback and the INFO field that names the blocker; bgsave-hybrid-max-retained-bytes describes retention while the bucket is in the window and the queued bytes the cap covers. The spec carries a reading note naming its superseded sections until TASK-1.42 replaces it; the blog's cluster-mode line is corrected (left uncommitted with the user's pending blog edits). Verified: clean build, redis-server test snapshot 184 passed, unit/snapshot 81 ok.
+<!-- SECTION:FINAL_SUMMARY:END -->
