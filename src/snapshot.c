@@ -47,34 +47,21 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 
-#ifdef HAVE_NOFORK_ARENA
-#define SNAP_NOFORK_ARENA_SUPPORTED 1
-#endif
-
-/* Guard: the SNAP_NOFORK arena must never be allocated from, freed into, or
- * otherwise touched by a fork child (its virtual range is unmapped there). */
-static inline void snapAssertNotChild(void) {
-    if (unlikely(server.in_fork_child != CHILD_TYPE_NONE))
-        serverPanic("SNAP_NOFORK arena accessed from a fork child");
-}
-
 /* The arena itself (reserved DONTFORK address range, extent hooks, per-thread
  * tcache flags, range-aware zfree/zrealloc) lives in zmalloc.c so that sds,
  * listpack, intset and dict code keep arena memory in the arena without
  * knowing about classes. These are the snapshot-facing entry points. */
 void snapArenaInit(void) {
-    server.snap_nofork_arena = UINT_MAX;
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     if (!zmalloc_nofork_arena_init()) {
         serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
                               "range or create the jemalloc arena; hybrid BGSAVE runs without it.");
         return;
     }
-    server.snap_nofork_arena = zmalloc_nofork_arena_index();
     zmalloc_nofork_set_active(server.bgsave_hybrid);       /* new headers, tables and values go there only when on */
     if (!server.bgsave_hybrid) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
     serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
-                         "%s).", server.snap_nofork_arena, snapArenaVaReserved() >> 30,
+                         "%s).", zmalloc_nofork_arena_index(), snapArenaVaReserved() >> 30,
                          server.bgsave_hybrid ? "MADV_DONTFORK: hybrid BGSAVE on" : "forkable: bgsave-hybrid no");
 #else
     serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
@@ -103,7 +90,7 @@ static void snapHybridFallbackLog(void) {
 }
 
 int snapArenaForkable(void) {
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     return snapArenaAvailable() && zmalloc_nofork_arena_forkable();
 #else
     return 0;
@@ -111,7 +98,7 @@ int snapArenaForkable(void) {
 }
 
 int snapArenaSetForkable(int forkable) {
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     if (!snapArenaAvailable()) return 0;
     if (!zmalloc_nofork_arena_set_forkable(forkable)) {
         serverLog(LL_WARNING, "SNAP_NOFORK arena: madvise(%s) failed: %s",
@@ -168,7 +155,7 @@ int snapHybridConfigApply(const char **err) {
 
 
 size_t snapArenaVaReserved(void) {
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     size_t reserved = 0;
     if (snapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
     return reserved;
@@ -178,7 +165,7 @@ size_t snapArenaVaReserved(void) {
 }
 
 size_t snapArenaVaUsed(void) {
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     size_t used = 0;
     if (snapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
     return used;
@@ -190,42 +177,6 @@ size_t snapArenaVaUsed(void) {
 
 
 
-void *snapNoforkRealloc(void *ptr, size_t size) {
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    return zrealloc_nofork(ptr, size);
-#else
-    return zrealloc(ptr, size);
-#endif
-}
-
-void snapNoforkFree(void *ptr) {
-    if (ptr == NULL) return;
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    zfree_nofork(ptr);
-#else
-    zfree(ptr);
-#endif
-}
-
-void snapNoforkFreeSize(void *ptr, size_t usable) {
-    if (ptr == NULL) return;
-    snapAssertNotChild();
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
-    zfree_nofork_size(ptr, usable);
-#else
-    zfree_with_size(ptr, usable);
-#endif
-}
-
-int snapPtrIsNofork(const void *ptr) {
-    return zmalloc_is_nofork(ptr);
-}
-
-size_t snapNoforkUsableSize(void *ptr) {
-    return zmalloc_size(ptr);
-}
 
 
 /* ============================================================================
@@ -296,7 +247,7 @@ static sds snapSdsCopy(sds s, int to_nofork) {
     char type = sdsReqType(len);
     size_t need = sdsReqSize(len, type);
     size_t usable = 0;
-    char *buf = to_nofork ? snapNoforkAllocUsable(need, &usable) : zmalloc_usable(need, &usable);
+    char *buf = to_nofork ? zmalloc_nofork_usable(need, &usable) : zmalloc_usable(need, &usable);
     return sdsnewplacement(buf, usable, type, s, len);
 }
 
@@ -309,7 +260,7 @@ static sds snapSdsMove(sds s, int to_nofork) {
 
 /* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested arena. */
 static void *snapBlobCopy(void *p, size_t bytes, int to_nofork) {
-    void *n = to_nofork ? snapNoforkAlloc(bytes) : zmalloc(bytes);
+    void *n = to_nofork ? zmalloc_nofork(bytes) : zmalloc(bytes);
     memcpy(n, p, bytes);
     return n;
 }
@@ -408,7 +359,7 @@ static void snapPlacementScanTables(kvstore *kvs, snapPlacementStats *st) {
 static kvobj *snapKvobjCloneHeader(kvobj *orig) {
     char *alloc = kvobjGetAllocPtr(orig);
     size_t size = zmalloc_size(alloc);
-    char *nalloc = snapNoforkAlloc(size);
+    char *nalloc = zmalloc_nofork(size);
     memcpy(nalloc, alloc, size);
     kvobj *kv = (kvobj *)(nalloc + ((char *)orig - alloc));
     if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
@@ -467,7 +418,7 @@ void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shar
             /* Private copy (struct + listpack) with a fresh ExpireMeta. */
             listpackEx *o = orig->ptr;
             if (nofork) {
-                listpackEx *n = snapNoforkCalloc(sizeof(*n));
+                listpackEx *n = zcalloc_nofork(sizeof(*n));
                 n->meta.trash = 1;
                 n->lp = snapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
                 kv->ptr = n;
@@ -3309,11 +3260,11 @@ static int snapTestCountMaps(void) {
 }
 
 static void snapTestPurgeArena(void) {
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     char buf[64];
-    snprintf(buf, sizeof(buf), "arena.%u.purge", server.snap_nofork_arena);
+    snprintf(buf, sizeof(buf), "arena.%u.purge", zmalloc_nofork_arena_index());
     je_mallctl(buf, NULL, 0, NULL, 0);
-    snprintf(buf, sizeof(buf), "arena.%u.decay", server.snap_nofork_arena);
+    snprintf(buf, sizeof(buf), "arena.%u.decay", zmalloc_nofork_arena_index());
     je_mallctl(buf, NULL, 0, NULL, 0);
 #endif
 }
@@ -3773,7 +3724,7 @@ static void snapPlacementTests(void) {
 
     /* Generic allocator paths keep arena memory in the arena. */
     {
-        char *p = snapNoforkAlloc(100);
+        char *p = zmalloc_nofork(100);
         p = zrealloc(p, 5000);
         test_cond("zrealloc() of an arena pointer stays in the arena (grow)", zmalloc_is_nofork(p));
         p = zrealloc(p, 40);
@@ -3786,20 +3737,20 @@ static void snapPlacementTests(void) {
 
         const int N = 2000;
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
         for (int i = 0; i < N; i++) zfree(a[i]);                     /* generic zfree */
         int leaked = 0;
         for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("arena blocks freed with plain zfree() never come back from zmalloc()", leaked == 0);
-        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
         for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);       /* sized generic free */
         leaked = 0;
         for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("arena blocks freed with zfree_with_size() never come back from zmalloc()", leaked == 0);
         zfree(a);
-#if defined(SNAP_NOFORK_ARENA_SUPPORTED) && defined(HAVE_DEFRAG)
+#if defined(HAVE_NOFORK_ARENA) && defined(HAVE_DEFRAG)
         void *nt = zmalloc_nofork_no_tcache(300);   /* the no-tcache entry points exist only with the arena and defrag */
         test_cond("zmalloc_nofork_no_tcache() allocates in the arena", zmalloc_is_nofork(nt));
         zfree_no_tcache(nt);
@@ -4265,13 +4216,13 @@ int snapshotTest(int argc, char **argv, int flags) {
     server.bgsave_hybrid = 1;
     snapArenaInit();
 
-#ifdef SNAP_NOFORK_ARENA_SUPPORTED
+#ifdef HAVE_NOFORK_ARENA
     test_cond("SNAP_NOFORK arena is available on Linux+jemalloc", snapArenaAvailable());
 #else
     test_cond("SNAP_NOFORK arena reported unavailable on this platform", !snapArenaAvailable());
-    void *fb = snapNoforkAlloc(100);
-    test_cond("fallback alloc goes to the default allocator", fb != NULL && !snapPtrIsNofork(fb));
-    snapNoforkFree(fb);
+    void *fb = zmalloc_nofork(100);
+    test_cond("fallback alloc goes to the default allocator", fb != NULL && !zmalloc_is_nofork(fb));
+    zfree(fb);
     /* The background scan and the keyspace overlay do not depend on the arena. */
     snapScanTests(accurate);
     snapRefcountTests();
@@ -4282,12 +4233,12 @@ int snapshotTest(int argc, char **argv, int flags) {
 #endif
 
     /* 1. predicate */
-    char *p = snapNoforkAlloc(100);
+    char *p = zmalloc_nofork(100);
     char *q = zmalloc(100);
     memset(p, 'x', 100);
-    test_cond("snapPtrIsNofork() is true for an arena pointer", snapPtrIsNofork(p));
-    test_cond("snapPtrIsNofork() is false for a zmalloc pointer", !snapPtrIsNofork(q));
-    test_cond("snapNoforkUsableSize() >= requested size", snapNoforkUsableSize(p) >= 100);
+    test_cond("zmalloc_is_nofork() is true for an arena pointer", zmalloc_is_nofork(p));
+    test_cond("zmalloc_is_nofork() is false for a zmalloc pointer", !zmalloc_is_nofork(q));
+    test_cond("zmalloc_size() >= requested size", zmalloc_size(p) >= 100);
 
     /* 2. fork visibility */
     test_cond("SNAP_NOFORK mapping carries the VM_DONTCOPY (dc) flag", snapTestMappingIsDontcopy(p) == 1);
@@ -4303,20 +4254,20 @@ int snapshotTest(int argc, char **argv, int flags) {
     test_cond("flip: fork child faults again on the same allocation", snapTestChildWriteFaults(p) == 1);
 
     /* Large (>= 2MB, multi-page-run) allocation is also DONTFORK. */
-    char *big = snapNoforkAlloc(5 * 1024 * 1024);
+    char *big = zmalloc_nofork(5 * 1024 * 1024);
     memset(big, 1, 5 * 1024 * 1024);
-    test_cond("large SNAP_NOFORK allocation is in the arena", snapPtrIsNofork(big));
+    test_cond("large SNAP_NOFORK allocation is in the arena", zmalloc_is_nofork(big));
     test_cond("fork child faults on a large SNAP_NOFORK allocation (first page)", snapTestChildWriteFaults(big) == 1);
     test_cond("fork child faults on a large SNAP_NOFORK allocation (last page)",
               snapTestChildWriteFaults(big + 5 * 1024 * 1024 - 1) == 1);
 
     /* realloc keeps the class */
-    p = snapNoforkRealloc(p, 5000);
-    test_cond("snapNoforkRealloc() result stays in the arena", snapPtrIsNofork(p));
+    p = zrealloc_nofork(p, 5000);
+    test_cond("zrealloc_nofork() result stays in the arena", zmalloc_is_nofork(p));
     test_cond("fork child faults after realloc", snapTestChildWriteFaults(p) == 1);
-    snapNoforkFree(p);
+    zfree(p);
     zfree(q);
-    snapNoforkFree(big);
+    zfree(big);
 
     /* 3. stress: mixed sizes, frees, purge/decay, then re-check the flag. */
     {
@@ -4329,32 +4280,32 @@ int snapshotTest(int argc, char **argv, int flags) {
                 seed = seed * 1103515245u + 12345u;
                 size_t sz = 8 + (seed >> 8) % 8192;
                 if (i % 5000 == 0) sz = 3 * 1024 * 1024 + (seed % 1024) * 1024;
-                ptrs[i] = snapNoforkAlloc(sz);
+                ptrs[i] = zmalloc_nofork(sz);
                 ((char*)ptrs[i])[0] = 1;
                 ((char*)ptrs[i])[sz-1] = 1;
             }
-            for (int i = 0; i < N; i += 2) { snapNoforkFree(ptrs[i]); ptrs[i] = NULL; }
+            for (int i = 0; i < N; i += 2) { zfree(ptrs[i]); ptrs[i] = NULL; }
             snapTestPurgeArena();
             for (int i = 1; i < N; i += 2) {
                 seed = seed * 1103515245u + 12345u;
-                ptrs[i] = snapNoforkRealloc(ptrs[i], 8 + (seed >> 8) % 16384);
+                ptrs[i] = zrealloc_nofork(ptrs[i], 8 + (seed >> 8) % 16384);
             }
             snapTestPurgeArena();
             for (int i = 1; i < N; i += (N / 32)) {
-                if (!snapPtrIsNofork(ptrs[i])) bad_class++;
+                if (!zmalloc_is_nofork(ptrs[i])) bad_class++;
                 if (snapTestChildWriteFaults(ptrs[i]) != 1) bad_fork++;
             }
-            for (int i = 1; i < N; i += 2) snapNoforkFree(ptrs[i]);
+            for (int i = 1; i < N; i += 2) zfree(ptrs[i]);
             snapTestPurgeArena();
         }
         /* Fresh allocation after purge cycles must still be DONTFORK (commit path). */
-        void *fresh = snapNoforkAlloc(4096 * 3);
+        void *fresh = zmalloc_nofork(4096 * 3);
         memset(fresh, 2, 4096 * 3);
         test_cond("mapping after purge cycles carries the dc flag", snapTestMappingIsDontcopy(fresh) == 1);
         test_cond("stress: sampled live pointers are all in the arena", bad_class == 0);
         test_cond("stress: sampled live pointers all fault in the child after purge/decay/realloc cycles", bad_fork == 0);
         test_cond("allocation after purge cycles is still DONTFORK", snapTestChildWriteFaults(fresh) == 1);
-        snapNoforkFree(fresh);
+        zfree(fresh);
         zfree(ptrs);
     }
 
@@ -4363,28 +4314,28 @@ int snapshotTest(int argc, char **argv, int flags) {
     {
         const int N = 2000;
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
-        for (int i = 0; i < N; i++) snapNoforkFree(a[i]);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) zfree(a[i]);
         int leaked = 0;
-        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (snapPtrIsNofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("freed SNAP_NOFORK blocks are never handed to zmalloc()", leaked == 0);
 
         for (int i = 0; i < N; i++) a[i] = zmalloc(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
         int wrong = 0;
-        for (int i = 0; i < N; i++) { a[i] = snapNoforkAlloc(64); if (!snapPtrIsNofork(a[i])) wrong++; }
-        for (int i = 0; i < N; i++) snapNoforkFree(a[i]);
-        test_cond("freed zmalloc blocks are never handed to snapNoforkAlloc()", wrong == 0);
+        for (int i = 0; i < N; i++) { a[i] = zmalloc_nofork(64); if (!zmalloc_is_nofork(a[i])) wrong++; }
+        for (int i = 0; i < N; i++) zfree(a[i]);
+        test_cond("freed zmalloc blocks are never handed to zmalloc_nofork()", wrong == 0);
         zfree(a);
     }
 
     /* 5. accounting */
     {
         size_t before = zmalloc_used_memory();
-        void *x = snapNoforkAlloc(10000);
+        void *x = zmalloc_nofork(10000);
         size_t mid = zmalloc_used_memory();
-        snapNoforkFreeSize(x, snapNoforkUsableSize(x));
+        zfree_with_size(x, zmalloc_size(x));
         size_t after = zmalloc_used_memory();
         test_cond("snapNofork allocations are counted in zmalloc_used_memory()", mid > before && after == before);
     }
@@ -4401,7 +4352,7 @@ int snapshotTest(int argc, char **argv, int flags) {
         double z_pair = (double)(t1 - t0) / N;
 
         t0 = snapTestNowNs();
-        for (int i = 0; i < N; i++) { void *x = snapNoforkAlloc(64); snapNoforkFree(x); }
+        for (int i = 0; i < N; i++) { void *x = zmalloc_nofork(64); zfree(x); }
         t1 = snapTestNowNs();
         double s_pair = (double)(t1 - t0) / N;
 
@@ -4412,14 +4363,14 @@ int snapshotTest(int argc, char **argv, int flags) {
         double z_bulk = (double)(t1 - t0) / N;
 
         t0 = snapTestNowNs();
-        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
-        for (int i = 0; i < N; i++) snapNoforkFree(a[i]);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) zfree(a[i]);
         t1 = snapTestNowNs();
         double s_bulk = (double)(t1 - t0) / N;
 
         t0 = snapTestNowNs();
-        for (int i = 0; i < N; i++) a[i] = snapNoforkAlloc(64);
-        for (int i = 0; i < N; i++) snapNoforkFreeSize(a[i], 64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);
         t1 = snapTestNowNs();
         double s_bulk_sized = (double)(t1 - t0) / N;
 
@@ -4437,9 +4388,9 @@ int snapshotTest(int argc, char **argv, int flags) {
         const int N = large ? 10000000 : 1000000;
         int maps_before = snapTestCountMaps();
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) { a[i] = snapNoforkAlloc(96); ((char*)a[i])[0] = 1; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc_nofork(96); ((char*)a[i])[0] = 1; }
         int maps_after = snapTestCountMaps();
-        for (int i = 0; i < N; i++) snapNoforkFree(a[i]);
+        for (int i = 0; i < N; i++) zfree(a[i]);
         zfree(a);
         printf("VMA maps: before=%d after %d x 96B SNAP_NOFORK allocations=%d (delta %d)\n",
                maps_before, N, maps_after, maps_after - maps_before);

@@ -41,7 +41,7 @@ struct listpackEx;
 void snapArenaInit(void);
 
 /* 1 if the arena exists (DONTFORK or currently forkable, see below). */
-static inline int snapArenaAvailable(void) { return server.snap_nofork_arena != UINT_MAX; }
+static inline int snapArenaAvailable(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
 
 /* Fork visibility of the arena. Normally DONTFORK: the hybrid save's child
  * never maps it. Any other fork (stock RDB save while the feature is off,
@@ -61,26 +61,14 @@ void snapArenaChildExited(void);                /* after a child of any type was
 size_t snapArenaVaReserved(void);
 size_t snapArenaVaUsed(void);
 
-/* ---- Fast allocation API for SNAP_NOFORK memory -------------------------- */
-
-/* Allocation in the SNAP_NOFORK arena, or the default allocator when there is
- * none (zmalloc.h inlines that decision). All of these keep zmalloc's
- * used_memory accounting and select the arena with MALLOCX_ARENA and a
- * per-thread explicit tcache. zfree() and zrealloc() recognise arena blocks
- * by address range, so any free path is correct; the Realloc/Free/FreeSize
- * wrappers below add the assertion that no fork child touches the arena
- * (its range is unmapped there). */
-static inline void *snapNoforkAlloc(size_t size) { return zmalloc_nofork(size); }
-static inline void *snapNoforkCalloc(size_t size) { return zcalloc_nofork(size); }
-static inline void *snapNoforkAllocUsable(size_t size, size_t *usable) { return zmalloc_nofork_usable(size, usable); }
-void *snapNoforkRealloc(void *ptr, size_t size);
-void snapNoforkFree(void *ptr);
-void snapNoforkFreeSize(void *ptr, size_t usable);   /* sized free fast path */
-size_t snapNoforkUsableSize(void *ptr);
-
-/* 1 if 'ptr' lies in the SNAP_NOFORK arena's reserved address range. A
- * two-compare range check (see zmalloc_is_nofork), cheap enough for hot paths. */
-int snapPtrIsNofork(const void *ptr);
+/* ---- Allocation in the SNAP_NOFORK arena ---------------------------------
+ *
+ * One layer, in zmalloc.h: zmalloc_nofork / zcalloc_nofork /
+ * zmalloc_nofork_usable / ztrycalloc_nofork allocate in the arena while the
+ * feature is on (the default allocator otherwise), zrealloc_nofork keeps an
+ * arena block in the arena, and the plain zfree / zrealloc / zmalloc_size
+ * recognise arena blocks by address range (zmalloc_is_nofork). Nothing may
+ * touch the arena from a fork child: its range is unmapped there. */
 
 /* ---- Classification and placement ---------------------------------------- */
 

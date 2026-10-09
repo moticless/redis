@@ -1613,7 +1613,7 @@ static void hashTypeTmplDeleteFields(robj *o, robj **argv, int n, vec *vdeleted,
 struct listpackEx *listpackExCreate(void) {
     /* Hybrid BGSAVE: the struct is always SNAP_NOFORK and is never moved
      * afterwards (its ExpireMeta may be registered in ebuckets). */
-    listpackEx *lpt = snapNoforkCalloc(sizeof(*lpt));
+    listpackEx *lpt = zcalloc_nofork(sizeof(*lpt));
     lpt->meta.trash = 1;
     lpt->lp = NULL;
     return lpt;

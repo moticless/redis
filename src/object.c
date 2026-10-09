@@ -85,7 +85,7 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
 
     /* Allocate object memory. Every kvobj header lives in the SNAP_NOFORK
      * arena (hybrid BGSAVE): the fork child never reads headers directly. */
-    char *alloc = snapNoforkAlloc(min_size);
+    char *alloc = zmalloc_nofork(min_size);
     kvobj *kv = (kvobj *) (alloc + sizeMetas);
     kv->type = type;
     kv->encoding = OBJ_ENCODING_RAW;
@@ -187,7 +187,7 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
 
     /* Allocate object memory (SNAP_NOFORK arena, see kvobjCreate). */
     size_t bufsize = 0;
-    char *alloc = snapNoforkAllocUsable(min_size, &bufsize);
+    char *alloc = zmalloc_nofork_usable(min_size, &bufsize);
     o = (kvobj *) (alloc + sizeMetas);
 
     o->type = OBJ_STRING;

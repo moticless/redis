@@ -1537,8 +1537,8 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_resident,
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
-        if (server.snap_nofork_arena != UINT_MAX) {
-            zmalloc_get_allocator_info_by_arena(server.snap_nofork_arena,
+        if (snapArenaAvailable()) {
+            zmalloc_get_allocator_info_by_arena(zmalloc_nofork_arena_index(),
                                                 0,
                                                 &server.cron_malloc_stats.nofork_allocator_allocated,
                                                 &server.cron_malloc_stats.nofork_allocator_active,

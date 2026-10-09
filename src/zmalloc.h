@@ -156,11 +156,11 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
  * in its arena-free mode (classification by encoding and size, values copied
  * on clone), which the sanitizer builds exercise. */
 #include <stdint.h>
+#include <limits.h>
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
 #define HAVE_NOFORK_ARENA 1
 extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
 extern char *zmalloc_nofork_hi;
-extern unsigned zmalloc_nofork_arena;   /* jemalloc arena index, UINT_MAX until created */
 extern int zmalloc_nofork_active;       /* 1 while NEW SNAP_NOFORK requests go to the arena (bgsave-hybrid on) */
 /* hi is NULL while there is no arena: one load and one compare decide. */
 static inline int zmalloc_is_nofork(const void *p) {
@@ -174,7 +174,6 @@ static inline int zmalloc_is_nofork(const void *p) {
 static inline int zmalloc_nofork_enabled(void) { return zmalloc_nofork_active; }
 void zmalloc_nofork_set_active(int active);          /* follows CONFIG bgsave-hybrid; no-op without an arena */
 int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unavailable */
-int zmalloc_nofork_arena_available(void);
 int zmalloc_nofork_arena_set_forkable(int forkable); /* MADV_DOFORK (1) / MADV_DONTFORK (0) on the range; 1 on success */
 int zmalloc_nofork_arena_forkable(void);             /* 1 while a fork child would map the arena */
 void zmalloc_nofork_tcache_flush(void);              /* return this thread's cached arena regions to the bins */
@@ -193,9 +192,7 @@ static inline void *zcalloc_nofork(size_t size) {
 static inline void *zmalloc_nofork_usable(size_t size, size_t *usable) {
     return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zmalloc_nofork_usable_slow(size, usable) : zmalloc_usable(size, usable);
 }
-void *zrealloc_nofork(void *ptr, size_t size);
-void zfree_nofork(void *ptr);
-void zfree_nofork_size(void *ptr, size_t size);
+void *zrealloc_nofork(void *ptr, size_t size);   /* zrealloc, which keeps an arena block in the arena; NULL allocates in the arena */
 __attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);
 void *ztrycalloc_nofork(size_t size);           /* NULL on OOM */
 void zmalloc_nofork_va_stats(size_t *reserved, size_t *used);
@@ -214,8 +211,10 @@ static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *u
 #define zmalloc_nofork(size) zmalloc(size)
 #define zcalloc_nofork(size) zcalloc(size)
 #define zmalloc_nofork_usable(size, usable) zmalloc_usable(size, usable)
+#define zrealloc_nofork(ptr, size) zrealloc(ptr, size)
 #define ztrycalloc_nofork(size) ztrycalloc(size)
 static inline int zmalloc_nofork_enabled(void) { return 0; }
+static inline unsigned zmalloc_nofork_arena_index(void) { return UINT_MAX; }
 void zmalloc_nofork_set_active(int active);   /* no-op stubs in zmalloc.c: nothing to gate, no arena tcache to flush */
 void zmalloc_nofork_tcache_flush(void);
 #endif

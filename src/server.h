@@ -2708,7 +2708,6 @@ struct redisServer {
     int cluster_slot_stats_enabled; /* Cluster slot usage statistics tracking enabled. */
     /* Scripting */
     unsigned int lua_arena;         /* eval lua arena used in jemalloc. */
-    unsigned int snap_nofork_arena; /* SNAP_NOFORK (MADV_DONTFORK) jemalloc arena, UINT_MAX if unavailable. */
     mstime_t busy_reply_threshold;  /* Script / module timeout in milliseconds */
     int pre_command_oom_state;         /* OOM before command (script?) was started */
     int script_disable_deny_script;    /* Allow running commands marked "noscript" inside a script. */

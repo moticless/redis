@@ -371,7 +371,7 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
 char *zmalloc_nofork_lo = NULL;
 char *zmalloc_nofork_hi = NULL;
 static char *nofork_bump = NULL;                 /* atomic bump pointer inside [lo,hi) */
-unsigned zmalloc_nofork_arena = UINT_MAX;   /* read inline by zmalloc.h fast paths */
+static unsigned zmalloc_nofork_arena = UINT_MAX;   /* jemalloc arena index; zmalloc_nofork_arena_index() */
 int zmalloc_nofork_active = 0;              /* placement gate, see zmalloc.h */
 static extent_hooks_t *nofork_default_hooks = NULL;
 static extent_hooks_t nofork_hooks;              /* must outlive the arena */
@@ -484,7 +484,6 @@ int zmalloc_nofork_arena_init(void) {
     return 1;
 }
 
-int zmalloc_nofork_arena_available(void) { return zmalloc_nofork_arena != UINT_MAX; }
 void zmalloc_nofork_set_active(int active) { zmalloc_nofork_active = (zmalloc_nofork_arena != UINT_MAX) && active; }
 
 /* Flip the whole reserved range between MADV_DONTFORK (children never map it)
@@ -551,18 +550,6 @@ void *zmalloc_nofork_usable_slow(size_t size, size_t *usable) {
 void *zrealloc_nofork(void *ptr, size_t size) {
     if (ptr == NULL) return zmalloc_nofork(size);
     return zrealloc(ptr, size);   /* range-aware: an arena pointer stays in the arena */
-}
-
-void zfree_nofork(void *ptr) {
-    if (ptr == NULL) return;
-    if (zmalloc_nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree(ptr); return; }
-    zfree_with_flags(ptr, noforkFlags());
-}
-
-void zfree_nofork_size(void *ptr, size_t size) {
-    if (ptr == NULL) return;
-    if (zmalloc_nofork_arena == UINT_MAX || !zmalloc_is_nofork(ptr)) { zfree_with_size(ptr, size); return; }
-    zfree_with_size_and_flags(ptr, size, noforkFlags());
 }
 
 void *ztrycalloc_nofork(size_t size) {
