@@ -237,9 +237,11 @@ From then on writes to it are stock writes. INFO `snap_save_side_entries` counts
 aborts the save when retained clones plus queued bytes exceed `bgsave-hybrid-max-retained-bytes`
 (default 256 MB, 0 = unlimited). Abort marks the context, joins the thread (which gives up its
 quiescence wait when it sees the abort, since the aborting command may itself hold the section
-open), kills the child, releases every side table and unfreezes. FLUSHALL, DEBUG RELOAD/LOADAOF, a
-replica's full-sync load, SHUTDOWN and a killed child take the same path (stock kills its child there
-too). The previous dump file is untouched.
+open), kills the child, releases every side table and unfreezes. FLUSHALL and a replica's full-sync
+load take the same path through the caller's `killRDBChild` (stock kills its child there too), as do
+SHUTDOWN and a killed child. Since TASK-1.39 (2026-10-09) emptying every db no longer aborts by
+itself: DEBUG RELOAD/LOADAOF, CLUSTER RESET and RM_ResetDataset hand the dbs to the save, which
+finishes with the fork-instant data as stock's child does. The previous dump file is untouched.
 
 **FLUSHDB and SWAPDB during a save do not abort it (TASK-1.24, 2026-10-01).** The save scans
 *kvstores*, indexed by the db id they had at the fork instant; the overlay hooks carry that index and
@@ -376,7 +378,7 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
 4. **Class-change safety.** A SNAP_NOFORK value that becomes SNAP_FORK during a save is cloned into
    SNAP_FORK memory; its fork-instant SNAP_NOFORK original is what the bg serializes. Never let a
    SNAP_FORK value sit in the SNAP_NOFORK arena (the fork could not read it).
-5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save. (Since TASK-1.24, 2026-10-01: only FLUSHALL, DEBUG RELOAD/LOADAOF and a full-sync load abort a BGSAVE, and since TASK-1.15 stage 1 they detach every db of a hybrid AOF rewrite instead, which then finishes with the fork-instant data as stock's AOF child does; FLUSHDB detaches the db, SWAPDB needs nothing, see §4.)
+5. **FLUSHALL / FLUSHDB / SWAPDB during a save:** abort the save. (Since TASK-1.24, 2026-10-01: FLUSHDB detaches the db and SWAPDB needs nothing, see §4. Since TASK-1.15 stage 1 and TASK-1.39, 2026-10-09: emptying every db detaches every db to the running save, BGSAVE or AOF rewrite, which finishes with the fork-instant data as stock's child does; only FLUSHALL and a full-sync load end a BGSAVE, through the same `killRDBChild` stock uses there.)
 6. **Memory bound.** Clones + preserved originals for still-owed slots are bounded by
    write_rate x save_duration. Add a soft watermark (backpressure the scan) and a hard watermark that
    ABORTS the save rather than stalling clients.

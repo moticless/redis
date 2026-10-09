@@ -1079,18 +1079,16 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
  * database(s). Otherwise -1 is returned in the specific case the
  * DB number is out of range, and errno is set to EINVAL. */
 long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
-    /* A hybrid BGSAVE scans the live dicts from a thread. FLUSHALL, DEBUG
-     * RELOAD/LOADAOF and a replica's full-sync load empty every db: stop it
-     * (and the child) before the keyspace is destroyed, as stock kills its
-     * RDB child there. A single-db FLUSHDB hands that db's structures to the
-     * save instead (emptyDbStructure) and the save goes on; so does every db
-     * of a hybrid AOF rewrite, which stock lets run through a FLUSHALL (the
-     * FLUSHALL lands in the INCR file): killing it counted as a failed
-     * rewrite and tripped the rewrite limiter (aof-multi-part suite). */
-    if (dbnum == -1 && snapSaveInProgress() && !snapSaveIsAofRewrite()) {
-        snapSaveAbort();
-        killRDBChild();
-    }
+    /* A hybrid save scans the live dicts from a thread, so a db emptied
+     * while it runs hands its structures to the save (emptyDbStructure,
+     * emptyDbDetachToSnapshot) and the save finishes with the fork-instant
+     * data, as a stock fork child does from its copy. That holds for every
+     * caller: FLUSHDB, and the dbnum == -1 callers (FLUSHALL, DEBUG
+     * RELOAD/LOADAOF, a full-sync load, CLUSTER RESET, RM_ResetDataset).
+     * Where stock kills its RDB child (FLUSHALL after emptying, the full-sync
+     * load before it) the caller's killRDBChild() ends the hybrid save too
+     * (snapSaveAbort is hooked into it); the other callers leave it running,
+     * as stock does (TASK-1.39). */
     int async = (flags & EMPTYDB_ASYNC);
     int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
     RedisModuleFlushInfoV1 fi = {REDISMODULE_FLUSHINFO_VERSION,!async,dbnum};

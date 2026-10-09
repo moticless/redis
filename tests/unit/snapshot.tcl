@@ -396,6 +396,50 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [r dbsize]
         }
 
+        test {Hybrid BGSAVE: DEBUG RELOAD during the save hands the dbs to it; the save completes with the fork instant} {
+            populate_all_types
+            populate_fillers 3000
+            r set marker before
+            r save                              ;# dump A: the state DEBUG RELOAD will bring back
+            set digest_a [debug_digest]
+            r set marker fork-instant
+            r set extra 1
+            set digest_b [debug_digest]         ;# the fork instant
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            r debug reload nosave               ;# empties every db (handed to the save) and loads dump A
+            assert_equal 1 [s snap_save_in_progress]
+            assert_equal $digest_a [debug_digest]
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave               ;# the dump the save wrote
+            assert_equal $digest_b [debug_digest]
+            snap_assert_placement_clean
+        }
+
+        test {Hybrid BGSAVE: DEBUG LOADAOF during the save hands the dbs to it; the save completes with the fork instant} {
+            populate_all_types
+            populate_fillers 3000
+            r config set appendonly yes          ;# the rewrite's base holds the data; no FLUSHALL in the AOF (a replayed
+            waitForBgrewriteaof r                ;# FLUSHALL kills the RDB child, in stock as here)
+            set digest [debug_digest]
+            r config set rdb-key-save-delay 300
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            r debug loadaof                     ;# empties every db (handed to the save) and replays the AOF
+            assert_equal 1 [s snap_save_in_progress]
+            assert_equal $digest [debug_digest]
+            r config set rdb-key-save-delay 0
+            wait_hybrid_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r config set appendonly no
+            r debug reload nosave               ;# the dump the save wrote
+            assert_equal $digest [debug_digest]
+            snap_assert_placement_clean
+        }
+
         test {Hybrid BGSAVE: FLUSHDB during the save empties the live db at once and the save completes with the fork-instant keys} {
             foreach async {{} async} {
                 r flushall
