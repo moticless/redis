@@ -5291,9 +5291,6 @@ static void backgroundSaveDoneHandlerSocket(int exitcode, int bysignal) {
 
 /* When a background RDB saving/transfer terminates, call the right handler. */
 void backgroundSaveDoneHandler(int exitcode, int bysignal) {
-    /* Hybrid BGSAVE: stop the scan thread if still running, merge the
-     * remaining slots and release the save before the stock bookkeeping. */
-    snapSaveChildDone(exitcode, bysignal);
     int type = server.rdb_child_type;
     time_t save_end = time(NULL);
     if (server.bgsave_aborted)

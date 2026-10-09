@@ -32,7 +32,7 @@ struct listpackEx;
 /* ---- SNAP_NOFORK arena lifecycle ---------------------------------------- */
 
 /* Create the SNAP_NOFORK arena. Must be called once, in the main thread,
- * before any snapNofork* allocation (initServer does it before creating the
+ * before any zmalloc_nofork* allocation (initServer does it before creating the
  * db kvstores). The arena is created whenever the platform supports it so
  * that `bgsave-hybrid` can be switched at runtime; while the feature is off
  * the arena is left forkable and nothing new is placed in it. On platforms
@@ -249,10 +249,6 @@ size_t snapScanBitmapBytes(snapScanCtx *ctx);
 void *snapOverlayCloneKey(void *privdata, int didx, void *orig, int *value_shared);
 void snapOverlayFreeOriginal(void *privdata, int didx, void *orig, int value_shared);
 
-/* Cheap, lock-free state queries usable on every write path. A dict the
- * save has not touched reads PENDING (DONE once the scan ended or for a
- * store that holds nothing of the fork instant). */
-int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx);
 
 /* Readable fd that becomes ready whenever a slot completes or the thread
  * exits; register snapScanAeHandler() on it with AE_READABLE and 'ctx' as
@@ -339,8 +335,13 @@ int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *st
 /* Stop the scan thread and complete every slot (main thread). Safe to call when
  * no hybrid save is running. Does not touch the child (see killRDBChild). */
 void snapSaveAbort(void);
-/* Called by backgroundSaveDoneHandler() when the RDB child exited. */
-void snapSaveChildDone(int exitcode, int bysignal);
+/* The one child-end hook: called once for every child that ended, whatever
+ * its type and whether it was reaped (checkChildrenDone) or killed
+ * (killAppendOnlyChild), before the type's done handler runs. A no-op when
+ * no hybrid save owns the child; otherwise stops the scan if the child failed
+ * or the scan is unfinished, joins the thread, releases every state and
+ * publishes the last save's peaks. */
+void snapOnChildEnd(int exitcode, int bysignal);
 /* 1 when bgsave-hybrid is on (a runtime config): saves take the hybrid path
  * whether or not the SNAP_NOFORK arena exists (without it the CoW benefit is
  * gone but the mechanics are identical, which is what sanitizer builds
@@ -353,13 +354,20 @@ int snapHybridConfigApply(const char **err);
 /* 1 if 'kv' is a fork-instant original the running save has not taken yet:
  * its bucket is ahead of the scan thread and not emitted by the main thread,
  * or the thread is reading it right now. Such an object must not be mutated
- * in place (a write funnel emits or clones first; read paths that would
- * mutate, e.g. lazy field expiry, must skip). Opens a write section. */
+ * in place. Opens the command's write section, which is what keeps the answer
+ * valid until the command ends (the window cannot move past an open section);
+ * a read path that would mutate (lazy field expiry) skips the mutation when
+ * this returns 1, a read path that must mutate calls snapPrepareMutation. */
 int snapKvobjIsOwed(redisDb *db, kvobj *kv);
-/* Same test, used by the debug-build assertions at the keyspace write funnels
- * (after the funnel's prepare step the object is no longer owed) and by a
- * read command that writes a value in place (PFCOUNT's cache) to route the
- * update through the write path instead. */
+/* A read-path command about to write 'kv' in place (PFCOUNT's cache, a module
+ * setting LRU/LFU through a READ handle): if the object is owed, take the key
+ * through the write funnel (a write lookup that emits or clones its bucket)
+ * and return the object to write, which may be the clone; else 'kv'. NULL
+ * only if the key is gone. */
+kvobj *snapPrepareMutation(redisDb *db, robj *key, kvobj *kv);
+/* The debug-build assertion's predicate at the keyspace write funnels: after
+ * the funnel's prepare step the object is no longer owed. Multi-allocation
+ * SNAP_FORK values are exempt (the child has its own copy; see snapshot.c). */
 int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
 /* 1 while the main thread serializes a bucket for the snapshot (rdb.c skips
  * the rdb-key-save-delay there: it is meant to slow the scan thread). */

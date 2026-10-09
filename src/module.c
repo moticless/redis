@@ -15255,12 +15255,11 @@ size_t moduleCount(void) {
 static int moduleKeyPrepareLruWrite(RedisModuleKey *key) {
     if (!key->kv) return 0;
     if (key->mode & REDISMODULE_WRITE) return 1;
-    if (snapKvobjIsOwed(key->db, key->kv)) {
-        kvobj *kv = lookupKeyWriteWithFlags(key->db, key->key,
-            LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
-        if (!kv) return 0;
-        key->kv = kv;
-    }
+    /* A READ handle: during a hybrid BGSAVE an owed key goes through the
+     * write funnel first, as a WRITE handle did at open time. */
+    kvobj *kv = snapPrepareMutation(key->db, key->key, key->kv);
+    if (!kv) return 0;
+    key->kv = kv;
     return 1;
 }
 

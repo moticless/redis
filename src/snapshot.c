@@ -22,7 +22,7 @@
  * header copies whose values the child resolves in its own memory. The child
  * takes the small backlog first, then one big value, until END; the parent
  * drains each dict's side table as the window moves past it and completes
- * the save when the child exits (checkChildrenDone -> snapSaveChildDone ->
+ * the save when the child exits (checkChildrenDone -> snapOnChildEnd ->
  * the stock done handler). Abort (hard mark, FLUSHALL, killed child) joins
  * the thread, drains every overlay and leaves the previous dump untouched.
  *
@@ -1366,10 +1366,6 @@ int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
     return snapDictStateOf(ctx, d);
 }
 
-int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
-    return snapScanSlotState(ctx, store_idx, didx) != SNAP_SLOT_DONE;
-}
-
 int snapScanReadEventFd(snapScanCtx *ctx) {
     return ctx->en ? getReadEventFd(ctx->en) : -1;
 }
@@ -1420,7 +1416,7 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
  * SELECT in AOF command form) tracked per message, records, footer, fsync,
  * rename; or the replica sockets for a diskless sync. Completion and abort
  * both flow through the stock child machinery (checkChildrenDone -> the done
- * handler -> snapSaveChildDone).
+ * handler -> snapOnChildEnd).
  */
 
 #define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
@@ -2006,6 +2002,11 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
      * a side-table clone of it is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
     return l && dictGetKV(*l) == kv;
+}
+
+kvobj *snapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
+    if (!snapKvobjIsOwed(db, kv)) return kv;
+    return lookupKeyWriteWithFlags(db, key, LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
 }
 
 /* Debug-build check at the write funnels. A SNAP_FORK value whose top-level
@@ -3128,7 +3129,7 @@ void snapSaveAbort(void) {
     serverLog(LL_NOTICE, "Hybrid BGSAVE: scan aborted, keyspace overlay drained.");
 }
 
-void snapSaveChildDone(int exitcode, int bysignal) {
+void snapOnChildEnd(int exitcode, int bysignal) {
     if (!snap_save) return;
     snapSave *sv = snap_save;
     /* The child is gone. If the scan did not complete (or the thread stopped
@@ -3153,6 +3154,10 @@ void snapSaveChildDone(int exitcode, int bysignal) {
 
 /* ---- Unit tests ---------------------------------------------------------- */
 #ifdef REDIS_TEST
+/* Test helper: 1 while slot (store, dict) is not DONE. */
+static int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
+    return snapScanSlotState(ctx, store_idx, didx) != SNAP_SLOT_DONE;
+}
 #include "testhelp.h"
 #include <sys/wait.h>
 #include <time.h>
@@ -3196,7 +3201,7 @@ static int snapTestChildWriteFaults(void *p) {
     return -1;
 }
 
-/* Fork a child that exercises the allocator (zmalloc + snapNofork are both
+/* Fork a child that exercises the allocator (zmalloc + zmalloc_nofork are both
  * forbidden/unmapped for the arena, so only the default arena is used) to
  * prove jemalloc's post-fork state is intact with the SNAP_NOFORK arena
  * present. Returns 1 on success. */
@@ -4337,7 +4342,7 @@ int snapshotTest(int argc, char **argv, int flags) {
         size_t mid = zmalloc_used_memory();
         zfree_with_size(x, zmalloc_size(x));
         size_t after = zmalloc_used_memory();
-        test_cond("snapNofork allocations are counted in zmalloc_used_memory()", mid > before && after == before);
+        test_cond("zmalloc_nofork allocations are counted in zmalloc_used_memory()", mid > before && after == before);
     }
 
     /* 6. microbenchmark (reported, not asserted) */
@@ -4374,8 +4379,8 @@ int snapshotTest(int argc, char **argv, int flags) {
         t1 = snapTestNowNs();
         double s_bulk_sized = (double)(t1 - t0) / N;
 
-        printf("BENCH alloc+free 64B, N=%d: zmalloc/zfree pair %.1f ns, snapNofork pair %.1f ns; "
-               "bulk zmalloc %.1f ns/op, bulk snapNofork %.1f ns/op, bulk snapNofork sized-free %.1f ns/op\n",
+        printf("BENCH alloc+free 64B, N=%d: zmalloc/zfree pair %.1f ns, zmalloc_nofork pair %.1f ns; "
+               "bulk zmalloc %.1f ns/op, bulk zmalloc_nofork %.1f ns/op, bulk zmalloc_nofork sized-free %.1f ns/op\n",
                N, z_pair, s_pair, z_bulk, s_bulk, s_bulk_sized);
         zfree(a);
         test_cond("microbenchmark ran", 1);

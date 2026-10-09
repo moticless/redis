@@ -1466,6 +1466,9 @@ void checkChildrenDone(void) {
                 strChildType(server.child_type),
                 (int) server.child_pid);
         } else if (pid == server.child_pid) {
+            /* Hybrid BGSAVE: release the save (scan thread, overlays) before
+             * the type's done handler does the stock bookkeeping. */
+            snapOnChildEnd(exitcode, bysignal);
             if (server.child_type == CHILD_TYPE_RDB) {
                 backgroundSaveDoneHandler(exitcode, bysignal);
             } else if (server.child_type == CHILD_TYPE_AOF) {

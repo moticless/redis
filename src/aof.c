@@ -1250,15 +1250,19 @@ void killAppendOnlyChild(void) {
     /* Kill AOFRW child, wait for child exit. */
     serverLog(LL_NOTICE,"Killing running AOF rewrite child: %ld",
         (long) server.child_pid);
-    /* Hybrid rewrite: stop the scan thread and merge the overlay first, as
+    /* Hybrid rewrite: stop the scan thread and drain the overlay first, as
      * killRDBChild does. */
     snapSaveAbort();
-    if (kill(server.child_pid,SIGUSR1) != -1) {
+    int killed = kill(server.child_pid,SIGUSR1) != -1;
+    if (killed) {
         while(waitpid(-1, &statloc, 0) != server.child_pid);
     }
-    /* Hybrid rewrite: no done handler runs on this path, so release the save
-     * object here (the next BGSAVE asserts on a leftover one). */
-    snapSaveChildDone(WIFEXITED(statloc) ? WEXITSTATUS(statloc) : 1, WIFSIGNALED(statloc) ? WTERMSIG(statloc) : 0);
+    /* No done handler runs on this path: the child-end hook runs here. A
+     * kill() that failed left no exit status to read, so the child counts as
+     * failed rather than as a clean exit. */
+    int exitcode = !killed ? 1 : WIFEXITED(statloc) ? WEXITSTATUS(statloc) : 1;
+    int bysignal = killed && WIFSIGNALED(statloc) ? WTERMSIG(statloc) : 0;
+    snapOnChildEnd(exitcode, bysignal);
     aofRemoveTempFile(server.child_pid);
     resetChildState();
     server.aof_rewrite_time_start = -1;
@@ -3907,11 +3911,6 @@ NULL
 void backgroundRewriteDoneHandler(int exitcode, int bysignal) {
     int rewrite_success = 0;
     char bgrewrite_error[256] = "";
-
-    /* Hybrid rewrite (RDB preamble): stop the scan thread if still running,
-     * merge the remaining slots and release the save object first; a no-op
-     * for the stock child. */
-    snapSaveChildDone(exitcode, bysignal);
 
     if (!bysignal && exitcode == 0) {
         char tmpfile[256];
