@@ -211,13 +211,6 @@ int kvstoreOverlayIsFrozen(kvstore *kvs, int didx) {
     return ovPeek(kvs, didx) != NULL;
 }
 
-void kvstoreOverlayStats(kvstore *kvs, int didx, long *side_entries, long *adds, long *tombstones) {
-    kvstoreDictOverlay *ov = ovPeek(kvs, didx);
-    if (side_entries) *side_entries = ov ? ov->entries : 0;
-    if (adds) *adds = ov ? ov->adds : 0;
-    if (tombstones) *tombstones = ov ? ov->tombs : 0;
-}
-
 /* Ensure 'key' (present in the frozen dict, not tombstoned, not yet in the
  * side table) has a clone in the side table. Returns its link or NULL when
  * the key is not logically present. */
@@ -520,7 +513,7 @@ dictEntry *ovIteratorNext(kvstore *kvs, kvstoreDictOverlay *ov, dictIterator *di
 }
 
 /* Random entry of a frozen dict: sample the real dict (mapping through the
- * overlay, retrying on tombstones) and fall back to the temp dict. */
+ * overlay, retrying on tombstones) and fall back to the side table's adds. */
 dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair) {
     dict *d = ov->d;
     if (ovDictSize(kvs, didx) == 0) return NULL;

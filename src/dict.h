@@ -316,7 +316,6 @@ void dictFreeStats(dictStats *stats);
 
 dictEntryLink dictFindLink(dict *d, const void *key, dictEntryLink *bucket);
 void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int newItem);
-dictEntry *dictEncodeKeyAsEntry(dict *d, void *key);
 /* Detached entries for a side chain outside the tables (kvstore overlay):
  * allocated entries of the dict's own kind ({next, key} first, never the
  * bare-key form), so a pointer to one inside such a chain is a valid

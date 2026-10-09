@@ -329,7 +329,7 @@ void emptyDbAsync(redisDb *db) {
                      oldblessed, NULL, NULL);
 }
 
-/* FLUSHDB while a hybrid BGSAVE scans this db (TASK-1.24): the db gets fresh,
+/* FLUSHDB while a hybrid BGSAVE scans this db: the db gets fresh,
  * empty structures at once, as the ASYNC flush does, and the fork-instant
  * ones stay with the save, which frees them on BIO when it is done with
  * them. Stock keeps its child alive on FLUSHDB; this keeps the save alive.

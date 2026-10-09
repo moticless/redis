@@ -721,10 +721,6 @@ void keyMetaTransition(kvobj *kvOld, kvobj *kvNew) {
     } while (mbitsOld);
 }
 
-/* Create a new metadata class. Returns class ID (1-7) on success, 0 on failure.
- * 
- * context - In case of a module, pass the module pointer. Otherwise NULL.
- */
 /* Does 'module' own any key metadata class in use? (hybrid BGSAVE: such a
  * module has save callbacks that run in the child.) */
 int keyMetaClassModuleHasAny(RedisModule *module) {
@@ -733,6 +729,10 @@ int keyMetaClassModuleHasAny(RedisModule *module) {
     return 0;
 }
 
+/* Create a new metadata class. Returns class ID (1-7) on success, 0 on failure.
+ *
+ * context - In case of a module, pass the module pointer. Otherwise NULL.
+ */
 KeyMetaClassId keyMetaClassCreate(RedisModule *context, const char *name,
                                   int metaver, KeyMetaClassConf *conf) {
     if (!conf) return 0;

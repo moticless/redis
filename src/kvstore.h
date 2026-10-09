@@ -67,7 +67,7 @@ typedef struct _kvstoreDictIterator {
  * kvstoreDictSnapRelease() applies whatever is left and unfreezes the dict
  * once its scan is complete. The overlay hangs off the dict's save state
  * (kvstoreDictSnap.ov). The side table is a fixed array of per-bucket chains
- * of ordinary dict entries (TASK-1.21.9): a key's chain is its hash modulo the
+ * of ordinary dict entries: a key's chain is its hash modulo the
  * array size, four chains per slot tell a clone whose value is still the
  * original's, a deep clone or add, and the tombstones of each kind apart. */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
@@ -102,7 +102,7 @@ typedef struct kvstoreOverlayHooks {
  * read on a dict the scan thread is not reading). A NULL fn turns the guard
  * off; the fast path is then one load. */
 typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
-/* The other snapshot hooks of a scanned store (TASK-1.21.7 stage B): a dict
+/* The other snapshot hooks of a scanned store: a dict
  * started or finished an incremental rehash (main thread, inside the dict
  * operation; both tables are set up at 'started'), and whether a dict may
  * shrink right now (a snapshot bitmap follows a split but not a merge). */
@@ -117,7 +117,7 @@ typedef struct kvstoreSnapHooks {
 /* NULL hooks turn the snapshot off for the store. While hooks are set, every
  * access to a dict of the store that meets no overlay asks the guard. */
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
-/* References (TASK-1.37). A dict is owned by its store (one reference from
+/* References. A dict is owned by its store (one reference from
  * creation) and may be held by a running save (one more, taken at freeze
  * for every fork-instant dict). A store that frees, empties or moves a dict
  * another holder references detaches it instead: the dict leaves the slot
@@ -138,7 +138,6 @@ void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hoo
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
 long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */
-void kvstoreOverlayStats(kvstore *kvs, int didx, long *side_entries, long *adds, long *tombstones);
 
 typedef int (kvstoreScanShouldSkipDict)(dict *d, int didx);
 typedef int (kvstoreExpandShouldSkipDictIndex)(int didx);
@@ -195,7 +194,7 @@ typedef struct {
                                    generation means this save has not touched the dict. */
     kvstoreDictSnap *snap;      /* NULL until the save touches the dict; main thread stores (release),
                                    scan thread loads (acquire) */
-    int refcount;               /* holders: the owning store, a running save (TASK-1.37); atomic */
+    int refcount;               /* holders: the owning store, a running save; atomic */
     int detached;               /* out of the store's slot table, kept by a holder: the dict callbacks
                                    skip the store's bookkeeping for it */
 } kvstoreDictMetaBase;
@@ -302,7 +301,7 @@ struct _kvstore {
     fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
     int refcount;                          /* the owner plus one per allocated dict (atomic): the struct outlives
-                                              its detached dicts, whose dictType it holds (TASK-1.37) */
+                                              its detached dicts, whose dictType it holds */
     list *ov_dirty;                        /* Frozen dicts whose side table is (or was) non-empty (kvstoreDictOverlay *). */
     const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
     void *snap_priv;

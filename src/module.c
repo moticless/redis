@@ -4159,14 +4159,14 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
     return (retval == C_OK) ? REDISMODULE_OK : REDISMODULE_ERR;
 }
 
+static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit);
+
 /* Check if a key exists, without affecting its last access time.
  *
  * This is equivalent to calling RM_OpenKey with the mode REDISMODULE_READ |
  * REDISMODULE_OPEN_KEY_NOTOUCH, then checking if NULL was returned and, if not,
  * calling RM_CloseKey on the opened key.
  */
-static int moduleHybridChildGuard(struct RedisModule *module, const char *api, unsigned bit);
-
 int RM_KeyExists(RedisModuleCtx *ctx, robj *keyname) {
     if (moduleHybridChildGuard(ctx->module, "RedisModule_KeyExists", 1u << 0)) return 0;
     kvobj *kv = lookupKeyReadWithFlags(ctx->client->db, keyname, LOOKUP_NOTOUCH);

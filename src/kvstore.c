@@ -94,7 +94,7 @@ static dict *createDictIfNeeded(kvstore *kvs, int didx) {
     d = dictCreate(&kvs->dtype);
     kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
     meta->didx = didx;
-    meta->refcount = 1;   /* the store's (TASK-1.37) */
+    meta->refcount = 1;   /* the store's */
     kvstoreRetain(kvs);   /* the dict's, on its store */
     kvs->dicts[didx] = d;
     kvs->allocated_dicts++;
@@ -120,7 +120,7 @@ static void freeDictIfNeeded(kvstore *kvs, int didx) {
         return;
 
     /* Logically empty. A save still reading its fork-instant content keeps
-     * it, detached; the slot gets a fresh dict on the next add (TASK-1.37). */
+     * it, detached; the slot gets a fresh dict on the next add. */
     detachDict(kvs, didx, 0);
 }
 
@@ -141,7 +141,7 @@ void kvstoreFreeDictIfNeeded(kvstore *kvs, int didx) {
 static void kvstoreDictRehashingStarted(dict *d) {
     kvstore *kvs = d->type->userdata;
     kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
-    if (metadata->detached) return;   /* a holder keeps it, the store does not (TASK-1.37) */
+    if (metadata->detached) return;   /* a holder keeps it, the store does not */
     listAddNodeTail(kvs->rehashing, d);
     metadata->rehashing_node = listLast(kvs->rehashing);
     if (kvs->snap_hooks && kvs->snap_hooks->rehash_started)
@@ -255,7 +255,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     return kvs;
 }
 
-/* ---- References (TASK-1.37, kvstore.h) ---- */
+/* ---- References (kvstore.h) ---- */
 
 static void kvstoreRetain(kvstore *kvs) { __atomic_add_fetch(&kvs->refcount, 1, __ATOMIC_RELAXED); }
 
@@ -321,7 +321,7 @@ void kvstoreEmpty(kvstore *kvs, void(callback)(dict*)) {
         if (!d)
             continue;
         if (kvstoreDictRefcount(d) > 1) {
-            /* A save reads it: hand it over instead of emptying it (TASK-1.37). */
+            /* A save reads it: hand it over instead of emptying it. */
             detachDict(kvs, didx, 0);
             if (kvs->type->onDictEmpty) kvs->type->onDictEmpty(kvs, didx);
             continue;
@@ -356,7 +356,7 @@ void kvstoreRelease(kvstore *kvs) {
         if (metadata->rehashing_node)
             metadata->rehashing_node = NULL;
         if (kvs->type->onDictEmpty) kvs->type->onDictEmpty(kvs, didx);
-        kvstoreDictUnref(d);   /* a dict a save still holds lives on, with the struct (TASK-1.37) */
+        kvstoreDictUnref(d);   /* a dict a save still holds lives on, with the struct */
     }
     zfree(kvs->dicts);
 
@@ -642,7 +642,7 @@ int kvstoreNumDicts(kvstore *kvs) {
  * included). A dict a save is reading is moved as it is, its save state
  * with it: the save keeps reading the fork-instant layout, applies or drops
  * its side table when it completes the slot, and the dict stays out of the
- * destination's layout bookkeeping until then (TASK-1.37). */
+ * destination's layout bookkeeping until then. */
 void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     assert(kvs->num_dicts > didx);
     assert(kvs->num_dicts == dst->num_dicts);

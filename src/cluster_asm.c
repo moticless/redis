@@ -3097,7 +3097,7 @@ static void asmTrimJobAccountKv(asmTrimJob *trim_job, kvobj *kv) {
 }
 
 /* Main thread, before a slot dict is moved out: a dict a running hybrid save
- * still reads (TASK-1.37) goes to the BIO thread's kvstore with the save's
+ * still reads goes to the BIO thread's kvstore with the save's
  * reference on it, the save's thread keeps reading it and the main thread
  * completes it there, so the BIO pass below leaves it alone. Its keys are
  * accounted here instead, through the live (overlay-aware) view. */

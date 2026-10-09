@@ -2441,7 +2441,7 @@ int rewriteHashObject(rio *r, robj *key, robj *o, int dbid) {
     /* Decide from the hash's own content (accurate), not from the ExpireMeta
      * registered in the db's ebuckets: a hybrid BGREWRITEAOF serializes the
      * fork-instant original of a hash written during the rewrite, whose meta
-     * the live clone took over (the scan thread, TASK-1.15 stage 2). */
+     * the live clone took over (the scan thread). */
     int isHFE = hashTypeGetMinExpire(o, 1) != EB_EXPIRE_TIME_INVALID;
     hashTypeInitIterator(&hi, o);
 
@@ -3268,7 +3268,7 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
-    /* Hybrid BGSAVE (TASK-1.15): the base file is written by the hybrid scan
+    /* Hybrid BGSAVE: the base file is written by the hybrid scan
      * thread and child like a BGSAVE, as an RDB with the preamble or in AOF
      * command form without it; the INCR file opened above takes the writes
      * from the fork instant on. With a module that has not opted in, the

@@ -1,5 +1,13 @@
 # BGSAVE redesign — background per-slot scan, SNAP_NOFORK arena for small values, fork for SNAP_FORK values
 
+> **Reading note (2026-10-09).** This document grew with the implementation and mixes the current design
+> with its history. Where a section describes a *per-slot temporary dict* and a *main-thread merge*
+> (§3, §4 in part, §5, §7 invariants 2-3, §8, the 11.z.2 table), that mechanism was replaced by the
+> bucket window, the write funnel (in place / side table / emit-ahead) and the side-table drain
+> described in §4 and §11.z.2; the file header of `src/snapshot.c` gives the current end-to-end flow.
+> A design document describing the current state only is being written to replace this file.
+
+
 Self-contained implementation spec. Assumes ONLY a fresh clone of the upstream `redis` repository
 (branch `unstable`). Do the work on a new branch. The baseline to beat is stock `BGSAVE`.
 

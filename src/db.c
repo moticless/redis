@@ -1088,7 +1088,7 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
      * Where stock kills its RDB child (FLUSHALL after emptying, the full-sync
      * load before it) the caller's killRDBChild() ends the hybrid save too
      * (snapSaveAbort is hooked into it); the other callers leave it running,
-     * as stock does (TASK-1.39). */
+     * as stock does. */
     int async = (flags & EMPTYDB_ASYNC);
     int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
     RedisModuleFlushInfoV1 fi = {REDISMODULE_FLUSHINFO_VERSION,!async,dbnum};

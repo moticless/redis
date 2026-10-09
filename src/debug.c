@@ -2348,7 +2348,7 @@ void logServerInfo(void) {
         /* The keyspace kvstores live in the DONTFORK arena, which is not
          * mapped in the hybrid save child: the memory, keyspace, keysizes and
          * hotkeys sections would fault inside this handler and leave the
-         * reduced report (TASK-1.26). */
+         * reduced report. */
         serverLogRaw(LL_WARNING|LL_RAW, "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n");
         char *keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
                         "cpu", "module_list", "errorstats", "cluster", NULL};
@@ -2531,7 +2531,7 @@ static void killMainThread(void) {
 void killThreads(void) {
     /* A fork child has exactly one thread: the parent's pthread handles are
      * stale here and pthread_cancel on them faulted inside the crash handler
-     * (the hybrid save child, TASK-1.26), which left the reduced report. */
+     * (the hybrid save child), which left the reduced report. */
     if (server.in_fork_child) return;
     killMainThread();
     bioKillThreads();
