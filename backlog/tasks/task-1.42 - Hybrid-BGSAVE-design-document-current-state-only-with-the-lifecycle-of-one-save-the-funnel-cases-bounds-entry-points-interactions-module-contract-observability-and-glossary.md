@@ -4,9 +4,11 @@ title: >-
   Hybrid BGSAVE design document: current state only, with the lifecycle of one
   save, the funnel cases, bounds, entry points, interactions, module contract,
   observability and glossary
-status: To Do
-assignee: []
+status: Done
+assignee:
+  - '@Claude'
 created_date: '2026-10-09 22:23'
+updated_date: '2026-10-09 23:05'
 labels:
   - hybrid-bgsave
   - docs
@@ -31,9 +33,33 @@ Outcome wanted: one design document (docs/hybrid-bgsave.md or equivalent) descri
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 The document contains all ten parts (a) to (j) listed in the description, with no dates and no task IDs
-- [ ] #2 At least one diagram: the blog's figure 1 reused, plus a channel and queue diagram (producers, mq, oq/bq, two pipes, child)
-- [ ] #3 The four decisions that live only in backlog notes (small-channel wait and END counts, drain dict-type swap, expiry policy during a save, no generation tag) are stated in the document
-- [ ] #4 poc-hybrid-bgsave-spec.md either becomes the history appendix or is replaced by a pointer to the new document; no remaining section describes the temp-dict design as current
-- [ ] #5 redis.conf, redismodule.h and the snapshot.c header point to the document
+- [x] #1 The document contains all ten parts (a) to (j) listed in the description, with no dates and no task IDs
+- [x] #2 At least one diagram: the blog's figure 1 reused, plus a channel and queue diagram (producers, mq, oq/bq, two pipes, child)
+- [x] #3 The four decisions that live only in backlog notes (small-channel wait and END counts, drain dict-type swap, expiry policy during a save, no generation tag) are stated in the document
+- [x] #4 poc-hybrid-bgsave-spec.md either becomes the history appendix or is replaced by a pointer to the new document; no remaining section describes the temp-dict design as current
+- [x] #5 redis.conf, redismodule.h and the snapshot.c header point to the document
 <!-- AC:END -->
+
+## Implementation Plan
+
+<!-- SECTION:PLAN:BEGIN -->
+1. Sources: spec §0-§7 for the problem, classes, window protocol, channels and bounds; 11.z.2 for the scan/main-thread agreement and the ASM-trim and rehash rules; 11.z.4 for the module contract; snapshot.c header (TASK-1.40) for the lifecycle; server.c INFO blocks and snapshot.c serverLog lines for observability; debug.c for the DEBUG subcommands; backlog notes TASK-1.31 (small-channel wait, END counts, drain on abort), TASK-1.37 (drain's dict-type swap), TASK-1.9 (expiry policy during a save), TASK-1.21.6 (no generation tag) for the decisions that exist only there; this session's TASK-1.15, 1.37, 1.39 outcomes for the entry points and the interactions table; blog figure 1 (images/hybrid-bgsave-flow.png) for the diagram.
+2. Write docs/hybrid-bgsave.md with the ten parts (a)-(j) in the acceptance criteria, current state only, no dates, no task IDs, with an ASCII channel/queue diagram and the blog figure referenced.
+3. Replace the top of poc-hybrid-bgsave-spec.md with a pointer to the new document and a statement that the rest is the design history; keep its content for the record.
+4. Point the snapshot.c header, redis.conf (bgsave-hybrid entry) and redismodule.h (the option's comment) at docs/hybrid-bgsave.md.
+5. Verify every INFO field named in the document exists in server.c (grep), every config exists in config.c, and the interactions table agrees with the tests in unit/snapshot.
+<!-- SECTION:PLAN:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Written 2026-10-09/10 as docs/hybrid-bgsave.md (391 lines) from spec §0-§7, 11.z.2, 11.z.4, the snapshot.c header, server.c INFO blocks, snapshot.c log lines, debug.c, and the notes of the four tasks named in the description. Verified by grep that every INFO field and config the document names exists in server.c and config.c and that the document holds no dates or task IDs. The figure is copied to docs/images/. The spec is kept as the history with a pointer at the top; its content is otherwise unchanged (its stale sections are named in the pointer).
+<!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+docs/hybrid-bgsave.md is the reference for the hybrid BGSAVE as implemented, written for a Redis core reviewer who has not seen the branch. Ten parts: problem and the two classes with the arena and placement; one save end to end as a main-thread / scan-thread / child sequence, with the flow figure and an ASCII diagram of the queues and the two channels; the write funnel (behind, emitted, inside, ahead) with the race-freedom argument, attach and pause, the side table's four chains, clone, drain and release, and the reference-count model; the memory model and its two bounds; every entry point and whether it takes the hybrid or the stock child; an interactions table (FLUSHALL, FLUSHDB, SWAPDB, DEBUG RELOAD/LOADAOF, RM_ResetDataset, full-sync load, ASM trim, rehash, defrag, expiry, eviction, SHUTDOWN, child crash, hard mark, CONFIG SET) with a same-as-stock column; the module contract including the stored-pointer and main-thread rules; every config, INFO field, DEBUG subcommand and log line; a glossary; eight invariants. The four decisions that lived only in task notes are stated: the child's small-channel policy and END's counts, the drain's private dict type, the expiry policy during a save, and why no leftover handling exists.
+
+poc-hybrid-bgsave-spec.md is kept as the design history with a pointer to the document at the top and its superseded sections named. snapshot.c, snapshot.h, redis.conf and the REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE comment point to the document; the option's comment now also carries the stored-pointer and main-thread rules. No dates and no task IDs in the document; every INFO field and config it names was checked against server.c and config.c.
+<!-- SECTION:FINAL_SUMMARY:END -->
