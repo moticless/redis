@@ -4,11 +4,11 @@ title: >-
   Hybrid BGSAVE boundary fixes: snapshot state out of kvstore.h, one dispatch
   and one child-end hook, INFO/DEBUG generation inside the feature, one
   allocator layer, one owed predicate
-status: In Progress
+status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-09 22:23'
-updated_date: '2026-10-10 08:02'
+updated_date: '2026-10-10 18:28'
 labels:
   - hybrid-bgsave
   - refactor
@@ -67,11 +67,11 @@ Items: (1) kvstore.h exposes one opaque per-dict extension slot plus an ext-ops 
 <!-- AC:BEGIN -->
 - [x] #1 kvstore.h contains no snapshot-specific types or encodings beyond an opaque extension slot and its ops vtable; kvsoverlay.c neither allocates nor frees bitmaps; one hook struct and one privdata convention; one key-count update function used by kvstore.c, kvsoverlay.c and kvstoreMoveDict
 - [x] #2 rdb.c, replication.c and aof.c each call one hybrid dispatch function and contain no inline eligibility logic; the AOF rewrite start bookkeeping exists once
-- [ ] #3 One child-end hook handles kill and reap for RDB, AOF and module children; a failed kill() in killAppendOnlyChild is reported as a failure, with a test
+- [x] #3 One child-end hook handles kill and reap for RDB, AOF and module children; a failed kill() in killAppendOnlyChild is reported as a failure (no test: the path cannot be driven without fault injection; the user dropped the test clause on 2026-10-10)
 - [x] #4 server.c and debug.c call one function each for INFO memory fields, INFO persistence fields, the DEBUG SNAP-* subcommands and the crash-report section list
 - [x] #5 rdb.c reads the scan-thread configuration (compression, maxmemory policy, LRU clock, key-save delay) through one struct or getter
-- [ ] #6 zmalloc.h exports one nofork allocation layer with no redundant free/realloc variants, no extern lo/hi/arena/active globals, one arena index and one feature macro; all call sites use that layer
-- [ ] #7 Read paths call a side-effect-free owed predicate; the three mutation-preparation sites call one shared function; snapKvobjIsFrozenOriginal is used only in debug assertions; snapScanKeyIsOwed lives in the tests
+- [x] #6 zmalloc.h exports one nofork allocation layer with no redundant free/realloc variants, one arena index and one feature macro; all call sites use that layer; the only extern globals are the three read by the inline range check and placement gate (lo, hi, active), documented as such, and cold callers reach the range through an accessor (reworded 2026-10-10: hiding them would add a call per free and per allocation)
+- [x] #7 Read paths call the owed predicate, which may hold the window open (a write section) for the rest of the command because that is what keeps its answer valid; the three mutation-preparation sites call one shared function; snapKvobjIsFrozenOriginal is used only in debug assertions; snapScanKeyIsOwed lives in the tests (reworded 2026-10-10: a side-effect-free variant would be racy against the scan thread)
 - [x] #8 Module child guard bits come from a table; every suite named in the description passes after each item's commit
 <!-- AC:END -->
 
@@ -99,4 +99,14 @@ Order, one commit per item, each verified by build without warnings, redis-serve
 Sanitizer pass on the final head (39f68a939): TSan unit/snapshot 75 ok, 0 reports; ASan unit/snapshot 75 ok, 0 reports. AC 1, 2, 4, 5, 6 and 8 verified. AC 3 and 7 are implemented except for one clause each, which the user decides on: AC 3 asks for a test of the failed-kill() path in killAppendOnlyChild, which cannot be driven deterministically without fault injection; AC 7 asks for a side-effect-free owed predicate on read paths, where the write section the predicate opens is what makes its answer valid for the rest of the command (a section-free check would be racy), so the read paths keep calling snapKvobjIsOwed and skip, and the mutating paths call snapPrepareMutation.
 
 Correction (2026-10-10, after the user asked whether I challenge the tickets or accept them): AC 6 was checked although one clause is not met. zmalloc_nofork_lo, zmalloc_nofork_hi and zmalloc_nofork_active remain extern because the inline zmalloc_is_nofork() range check and the zmalloc_nofork_enabled() placement gate in zmalloc.h read them on hot paths; hiding them behind out-of-line accessors would cost a call per free and per allocation. The clause 'no extern lo/hi/arena/active globals' is therefore wrong as written; the arena index is the one global that moved behind an accessor. Unchecked; the user decides whether to reword or keep it open.
+
+Closed 2026-10-10 after the user's decisions on the three open clauses: AC 3 test clause dropped (no fault injection for a failed kill()); AC 6 reworded to allow the three globals the inline hot-path checks read, with the one cold reader (the child's address-range reservation in snapshot.c) moved to a new zmalloc_nofork_arena_range() accessor and the header documenting the globals as inline-only; AC 7 reworded to say the owed predicate may hold the window open for the rest of the command, since that section is what keeps its answer valid against the scan thread. Accessor change verified by build without warnings, redis-server test snapshot 184, unit/snapshot (hybrid) 81 ok.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Boundary cleanup of the hybrid BGSAVE feature from the 2026-10-09 review, done in place without file splits or renames (user decision). Eight items in five commits (9fb660285, ae61ea7e5, the allocator-layer commit, 2673049fc, 787ca1d1d, 39f68a939) plus the AC 6 follow-up: one dispatch entry point snapSaveTryStart owning the eligibility rule for RDB, sockets and AOF; INFO, DEBUG and crash-report generation inside snapshot.c; one per-save configuration getter for rdb.c; module guard bits from an enum table; one nofork allocation layer (wrappers and redundant free/realloc variants removed, one arena index, one feature macro, the three inline-read globals documented and the cold reader behind an accessor); one child-end hook snapOnChildEnd for kill and reap, with a failed kill() in killAppendOnlyChild counted as a failure; one mutation-preparation function snapPrepareMutation for PFCOUNT, the module LRU/LFU setters and lazy field expiry, with the owed predicate holding the window open by design; kvstore.h reduced from 423 to 273 lines with an opaque extension slot, one hook struct and privdata, the overlay internals in kvsoverlay.h, and one key-count function.
+
+Verification across the items: build without warnings, redis-server test snapshot 184, and the six-suite chain with the hybrid on (unit/snapshot 81, aofrw 25, aof 63, aof-multi-part 41, replication 80, info 31); TSan and ASan unit/snapshot 75 ok with 0 reports on 39f68a939; the full suite with the hybrid on afterwards (TASK-1.44) 6310 ok with two unrelated timing flakes. Three acceptance clauses were reworded or dropped with the user (test of a failed kill(), the inline-only globals, the side-effect-free predicate) rather than claimed; the reasons are in the notes.
+<!-- SECTION:FINAL_SUMMARY:END -->
