@@ -369,10 +369,12 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
 }
 
 static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
-/* Overlay hook privdata of store s: the store index. The redisDb owning the
- * store is resolved at call time (SWAPDB moves a store to another db id; a
- * FLUSHDB leaves it with no owner), the db id in the dump is always s. */
-typedef struct snapStorePriv { int s; } snapStorePriv;
+/* The privdata of every kvstore hook on store s (guard, layout and overlay
+ * callbacks alike, one convention): the scan and the store index, plus what
+ * the overlay's user handed to snapScanSetOverlay for that store. The redisDb
+ * owning a store is resolved at call time (SWAPDB moves a store to another db
+ * id; a FLUSHDB leaves it with no owner), the db id in the dump is always s. */
+struct snapGuardPriv { struct snapScanCtx *ctx; int s; void *user; };
 typedef struct snapSave snapSave;
 static snapSave *snap_save;   /* defined with the save object below */
 static redisDb *snapStoreOwnerDb(snapSave *sv, int s);
@@ -382,7 +384,7 @@ void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int6
 void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
     /* The db owning the store right now (NULL once FLUSHDB detached it: no
      * expires/subexpires to keep in step, and no writes reach it anyway). */
-    redisDb *db = snap_save ? snapStoreOwnerDb(snap_save, ((snapStorePriv *)privdata)->s) : NULL;
+    redisDb *db = snap_save ? snapStoreOwnerDb(snap_save, ((struct snapGuardPriv *)privdata)->s) : NULL;
     kvobj *orig = orig_;
     kvobj *kv = snapKvobjCloneHeader(orig);
     *value_shared = 0;
@@ -637,7 +639,7 @@ struct snapScanCtx {
     int ended;                      /* Main thread: every store completed; nothing is owed any more. */
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
     uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
-    struct snapGuardPriv { struct snapScanCtx *ctx; int s; } *guards;   /* Per store, the guard's privdata. */
+    struct snapGuardPriv *guards;   /* Per store: the privdata of every hook on that store. */
 
     snapScanDispatchFn *dispatch;
     snapScanSlotDoneFn *slot_done;
@@ -661,7 +663,7 @@ struct snapScanCtx {
     redisAtomic long long keys_dispatched;
 
     /* Keyspace overlay (optional). */
-    kvstoreOverlayHooks ov_hooks;
+    kvstoreSnapHooks hooks;         /* installed on every store: the scan's guard and layout hooks plus the user's overlay callbacks */
     int has_ov;
     void **ov_priv;                 /* Per store. */
     int frozen_all;                 /* snapScanFreeze() done. */
@@ -902,10 +904,14 @@ void snapScanSetStoreDone(snapScanCtx *ctx, void (*fn)(void *privdata, int s)) {
     ctx->store_done = fn;
 }
 
-void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata)
+void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
 {
     serverAssert(!ctx->started);
-    ctx->ov_hooks = *hooks;
+    ctx->hooks.clone = hooks->clone;
+    ctx->hooks.free_orig = hooks->free_orig;
+    ctx->hooks.enter = hooks->enter;
+    ctx->hooks.prepare = hooks->prepare;
+    ctx->hooks.drainable = hooks->drainable;
     ctx->has_ov = 1;
     ctx->ov_priv = store_privdata;
 }
@@ -934,6 +940,7 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
         ctx->num_dicts[s] = kvstoreNumDicts(stores[s]);
         ctx->guards[s].ctx = ctx;
         ctx->guards[s].s = s;
+        ctx->guards[s].user = NULL;
     }
     ctx->window_buckets = snap_window_buckets;
     ctx->gen = ++snap_scan_gen;
@@ -962,8 +969,7 @@ static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int di
         sn = zcalloc(sizeof(*sn));
         __atomic_store_n(&snapMeta(d)->ext, sn, __ATOMIC_RELEASE);
         snapScanBitmapAlloc(ctx, sn, d);
-        if (ctx->has_ov)
-            kvstoreOverlayAttach(ctx->stores[s], didx, &ctx->ov_hooks, ctx->ov_priv ? ctx->ov_priv[s] : NULL);
+        if (ctx->has_ov) kvstoreOverlayAttach(ctx->stores[s], didx);
     }
     if (pause && !sn->paused) {
         sn->paused = 1;
@@ -1014,9 +1020,6 @@ static int snapGuardShrinkAllowed(void *privdata, int didx) {
     dict *d = kvstoreGetDict(g->ctx->stores[g->s], didx);
     return !d || snapMeta(d)->ext == NULL;   /* a bitmap cannot follow a merge of buckets */
 }
-static const kvstoreSnapHooks snap_guard_hooks = {
-    snapOverlayGuard, snapGuardRehashStarted, snapGuardRehashCompleted, snapGuardShrinkAllowed,
-};
 
 /* One pass over the store's dicts (a store empty right now holds nothing of
  * the fork instant and is never scanned nor guarded): every non-empty dict
@@ -1040,7 +1043,12 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
         ctx->nrefs[s]++;
     }
     ctx->slots_total += ctx->nrefs[s];
-    kvstoreSnapGuardSet(kvs, &snap_guard_hooks, &ctx->guards[s]);
+    ctx->hooks.guard = snapOverlayGuard;
+    ctx->hooks.rehash_started = snapGuardRehashStarted;
+    ctx->hooks.rehash_completed = snapGuardRehashCompleted;
+    ctx->hooks.shrink_allowed = snapGuardShrinkAllowed;
+    ctx->guards[s].user = ctx->ov_priv ? ctx->ov_priv[s] : NULL;
+    kvstoreSnapGuardSet(kvs, &ctx->hooks, &ctx->guards[s]);
     ctx->frozen[s] = 1;
 }
 
@@ -1500,8 +1508,6 @@ typedef struct snapShared {
 struct snapSave {
     snapScanCtx *scan;
     kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
-    void **privs;              /* &store_priv[s] per store */
-    snapStorePriv *store_priv;
     snapFlushedDb *flushed;    /* per store */
     int dbnum;
     /* Two channels to the child. The small channel carries the
@@ -1880,11 +1886,11 @@ static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table,
     return !snapScanBucketEmitted(ctx, s, didx, table, idx);
 }
 
-/* Overlay 'prepare' hook (privdata = redisDb *): may the frozen chain of
+/* Overlay 'prepare' hook (privdata = the store's snapGuardPriv): may the frozen chain of
  * 'key' be written in place? Emits the bucket first when the thread has not
  * reached it. */
 static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key) {
-    int s = ((snapStorePriv *)privdata)->s;
+    int s = ((struct snapGuardPriv *)privdata)->s;
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
     int table, pos;
@@ -1931,7 +1937,7 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
  * the frozen chain now? Yes once the scan thread has passed its bucket (the
  * position is stable inside the section the caller holds). */
 static int snapOverlayDrainable(void *privdata, int didx, dict *d, const void *key) {
-    int s = ((snapStorePriv *)privdata)->s;
+    int s = ((struct snapGuardPriv *)privdata)->s;
     snapSave *sv = snap_save;
     if (!sv) return 1;
     int table;
@@ -2827,15 +2833,14 @@ static void snapSaveFree(snapSave *sv) {
     for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
     zfree(sv->flushed);
     zfree(sv->stores);
-    zfree(sv->privs);
-    zfree(sv->store_priv);
     zfree(sv);
 }
 
-/* Overlay hooks for the server keyspace (privdata = redisDb *). */
+/* Overlay callbacks for the server keyspace (privdata = the store's snapGuardPriv). */
 static void snapOverlayEnter(void *privdata) { UNUSED(privdata); snapFunnelOpen(); }
-static const kvstoreOverlayHooks snap_server_hooks = {
-    snapOverlayCloneKey, snapOverlayFreeOriginal, snapOverlayEnter, snapOverlayPrepare, snapOverlayDrainable,
+static const kvstoreSnapHooks snap_server_hooks = {
+    .clone = snapOverlayCloneKey, .free_orig = snapOverlayFreeOriginal, .enter = snapOverlayEnter,
+    .prepare = snapOverlayPrepare, .drainable = snapOverlayDrainable,
 };
 
 /* Main thread: the save object, its channel, queues and scan context for a
@@ -2852,15 +2857,11 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->filename = filename;
     if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
     sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
-    sv->privs = zmalloc(sizeof(void *) * sv->dbnum);
-    sv->store_priv = zmalloc(sizeof(snapStorePriv) * sv->dbnum);
     sv->flushed = zcalloc(sizeof(snapFlushedDb) * sv->dbnum);
     sv->sizes = zcalloc(sizeof(snapDbSizes) * sv->dbnum);
     for (int j = 0; j < sv->dbnum; j++) {
         redisDb *db = &server.db[j];
         sv->stores[j] = db->keys;
-        sv->store_priv[j].s = j;
-        sv->privs[j] = &sv->store_priv[j];
         sv->sizes[j].keys = kvstoreSize(db->keys);
         sv->sizes[j].expires = kvstoreSize(db->expires);
         if (server.cluster_enabled) {
@@ -2924,7 +2925,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->rdb_compression = (req & SLAVE_REQ_RDB_NO_COMPRESS) ? 0 : server.rdb_compression;
     server.stat_snap_saves++;
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
-    snapScanSetOverlay(sv->scan, &snap_server_hooks, sv->privs);
+    snapScanSetOverlay(sv->scan, &snap_server_hooks, NULL);
     snapScanSetStoreDone(sv->scan, snapSaveStoreDone);
     snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
     snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
@@ -3935,7 +3936,7 @@ struct ovTestCounters { int clones; int frees; int frees_shared; };
 
 static void *ovTestClone(void *priv, int didx, void *orig, int *shared) {
     UNUSED(didx);
-    struct ovTestCounters *c = priv;
+    struct ovTestCounters *c = ((struct snapGuardPriv *)priv)->user;
     c->clones++;
     *shared = 0;
     return zstrdup(orig);
@@ -3943,7 +3944,7 @@ static void *ovTestClone(void *priv, int didx, void *orig, int *shared) {
 
 static void ovTestFree(void *priv, int didx, void *orig, int shared) {
     UNUSED(didx);
-    struct ovTestCounters *c = priv;
+    struct ovTestCounters *c = ((struct snapGuardPriv *)priv)->user;
     c->frees++;
     if (shared) c->frees_shared++;
     zfree(orig);
@@ -3991,7 +3992,7 @@ static void snapRefcountTests(void) {
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0, 0};
     void *privs[1] = { &cnt };
-    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL, NULL };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
     long dispatched, bad, t, sc, dn;
     long long kd;
 
@@ -4126,7 +4127,7 @@ static void snapOverlayTests(int abort_variant) {
 
     snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
     st->ctx = ctx;
-    kvstoreOverlayHooks hooks = { ovTestClone, ovTestFree, snapOverlayEnter, NULL, NULL };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
     snapScanSetOverlay(ctx, &hooks, privs);
     test_cond("overlay: start", snapScanStart(ctx) == C_OK);
     test_cond("overlay: nothing is attached at start, the empty slot is DONE",

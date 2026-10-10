@@ -192,12 +192,14 @@ void snapScanAbort(snapScanCtx *ctx);
 void snapScanRelease(snapScanCtx *ctx);
 
 /* Attach the keyspace overlay (kvstore.h) to the scan: a dict gets an
- * overlay with these hooks the first time the guard attaches it; its side
- * table drains on the main thread as the window moves and is released when
- * its slot completes. 'store_privdata[s]' is passed to the hooks for store s
- * (the server passes the redisDb). Must be called before snapScanStart().
- * The hooks struct is copied. */
-void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreOverlayHooks *hooks, void **store_privdata);
+ * overlay the first time the guard attaches it; its side table drains on
+ * the main thread as the window moves and is released when its slot
+ * completes. Only the overlay callbacks of 'hooks' (clone, free_orig, enter,
+ * prepare, drainable) are taken; the guard and layout hooks are the scan's
+ * own. Every hook of store s receives the store's snapGuardPriv, whose 'user'
+ * field is 'store_privdata[s]' (NULL array: NULL). Must be called before
+ * snapScanStart(). */
+void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
 
 /* ---- Bucket window and write sections ------------------------------------
  *
@@ -241,7 +243,7 @@ long snapScanDictsGrown(snapScanCtx *ctx);
 long snapScanRetainedDicts(snapScanCtx *ctx);
 size_t snapScanBitmapBytes(snapScanCtx *ctx);
 
-/* Overlay callbacks for the server keyspace (privdata = redisDb *). The clone
+/* Overlay callbacks for the server keyspace (privdata = the store's snapGuardPriv). The clone
  * copies the whole kvobj allocation into a fresh arena block; SNAP_NOFORK
  * values (single allocation in the arena) are deep-copied, everything else
  * is shared with the original. db->expires and db->subexpires are pointed

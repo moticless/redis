@@ -12,14 +12,13 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-#define KVSTORE_INTERNAL
 #include "fmacros.h"
 
 #include <string.h>
 #include <stddef.h>
 
 #include "zmalloc.h"
-#include "kvstore.h"
+#include "kvsoverlay.h"
 #include "fwtree.h"
 #include "redisassert.h"
 #include "monotonic.h"
@@ -184,6 +183,12 @@ static int kvstoreDictShrinkAllowed(dict *d) {
     if (!kvs->snap_hooks || !kvs->snap_hooks->shrink_allowed) return 1;
     kvstoreDictMetaBase *metadata = (kvstoreDictMetaBase *)dictMetadata(d);
     return kvs->snap_hooks->shrink_allowed(kvs->snap_priv, metadata->didx);
+}
+
+/* The snapshot's hooks on this store (kvstore.h kvstoreSnapHooks). */
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
+    kvs->snap_hooks = hooks;
+    kvs->snap_priv = privdata;
 }
 
 /* Updates the bucket count for the given dictionary in a DB. It adds the new ht size
@@ -729,7 +734,7 @@ int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it) {
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
     for (;;) {
         kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? ovRead(kvs_it->kvs, kvs_it->didx) : NULL;
-        dictEntry *de = ov ? ovIteratorNext(kvs_it->kvs, ov, &kvs_it->di, &kvs_it->ov_phase, (ovCursor *)&kvs_it->ov_cur)
+        dictEntry *de = ov ? ovIteratorNext(kvs_it->kvs, ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
                            : (kvs_it->di.d ? dictNext(&kvs_it->di) : NULL);
         if (de) return de;
         /* No current dict or reached the end of the dictionary.
@@ -844,7 +849,7 @@ dictEntry *kvstoreDictIteratorNext(kvstoreDictIterator *kvs_di)
     /* The dict may be deleted during the iteration process, so here need to check for NULL. */
     if (!kvs_di->di.d) return NULL;
     kvstoreDictOverlay *ov = ovRead(kvs_di->kvs, kvs_di->didx);
-    if (ov) return ovIteratorNext(kvs_di->kvs, ov, &kvs_di->di, &kvs_di->ov_phase, (ovCursor *)&kvs_di->ov_cur);
+    if (ov) return ovIteratorNext(kvs_di->kvs, ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
     if (!kvstoreGetDict(kvs_di->kvs, kvs_di->didx)) return NULL;
     return dictNext(&kvs_di->di);
 }

@@ -12,31 +12,22 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-/* Snapshot overlay of a kvstore (hybrid BGSAVE): the per-dict save state and
- * the side table that keeps main-thread writes out of the buckets the scan
- * thread is reading. kvstore.c holds only the dispatch into this file (the
- * public wrappers, the iterators and the dict hooks). See kvstore.h, the
- * KVSTORE_INTERNAL section, for what the two files share. */
+/* Snapshot overlay of a kvstore (hybrid BGSAVE): the side table that keeps
+ * main-thread writes out of the buckets the scan thread is reading, and the
+ * overlay halves of the kvstore entry points. kvstore.c holds only the
+ * dispatch into this file (the public wrappers, the iterators and the dict
+ * hooks); kvsoverlay.h is what the two files share. The save's own per-dict
+ * state (bitmaps, pause) lives in the dict's extension slot and is
+ * snapshot.c's. */
 
-#define KVSTORE_INTERNAL
 #include "fmacros.h"
 
 #include <string.h>
 #include <stddef.h>
 
 #include "zmalloc.h"
-#include "kvstore.h"
-#include "fwtree.h"
+#include "kvsoverlay.h"
 #include "redisassert.h"
-
-/* ==========================================================================
- * Per-dict save state
- * ========================================================================== */
-
-void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
-    kvs->snap_hooks = hooks;
-    kvs->snap_priv = privdata;
-}
 
 /* ==========================================================================
  * Side table
@@ -158,7 +149,7 @@ dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c) {
 
 /* Start of a main-thread write on a frozen dict (see kvstoreOverlayEnterFn). */
 static inline void ovEnter(kvstoreDictOverlay *ov) {
-    if (ov->h.enter) ov->h.enter(ov->privdata);
+    if (ov->h->enter) ov->h->enter(ov->privdata);
 }
 
 /* May the frozen chain of 'key' be written in place? Must be called after
@@ -166,8 +157,8 @@ static inline void ovEnter(kvstoreDictOverlay *ov) {
  * prepare hook the overlay is pure clone-on-write. */
 static inline int ovPrepare(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
     (void)kvs;
-    if (!ov->h.prepare) return KVSTORE_OV_DEFER;
-    return ov->h.prepare(ov->privdata, didx, ov->d, key);
+    if (!ov->h->prepare) return KVSTORE_OV_DEFER;
+    return ov->h->prepare(ov->privdata, didx, ov->d, key);
 }
 
 /* Is 'bucket' (a link handed out as a bucket) one of dict d's own buckets? */
@@ -179,18 +170,19 @@ static int ovBucketInDict(dict *d, dictEntryLink bucket) {
     return 0;
 }
 
-void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata)
+void kvstoreOverlayAttach(kvstore *kvs, int didx)
 {
     dict *d = kvs->dicts[didx];
     assert(d != NULL);   /* only an existing dict can be frozen; it stays alive while frozen */
+    assert(kvs->snap_hooks != NULL);
     kvstoreDictMetaBase *meta = (kvstoreDictMetaBase *)dictMetadata(d);
     assert(meta->ov == NULL);
     kvstoreDictOverlay *ov = zcalloc(sizeof(*ov));
     ov->kvs = kvs;
     ov->didx = didx;
     ov->d = d;
-    ov->h = *hooks;
-    ov->privdata = privdata;
+    ov->h = kvs->snap_hooks;
+    ov->privdata = kvs->snap_priv;
     __atomic_store_n(&meta->ov, ov, __ATOMIC_RELEASE);
 }
 
@@ -208,7 +200,7 @@ static dictEntryLink ovEnsureClone(kvstore *kvs, int didx, kvstoreDictOverlay *o
     dictEntry *fe = dictFind(ov->d, key);
     if (!fe) return NULL;
     int shared = 0;
-    void *clone = ov->h.clone(ov->privdata, didx, dictGetKey(fe), &shared);
+    void *clone = ov->h->clone(ov->privdata, didx, dictGetKey(fe), &shared);
     assert(clone != NULL);
     link = ovChainPush(kvs, ov, shared ? OV_SHARED : OV_LIVE, clone);
     ov->entries++;
@@ -302,7 +294,7 @@ static void ovApplySide(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d,
     if (flink) {
         void *orig = dictGetKey(*flink);
         dictSetKeyAtLink(d, kv, &flink, 0);
-        ov->h.free_orig(ov->privdata, didx, orig, chain == OV_SHARED);
+        ov->h->free_orig(ov->privdata, didx, orig, chain == OV_SHARED);
     } else {
         dictSetKeyAtLink(d, kv, NULL, 1);   /* no expand: auto-resize is paused */
         ov->adds--;
@@ -318,7 +310,7 @@ static void ovApplyTomb(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dict *d,
     assert(fe != NULL);
     void *orig = dictGetKey(fe);
     dictFreeUnlinkedEntry(d, fe);            /* destructor suppressed: frees only a chain node */
-    ov->h.free_orig(ov->privdata, didx, orig, chain == OV_TOMB_SHARED);
+    ov->h->free_orig(ov->privdata, didx, orig, chain == OV_TOMB_SHARED);
     ov->tombs--;
     dictEntryFreeDetached(d, ovChainUnlink(link), 0);   /* the tombstone borrowed the original's pointer */
 }
@@ -350,7 +342,7 @@ static long ovDrainOne(kvstore *kvs, kvstoreDictOverlay *ov, int force) {
                 dictEntryLink link = &slot->heads[chain];
                 while (*link) {
                     const void *key = ovEntryKey(tkvs, *link);
-                    if (!force && !(ov->h.drainable && ov->h.drainable(ov->privdata, didx, d, key))) {
+                    if (!force && !(ov->h->drainable && ov->h->drainable(ov->privdata, didx, d, key))) {
                         link = dictEntryNextLink(*link);
                         continue;
                     }

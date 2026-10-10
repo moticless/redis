@@ -31,6 +31,10 @@
 
 typedef struct _kvstore kvstore;
 
+/* Snapshot overlay (hybrid BGSAVE): an iterator's position in a frozen dict's
+ * side table while it enumerates the keys the overlay added (phase 1). */
+typedef struct kvstoreOvCursor { int slot, chain; dictEntry *next; } kvstoreOvCursor;
+
 /* Structure for kvstore iterator that allows iterating across multiple dicts. */
 typedef struct _kvstoreIterator {
     kvstore *kvs;
@@ -38,7 +42,7 @@ typedef struct _kvstoreIterator {
     long long next_didx;
     dictIterator di;
     int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = side table (ADDs) */
-    struct { int slot, chain; dictEntry *next; } ov_cur;   /* side-table position in phase 1 */
+    kvstoreOvCursor ov_cur;     /* side-table position in phase 1 */
 } kvstoreIterator;
 
 /* Structure for kvstore dict iterator that allows iterating the corresponding dict. */
@@ -47,7 +51,7 @@ typedef struct _kvstoreDictIterator {
     long long didx;
     dictIterator di;
     int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = side table (ADDs) */
-    struct { int slot, chain; dictEntry *next; } ov_cur;   /* side-table position in phase 1 */
+    kvstoreOvCursor ov_cur;     /* side-table position in phase 1 */
 } kvstoreDictIterator;
 
 /* ---- Snapshot overlay: the in-window side table (hybrid BGSAVE) -------------
@@ -88,13 +92,6 @@ typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const v
  * will the snapshot thread never read that bucket again? Optional (absent:
  * nothing drains before kvstoreOverlayRelease). */
 typedef int (kvstoreOverlayDrainableFn)(void *privdata, int didx, dict *d, const void *key);
-typedef struct kvstoreOverlayHooks {
-    kvstoreOverlayCloneFn *clone;
-    kvstoreOverlayFreeOrigFn *free_orig;
-    kvstoreOverlayEnterFn *enter;
-    kvstoreOverlayPrepareFn *prepare;
-    kvstoreOverlayDrainableFn *drainable;
-} kvstoreOverlayHooks;
 /* Snapshot guard: while a scan runs over the store, every access to a dict
  * that has no overlay yet asks the snapshot first (write = 1 for structural
  * writes). The guard may attach an overlay (kvstoreOverlayAttach) and return
@@ -108,14 +105,25 @@ typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore 
  * shrink right now (a snapshot bitmap follows a split but not a merge). */
 typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);
 typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);
+/* The snapshot's hooks on a store, one struct and one privdata: the guard and
+ * the layout hooks the store consults on every dict, and the overlay
+ * callbacks a frozen dict's side table calls (clone, free_orig, enter,
+ * prepare, drainable). The struct must outlive every overlay attached while
+ * it was installed (a detached dict's overlay keeps pointing at it). */
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;
     kvstoreSnapRehashFn *rehash_started;
     kvstoreSnapRehashFn *rehash_completed;
     kvstoreSnapShrinkAllowedFn *shrink_allowed;
+    kvstoreOverlayCloneFn *clone;
+    kvstoreOverlayFreeOrigFn *free_orig;
+    kvstoreOverlayEnterFn *enter;
+    kvstoreOverlayPrepareFn *prepare;
+    kvstoreOverlayDrainableFn *drainable;
 } kvstoreSnapHooks;
 /* NULL hooks turn the snapshot off for the store. While hooks are set, every
- * access to a dict of the store that meets no overlay asks the guard. */
+ * access to a dict of the store that meets no overlay asks the guard, and
+ * the overlays attached meanwhile call back with the same privdata. */
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
 /* References. A dict is owned by its store (one reference from
  * creation) and may be held by a running save (one more, taken at freeze
@@ -133,7 +141,7 @@ int kvstoreRefcount(kvstore *kvs);                  /* the owner plus one per al
 /* The save state of a dict: allocate it, or release it (side table applied,
  * bitmaps freed and their bytes returned, layout resumed). */
 void kvstoreOverlayRelease(dict *d);   /* the dict's scan is complete or the save aborted: side table applied, overlay gone */
-void kvstoreOverlayAttach(kvstore *kvs, int didx, const kvstoreOverlayHooks *hooks, void *privdata);   /* needs the save state attached */
+void kvstoreOverlayAttach(kvstore *kvs, int didx);   /* the store's hooks and privdata serve the overlay */
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
 long kvstoreOverlayDrain(kvstore *kvs);            /* every frozen dict with a non-empty side table; returns what is left */
 long kvstoreOverlayPending(kvstore *kvs);          /* side-table entries (clones, adds, tombstones) across the store */
@@ -261,154 +269,5 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val);
 #ifdef REDIS_TEST
 int kvstoreTest(int argc, char *argv[], int flags);
 #endif
-
-
-/* ==========================================================================
- * Internal to kvstore.c and kvsoverlay.c, not an API: the store itself, the
- * snapshot overlay types, the inline fast paths every dict access takes and
- * the overlay routines the two files exchange. Both files define
- * KVSTORE_INTERNAL before including this header; nothing else does.
- * ========================================================================== */
-#ifdef KVSTORE_INTERNAL
-
-#include "fwtree.h"
-
-struct _kvstore {
-    int flags;
-    kvstoreType *type;
-    dictType dtype;
-    dict **dicts;
-    long long num_dicts;
-    long long num_dicts_bits;
-    list *rehashing;                       /* List of dictionaries in this kvstore that are currently rehashing. */
-    int resize_cursor;                     /* Cron job uses this cursor to gradually resize dictionaries (only used if num_dicts > 1). */
-    int allocated_dicts;                   /* The number of allocated dicts. */
-    int non_empty_dicts;                   /* The number of non-empty dicts. */
-    unsigned long long key_count;          /* Total number of keys in this kvstore. */
-    unsigned long long bucket_count;       /* Total number of buckets in this kvstore across dictionaries. */
-    fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
-    size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
-    int refcount;                          /* the owner plus one per allocated dict (atomic): the struct outlives
-                                              its detached dicts, whose dictType it holds */
-    list *ov_dirty;                        /* Frozen dicts whose side table is (or was) non-empty (kvstoreDictOverlay *). */
-    const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
-    void *snap_priv;
-    void *metadata[];                      /* conditionally allocated based on "flags" */
-};
-
-/* ==========================================================================
- * Snapshot overlay
- * ========================================================================== */
-
-/* The side table of a frozen dict (the overlay API above): OV_SLOTS chains of detached
- * dict entries, a key's slot being its hash modulo OV_SLOTS (the low bits of
- * its bucket index in either table). Four chains per slot:
- *   LIVE         deep clones and adds: at drain they replace their original
- *                (freed in full) or are inserted.
- *   SHARED       clones whose value allocation is still the original's: at
- *                drain they replace the original, which is freed header-only.
- *   TOMB         tombstones: the key is the frozen original itself (borrowed,
- *                never destructed here); at drain the original leaves the
- *                dict and is freed in full.
- *   TOMB_SHARED  tombstones of keys whose clone shared the original's value
- *                (the clone's release took the value with it): header-only.
- * A key is in at most one chain. Entries are allocated with the dict's own
- * entry kind, so a position in a chain is an ordinary dictEntryLink for the
- * callers. The array exists from the first deferred write to the release. */
-#define OV_SLOTS 1024
-#define OV_SLOT_MASK (OV_SLOTS - 1)
-enum { OV_LIVE = 0, OV_SHARED = 1, OV_TOMB = 2, OV_TOMB_SHARED = 3, OV_CHAINS = 4 };
-#define OV_IS_TOMB(chain) ((chain) >= OV_TOMB)
-typedef struct ovSlot { dictEntry *heads[OV_CHAINS]; } ovSlot;
-
-typedef struct kvstoreDictOverlay {
-    kvstore *kvs;               /* the store the dict is in; NULL once the dict left it (detached: no more
-                                   accesses through the store, the side table only waits for the release) */
-    int didx;                   /* the dict's slot */
-    dict *d;                    /* the frozen dict itself (kvs->dicts[didx] while owned) */
-    ovSlot *slots;              /* OV_SLOTS, NULL until the first side entry */
-    long entries;               /* LIVE + SHARED entries (clones and adds) */
-    long adds;                  /* LIVE entries whose key is not in the frozen dict */
-    long tombs;                 /* TOMB + TOMB_SHARED entries */
-    kvstoreOverlayHooks h;
-    int unlink_frozen;          /* the pending two-phase unlink targets the frozen dict */
-    listNode *dirty_node;       /* node in kvs->ov_dirty while the side table may be non-empty */
-    void *privdata;
-} kvstoreDictOverlay;
-
-/* Side-table cursor: every LIVE and SHARED entry once, slot by slot. The next
- * entry is fetched before the current one is handed out, so a caller may
- * delete the entry it got (safe-iterator contract). */
-typedef struct ovCursor { int slot; int chain; dictEntry *next; } ovCursor;
-
-/* Save state exists on a dict only while its store is under a save (the save
- * releases every state it attached before the hooks come off): no save, one
- * load. ovPeek: the attached overlay or NULL, no side effects. ovGet: what a
- * dict access must go through: the attached overlay, or whatever the guard
- * decides (it may attach one now). */
-static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
-    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
-    dict *d = kvs->dicts[didx];
-    return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
-}
-
-static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
-    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
-    dict *d = kvs->dicts[didx];
-    if (!d) return NULL;
-    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
-    if (ov) return ov;
-    return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
-}
-
-/* A non-empty side table: reads must consult it. Writes always go through
- * the overlay of a frozen dict (ovGet), whatever the side table holds. */
-static inline int ovActive(kvstoreDictOverlay *ov) {
-    return ov && (ov->entries || ov->tombs);
-}
-
-/* The interception points of kvstore.c. Every public entry point that
- * touches a dict's content starts with exactly one of these three (grep
- * them to list every place the snapshot may step in):
- *   ovRead(kvs, didx)    reads and enumeration: the overlay only while its
- *                        side table is non-empty, a plain dict read otherwise;
- *   ovWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
- *                        attached through the guard on first touch;
- *   ovFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
-static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
-    kvstoreDictOverlay *ov = ovGet(kvs, didx, 0);
-    return ovActive(ov) ? ov : NULL;
-}
-static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
-static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
-
-/* kvstore.c: the one place the store's key count, non-empty count and
- * cumulative-size tree change. 'after' is the dict's logical size after the
- * change (the real size, or the overlay's logical size for a frozen dict). */
-void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);
-
-/* kvsoverlay.c, for the enumeration and the public wrappers in kvstore.c. */
-unsigned long ovDictSize(kvstore *kvs, int didx);
-dictEntry *ovMapFrozenEntry(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry *de);
-int ovSideEntryIsAdd(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry *te);
-void ovDetachFromStore(dict *d);   /* the dict leaves its store: its side table is cut loose (kvstore.c detachDict) */
-void ovCursorInit(kvstoreDictOverlay *ov, ovCursor *c);
-dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c);
-unsigned long long ovScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
-                          dictScanFunction *scan_cb, void *privdata);
-dictEntry *ovIteratorNext(kvstore *kvs, kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);
-dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
-unsigned int ovGetSomeKeys(kvstore *kvs, kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
-/* The overlay halves of the hot kvstore entry points: out of line so the
- * common path stays as small as it was and keeps being inlined. */
-dictEntry *ovDictFind(kvstore *kvs, kvstoreDictOverlay *ov, void *key);
-dictEntryLink ovDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntryLink *bucket);
-void ovDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, dictEntryLink *link, int newItem);
-dictEntry *ovDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntry **existing);
-dictEntryLink ovDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int *table_index);
-void ovDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntryLink link, int table_index, const void *key);
-int ovDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key);
-
-#endif /* KVSTORE_INTERNAL */
 
 #endif /* DICTARRAY_H_ */
