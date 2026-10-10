@@ -8,7 +8,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-10-09 22:23'
-updated_date: '2026-10-10 00:16'
+updated_date: '2026-10-10 08:02'
 labels:
   - hybrid-bgsave
   - refactor
@@ -70,7 +70,7 @@ Items: (1) kvstore.h exposes one opaque per-dict extension slot plus an ext-ops 
 - [ ] #3 One child-end hook handles kill and reap for RDB, AOF and module children; a failed kill() in killAppendOnlyChild is reported as a failure, with a test
 - [x] #4 server.c and debug.c call one function each for INFO memory fields, INFO persistence fields, the DEBUG SNAP-* subcommands and the crash-report section list
 - [x] #5 rdb.c reads the scan-thread configuration (compression, maxmemory policy, LRU clock, key-save delay) through one struct or getter
-- [x] #6 zmalloc.h exports one nofork allocation layer with no redundant free/realloc variants, no extern lo/hi/arena/active globals, one arena index and one feature macro; all call sites use that layer
+- [ ] #6 zmalloc.h exports one nofork allocation layer with no redundant free/realloc variants, no extern lo/hi/arena/active globals, one arena index and one feature macro; all call sites use that layer
 - [ ] #7 Read paths call a side-effect-free owed predicate; the three mutation-preparation sites call one shared function; snapKvobjIsFrozenOriginal is used only in debug assertions; snapScanKeyIsOwed lives in the tests
 - [x] #8 Module child guard bits come from a table; every suite named in the description passes after each item's commit
 <!-- AC:END -->
@@ -97,4 +97,6 @@ Order, one commit per item, each verified by build without warnings, redis-serve
 2026-10-10, remaining items landed: item 3 + 7 as 2673049fc (snapOnChildEnd from checkChildrenDone and killAppendOnlyChild, failed kill() counted as a failure; snapPrepareMutation for PFCOUNT and RM_SetLRU/SetLFU; snapKvobjIsFrozenOriginal debug-only; snapScanKeyIsOwed a test helper), item 1 first half as 787ca1d1d (opaque ext_word/ext slot and the overlay pointer in kvstoreDictMetaBase; snapDictState private to snapshot.c, which frees bitmaps and pause before kvstoreOverlayRelease; kvstoreKeyCountAdd as the one key-count function), item 1 second half as 39f68a939 (one kvstoreSnapHooks with the five overlay callbacks and one privdata, the per-store snapGuardPriv with a 'user' field; kvsoverlay.h internal header with the store struct, overlay types, inline interception and the exchanged routines; kvstore.h 423 -> 273 lines; kvstoreOvCursor named; kvstoreSnapGuardSet in kvstore.c). Every step: build without warnings, redis-server test snapshot 184, and the six-suite chain green (unit/snapshot 81, aofrw 25, aof 63, aof-multi-part 41, replication 80, info 31 with the hybrid on). AC #7 nuance: snapKvobjIsOwed still opens the write section by design (the section is what keeps the answer valid for the command; a section-free variant would be racy), so read paths call it and skip; the mutation sites call snapPrepareMutation. AC #3 nuance: a deterministic test of a failed kill() in killAppendOnlyChild is not writable without fault injection (kill(ESRCH) needs an already-reaped pid); the handling is in place, the test is not. Sanitizer pass (TSan + ASan unit/snapshot on the final head) running.
 
 Sanitizer pass on the final head (39f68a939): TSan unit/snapshot 75 ok, 0 reports; ASan unit/snapshot 75 ok, 0 reports. AC 1, 2, 4, 5, 6 and 8 verified. AC 3 and 7 are implemented except for one clause each, which the user decides on: AC 3 asks for a test of the failed-kill() path in killAppendOnlyChild, which cannot be driven deterministically without fault injection; AC 7 asks for a side-effect-free owed predicate on read paths, where the write section the predicate opens is what makes its answer valid for the rest of the command (a section-free check would be racy), so the read paths keep calling snapKvobjIsOwed and skip, and the mutating paths call snapPrepareMutation.
+
+Correction (2026-10-10, after the user asked whether I challenge the tickets or accept them): AC 6 was checked although one clause is not met. zmalloc_nofork_lo, zmalloc_nofork_hi and zmalloc_nofork_active remain extern because the inline zmalloc_is_nofork() range check and the zmalloc_nofork_enabled() placement gate in zmalloc.h read them on hot paths; hiding them behind out-of-line accessors would cost a call per free and per allocation. The clause 'no extern lo/hi/arena/active globals' is therefore wrong as written; the arena index is the one global that moved behind an accessor. Unchecked; the user decides whether to reword or keep it open.
 <!-- SECTION:NOTES:END -->

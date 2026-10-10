@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-09 22:23'
+updated_date: '2026-10-10 08:02'
 labels:
   - hybrid-bgsave
   - robustness
@@ -42,3 +43,9 @@ The 2026-10-09 review found the kvstore interception uniform for the fifteen key
 - [ ] #3 A debug-build test demonstrates that calling an exempt entry point on a frozen keyspace dict trips the assertion
 - [ ] #4 unit/snapshot, redis-server test snapshot and the defrag tests of unit/memefficiency pass with the hybrid on
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Premise to verify before any code (2026-10-10): this task was filed from a reviewer's claim that kvstoreDictFetchValue, kvstoreDictSetKey/SetVal and the defrag entry points bypass the overlay unsafely. Their callers were not audited when the task was filed. First step is to list every caller of each listed entry point and decide, per entry point, whether a keyspace path can reach it during a save; an entry point no keyspace path reaches needs only the assertion, and if none can, this task may close with assertions alone or as not needed.
+<!-- SECTION:NOTES:END -->
