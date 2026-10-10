@@ -23,6 +23,73 @@
 #include "redisassert.h"
 #include "monotonic.h"
 
+#include "fwtree.h"
+
+struct _kvstore {
+    int flags;
+    kvstoreType *type;
+    dictType dtype;
+    dict **dicts;
+    long long num_dicts;
+    long long num_dicts_bits;
+    list *rehashing;                       /* List of dictionaries in this kvstore that are currently rehashing. */
+    int resize_cursor;                     /* Cron job uses this cursor to gradually resize dictionaries (only used if num_dicts > 1). */
+    int allocated_dicts;                   /* The number of allocated dicts. */
+    int non_empty_dicts;                   /* The number of non-empty dicts. */
+    unsigned long long key_count;          /* Total number of keys in this kvstore. */
+    unsigned long long bucket_count;       /* Total number of buckets in this kvstore across dictionaries. */
+    fenwickTree *dict_sizes;               /* Binary indexed tree (BIT) that describes cumulative key frequencies up until given dict-index. */
+    size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
+    int refcount;                          /* the owner plus one per allocated dict (atomic): the struct outlives
+                                              its detached dicts, whose dictType it holds */
+    void *ov_state;                        /* the overlay's per-store state (kvsoverlay.c), opaque here */
+    const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
+    void *snap_priv;
+    void *metadata[];                      /* conditionally allocated based on "flags" */
+};
+
+/* Save state exists on a dict only while its store is under a save (the save
+ * releases every state it attached before the hooks come off): no save, one
+ * load. ovPeek: the attached overlay or NULL, no side effects. ovGet: what a
+ * dict access must go through: the attached overlay, or whatever the guard
+ * decides (it may attach one now). */
+static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
+    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
+    dict *d = kvs->dicts[didx];
+    return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
+}
+
+static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
+    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
+    dict *d = kvs->dicts[didx];
+    if (!d) return NULL;
+    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    if (ov) return ov;
+    return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
+}
+
+/* A non-empty side table: reads must consult it. Writes always go through
+ * the overlay of a frozen dict (ovGet), whatever the side table holds. */
+static inline int ovActive(kvstoreDictOverlay *ov) {
+    return ov && (ov->entries || ov->tombs);
+}
+
+/* The interception points of kvstore.c. Every public entry point that
+ * touches a dict's content starts with exactly one of these three (grep
+ * them to list every place the snapshot may step in):
+ *   ovRead(kvs, didx)    reads and enumeration: the overlay only while its
+ *                        side table is non-empty, a plain dict read otherwise;
+ *   ovWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
+ *                        attached through the guard on first touch;
+ *   ovFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
+static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
+    kvstoreDictOverlay *ov = ovGet(kvs, didx, 0);
+    return ovActive(ov) ? ov : NULL;
+}
+static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
+static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
+
+
 #define UNUSED(V) ((void) V)
 
 static dict *createDictIfNeeded(kvstore *kvs, int didx);
@@ -190,6 +257,13 @@ void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *priv
     kvs->snap_hooks = hooks;
     kvs->snap_priv = privdata;
 }
+
+const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata) {
+    if (privdata) *privdata = kvs->snap_priv;
+    return kvs->snap_hooks;
+}
+
+void **kvstoreOverlaySlot(kvstore *kvs) { return &kvs->ov_state; }
 
 /* Updates the bucket count for the given dictionary in a DB. It adds the new ht size
  * of the dictionary or removes the old ht size of the dictionary from the total
@@ -370,7 +444,7 @@ void kvstoreRelease(kvstore *kvs) {
     zfree(kvs->dicts);
 
     listRelease(kvs->rehashing);
-    if (kvs->ov_dirty) listRelease(kvs->ov_dirty);
+    ovStoreRelease(kvs);
     if (kvs->dict_sizes)
         fwTreeDestroy(kvs->dict_sizes);
 
@@ -734,7 +808,7 @@ int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it) {
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
     for (;;) {
         kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? ovRead(kvs_it->kvs, kvs_it->didx) : NULL;
-        dictEntry *de = ov ? ovIteratorNext(kvs_it->kvs, ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
+        dictEntry *de = ov ? ovIteratorNext(ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
                            : (kvs_it->di.d ? dictNext(&kvs_it->di) : NULL);
         if (de) return de;
         /* No current dict or reached the end of the dictionary.
@@ -849,7 +923,7 @@ dictEntry *kvstoreDictIteratorNext(kvstoreDictIterator *kvs_di)
     /* The dict may be deleted during the iteration process, so here need to check for NULL. */
     if (!kvs_di->di.d) return NULL;
     kvstoreDictOverlay *ov = ovRead(kvs_di->kvs, kvs_di->didx);
-    if (ov) return ovIteratorNext(kvs_di->kvs, ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
+    if (ov) return ovIteratorNext(ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
     if (!kvstoreGetDict(kvs_di->kvs, kvs_di->didx)) return NULL;
     return dictNext(&kvs_di->di);
 }
@@ -877,7 +951,7 @@ dictEntry *kvstoreDictGetFairRandomKey(kvstore *kvs, int didx)
 unsigned int kvstoreDictGetSomeKeys(kvstore *kvs, int didx, dictEntry **des, unsigned int count)
 {
     kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (ov) return ovGetSomeKeys(kvs, ov, des, count);
+    if (ov) return ovGetSomeKeys(ov, des, count);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return 0;
@@ -941,7 +1015,7 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
 
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
     kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(kvs, ov, key);
+    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
