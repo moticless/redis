@@ -14,9 +14,15 @@ start_server {tags {"snapshot"} overrides {bgsave-hybrid yes}} {
         assert_match {*allocator_resident_nofork:*} $info
         assert_match {*allocator_frag_bytes_nofork:*} $info
         assert_match {*snap_nofork_arena_available:*} $info
-        # On Linux + jemalloc the arena must be available.
+        # On Linux + jemalloc the arena must be available, and once it holds
+        # keys its resident figure is a real number (the per-arena stats read
+        # jemalloc's stats.arenas.<i>.resident).
         if {[string match {*jemalloc*} [s mem_allocator]] && $::tcl_platform(os) eq "Linux"} {
             assert_equal 1 [s snap_nofork_arena_available]
+            r debug populate 1000 resident 100
+            after 1100   ;# the figures are sampled by cron, once a second
+            assert {[s allocator_resident_nofork] > 0}
+            assert {[s allocator_resident_nofork] >= [s allocator_active_nofork]}
         }
     }
 }
@@ -1050,8 +1056,13 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
 
         test {Hybrid BGSAVE harness: passing the retained-bytes hard mark aborts the save, clients never wait} {
             snap_populate_race 0 1
-            r config set bgsave-hybrid-max-retained-bytes 65536
-            r config set rdb-key-save-delay 2000
+            # A mark the emit-ahead records of the first window cross whatever
+            # the client's speed (sanitizer builds run the writes 10x slower
+            # than the scan thread's sleep-based delay): 8 KB of records
+            # against a 5 ms per key scan, so the thread forwards the queue
+            # (at window boundaries) only every few seconds.
+            r config set bgsave-hybrid-max-retained-bytes 8192
+            r config set rdb-key-save-delay 5000
             r config set latency-monitor-threshold 50
             r latency reset
             set aborts0 [s snap_hard_mark_aborts]
@@ -1062,15 +1073,17 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             # retained bytes) faster than the thread forwards it
             for {set i 0} {$i < 3000} {incr i} { r set filler:$i [string repeat g 60] }
             snap_wait_bgsave_done
-            assert_equal err [s rdb_last_bgsave_status]
-            assert_equal [expr {$aborts0 + 1}] [s snap_hard_mark_aborts]
-            assert {[s snap_last_save_retained_peak] > 65536}
-            assert_equal 0 [s snap_save_retained_bytes]
-            verify_log_message 0 "*bgsave-hybrid-max-retained-bytes*" 0
-            assert_equal {} [r latency history command]
+            # restore before asserting: a failed assertion must not leave the
+            # tiny mark and the delay behind for the next tests
             r config set latency-monitor-threshold 0
             r config set bgsave-hybrid-max-retained-bytes 256mb
             r config set rdb-key-save-delay 0
+            assert_equal err [s rdb_last_bgsave_status]
+            assert_equal [expr {$aborts0 + 1}] [s snap_hard_mark_aborts]
+            assert {[s snap_last_save_retained_peak] > 8192}
+            assert_equal 0 [s snap_save_retained_bytes]
+            verify_log_message 0 "*bgsave-hybrid-max-retained-bytes*" 0
+            assert_equal {} [r latency history command]
             assert_equal [string repeat g 60] [r get filler:2999]
             set ref [debug_digest]
             r bgsave
@@ -1238,9 +1251,11 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
         }
 
         snap_arena_test {Hybrid BGSAVE harness: child CoW stays flat under heavy writes versus stock BGSAVE} {
-            # baseline (no writes) first: the child dirties some pages of its own
-            set hy_base_small [snap_cow_run 20000 60 50 none]
-            set hy_set [snap_cow_run 20000 60 50 set]
+            # baseline (no writes) first: the child dirties some pages of its
+            # own, a noise of about 1 MB either way; 50000 small keys put
+            # stock's copy-on-write well above it
+            set hy_base_small [snap_cow_run 50000 60 50 none]
+            set hy_set [snap_cow_run 50000 60 50 set]
             # SNAP_FORK dataset: 20000 values just over a lowered threshold, then
             # an EXPIRE storm touches every header but no value
             r config set save-small-max-bytes 256
@@ -1249,8 +1264,8 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {[dict get [snap_placement] class_fork] >= 20000}
             r config set save-small-max-bytes 4096
             start_server {overrides {bgsave-hybrid no save ""}} {
-                set st_base_small [snap_cow_run 20000 60 50 none]
-                set st_set [snap_cow_run 20000 60 50 set]
+                set st_base_small [snap_cow_run 50000 60 50 none]
+                set st_set [snap_cow_run 50000 60 50 set]
                 set st_base_big [snap_cow_run 20000 1000 50 none]
                 set st_exp [snap_cow_run 20000 1000 50 expire]
             }

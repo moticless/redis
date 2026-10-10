@@ -234,7 +234,7 @@ What happens when something else touches the keyspace or the child during a hybr
 | DEBUG RELOAD, DEBUG LOADAOF, CLUSTER RESET HARD, `RedisModule_ResetDataset` | every db is handed to the save, which finishes with the fork-instant data | yes |
 | a replica's full-sync load | the replica's own running save is ended by its `killRDBChild` before the load | yes |
 | hybrid AOF rewrite and FLUSHALL | the rewrite finishes on the detached dbs; the FLUSHALL lands in the INCR file | yes, stock keeps its AOF child |
-| atomic slot migration's trim | moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete; the trim's histogram pass leaves them alone | n/a |
+| atomic slot migration's trim | keys of slots under a trim job at the fork instant are skipped and counted in the "keys skipped" log line, as stock's child skips them; a trim that starts during the save is not in that set, its moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete | yes |
 | rehash and resize | the dict under the window is paused; unreached dicts grow with their bitmap, shrink is refused for attached dicts | stock avoids resizing while a child exists |
 | active defrag | off while a child exists (stock rule); the arena's tcache is flushed once a second by cron | yes |
 | key expiry and eviction | active expiry and eviction continue; deletes go through the funnel; LRU/LFU updates on lookups are skipped while a child exists | yes |

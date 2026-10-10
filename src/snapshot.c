@@ -42,6 +42,8 @@
 
 #include "server.h"
 #include "snapshot.h"
+#include "cluster.h"
+#include "cluster_asm.h"
 #include "fmtargs.h"
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -1539,6 +1541,13 @@ struct snapSave {
     sds stage;
     int stage_dbid, stage_slot;
     redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
+    /* Cluster mode: the slots an atomic slot migration was trimming at the
+     * fork instant, one bit each (NULL when none). Their keys are leaving the
+     * node: stock's child skips them, reading the fork-instant copy of the
+     * trim jobs, and so do the two producers here. A trim that starts during
+     * the save is not in the set, as in stock. */
+    uint8_t *trim_slots;
+    redisAtomic long long keys_skipped;
     /* Main-thread emission (emit-ahead): records the main thread serialized
      * before writing a bucket the thread had not reached. mq_lock guards
      * mq (ready messages) and mstage (the partial BUFFER of one (db, slot));
@@ -1787,6 +1796,12 @@ static void snapSaveMainStageFlushLocked(snapSave *sv) {
     sv->mstage = sdsempty();
 }
 
+/* Cluster mode: is slot didx one an atomic slot migration was trimming at the
+ * fork instant? Its keys are skipped by every producer (stock parity). */
+static inline int snapSaveSlotTrimmed(snapSave *sv, int didx) {
+    return sv->trim_slots && (sv->trim_slots[didx >> 3] & (1u << (didx & 7)));
+}
+
 /* One record of 'kv' in the save's format, from any producer (main thread,
  * scan thread, child): the RDB key-value pair, or for an AOF rewrite without
  * the preamble the command form rewriteAppendOnlyFileRio writes per key
@@ -1805,6 +1820,10 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
     snap_main_emitting = 1;
     for (dictEntry *de = d->ht_table[table][idx]; de; de = dictGetNext(de)) {
         kvobj *kv = dictGetKV(de);
+        if (snapSaveSlotTrimmed(sv, didx)) {
+            atomicIncr(sv->keys_skipped, 1);
+            continue;
+        }
         int cls = snapKeyClass(kv);
         if (cls == SNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = SNAP_FORK;
         if (cls == SNAP_FORK) {
@@ -2371,6 +2390,10 @@ static void snapStageFlush(snapSave *sv) {
 /* Scan thread: one fork-instant key. Read-only on the keyspace. */
 static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
     snapSave *sv = priv;
+    if (snapSaveSlotTrimmed(sv, didx)) {
+        atomicIncr(sv->keys_skipped, 1);
+        return;
+    }
     if (sv->stage_dbid != s || sv->stage_slot != didx) {
         snapStageFlush(sv);
         sv->stage_dbid = s;
@@ -2833,6 +2856,7 @@ static void snapSaveFree(snapSave *sv) {
     for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
     zfree(sv->flushed);
     zfree(sv->stores);
+    zfree(sv->trim_slots);
     zfree(sv);
 }
 
@@ -2859,6 +2883,13 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
     sv->flushed = zcalloc(sizeof(snapFlushedDb) * sv->dbnum);
     sv->sizes = zcalloc(sizeof(snapDbSizes) * sv->dbnum);
+    if (server.cluster_enabled && asmIsTrimInProgress()) {
+        /* The fork-instant set of slots under a trim job (stock's child reads
+         * its copy-on-write copy of the same jobs). */
+        sv->trim_slots = zcalloc(CLUSTER_SLOTS / 8);
+        for (int slot = 0; slot < CLUSTER_SLOTS; slot++)
+            if (isSlotInTrimJob(slot)) sv->trim_slots[slot >> 3] |= 1u << (slot & 7);
+    }
     for (int j = 0; j < sv->dbnum; j++) {
         redisDb *db = &server.db[j];
         sv->stores[j] = db->keys;
@@ -3185,6 +3216,18 @@ void snapOnChildEnd(int exitcode, int bysignal) {
     snap_last_retained_peak = sv->retained_peak;
     atomicGet(sv->queued_peak, snap_last_queued_peak);
     snap_last_inplace_writes = sv->inplace_writes;
+    if (!bysignal && exitcode == 0 && !sv->failed) {
+        /* Stock's end-of-save line, from the side that knows the counts: the
+         * keys the scan thread and the main thread produced, and the keys of
+         * slots under a trim job at the fork instant that were skipped. */
+        long long nofork, fork, skipped;
+        atomicGet(sv->keys_nofork, nofork);
+        atomicGet(sv->keys_fork, fork);
+        atomicGet(sv->keys_skipped, skipped);
+        serverLog(LL_NOTICE, "%s done, %lld keys saved, %lld keys skipped.",
+                  sv->child_type == CHILD_TYPE_AOF ? "AOF rewrite" : "BGSAVE",
+                  nofork + fork + sv->main_keys, skipped);
+    }
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions, joins, unregisters */
     serverLog(LL_NOTICE, "Hybrid BGSAVE: scan thread joined and overlay released.");

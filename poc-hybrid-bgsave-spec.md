@@ -337,9 +337,9 @@ a memory-vs-CoW tradeoff, not needed for correctness.)
   rewriter, PEXPIREAT, BLESS, module key metadata). Framing, channels and queues are unchanged. The child
   writes the prologue `rewriteAppendOnlyFileHeader` (timestamp annotation, functions) instead of the RDB
   header, no footer, and `snapChildSelect` emits `SELECT <db>` on a db change only, whatever order the
-  producers' records arrive in (no RESIZEDB, no SLOT_INFO). Keys in slots an atomic slot migration is
-  trimming: stock's command-form rewriter skips them, the hybrid keeps the fork instant, as its RDB does
-  (TASK-1.37). The rewriters the scan thread runs (string, listpack list/set/zset/hash, listpackEx field
+  producers' records arrive in (no RESIZEDB, no SLOT_INFO). Keys in slots an atomic slot migration was
+  trimming at the fork instant are skipped, as stock's child skips them in both formats (the set is
+  captured by the main thread at save start); a trim that starts during the save is not in the set. The rewriters the scan thread runs (string, listpack list/set/zset/hash, listpackEx field
   TTLs, intset) read only the value and write only the rio; streams, modules, hash tables, quicklists,
   skiplists and template hashes are fork class and stay in the child.
 

@@ -1293,8 +1293,8 @@ int zmalloc_get_allocator_info_by_arena(unsigned int arena, int refresh_stats, s
     sz = sizeof(size_t);
     /* Unlike RSS, this does not include RSS from shared libraries and other non
      * heap mappings. */
-    snprintf(buf, sizeof(buf), "stats.arenas.%u.small.resident", arena);
-    je_mallctl(buf, resident, &sz, NULL, 0);
+    snprintf(buf, sizeof(buf), "stats.arenas.%u.resident", arena);
+    assert(!je_mallctl(buf, resident, &sz, NULL, 0));
     /* Unlike resident, this doesn't not include the pages jemalloc reserves
      * for re-use (purge will clean that). */
     size_t pactive, page;
