@@ -509,6 +509,12 @@ void zmalloc_nofork_va_stats(size_t *reserved, size_t *used) {
     if (used) *used = __atomic_load_n(&nofork_bump, __ATOMIC_RELAXED) - zmalloc_nofork_lo;
 }
 
+int zmalloc_nofork_arena_range(void **lo, size_t *len) {
+    *lo = zmalloc_nofork_lo;
+    *len = zmalloc_nofork_hi - zmalloc_nofork_lo;
+    return zmalloc_nofork_lo != NULL;
+}
+
 /* Per-thread flags: the arena plus an explicit tcache created lazily. Explicit
  * tcaches may be used by one thread at a time (jemalloc), hence per thread;
  * only arena blocks ever pass through them, so they cannot hand arena memory
@@ -1390,6 +1396,7 @@ void set_jemalloc_bg_thread(int enable) {
 
 void zmalloc_nofork_set_active(int active) { (void)active; }
 void zmalloc_nofork_tcache_flush(void) { }
+int zmalloc_nofork_arena_range(void **lo, size_t *len) { *lo = NULL; *len = 0; return 0; }
 
 int jemalloc_purge(void) {
     return 0;

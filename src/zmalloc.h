@@ -159,6 +159,9 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #include <limits.h>
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
 #define HAVE_NOFORK_ARENA 1
+/* Three globals exported for the two inline hot-path checks below only (one
+ * load and one compare per free, one load per placement); no other code reads
+ * them. Cold callers use zmalloc_nofork_arena_range(). */
 extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
 extern char *zmalloc_nofork_hi;
 extern int zmalloc_nofork_active;       /* 1 while NEW SNAP_NOFORK requests go to the arena (bgsave-hybrid on) */
@@ -178,6 +181,7 @@ int zmalloc_nofork_arena_set_forkable(int forkable); /* MADV_DOFORK (1) / MADV_D
 int zmalloc_nofork_arena_forkable(void);             /* 1 while a fork child would map the arena */
 void zmalloc_nofork_tcache_flush(void);              /* return this thread's cached arena regions to the bins */
 unsigned zmalloc_nofork_arena_index(void);           /* UINT_MAX if unavailable */
+int zmalloc_nofork_arena_range(void **lo, size_t *len); /* the reserved range; 0 (and NULL/0) when unavailable */
 /* The arena entry points: with no arena they ARE the default allocators (one
  * predictable branch, inlined), so a server with bgsave-hybrid off pays nothing. */
 __attribute__((malloc)) void *zmalloc_nofork_slow(size_t size);

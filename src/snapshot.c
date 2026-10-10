@@ -2732,14 +2732,15 @@ werr:
  * the whole range PROT_NONE so nothing of ours can land in it. */
 static void snapChildReserveArenaRange(void) {
 #ifdef HAVE_NOFORK_ARENA
-    if (!zmalloc_nofork_lo || !zmalloc_nofork_hi) return;
+    void *lo; size_t len;
+    if (!zmalloc_nofork_arena_range(&lo, &len)) return;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
 #else
     flags |= MAP_FIXED;
 #endif
-    void *p = mmap(zmalloc_nofork_lo, (size_t)(zmalloc_nofork_hi - zmalloc_nofork_lo), PROT_NONE, flags, -1, 0);
+    void *p = mmap(lo, len, PROT_NONE, flags, -1, 0);
     if (p == MAP_FAILED)
         serverLog(LL_WARNING, "Hybrid BGSAVE child: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
 #endif
