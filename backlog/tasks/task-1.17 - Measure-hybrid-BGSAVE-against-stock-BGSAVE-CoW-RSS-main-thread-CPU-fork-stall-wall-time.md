@@ -6,7 +6,7 @@ title: >-
 status: In Progress
 assignee: []
 created_date: '2026-09-20 17:22'
-updated_date: '2026-09-25 21:09'
+updated_date: '2026-10-11 13:33'
 labels:
   - bgsave
   - persistence
@@ -14,7 +14,6 @@ labels:
   - docs
 milestone: m-2
 dependencies:
-  - TASK-1.11
   - TASK-1.12
   - TASK-1.13
 documentation:

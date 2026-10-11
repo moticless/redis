@@ -4,7 +4,7 @@ title: Multiple background scan threads over disjoint slot sets
 status: To Do
 assignee: []
 created_date: '2026-09-20 17:22'
-updated_date: '2026-09-20 18:28'
+updated_date: '2026-10-11 13:33'
 labels:
   - bgsave
   - persistence
@@ -36,3 +36,9 @@ Scope: thread count config (e.g. 'bgsave-threads', default to be decided; 1 pres
 - [ ] #5 Parallelism is effective in standalone mode as well as cluster mode (scan wall-time on a large SNAP_NOFORK-only dataset drops measurably from 1 to 4 threads; numbers recorded in task notes)
 - [ ] #6 ThreadSanitizer run of the harness with 4 threads reports no races
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Discarded 2026-10-11 by the user: at this phase a scan-thread pool would add noise (a config, multi-producer channels, slot ownership, more TSan surface) for an unproven payoff. Runs 18 and 38 showed the single scan thread keeps pace with the fork child on the benchmark datasets (the child's SNAP_FORK stream and the write stall, not the scan, bound the save), so parallelism is not where the time goes. TASK-1.49 (atomic slot migration over the hybrid path) is the next feature item instead. Revisit only with a measurement that shows the scan thread as the bottleneck on a real dataset.
+<!-- SECTION:NOTES:END -->
