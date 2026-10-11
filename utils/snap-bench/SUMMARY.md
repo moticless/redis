@@ -129,3 +129,17 @@ engineering cost (the scan thread, the window and write-section protocol, per-di
 around rehash) and carried over what the forkable prototype did better as follow-ups: the arena
 madvise flip, now the fallback for AOF rewrite and module forks, eviction integration and its test
 scenarios; runtime mode switching is still open.
+
+## Atomic slot migration on the source node (run 39, 2026-10-12, 4 GB, 25% of the slots moved)
+
+| dataset | writes/s | fork stall stock → hybrid | copy-on-write stock → hybrid | write max stock → hybrid |
+|---|---|---|---|---|
+| small | idle | 38 ms → 2 ms | 2 MB → 1 MB (+ 100 MB output queue) | – |
+| small | 20k | 40 ms → 2 ms | 0.5 GB → 2 MB | 41 ms → 9 ms |
+| small | 50k | 40 ms → 2 ms | 1.1 GB → 2 MB | 43 ms → 11 ms |
+| mixed (9 KB) | 20k | 43 ms → 23 ms | 0.6 GB → 0.25 GB | 45 ms → 26 ms |
+| mixed (9 KB) | 50k | 45 ms → 23 ms | 1.2 GB → 0.56 GB | 47 ms → 27 ms |
+
+The migration's slot snapshot is a hybrid save over the migrating slots (TASK-1.49): the source pays the hybrid
+BGSAVE's fork stall and copy-on-write instead of the stock child's whole-heap ones. The child's copy-on-write scales with
+the migration's duration and write rate, not with the slice; the hybrid's with the fork-class writes only.

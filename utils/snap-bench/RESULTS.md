@@ -2162,3 +2162,97 @@ replica's dbsize equal to the primary's; no hard-mark aborts.
   buffer, 2.6-2.9 GB of copy-on-write.
 - Caveat as in runs 15 and 33: one P-core with its SMT sibling idle is a generous "one CPU"; a one-vCPU cgroup on a
   busy host is tighter.
+
+
+## Run 39 (2026-10-12): atomic slot migration on the source node, stock child vs hybrid save, small and mixed at 4 GB, fresh c7i.4xlarge
+
+Raw: `run39s5.csv`, `run39s25.csv` (small), `run39m5.csv`, `run39m25.csv` (mixed); driver `run39.sh` (fresh instance at
+54.176.250.28, same build 24393071a for both configurations). TASK-1.49 made the slot snapshot of an atomic slot
+migration a hybrid save over the migrating slots; this run measures what the SOURCE node pays per migration. bench.py's
+new `--asm-bin` mode (`ASM=1` in run.sh): the server under test runs as a one-node cluster owning all 16384 slots, a
+second node from the same binary and flags runs on the load CPUs, and a cell is `CLUSTER MIGRATION IMPORT 0 n-1` issued
+on the destination, timed until the task reports `completed`, then the slice is migrated back unmeasured so every cell
+starts from the same source. bench.py's keys carry no hashtags, so a slice of 5% of the slots (819) holds 5% of the keys
+(945k on small, 973k on mixed) and 25% (4096 slots) a quarter (4.7M). `hybrid-off` is our tree with `hybrid-snapshot no`,
+i.e. the unchanged stock slot-snapshot child (upstream 0d6266f2d has no slot migration to compare against); `hybrid` is
+the same binary with it on. Server on vCPUs 0-3,8-11, destination and load on 4-7,12-15, uniform writes over all keys
+(HOT 1.0), 2 reps interleaved per cell. Valkey was left out: its slot migration (`cluster_migrateslots.c`) forks a child
+whatever the forkless settings say, so it would only have repeated the stock profile.
+
+Columns: `migration s` = IMPORT to completed; `snapshot s` = until the source's child/save ended (here the whole migration
+but the hand-off); `fork ms` = latest_fork_usec; `CoW MB` = the child's copy-on-write (rdb_last_cow_size, reported by
+both children); `child dirty MB` = the sampler's view of the same; `parent +MB` = the source's RSS growth (the hybrid's
+output queue and tables); `retained MB` = snap_last_save_retained_peak, which includes the queued records; `pause ms` =
+the hand-off's write pause (`write_pause_ms` of the migrate task); `redirects` = MOVED replies the uniform load got for
+keys of the moved slice between the hand-off and the migrate-back (counted, not errors). Every cell completed, every
+migrate-back restored the source's key count, no hard-mark aborts.
+
+### Small (4.1 GB, 18.9M keys, all in the arena): 5% of the slots, a 0.8 s migration
+
+| dataset | rate | config | migration s | snapshot s | fork ms | extra MB | parent +MB | child dirty MB | CoW MB | retained MB | main cpu s | scan cpu s | child cpu s | ping max ms | ops | wp99 ms | wmax ms | pause ms | redirects |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | idle | stock (hybrid off) | 0.8 | 0.8 | 44 / 32 | 3 / 1 | 0 | 3 / 1 | 5 / 1 | 0.0 | 0.1 | 0.4 / 0.1 | 0.7 / 0.3 | 40.9 / 32.1 | - | - | - | 0 | - |
+| small | idle | hybrid | 0.8 | 0.8 | 2 | 91 | 90 | 1 | 1 | 100.1 | 0.0 | 0.5 | 0.1 | 1.7 / 2.7 | - | - | - | 0 / 1 | - |
+| small | 20k | stock (hybrid off) | 0.8 | 0.8 | 33 | 107 | 0 | 107 | 112 | 0.0 | 0.4 | 0.2 / 0.2 | 0.4 | 30.9 / 29.0 | 19972 | 0.67 | 33.4 | 0 | 1696 |
+| small | 20k | hybrid | 0.9 / 0.8 | 0.9 / 0.8 | 2 | 91 | 90 | 1 | 1 | 100.0 | 0.3 / 0.3 | 0.5 | 0.1 | 0.7 | 19998 | 0.62 / 0.68 | 3.6 | 0 | 1792 / 1686 |
+| small | 50k | stock (hybrid off) | 0.8 / 0.8 | 0.8 / 0.8 | 35 | 255 / 293 | 0 | 255 / 293 | 276 | 0.0 | 0.8 | 0.2 / 0.2 | 0.3 / 0.3 | 32.8 | 49920 | 0.53 / 0.77 | 37.0 | 1 / 0 | 4640 |
+| small | 50k | hybrid | 0.8 | 0.8 | 2 | 90 | 90 | 1 | 1 | 99.9 | 0.7 | 0.6 / 0.6 | 0.1 | 2.3 / 1.1 | 49993 | 0.54 | 4.4 | 0 / 1 | 4580 |
+
+### Small: 25% of the slots, a 3.5-4 s migration
+
+| dataset | rate | config | migration s | snapshot s | fork ms | extra MB | parent +MB | child dirty MB | CoW MB | retained MB | main cpu s | scan cpu s | child cpu s | ping max ms | ops | wp99 ms | wmax ms | pause ms | redirects |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | idle | stock (hybrid off) | 3.5 | 3.5 | 38 | 11 / 1 | 0 | 11 / 1 | 3 / 2 | 0.0 | 0.1 | 0.8 | 1.4 / 1.4 | 36.0 / 39.0 | - | - | - | 0 | - |
+| small | idle | hybrid | 3.7 | 3.7 | 2 | 97 | 96 | 1 | 1 | 100.1 | 0.1 | 2.3 | 0.4 | 1.2 / 1.5 | - | - | - | 1 / 0 | - |
+| small | 20k | stock (hybrid off) | 3.6 / 3.9 | 3.6 / 3.9 | 40 | 481 / 536 | 0 | 481 / 536 | 487 / 525 | 0.0 | 1.0 / 1.2 | 0.8 | 1.5 | 36.8 | 19972 | 0.65 | 41.1 | 8 / 6 | 24863 |
+| small | 20k | hybrid | 4.0 | 4.0 | 2 | 100 | 98 | 1 / 2 | 1 / 2 | 100.1 | 0.9 | 2.4 | 0.4 | 2.4 / 3.0 | 19998 | 0.67 | 9.3 / 8.7 | 7 | 26184 |
+| small | 50k | stock (hybrid off) | 3.8 | 3.8 | 40 | 1055 | 0 | 1055 | 1056 | 0.0 | 2.4 / 2.3 | 0.8 | 1.5 | 39.7 | 49934 | 0.55 | 42.6 | 7 / 5 | 70137 |
+| small | 50k | hybrid | 4.0 | 4.0 | 2 | 102 | 100 | 2 | 2 | 100.1 | 2.1 | 2.4 | 0.5 / 0.5 | 1.5 / 3.3 | 49996 | 0.58 | 12.6 / 9.9 | 8 / 6 | 72205 |
+
+### Mixed (4.0 GB, 19.5M keys, 55% of bytes in 9 KB hashtable hashes above the cap): 5% of the slots, a 1 s migration
+
+| dataset | rate | config | migration s | snapshot s | fork ms | extra MB | parent +MB | child dirty MB | CoW MB | retained MB | main cpu s | scan cpu s | child cpu s | ping max ms | ops | wp99 ms | wmax ms | pause ms | redirects |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock (hybrid off) | 0.9 | 0.9 | 51 / 34 | 4 / 1 | 1 / 0 | 4 / 1 | 3 / 1 | 0.0 | 0.1 / 0.1 | 0.5 / 0.2 | 0.7 / 0.4 | 49.6 / 31.4 | - | - | - | 1 / 0 | - |
+| mixed | idle | hybrid | 1.1 / 1.0 | 1.1 / 1.0 | 21 | 28 | 26 | 1 | 1 | 100.1 | 0.1 | 0.5 | 0.2 / 0.2 | 17.4 / 19.8 | - | - | - | 1 | - |
+| mixed | 20k | stock (hybrid off) | 1.0 / 1.1 | 1.0 / 1.1 | 37 | 135 / 150 | 0 | 135 / 150 | 141 / 157 | 0.0 | 0.5 / 0.5 | 0.2 | 0.5 | 36.6 / 34.6 | 19973 | 0.77 | 37.5 | 1 | 1878 / 1977 |
+| mixed | 20k | hybrid | 1.3 / 1.0 | 1.3 / 1.0 | 21 | 101 / 89 | 28 | 78 / 69 | 79 / 69 | 100.0 | 0.5 / 0.5 | 0.6 / 0.5 | 0.2 / 0.2 | 19.3 / 17.6 | 19992 | 0.93 | 23.2 | 0 | 1948 |
+| mixed | 50k | stock (hybrid off) | 1.0 | 1.0 | 38 | 310 | 0 | 310 | 323 | 0.0 | 0.9 | 0.2 / 0.2 | 0.5 | 35.5 | 49917 | 0.84 | 40.2 | 0 | 5351 |
+| mixed | 50k | hybrid | 1.2 | 1.2 | 22 | 174 | 28 | 154 | 157 | 100.0 | 0.9 | 0.6 | 0.3 / 0.2 | 18.5 / 20.5 | 49972 | 0.95 / 1.05 | 24.5 | 0 / 1 | 5296 |
+
+### Mixed: 25% of the slots, a 5 s migration
+
+| dataset | rate | config | migration s | snapshot s | fork ms | extra MB | parent +MB | child dirty MB | CoW MB | retained MB | main cpu s | scan cpu s | child cpu s | ping max ms | ops | wp99 ms | wmax ms | pause ms | redirects |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock (hybrid off) | 4.5 | 4.5 | 41 | 1 / 9 | 0 | 1 / 9 | 1 | 0.0 | 0.1 | 0.8 | 2.1 | 40.1 | - | - | - | 1 | - |
+| mixed | idle | hybrid | 4.8 | 4.8 | 23 | 54 | 52 | 1 / 2 | 1 / 2 | 100.1 | 0.2 | 2.5 | 1.1 | 21.5 | - | - | - | 1 / 0 | - |
+| mixed | 20k | stock (hybrid off) | 5.0 | 5.0 | 43 | 608 | 1 / 0 | 608 | 606 | 0.0 | 1.4 | 0.8 | 2.1 | 40.1 | 19978 | 0.80 | 44.5 | 9 | 30642 |
+| mixed | 20k | hybrid | 5.0 | 5.0 | 23 / 24 | 284 | 50 | 253 | 253 | 100.1 | 1.3 / 1.4 | 2.6 | 1.2 | 22.2 / 26.0 | 19994 | 1.02 | 25.7 | 10 / 9 | 31575 |
+| mixed | 50k | stock (hybrid off) | 5.2 | 5.1 | 45 | 1238 | 1 | 1238 | 1239 | 0.0 | 3.1 | 0.8 | 2.2 / 2.1 | 44.8 | 49938 | 0.87 | 47.1 | 7 | 87005 |
+| mixed | 50k | hybrid | 5.4 | 5.3 | 23 | 597 | 57 | 559 | 560 | 100.1 | 3.1 | 2.7 | 1.2 / 1.1 | 21.5 / 20.3 | 49980 | 1.12 / 1.06 | 26.5 | 10 / 7 | 89406 |
+
+**Findings.**
+
+- **The migration's fork stall is the hybrid BGSAVE's.** Small: 32-44 ms stock against 2 ms hybrid, at both slices
+  (the arena holds every key, the child maps nothing of the data). Mixed: 34-51 ms against 21-24 ms, the fork-class
+  hashes' page tables. The source's `ping max` during a migration IS the fork stall in every stock cell (29-50 ms) and
+  drops to 1-3 ms (small) or 17-26 ms (mixed) with the hybrid.
+- **Copy-on-write goes from every written page to the fork-class values written during the migration.** Small: 107-293 MB
+  (5% slice) and 481-1055 MB (25% slice) stock against 1-2 MB hybrid, at any rate and slice. Mixed: 141-323 MB and
+  606-1239 MB stock against 69-157 MB and 253-560 MB hybrid, i.e. 45-55% of stock: the uniform load writes the 9 KB
+  hashes, which stay forkable, as often as the small values, which do not.
+- **The control holds: the stock child's copy-on-write scales with the migration's duration and the write rate, not with
+  the slice.** A 5x longer migration (25% against 5%) costs 4-5x the CoW on both datasets, because the child maps the
+  whole heap whatever it serializes; the hybrid's cost is flat on small and tracks the fork-class writes on mixed. That is
+  the "hybrid BGSAVE cost profile, not slot-proportional" expectation of the design note, measured.
+- **Worst write latency during a migration** falls from 33-47 ms (stock, the fork stall) to 4-13 ms on small and
+  23-27 ms on mixed; p99 is unchanged (0.5-1.1 ms). The hand-off's write pause is 0-10 ms in both configurations.
+- **The hybrid's own memory is its output queue.** On small the scan thread serializes RESTORE records faster than the
+  destination applies them, so the queue fills to its `hybrid-snapshot-max-queued-bytes` cap (100 MB default) and the
+  thread waits on it: `parent +MB` 90-100 and `retained MB` 100 in every small cell, idle included. On mixed the queue
+  peaks at 26-57 MB. Stock has no such cost at idle (1-11 MB) but pays the copy-on-write above under writes; the knob
+  bounds the hybrid's side. The queue also makes the hybrid migration 3-10% longer (small 4.0 s against 3.6-3.9 s at
+  25%): the migration is destination-bound either way, and the scan thread's 2.3-2.7 CPU-s replace the child's 1.4-2.2.
+- The 5% cells are short (0.8-1.2 s), so their copy-on-write figures are small in absolute terms; the 25% cells are the
+  representative ones for a real rebalance, where a slice of this size at 50k writes/s costs the stock source a gigabyte
+  of copy-on-write per migration.
