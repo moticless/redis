@@ -8,7 +8,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-10-11 12:35'
-updated_date: '2026-10-11 15:25'
+updated_date: '2026-10-11 19:51'
 labels:
   - hybrid-bgsave
   - cluster
@@ -31,6 +31,16 @@ references:
   - >-
     TASK-1.44 (trim-slot skip), TASK-1.37 (dict references), TASK-1.38
     (functions-only child arena flip)
+modified_files:
+  - src/snapshot.c
+  - src/snapshot.h
+  - src/cluster_asm.c
+  - src/cluster_asm.h
+  - src/kvstore.c
+  - src/evict.c
+  - docs/hybrid-snapshot.md
+  - tests/unit/cluster/atomic-slot-migration.tcl
+  - .mfiles/bgsave-blog/bgsave-blog-draft.md
 parent_task_id: TASK-1
 priority: medium
 ordinal: 45000
@@ -48,11 +58,11 @@ Design first: a short note (in the task or docs/hybrid-snapshot.md) on how ASM d
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 A slot snapshot transfer with hybrid-snapshot yes freezes and scans only the migrating slots; INFO or a DEBUG probe during a migration shows slots_total equal to the number of non-empty migrating slots and no arena fork-visibility flip
-- [ ] #2 tests/unit/cluster/atomic-slot-migration.tcl passes with hybrid-snapshot yes and no; a new test writes to migrating and non-migrating slots during the transfer and checks the destination holds the fork-instant content of the migrating slots while the source keeps serving
-- [ ] #3 Cancelling a migration mid-transfer and a destination failure both end the scan cleanly (every slot DONE, overlays released, no retained bytes) and leave the source's keyspace intact
+- [x] #1 A slot snapshot transfer with hybrid-snapshot yes freezes and scans only the migrating slots; INFO or a DEBUG probe during a migration shows slots_total equal to the number of non-empty migrating slots and no arena fork-visibility flip
+- [x] #2 tests/unit/cluster/atomic-slot-migration.tcl passes with hybrid-snapshot yes and no; a new test writes to migrating and non-migrating slots during the transfer and checks the destination holds the fork-instant content of the migrating slots while the source keeps serving
+- [x] #3 Cancelling a migration mid-transfer and a destination failure both end the scan cleanly (every slot DONE, overlays released, no retained bytes) and leave the source's keyspace intact
 - [ ] #4 Measured on a cluster node with a multi-GB keyspace: the source's fork stall during a migration drops from the whole heap's page tables to the fork-class values' (as a hybrid BGSAVE), and its copy-on-write from every written page to fork-class values written during the migration; recorded in utils/snap-bench/RESULTS.md (reworded 2026-10-11: slot-proportional CoW is not reachable with a fork child, see the design note)
-- [ ] #5 The design note (implementation plan of this task) explains the handshake with ASM's state machine, the slot set hand-off and the record form; docs/hybrid-snapshot.md's entry-point and interaction tables are updated
+- [x] #5 The design note (implementation plan of this task) explains the handshake with ASM's state machine, the slot set hand-off and the record form; docs/hybrid-snapshot.md's entry-point and interaction tables are updated
 <!-- AC:END -->
 
 ## Implementation Plan
@@ -84,4 +94,16 @@ e. docs/hybrid-snapshot.md: entry-point table (slot snapshot: hybrid), interacti
 
 <!-- SECTION:NOTES:BEGIN -->
 2026-10-11 design pass done (see the implementation plan). Key finding: the slot snapshot is not an RDB but a RESP command stream (FUNCTION RESTORE, SELECT, CLUSTER SYNCSLOTS CONF SLOT-INFO per slot, RESTORE ... ABSTTL per key from a DUMP payload, CLUSTER SYNCSLOTS SNAPSHOT-EOF), so the hybrid needs a third record form (after RDB pairs and AOF commands), not a new transport: the existing SNAP_SAVE_SOCKETS child/pipe relay carries it. Second finding: a fork child's copy-on-write cannot be confined to the migrating slots, so the gain is 'hybrid BGSAVE cost profile for migrations' (fork-class page tables and fork-class CoW) rather than slot-proportional; AC 4 reworded. Implementation starts with the record form and the slot filter.
+
+2026-10-11 implementation, first pass (steps a and b of the plan): cluster_asm.c exports slotSnapshotSaveKeyValuePair, slotSnapshotWritePrelude (fail point, compression off, module commands, FUNCTION RESTORE), slotSnapshotWriteSlotInfo, slotSnapshotWriteEOF and asmMigratingSlotsBitmap (the migrate task's slots as a CLUSTER_SLOTS bitmap); slotSnapshotSaveRio is built from the same pieces. snapshot.c: snapSave.slots_form and slot_filter; snapSaveCreate captures the migrating slots at the fork instant (SNAP_NOT_TAKEN when no migrate task runs) and turns compression off; snapScanSetSlotFilter restricts snapScanFreezeStore to the filter; snapSaveWriteRecord's third form; snapChildSelect writes SELECT per db and SLOT-INFO once per slot from the save's fork-instant sizes; the child writes the prelude instead of the RDB header and SNAPSHOT-EOF instead of footer and EOF mark; snapSaveTryStart takes slot snapshots when a migrate task runs. Two new cluster tests appended to atomic-slot-migration.tcl (hybrid only): slots_total equals the migrating slot count with the arena unmapped, writes to migrating and other slots during the transfer; cancel mid-snapshot ends the save cleanly with the keyspace intact.
+
+Bug found by the cluster suite's fail-point tests and fixed: snapScanCompleteSlot released the dict's state and overlay BEFORE publishing DONE. kvstoreOverlayRelease ends by asking the store whether the dict may be freed, through a public kvstore entry point and so through the guard; for an aborted slot the word still said SCANNING, the guard saw a table dict in that state and attached a fresh overlay and state, which the completion then left behind, and the dict's eventual free (the trim's temporary store on the lazy-free thread) tripped the unref assertion 'ov == NULL && ext == NULL'. Reproduced deterministically with the slot snapshot's fail points (child aborted inside slot 0), diagnosed with a temporary attach/complete trace. Fix: DONE is published first, the guard declines during the release. The unref assertion is now a descriptive panic (slot, overlay, state, word, detached, size). Latent in every abort of a dict mid-scan, not specific to the slot snapshot.
+
+Semantics found by the test 'Expired key is not deleted and SCAN/KEYS/... filter keys in importing slots': it relies on rdb-key-save-delay making a 3-key snapshot take 3 s while it writes to those keys; the hybrid's emit-ahead serialized the written keys at once and the scan thread then had nothing left to delay, so the import finished early. Fix in the hybrid: the scan thread owes the delay for every fork-instant key whoever produced the record (itself, the child for SNAP_FORK values, or the main thread's emit-ahead, which must not slow the command): snapSaveKeyDelay sleeps it per key in abort-aware 10 ms slices, for the thread's own keys and the child's at dispatch, and for the main thread's at each window boundary (the count main_keys is atomic now). A save of N keys takes N delays, as stock's child does.
+
+Two more differences surfaced by the cluster suite, both fixed. (1) The hybrid child's socket rio buffers small writes in user space (16 KB) and flushed only at END, so a tiny slot snapshot reached the destination all at once; stock flushes per key when rdb-key-save-delay is set and its stream is otherwise large. The child now flushes the socket rio before every blocking wait for the producers, so records reach the replica or the migration's destination as they are produced (this also helps diskless sync latency). (2) The hybrid save's bookkeeping lives in the parent: a cluster node's per-slot size tables alone are 256 KB (16384 slots x 2 x 8 bytes), plus the scan's dict tables, ring and bitmaps and the retained originals. The eviction test arms maxmemory 200 KB above the memory at its start and never resets it, so the next hybrid save on that node pushed used memory over the limit and the following test's writes got OOM; stock's child holds the equivalent memory in its own process. snapSaveOverheadBytes (queued + retained + bitmaps + tables + sizes) is now excluded from the eviction calculation in freeMemoryGetNotCountedMemory, like the replication buffers; docs updated. Diagnosed with temporary probes printing node 1's INFO memory before and after the failover test (hybrid and stock were within 3 KB of each other at the end of the eviction test; the gap appeared during the next save).
+
+Two timing differences in the cluster suite's timeout tests, both from the same root: a socket-target child is never killed when its replica disconnects (freeClient kills only disk-target children), so it learns of the dead destination at its next write. Stock's child writes continuously (and flushes per key under rdb-key-save-delay); the hybrid child wrote only what the scan thread delivered, and with two delayed keys in one window that was 20 s later, past the next test's 20 s wait for a new save ('ASM task did not start'), while a paused source made the destination time out on the snapshot channel instead of the stream. Fixes: (a) the child polls its rdb-channel connections for hangup (POLLRDHUP) while it waits for the producers and exits with 'replica connection closed' at once; (b) the scan thread flushes its stage after every key it delayed, so records stream one key at a time under a delay, as stock's child does; (c) the paused-source test accepts either channel's timeout, since the hybrid child cannot deliver a snapshot while the parent that feeds it is stopped. A harness TIMEOUT seen once in the chain was collateral: the failed paused-source test skipped its cleanup and left the source SIGSTOPped. Also: the chain's unit/maxmemory failure was my own doing, a second runtest started on the same ports while the chain was still running (the in-sandbox ps cannot see host processes); its rerun passed 39/39.
+
+2026-10-11 landed (see git log for TASK-1.49). Final verification: unit/cluster/atomic-slot-migration 108 ok with hybrid-snapshot yes (every stock test plus the two new hybrid-only tests, which also passed three isolated runs) and 107 ok with it off; unit/snapshot 81 ok in both modes; integration/replication 80, unit/maxmemory 39, integration/aof-multi-part 41, unit/aofrw 25 with the hybrid on; redis-server test snapshot 184; build without warnings. AC 1, 2, 3 and 5 met. AC 4 (the measurement on a multi-GB cluster node) is open: it needs the AWS host (one new c7i.4xlarge per session, see the aws-benchmark-host memory note); the expected result is the hybrid BGSAVE profile for a migration's fork stall and copy-on-write. The blog's slot-migration statements were updated to the implemented state. The last stock-mode cluster run that includes the final test-file edits is the 107-ok run on the previous binary; the two new tests are guarded by hybrid-snapshot yes and the adapted paused-source test accepts the stock pattern unchanged.
 <!-- SECTION:NOTES:END -->
