@@ -267,14 +267,17 @@ That moves the stream buffer from the primary to the replica, which is loading i
 empty process, so the primary sees no copy-on-write on small values and no output-buffer growth,
 with no new protocol. The same two-channel design carries Redis 8.2's atomic slot migration: the
 source forks and ships the slot snapshot on an rdb channel while streaming the slots' live writes
-on the main one. That snapshot still runs through the stock fork child today, so a migration pays
-stock's fork and copy-on-write for its duration; taking it through the hybrid, freezing and scanning
-only the migrating slots, is the next step and a natural one, since the per-slot dicts are exactly
-the unit the scan freezes. What the hybrid already handles is the trim at the end of a migration,
-which moves the migrated slot dicts out of the keyspace. Keys of slots that were already under a
-trim job at the fork instant are skipped, as stock's child skips them; a trim that starts while a
-hybrid save is reading those dicts leaves them with the save, which holds a reference on every dict
-it froze, until the scan passes them.
+on the main one. That snapshot is a hybrid save too, over the migrating slots only: the per-slot
+dicts are exactly the unit the scan freezes, so writes to every other slot never meet the funnel,
+and the same scan thread and child produce the migration's command stream (RESTORE from DUMP
+payloads) instead of an RDB. A fork child cannot confine its copy-on-write to a few slots, since
+it maps all forkable memory whatever it reads, so what a migration pays is the hybrid BGSAVE profile:
+the fork-class values' page tables at fork and copy-on-write on fork-class values written during
+the transfer, instead of the whole heap. The trim at the end of a migration, which moves the
+migrated slot dicts out of the keyspace, is handled as stock handles it: keys of slots already under
+a trim job at the fork instant are skipped; a trim that starts while a save is reading those dicts
+leaves them with the save, which holds a reference on every dict it froze, until the scan passes
+them.
 
 The buffer still exists, on one side or the other, and it grows with write rate times sync
 duration. Valkey's forkless full sync removes it with a good idea: the primary splices the
@@ -503,10 +506,11 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
 - **AOF rewrite** runs through the hybrid in both base-file formats: same scan thread, same child,
   the INCR file starts at the fork instant. With the RDB preamble the base file is the hybrid's RDB;
   without it the same producers write the command form, and the child emits SELECT only when the db
-  changes. Disk-based and diskless full sync run through the hybrid (section 6); functions-only
-  snapshots and the slot snapshot of an atomic slot migration still fork the stock child.
+  changes. Disk-based and diskless full sync and the slot snapshot of an atomic slot migration run
+  through the hybrid (section 6); functions-only snapshots still fork the stock child.
 - **Cluster mode** runs with the bucket window over the per-slot dicts; an atomic slot
-  migration's trim during a save is handled, its slot snapshot is not yet a hybrid save (section 6).
+  migration's slot snapshot is a hybrid save over the migrating slots and its trim during a save is
+  handled (section 6). Not yet measured at scale: the migration cells are the next benchmark.
 - **FLUSHALL** during a hybrid save ends it, as stock kills its child there. Everything else
   that empties the keyspace, DEBUG RELOAD included, hands the dbs to the save, which finishes with
   the fork-instant data as stock's child does; FLUSHDB hands over the flushed db and SWAPDB just
@@ -557,6 +561,6 @@ line between the halves can move as encodings evolve, one type at a time.
 | What a slow disk or slow replica stalls | the child | the save thread and every client blocked behind it; up to `repl-timeout` per dead replica, unbounded for a slow one | the child |
 | Modules | transparent | opt in; thread-safe serializers; NULL-handle branches; one holdout sends every save to fork | opt in; save callbacks must not read the keyspace |
 | Full sync | fork: copy-on-write plus the stream buffer | commands spliced into the RDB, required; new capability on every replica or the cohort forks; offset sent at the end; no dual-channel | stock protocol on the rdb channel: 0.1-0.8 GB extra against stock's 1.1-1.4 GB at 20k writes/s, same sync time; the same splice as an option |
-| AOF rewrite, slot migration | fork | fork, unchanged, full copy-on-write | hybrid for AOF rewrite; the slot-migration snapshot still forks a stock child (hybrid path planned) |
+| AOF rewrite, slot migration | fork | fork, unchanged, full copy-on-write | hybrid for both: the slot-migration snapshot is a hybrid save over the migrating slots |
 | Per-key state | none | 4 bytes declared, 8 in practice, always | one bit per bucket, per save |
 | Switching | n/a | infrastructure and per-key field at startup; method at runtime | runtime |
