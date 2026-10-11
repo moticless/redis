@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-04 20:14'
+updated_date: '2026-10-11 07:41'
 labels:
   - bgsave
   - upstream
@@ -35,3 +36,9 @@ Measure before and after with run 36's recipe (idle saves, hybrid and stock, mix
 - [ ] #3 RDB format unchanged; unit/snapshot and integration/rdb pass in hybrid and stock modes
 - [ ] #4 RESULTS.md records the before/after and the chosen heuristic
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Dropped 2026-10-11 at the user's request: not part of the hybrid BGSAVE effort. The adaptive LZF skip is a serializer-wide change that would benefit stock and hybrid alike (an upstream candidate, as the description says); run 36's measurements in RESULTS.md stay as the record if anyone picks it up later.
+<!-- SECTION:NOTES:END -->
