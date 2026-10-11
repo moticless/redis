@@ -8,7 +8,7 @@ status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-11 07:54'
-updated_date: '2026-10-11 08:02'
+updated_date: '2026-10-11 08:11'
 labels:
   - hybrid-bgsave
   - docs
@@ -49,6 +49,8 @@ Requested by the user on 2026-10-11. The headers of the hybrid BGSAVE feature ca
 
 <!-- SECTION:NOTES:BEGIN -->
 snapshot.h rewritten: overview sections WHAT IS HYBRID BGSAVE, KEY CLASSES AND THE SNAP_NOFORK ARENA, ONE SAVE END TO END (five numbered steps), THE BUCKET WINDOW AND WRITE SECTIONS, MEMORY (the three bounded quantities and their configs), ENTRY POINTS, WHERE TO LOOK; every declaration one line with a trailing comment; same declaration set as before (one dangling comment with no declaration dropped). 30 of its former multi-line comments moved onto the definitions in snapshot.c that had none (a script matched each name to its definition and skipped the ones already commented). kvsoverlay.h: WHAT IS KVSOVERLAY, WHO INCLUDES THIS, THE SIDE TABLE (four chains), LIFECYCLE (attach, write, drain, release, detach); declarations one line. kvstore.h: KVSTORE OVERLAY section after KVSTORE (the guard, frozen dicts, the side table, drain/release, reference counting, where the implementation is); the 90-line hook/reference/overlay block condensed to 39 lines of one-line comments; the cursor typedef comment one line; the detail that left the header (guard semantics, hooks lifetime, rehash/shrink hooks, reference rules, atomic counts) now sits on kvstoreSnapGuardSet and kvstoreDictRetain in kvstore.c. Config names checked against config.c (save-small-max-bytes, bgsave-hybrid, bgsave-hybrid-max-retained-bytes, bgsave-hybrid-max-queued-bytes); no stale identifiers (kvstoreDictSnap, snap_word, snapNofork*, kvstoreOverlayStats) in the three headers. Build without warnings, redis-server test snapshot 184, test kvstore. Commit: see git log for TASK-1.47.
+
+Follow-up at the user's request (2026-10-11): declaration comments go on their own line above the declaration, not trailing; related declarations are grouped under one comment line; order reviewed. snapshot.h now runs arena (create, availability, address range; fork visibility) -> classification and placement -> scan (states, callbacks, create and setters, start in one or two steps, completions and event fd, finish/abort/release, state and progress) -> window and write sections (funnel, window, bitmaps) -> the server keyspace on the scan (overlay callbacks, serializer configuration) -> the save (dispatch and the three saves, switch and state, events during a save, owed objects) -> observability (INFO/DEBUG, progress, retained, queued, bitmaps, main-thread work) -> tests. kvsoverlay.h: store accessors, then the overlay for kvstore.c (predicates, enumeration, the write halves). kvstore.h hybrid block: hook typedefs each with its line, the struct, the setter; references; the overlay of a dict; store-wide drain and pending. Trailing comments only on #defines and struct fields. Same declaration set (checked by script). Build without warnings, test snapshot 184, test kvstore.
 <!-- SECTION:NOTES:END -->
 
 ## Final Summary
