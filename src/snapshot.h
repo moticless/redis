@@ -91,7 +91,9 @@
  * takes the hybrid path when the switch is on, the request has keyspace
  * content and every loaded module has opted in
  * (REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT), else the caller runs the stock
- * child. Functions-only and slot-snapshot transfers always keep the stock child.
+ * child. Functions-only transfers always keep the stock child. An atomic slot
+ * migration's slot snapshot is a hybrid save over the migrating slots only:
+ * the same scan and child, a RESP record form (RESTORE from DUMP payloads).
  *
  * WHERE TO LOOK
  * -------------
@@ -191,6 +193,8 @@ snapScanCtx *snapScanCreate(kvstore **stores, int num_stores, snapScanDispatchFn
                             snapScanSlotDoneFn *slot_done, void *privdata);
 /* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare, drainable). */
 void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
+/* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
+void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap);
 /* Optional hooks: scan thread before the first slot / after the last; after every window; main thread when a store's last slot completed. */
 void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata));
 void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn);
@@ -314,6 +318,9 @@ sds snapInfoPersistence(sds info);
 int snapDebugCommand(struct client *c);
 const char *const *snapCrashReportInfoSections(void);
 
+/* The save's memory in the parent that stock's child would hold in its own process: excluded from the eviction calculation. */
+size_t snapSaveOverheadBytes(void);
+size_t snapScanTableBytes(snapScanCtx *ctx);
 /* The running save: slots and keys. */
 void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent);

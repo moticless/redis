@@ -189,8 +189,10 @@ The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlim
 retained originals plus the bytes the main thread has queued and the thread has not yet handed to
 its own queues. `snapSaveCron` aborts the save when it is exceeded, and reports the save as failed
 (`rdb_last_bgsave_status:err`, `snap_hard_mark_aborts`). The worst-case memory a save holds in the
-parent is the sum of the two bounds. The queues are excluded from the eviction calculation, like
-the replication buffers, so a save never causes evictions by itself.
+parent is the sum of the two bounds. The queues, the retained originals, the bitmaps and the save's
+fixed bookkeeping (per-slot size tables, dict tables, completion ring) are excluded from the eviction
+calculation, like the replication buffers, so a save never causes evictions by itself: that memory
+is what stock's child would hold in its own process.
 
 The small channel policy keeps the queue small in practice: the child drains the small backlog
 before each big value, so the queue peaks at about one big value's worth of scan output. A single
@@ -212,7 +214,7 @@ copy-on-write on the arena.
 | diskless full sync, rdb channel | hybrid; the child writes the replicas' sockets | several replicas share one child; the replication stream buffers on the replica |
 | diskless full sync, one connection | hybrid; the child writes a pipe, the parent relays it | about 2 CPU-seconds of relay per 4 GB on the main thread |
 | functions-only transfer | stock child | no keyspace content |
-| atomic slot migration's slot snapshot | stock child | walks the keyspace by slot |
+| atomic slot migration's slot snapshot | hybrid over the migrating slots only; the child writes the rdb-channel connection | a third record form: the stream is RESP (`FUNCTION RESTORE`, `SELECT`, `CLUSTER SYNCSLOTS CONF SLOT-INFO` once per slot, `RESTORE ... ABSTTL` from a `DUMP` payload per key, `CLUSTER SYNCSLOTS SNAPSHOT-EOF`), written by the same producers through `slotSnapshotSaveKeyValuePair`; only the migrating slots' dicts are frozen and scanned (`snapScanSetSlotFilter`), writes to every other slot are plain writes; the child never maps the arena, so the migration pays the fork-class page tables and fork-class copy-on-write, as a hybrid BGSAVE does |
 | BGREWRITEAOF, `aof-use-rdb-preamble yes` | hybrid, AOF child, RDB base file | the INCR file opens before the freeze, so the fork instant is where its history starts |
 | BGREWRITEAOF, `aof-use-rdb-preamble no` | hybrid, AOF child, command-form base file | the same producers call `rewriteObject` per record; the child writes the AOF prologue and emits `SELECT` only on a db change |
 | BACKUP | through BGREWRITEAOF | |
@@ -234,6 +236,7 @@ What happens when something else touches the keyspace or the child during a hybr
 | DEBUG RELOAD, DEBUG LOADAOF, CLUSTER RESET HARD, `RedisModule_ResetDataset` | every db is handed to the save, which finishes with the fork-instant data | yes |
 | a replica's full-sync load | the replica's own running save is ended by its `killRDBChild` before the load | yes |
 | hybrid AOF rewrite and FLUSHALL | the rewrite finishes on the detached dbs; the FLUSHALL lands in the INCR file | yes, stock keeps its AOF child |
+| atomic slot migration's slot snapshot | start, success, failure and cancel run through replication's hooks into the migration's state machine (`asmSlotSnapshotAndStreamStart`, `asmSlotSnapshotSucceed`, `asmSlotSnapshotFailed`, `killRDBChild` on cancel), the same path a hybrid full sync takes; the slot set is fixed at the fork instant from the migrate task, like the trim set below | yes |
 | atomic slot migration's trim | keys of slots under a trim job at the fork instant are skipped and counted in the "keys skipped" log line, as stock's child skips them; a trim that starts during the save is not in that set, its moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete | yes |
 | rehash and resize | the dict under the window is paused; unreached dicts grow with their bitmap, shrink is refused for attached dicts | stock avoids resizing while a child exists |
 | active defrag | off while a child exists (stock rule); the arena's tcache is flushed once a second by cron | yes |

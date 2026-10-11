@@ -375,12 +375,15 @@ size_t freeMemoryGetNotCountedMemory(void) {
         overhead += sdsAllocSize(server.aof_buf);
     }
 
-    /* A hybrid snapshot queues serialized records for its child while the
-     * child is inside a big value (bounded by hybrid-snapshot-max-queued-bytes,
-     * plus what the main thread emitted ahead): memory the save holds for a
-     * few seconds and releases, not the dataset's. Counting it would evict
-     * keys during every save on an instance near its limit. */
-    overhead += snapSaveQueuedBytes();
+    /* A hybrid snapshot holds memory in the parent that stock's child would
+     * hold in its own process: the records queued for the child (bounded by
+     * hybrid-snapshot-max-queued-bytes, plus what the main thread emitted
+     * ahead), the fork-instant originals the overlay keeps alive while the
+     * scan reads them, its bucket bitmaps and its fixed bookkeeping. Memory
+     * the save holds for its duration and releases, not the dataset's:
+     * counting it would evict keys during every save on an instance near its
+     * limit (a cluster node's per-slot size tables alone are 256 KB). */
+    overhead += snapSaveOverheadBytes();
     return overhead;
 }
 

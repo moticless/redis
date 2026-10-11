@@ -2247,7 +2247,11 @@ void clusterSyncSlotsCommand(client *c) {
 }
 
 /* Save a key-value pair to stream I/O using either RESTORE or AOF format. */
-static int slotSnapshotSaveKeyValuePair(rio *rdb, kvobj *o, int dbid) {
+/* One key of the slot snapshot stream: RESTORE ... ABSTTL from a DUMP payload,
+ * or the AOF command form for large non-string values. Also the hybrid
+ * snapshot's record writer for a slot snapshot (snapshot.c): it runs on the
+ * scan thread and the main thread there, besides the child. */
+int slotSnapshotSaveKeyValuePair(rio *rdb, kvobj *o, int dbid) {
     /* Get the expire time */
     long long expiretime = kvobjGetExpire(o);
 
@@ -2379,12 +2383,35 @@ static void propagateModuleCommandsAtEnd(asmTask *task) {
  * representation of each key in the slot ranges and writes it to the file.
  *
  * Returns C_OK on success, or C_ERR on error. */
-int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
-    serverAssert(req & SLAVE_REQ_SLOTS_SNAPSHOT);
+/* The single running migrate task, or NULL. */
+static asmTask *asmMigrateTask(void) {
+    if (listLength(asmManager->tasks) != 1) return NULL;
+    asmTask *task = listNodeValue(listFirst(asmManager->tasks));
+    return task->operation == ASM_MIGRATE ? task : NULL;
+}
 
-    dictEntry *de;
-    kvstoreDictIterator kvs_di;
+/* The slots of the running migrate task as a CLUSTER_SLOTS-bit bitmap
+ * (bitmap: CLUSTER_SLOTS / 8 bytes, zeroed by the caller). Returns the number
+ * of slots, 0 when no migrate task runs. The hybrid snapshot captures it at
+ * the fork instant to freeze and scan only those slots. */
+int asmMigratingSlotsBitmap(uint8_t *bitmap) {
+    asmTask *task = asmMigrateTask();
+    if (!task) return 0;
+    int n = 0;
+    for (int j = 0; j < task->slots->num_ranges; j++) {
+        slotRange *sr = &task->slots->ranges[j];
+        for (int k = sr->start; k <= sr->end; k++) {
+            bitmap[k >> 3] |= 1u << (k & 7);
+            n++;
+        }
+    }
+    return n;
+}
 
+/* The start of the slot snapshot stream, in the process that writes it (the
+ * fork child, stock or hybrid): the debug fail point, compression off for
+ * this process, the module commands, FUNCTION RESTORE. */
+int slotSnapshotWritePrelude(rio *rdb) {
     if (unlikely(asmDebugIsFailPointActive(ASM_MIGRATE_RDB_CHANNEL, ASM_SEND_BULK_AND_STREAM)))
         rioAbort(rdb); /* Simulate a failure */
 
@@ -2393,27 +2420,56 @@ int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
     server.rdb_compression = 0;
 
     /* Only support a single migrate task */
-    serverAssert(listLength(asmManager->tasks) == 1);
-    asmTask *task = listNodeValue(listFirst(asmManager->tasks));
-    serverAssert(task->operation == ASM_MIGRATE);
+    asmTask *task = asmMigrateTask();
+    serverAssert(task != NULL);
 
-    if (propagateModuleCommands(task, rdb) == C_ERR) goto werr;
+    if (propagateModuleCommands(task, rdb) == C_ERR) return C_ERR;
 
     /* Dump functions and send to destination side. */
     rio payload;
     createFunctionDumpPayload(&payload);
     sds functions = payload.io.buffer.ptr;
-    if (rioWriteBulkCount(rdb, '*', 4) == 0) goto werr;
-    if (rioWriteBulkString(rdb, "FUNCTION", 8) == 0) goto werr;
-    if (rioWriteBulkString(rdb, "RESTORE", 7) == 0) goto werr;
-    if (rioWriteBulkString(rdb, functions, sdslen(functions)) == 0) {
-        sdsfree(payload.io.buffer.ptr);
-        goto werr;
-    }
+    int ok = rioWriteBulkCount(rdb, '*', 4) && rioWriteBulkString(rdb, "FUNCTION", 8) &&
+             rioWriteBulkString(rdb, "RESTORE", 7) && rioWriteBulkString(rdb, functions, sdslen(functions)) &&
+             /* REPLACE: no error when migrating to a node with existing libraries. */
+             rioWriteBulkString(rdb, "REPLACE", 7);
     sdsfree(payload.io.buffer.ptr);
-    /* Add the REPLACE option to the RESTORE command, to avoid error
-     * when migrating to a node with existing libraries. */
-    if (rioWriteBulkString(rdb, "REPLACE", 7) == 0) goto werr;
+    return ok ? C_OK : C_ERR;
+}
+
+/* The slot info the destination sizes its slot dicts from, before the first
+ * key of a slot. */
+int slotSnapshotWriteSlotInfo(rio *rdb, int slot, unsigned long keys, unsigned long expires) {
+    char buf[128];
+    int len = snprintf(buf, sizeof(buf), "%d:%lu:%lu", slot, keys, expires);
+    serverAssert(len > 0 && len < (int)sizeof(buf));
+    if (rioWriteBulkCount(rdb, '*', 5) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "CLUSTER", 7) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "SYNCSLOTS", 9) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "CONF", 4) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "SLOT-INFO", 9) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, buf, len) == 0) return C_ERR;
+    return C_OK;
+}
+
+/* The end of the slot snapshot stream. */
+int slotSnapshotWriteEOF(rio *rdb) {
+    if (rioWriteBulkCount(rdb, '*', 3) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "CLUSTER", 7) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "SYNCSLOTS", 9) == 0) return C_ERR;
+    if (rioWriteBulkString(rdb, "SNAPSHOT-EOF", 12) == 0) return C_ERR;
+    return C_OK;
+}
+
+int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
+    serverAssert(req & SLAVE_REQ_SLOTS_SNAPSHOT);
+
+    dictEntry *de;
+    kvstoreDictIterator kvs_di;
+
+    asmTask *task = asmMigrateTask();
+    serverAssert(task != NULL);
+    if (slotSnapshotWritePrelude(rdb) == C_ERR) goto werr;
 
     for (int i = 0; i < server.dbnum; i++) {
         char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
@@ -2436,20 +2492,8 @@ int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
                 while ((de = kvstoreDictIteratorNext(&kvs_di)) != NULL) {
                     /* Send slot info before the first key in the slot */
                     if (!send_slot_info) {
-                        /* Format slot info */
-                        char buf[128];
-                        int len = snprintf(buf, sizeof(buf), "%d:%lu:%lu",
-                                    k, kvstoreDictSize(db->keys, k),
-                                    kvstoreDictSize(db->expires, k));
-                        serverAssert(len > 0 && len < (int)sizeof(buf));
-
-                        /* Send slot info */
-                        if (rioWriteBulkCount(rdb, '*', 5) == 0) goto werr2;
-                        if (rioWriteBulkString(rdb, "CLUSTER", 7) == 0) goto werr2;
-                        if (rioWriteBulkString(rdb, "SYNCSLOTS", 9) == 0) goto werr2;
-                        if (rioWriteBulkString(rdb, "CONF", 4) == 0) goto werr2;
-                        if (rioWriteBulkString(rdb, "SLOT-INFO", 9) == 0) goto werr2;
-                        if (rioWriteBulkString(rdb, buf, len) == 0) goto werr2;
+                        if (slotSnapshotWriteSlotInfo(rdb, k, kvstoreDictSize(db->keys, k),
+                                                      kvstoreDictSize(db->expires, k)) == C_ERR) goto werr2;
                         send_slot_info = 1;
                     }
 
@@ -2470,10 +2514,7 @@ int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
     }
 
     /* Write the end of the snapshot file command */
-    if (rioWriteBulkCount(rdb, '*', 3) == 0) goto werr;
-    if (rioWriteBulkString(rdb, "CLUSTER", 7) == 0) goto werr;
-    if (rioWriteBulkString(rdb, "SYNCSLOTS", 9) == 0) goto werr;
-    if (rioWriteBulkString(rdb, "SNAPSHOT-EOF", 12) == 0) goto werr;
+    if (slotSnapshotWriteEOF(rdb) == C_ERR) goto werr;
     return C_OK;
 
 werr2:

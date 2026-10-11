@@ -1378,13 +1378,18 @@ start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 
         set r0_process_id [S 0 process_id]
         pause_process $r0_process_id
 
-        # the destination node will fail after 7s, 5s for EOF wait and 2s for slot snapshot
+        # the destination node will fail after 7s, 5s for EOF wait and 2s for slot snapshot.
+        # With the hybrid snapshot the child is fed by the paused parent's scan
+        # thread, so the snapshot itself stalls and the destination times out
+        # on the rdb channel instead: either timeout fails the task.
         wait_for_condition 1000 20 {
             [string match {*failed*} [migration_status 1 $task_id state]] &&
-            [string match {*Main channel*Connection timeout*wait-stream-eof*} \
-                [migration_status 1 $task_id last_error]]
+            ([string match {*Main channel*Connection timeout*wait-stream-eof*} \
+                [migration_status 1 $task_id last_error]] ||
+             [string match {*RDB channel*Connection timeout*rdbchannel-transfer*} \
+                [migration_status 1 $task_id last_error]])
         } else {
-            fail "ASM task did not fail"
+            fail "ASM task did not fail: [migration_status 1 $task_id last_error]"
         }
 
         # resume the source node
@@ -3710,6 +3715,85 @@ start_cluster 3 3 {tags {external:skip cluster} overrides {cluster-node-timeout 
             [llength [lindex [R 0 bless scan 0 no-evict] 1]] == 0
         } else {
             fail "former owner still lists [llength [lindex [R 0 bless scan 0 no-evict] 1]] blessed key(s) after migration+trim"
+        }
+    }
+}
+
+# Hybrid snapshot (hybrid-snapshot yes): the slot snapshot of a migration is a
+# hybrid save over the migrating slots only; the stock child is not forked.
+start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 60000 cluster-allow-replica-migration no}} {
+    if {[lindex [R 0 config get hybrid-snapshot] 1] eq "yes"} {
+        test "Hybrid slot snapshot freezes only the migrating slots and serves writes meanwhile" {
+            # Keys in the migrating slots 1 and 2 and in slot 101, which stays
+            # behind; setup_slot_migration_with_delay populates slot 0 and
+            # starts the migration of 0-2 with 0.5 s of scan delay per key.
+            populate_slot 5 -idx 0 -slot 1
+            populate_slot 5 -idx 0 -slot 2
+            populate_slot 5 -idx 0 -slot 101
+            R 0 set [slot_key 101 k] before
+            set task_id [setup_slot_migration_with_delay 0 1 0 2 2 500000]
+
+            # The save runs over the three non-empty migrating slots only, with
+            # the arena unmapped in its child.
+            assert_equal 1 [status [Rn 0] snap_save_in_progress]
+            assert_equal 3 [status [Rn 0] snap_save_slots_total]
+            if {[status [Rn 0] snap_nofork_arena_available] == 1} {
+                assert_equal 0 [status [Rn 0] snap_nofork_arena_forkable]
+            }
+
+            # Writes during the transfer: one to a migrating slot (through the
+            # overlay, streamed to the destination after the snapshot), one to a
+            # slot the save never froze.
+            R 0 set [slot_key 1 w] during-migrating
+            R 0 set [slot_key 101 k] during-other
+            R 0 config set rdb-key-save-delay 0
+            wait_for_asm_done
+
+            # The destination holds the migrating slots with the write applied;
+            # the source kept serving the other slot.
+            assert_equal during-migrating [R 1 get [slot_key 1 w]]
+            assert_equal 5 [R 1 cluster countkeysinslot 2]
+            assert_equal during-other [R 0 get [slot_key 101 k]]
+
+            # The save ended clean.
+            wait_for_condition 200 50 {
+                [status [Rn 0] snap_save_in_progress] == 0
+            } else {
+                fail "hybrid save still running after the migration"
+            }
+            assert_equal 0 [status [Rn 0] snap_save_retained_bytes]
+            assert_equal 0 [status [Rn 0] snap_save_side_entries]
+        }
+
+        test "Cancelling a migration mid slot snapshot ends the hybrid save cleanly" {
+            R 0 set [slot_key 101 c] keep
+            set task_id [setup_slot_migration_with_delay 0 1 0 2 2 500000]
+            assert_equal 1 [status [Rn 0] snap_save_in_progress]
+            set marker [slot_key 0 c]
+            R 0 set $marker keep-migrating
+
+            # The destination cancels; the source sees its channels close and fails.
+            R 1 cluster migration cancel id $task_id
+            wait_for_condition 2000 10 {
+                [string match {*canceled*} [migration_status 1 $task_id state]] &&
+                ([string match {*failed*} [migration_status 0 $task_id state]] ||
+                 [string match {*canceled*} [migration_status 0 $task_id state]])
+            } else {
+                fail "ASM task did not cancel: [migration_status 0 $task_id state] / [migration_status 1 $task_id state]"
+            }
+            R 0 config set rdb-key-save-delay 0
+            wait_for_condition 200 50 {
+                [status [Rn 0] snap_save_in_progress] == 0 && [status [Rn 0] rdb_bgsave_in_progress] == 0
+            } else {
+                fail "hybrid save did not end after the cancel"
+            }
+            assert_equal 0 [status [Rn 0] snap_save_retained_bytes]
+            assert_equal 0 [status [Rn 0] snap_save_side_entries]
+
+            # The source's keyspace is intact: the migrating and the other slot.
+            assert_equal keep-migrating [R 0 get $marker]
+            assert_morethan [R 0 cluster countkeysinslot 0] 0
+            assert_equal keep [R 0 get [slot_key 101 c]]
         }
     }
 }

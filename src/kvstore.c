@@ -379,7 +379,12 @@ dict *kvstoreDictRetain(kvstore *kvs, int didx) {
 void kvstoreDictUnref(dict *d) {
     if (__atomic_sub_fetch(&dictMeta(d)->refcount, 1, __ATOMIC_ACQ_REL) != 0) return;
     kvstore *kvs = d->type->userdata;
-    assert(dictMeta(d)->ov == NULL && dictMeta(d)->ext == NULL);   /* a save releases its state before its reference */
+    /* A save releases its state before its reference. */
+    if (dictMeta(d)->ov != NULL || dictMeta(d)->ext != NULL)
+        _serverPanic(__FILE__, __LINE__, "dict of slot %d freed with save state: ov=%p ext=%p ext_word=%llx detached=%d size=%lu",
+                     dictMeta(d)->didx, (void *)dictMeta(d)->ov, dictMeta(d)->ext,
+                     (unsigned long long)__atomic_load_n(&dictMeta(d)->ext_word, __ATOMIC_RELAXED),
+                     dictMeta(d)->detached, dictSize(d));
     dictRelease(d);
     kvstoreUnref(kvs);
 }
