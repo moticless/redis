@@ -68,12 +68,6 @@ static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
     return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
 
-/* A non-empty side table: reads must consult it. Writes always go through
- * the overlay of a frozen dict (ovGet), whatever the side table holds. */
-static inline int ovActive(kvstoreDictOverlay *ov) {
-    return ov && (ov->entries || ov->tombs);
-}
-
 /* The interception points of kvstore.c. Every public entry point that
  * touches a dict's content starts with exactly one of these three (grep
  * them to list every place the snapshot may step in):
