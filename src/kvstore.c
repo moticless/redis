@@ -83,6 +83,12 @@ static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
 static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
 static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
 
+/* Debug-build check at the entry points that bypass the overlay on purpose:
+ * none of them may meet a frozen dict. Side-effect free (ovPeek: no guard
+ * call), so it never attaches an overlay itself. The reason each site is
+ * exempt is stated at the site; see also TASK-1.43's caller audit. */
+#define kvstoreDebugAssertNotFrozen(kvs, didx) debugAssert(ovPeek((kvs), (didx)) == NULL)
+
 
 #define UNUSED(V) ((void) V)
 
@@ -567,7 +573,11 @@ int kvstoreExpand(kvstore *kvs, uint64_t newsize, int try_expand, kvstoreExpandS
         if (skip_cb && skip_cb(i)) continue;
         dict *d = createDictIfNeeded(kvs, i);
         if (!d) continue;
-        if (d->pauseAutoResize > 0) continue;   /* frozen by a snapshot: layout must not change */
+        /* Frozen by a snapshot (its pause): the layout must not change. The
+         * pause and the overlay are attached together, so this is ovFrozen()
+         * without the guard call (expand runs at load and full sync, on fresh
+         * stores after the save's detach, so it never meets one in practice). */
+        if (d->pauseAutoResize > 0) continue;
 
         int result = try_expand ? dictTryExpand(d, newsize) : dictExpand(d, newsize);
         if (try_expand && result == DICT_ERR)
@@ -985,6 +995,9 @@ unsigned long kvstoreDictScanDefrag(kvstore *kvs, int didx, unsigned long v, dic
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return 0;
+    /* Bypasses the overlay: active defrag does not run while a child process
+     * exists (defrag.c), and a frozen dict only exists during a save. */
+    kvstoreDebugAssertNotFrozen(kvs, didx);
     return dictScanDefrag(d, v, fn, defragfns, privdata);
 }
 
@@ -1003,6 +1016,9 @@ unsigned long kvstoreDictLUTDefrag(kvstore *kvs, unsigned long cursor, kvstoreDi
         dict **d = kvstoreGetDictRef(kvs, didx), *newd;
         if (!*d)
             continue;
+        /* Bypasses the overlay (moves the dict struct): same child-exists rule
+         * as kvstoreDictScanDefrag; a frozen dict is also referenced by the save. */
+        kvstoreDebugAssertNotFrozen(kvs, didx);
         if ((newd = defragfn(*d))) {
             *d = newd;
 
@@ -1022,7 +1038,10 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
-    assert(d->type->no_value == 0); 
+    assert(d->type->no_value == 0);
+    /* Bypasses the overlay: only the pubsub channel stores (no_value == 0)
+     * call this, and the save freezes keyspace stores (db->keys) only. */
+    kvstoreDebugAssertNotFrozen(kvs, didx);
     return dictFetchValue(d, key);
 }
 
@@ -1107,12 +1126,18 @@ dictEntry *kvstoreDictAddRaw(kvstore *kvs, int didx, void *key, dictEntry **exis
 
 void kvstoreDictSetKey(kvstore *kvs, int didx, dictEntry* de, void *key) {
     dict *d = kvstoreGetDict(kvs, didx);
+    /* Bypasses the overlay: defrag's pubsub-channel key move only; never a
+     * keyspace store (keyspace key moves go through kvstoreDictSetAtLink). */
+    kvstoreDebugAssertNotFrozen(kvs, didx);
     dictSetKey(d, de, key);
 }
 
 void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
     dict *d = kvstoreGetDict(kvs, didx);
-    assert(d->type->no_value == 0); 
+    assert(d->type->no_value == 0);
+    /* Bypasses the overlay: pubsub client dicts, blessed_keys and defrag's
+     * channel stores, all no_value == 0; the save freezes db->keys only. */
+    kvstoreDebugAssertNotFrozen(kvs, didx);
     dictSetVal(d, de, val);
 }
 

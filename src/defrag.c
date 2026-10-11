@@ -1995,7 +1995,10 @@ static int activeDefragTimeProc(struct aeEventLoop *eventLoop, long long id, voi
     }
 
     if (hasActiveChildProcess()) {
-        /* If there's a child process, pause the defrag, polling until the child completes. */
+        /* If there's a child process, pause the defrag, polling until the child completes.
+         * The hybrid snapshot relies on this rule too: its save has a child for its whole
+         * life, so the kvstore defrag entry points (kvstoreDictScanDefrag, kvstoreDictLUTDefrag),
+         * which bypass the snapshot overlay, never meet a frozen dict. */
         defrag.timeproc_end_time = 0; /* prevent starvation recovery */
         return 100;
     }
