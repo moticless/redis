@@ -24,6 +24,7 @@ batch-latency percentiles and per-second completed counts.
 import argparse, asyncio, json, random, string, sys, time
 
 ALPHA = (string.ascii_letters + string.digits).encode()
+REDIRECTS = {"-MOVED", "-ASK", "-TRYAGAIN", "-CLUSTERDOWN"}   # a slot left this node mid-run (slot migration benchmarks): counted, not fatal
 
 class Conn:
     def __init__(self): self.r = self.w = None
@@ -80,7 +81,11 @@ async def worker(a, ident, rate, stats, start, stop_at):
             batch = b"".join(make_cmd(a, rnd, hot_keys) for _ in range(n))
             t0 = time.monotonic()
             c.w.write(batch); await c.w.drain()
-            for _ in range(n): await c.reply()
+            for _ in range(n):
+                try: await c.reply()
+                except RuntimeError as e:
+                    if str(e).split(" ", 1)[0] in REDIRECTS: stats["redirects"] += 1
+                    else: raise
             t1 = time.monotonic()
             stats["lat"].append((t1 - t0) * 1000.0)
             stats["completed"] += n
@@ -89,7 +94,7 @@ async def worker(a, ident, rate, stats, start, stop_at):
         await c.close()
 
 async def main_async(a):
-    stats = {"lat": [], "completed": 0, "ts": {}, "errors": []}
+    stats = {"lat": [], "completed": 0, "ts": {}, "errors": [], "redirects": 0}
     start = time.monotonic(); stop_at = start + a.seconds
     per_conn = a.rate / a.conns
     tasks = [asyncio.create_task(worker(a, i, per_conn, stats, start, stop_at)) for i in range(a.conns)]
@@ -103,9 +108,10 @@ async def main_async(a):
     out = {"ops_per_sec": stats["completed"] / secs, "completed": stats["completed"], "seconds": secs,
            "avg_ms": (sum(lat) / len(lat)) if lat else None, "p50.00": pct(50), "p99.00": pct(99), "p99.90": pct(99.9), "p100.00": pct(100),
            "batches": len(lat), "pipeline": a.pipeline, "conns": a.conns, "hot": a.hot, "kind": a.kind, "mode": a.mode,
-           "target_rate": a.rate, "ts": {str(k): {"Count": v} for k, v in sorted(stats["ts"].items())}, "errors": stats["errors"][:5]}
+           "target_rate": a.rate, "ts": {str(k): {"Count": v} for k, v in sorted(stats["ts"].items())}, "errors": stats["errors"][:5],
+           "redirects": stats["redirects"]}
     with open(a.out, "w") as f: json.dump(out, f)
-    print(f"{a.prefix} {a.kind}/{a.mode} hot={a.hot}: {out['ops_per_sec']:.0f} ops/s (target {a.rate}), batch p99 {out['p99.00']} ms, errors {len(stats['errors'])}", file=sys.stderr)
+    print(f"{a.prefix} {a.kind}/{a.mode} hot={a.hot}: {out['ops_per_sec']:.0f} ops/s (target {a.rate}), batch p99 {out['p99.00']} ms, errors {len(stats['errors'])}, redirects {stats['redirects']}", file=sys.stderr)
     return 0 if not stats["errors"] else 1
 
 def main():

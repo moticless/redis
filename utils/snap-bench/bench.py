@@ -208,7 +208,7 @@ def parse_load(path):
     try:
         d = json.load(open(path))
         out = {"ops_per_sec": d.get("ops_per_sec"), "avg_ms": d.get("avg_ms"), "p50.00": d.get("p50.00"), "p99.00": d.get("p99.00"),
-               "p99.90": d.get("p99.90"), "p100.00": d.get("p100.00")}
+               "p99.90": d.get("p99.90"), "p100.00": d.get("p100.00"), "redirects": d.get("redirects", 0)}
         if d.get("errors"): out["err"] = "; ".join(d["errors"])
         return out, d.get("ts", {})
     except (OSError, KeyError, json.JSONDecodeError, TypeError) as e:
@@ -272,6 +272,91 @@ class Replica:
         try: self.proc.wait(timeout=30)
         except subprocess.TimeoutExpired: self.proc.kill()
 
+# ------------------------------------------------------------------ atomic slot migration (TASK-1.49)
+ASM_SLOTS = 16384
+
+def _s(x): return x.decode() if isinstance(x, bytes) else x
+def _kv(flat):
+    """A RESP2 map (flat key/value array) as a dict of str; a dict passes through."""
+    if isinstance(flat, dict): return {_s(k): _s(v) for k, v in flat.items()}
+    return {_s(flat[i]): _s(flat[i + 1]) for i in range(0, len(flat) - 1, 2)}
+
+class ClusterNode:
+    """A second cluster node from the same binary on the load CPUs: the destination of the slot migrations.
+    Fresh identity per bench.py invocation (its dir is wiped) and met through CLUSTER MEET."""
+    def __init__(self, a):
+        self.a = a; self.port = a.asm_port
+        self.dir = os.path.join(a.workdir, f"asm-node-{self.port}")
+        shutil.rmtree(self.dir, ignore_errors=True); os.makedirs(self.dir)
+        cmd = ["taskset", "-c", a.load_cpus, a.asm_bin, "--port", str(self.port), "--bind", "127.0.0.1", "--save", "",
+               "--appendonly", "no", "--dir", self.dir, "--logfile", os.path.join(self.dir, "node.log"), "--protected-mode", "no",
+               "--cluster-enabled", "yes", "--cluster-config-file", os.path.join(self.dir, "nodes.conf"), "--cluster-bus-port-protected-mode", "no", "--cluster-allow-replica-migration", "no"] + (a.asm_node_args.split() if a.asm_node_args else [])
+        self.proc = subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        self.r = redis.Redis(port=self.port, socket_timeout=600)
+        for _ in range(100):
+            try: self.r.ping(); break
+            except redis.RedisError: time.sleep(0.1)
+        else: raise RuntimeError("cluster node did not start")
+        self.id = _s(self.r.execute_command("CLUSTER", "MYID"))
+    def stop(self):
+        try: self.r.shutdown(nosave=True)
+        except redis.RedisError: pass
+        try: self.proc.wait(timeout=30)
+        except subprocess.TimeoutExpired: self.proc.kill()
+
+def asm_setup(a, r):
+    """The server under test becomes a one-node cluster owning every slot (bench.py's keys carry no hashtags, so a
+    slot range holds a proportional share of them); the destination node is started and met. Returns (flavor, node)."""
+    flavor = "valkey" if "valkey_version" in r.info("server") else "redis"
+    try: r.execute_command("CLUSTER", "ADDSLOTSRANGE", 0, ASM_SLOTS - 1)
+    except redis.ResponseError as e:
+        if "busy" not in str(e): raise
+    node = ClusterNode(a)
+    node.r.execute_command("CLUSTER", "MEET", "127.0.0.1", a.port)
+    for _ in range(600):
+        ci = _kv(r.execute_command("CLUSTER INFO")); cj = _kv(node.r.execute_command("CLUSTER INFO"))
+        if ci.get("cluster_state") == "ok" and cj.get("cluster_state") == "ok" and int(ci.get("cluster_known_nodes", 0)) == 2 and int(cj.get("cluster_known_nodes", 0)) == 2: break
+        time.sleep(0.1)
+    else: raise RuntimeError(f"cluster did not form: {ci} {cj}")
+    time.sleep(1)
+    return flavor, node
+
+def asm_migrate(flavor, src, dst, lo, hi, on_poll=None, poll=0.02):
+    """Move slots lo..hi from src to dst (both redis clients) and wait for the terminal state.
+    Returns dict(t0, t1, cow_bytes, write_pause_ms, err). Redis: the destination imports (CLUSTER MIGRATION IMPORT);
+    Valkey: the source exports (CLUSTER MIGRATESLOTS)."""
+    out = {"t0": time.time(), "cow_bytes": None, "write_pause_ms": None, "err": None}
+    if flavor == "valkey":
+        dst_id = _s(dst.execute_command("CLUSTER", "MYID")); rng = f"{lo}-{hi}" if lo != hi else str(lo)
+        src.execute_command("CLUSTER", "MIGRATESLOTS", "SLOTSRANGE", lo, hi, "NODE", dst_id)
+        def status():
+            for j in src.execute_command("CLUSTER", "GETSLOTMIGRATIONS") or []:
+                d = _kv(j)
+                if d.get("slot_ranges") == rng and d.get("operation") == "EXPORT": return d
+            return {}
+        done, bad = ("success",), ("failed", "cancelled")
+    else:
+        tid = _s(dst.execute_command("CLUSTER", "MIGRATION", "IMPORT", lo, hi))
+        def status():
+            st = dst.execute_command("CLUSTER", "MIGRATION", "STATUS", "ID", tid) or []
+            return _kv(st[0]) if st else {}
+        done, bad = ("completed",), ("failed", "canceled")
+    while True:
+        d = status(); state = d.get("state")
+        if state in done or state in bad:
+            out["t1"] = time.time()
+            if state in bad: out["err"] = f"{state}: {d.get('last_error') or d.get('message') or ''}"
+            if flavor == "valkey": out["cow_bytes"] = int(d.get("cow_size") or 0)
+            else:
+                # the source's migrate task carries the write pause of the hand-off
+                for t in src.execute_command("CLUSTER", "MIGRATION", "STATUS", "ALL") or []:
+                    m = _kv(t)
+                    if m.get("id") == tid: out["write_pause_ms"] = int(m.get("write_pause_ms") or 0)
+            return out
+        if time.time() - out["t0"] > 1800: out["t1"] = time.time(); out["err"] = "timeout"; return out
+        if on_poll: on_poll()
+        time.sleep(poll)
+
 # ------------------------------------------------------------------ one cell
 def cool_down(a):
     """Thermal gate: this laptop throttles (package 85-89 C, cores at 0.8-1.6 GHz of 4.7) after minutes of load and
@@ -293,7 +378,7 @@ def run_cell(a, dataset, rate, est_save):
            "hybrid": int(r.config_get("hybrid-snapshot").get("hybrid-snapshot", "no") == "yes") if "hybrid-snapshot" in str(r.config_get("hybrid-snapshot")) else 0}
     row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
-    secs = int(a.warm + est_save * (3.0 if a.sync_bin else 1.6) + 8)
+    secs = int(a.warm + est_save * (3.0 if (a.sync_bin or a.asm_bin) else 1.6) + 8)
     procs, outs = [], {}
     if rate > 0:
         weights = class_weights(r, classes); tot = sum(weights)
@@ -333,6 +418,21 @@ def run_cell(a, dataset, rate, est_save):
                     replica_buf_peak_mb=rep_buf_peak // 2**20, replica_mem_growth_mb=(max(mem_rep, default=rep_mem0) - rep_mem0) // 2**20,
                     sync_full=r.info("stats").get("sync_full", 0) - sync_full0)
         time.sleep(0.8)
+    elif a.asm_bin:
+        # A slot migration instead of a BGSAVE: the server under test is the source, a.asm_node the destination.
+        n = max(1, round(ASM_SLOTS * a.asm_slice)); lo, hi = 0, n - 1; dbsize0 = r.dbsize(); row["asm_slots"] = n
+        seen = {"busy": False, "t_child": None}
+        def on_poll():
+            p = r.info("persistence")
+            busy = p.get("rdb_bgsave_in_progress") or p.get("snap_save_in_progress", 0) or p.get("slot_migration_fork_in_progress", 0)
+            if busy: seen["busy"] = True
+            elif seen["busy"] and seen["t_child"] is None: seen["t_child"] = time.time()
+        m = asm_migrate(a.asm_flavor, r, a.asm_node.r, lo, hi, on_poll=on_poll)
+        t0, t1 = m["t0"], m["t1"]; t_child = seen["t_child"] or t1
+        sync.update(transfer_sec=round(t_child - t0, 2), asm_write_pause_ms=m["write_pause_ms"])
+        if m["err"]: sync["asm_err"] = m["err"]
+        if m["cow_bytes"] is not None: sync["asm_cow_mb"] = m["cow_bytes"] // 2**20
+        time.sleep(0.8)
     else:
         t0 = time.time(); r.bgsave(); t1 = wait_save(r); time.sleep(0.8)
     cpu1 = srv.cpu_ticks(); sampler.stop_ev.set(); ping.stop_ev.set(); sampler.join(); ping.join()
@@ -340,6 +440,11 @@ def run_cell(a, dataset, rate, est_save):
         try: sync["replica_dbsize_equal"] = int(rep.r.dbsize() == r.dbsize())
         except redis.RedisError: pass
         rep.stop()
+    if a.asm_bin:
+        b = asm_migrate(a.asm_flavor, a.asm_node.r, r, lo, hi)
+        sync["asm_back_sec"] = round(b["t1"] - b["t0"], 2)
+        if b["err"]: sync["asm_err"] = (sync.get("asm_err") or "") + " back: " + b["err"]
+        sync["asm_dbsize_restored"] = int(r.dbsize() == dbsize0)
     p1 = r.info("persistence"); st = r.info("stats"); tick = os.sysconf("SC_CLK_TCK")
     row.update(save_sec=round(t1 - t0, 2), status=p1.get("rdb_last_bgsave_status"),
                fork_ms=round(st.get("latest_fork_usec", 0) / 1000, 2), cow_mb=p1.get("rdb_last_cow_size", 0) // 2**20,
@@ -350,6 +455,7 @@ def run_cell(a, dataset, rate, est_save):
                snap_hard_mark_aborts=p1.get("snap_hard_mark_aborts"),
                impl_stats=" ".join(f"{k}={p1[k]}" for k in IMPL_STATS if k in p1))
     row.update(sync)
+    if sync.get("asm_cow_mb") is not None: row["cow_mb"] = sync["asm_cow_mb"]
     base = st0.get("RssAnon", 0) + st0.get("VmSwap", 0)
     rows = [x for x in sampler.rows if t0 - 0.2 <= x["t"] <= t1 + 0.5]
     if rows:
@@ -373,16 +479,17 @@ def run_cell(a, dataset, rate, est_save):
     except redis.RedisError: pass
 
     for p in procs: p.wait(timeout=secs + 60)
-    ops = p99 = p999 = mx = stall = 0; missed = False; avg = []
+    ops = p99 = p999 = mx = stall = redirects = 0; missed = False; avg = []
     for prefix, (path, cr) in outs.items():
         m, ts = parse_load(path)
         if "err" in m: row["load_err"] = m["err"]; continue
-        ops += m.get("ops_per_sec") or 0; avg.append(m.get("avg_ms") or 0)
+        ops += m.get("ops_per_sec") or 0; avg.append(m.get("avg_ms") or 0); redirects += m.get("redirects") or 0
         p99 = max(p99, m.get("p99.00") or 0); p999 = max(p999, m.get("p99.90") or 0); mx = max(mx, m.get("p100.00") or 0)
         if (m.get("ops_per_sec") or 0) < 0.95 * cr: missed = True
         stall = max(stall, sum(1 for s, rr in ts.items() if t0 <= t_mt + int(s) <= t1 and rr.get("Count", 0) < 0.9 * cr))
     if procs:
-        row.update(ops=round(ops), load_avg_ms=round(statistics.fmean(avg), 3) if avg else None, load_p99_ms=p99, load_p999_ms=p999, load_max_ms=mx, stall_s=stall, target_missed=missed)
+        row.update(ops=round(ops), load_avg_ms=round(statistics.fmean(avg), 3) if avg else None, load_p99_ms=p99, load_p999_ms=p999, load_max_ms=mx, stall_s=stall, target_missed=missed,
+                   load_redirects=redirects)
     return row
 
 COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "hot", "shares", "dbsize", "used_mb", "rss_base_mb",
@@ -390,10 +497,19 @@ COLUMNS = ["name", "ts", "sha", "hybrid", "mode", "dataset", "rate", "hot", "sha
            "used_mem_growth_mb", "cpu_main_s", "cpu_threads_s", "cpu_child_s", "ping_p50_ms", "ping_p99_ms", "ping_max_ms",
            "cmd_events_ge20ms", "ops", "load_avg_ms", "load_p99_ms", "load_p999_ms", "load_max_ms", "stall_s", "target_missed",
            "blocked_peak", "cpu_mhz_min", "cpu_mhz_avg", "temp_c_start", "temp_c_max", "cooled_s", "snap_retained_peak_mb", "snap_hard_mark_aborts", "impl_stats", "latency_events", "load_err",
-           "transfer_sec", "master_cob_peak_mb", "replica_buf_peak_mb", "replica_mem_growth_mb", "sync_full", "replica_dbsize_equal", "sync_err"]
+           "transfer_sec", "master_cob_peak_mb", "replica_buf_peak_mb", "replica_mem_growth_mb", "sync_full", "replica_dbsize_equal", "sync_err",
+           "asm_slots", "asm_write_pause_ms", "asm_back_sec", "asm_dbsize_restored", "asm_err", "load_redirects"]
 
 def cmd_run(a):
     r = redis.Redis(port=a.port); r.ping()
+    if a.cache is None: a.cache = os.path.join(a.workdir, "cache")
+    a.asm_node = None
+    if a.asm_bin: a.asm_flavor, a.asm_node = asm_setup(a, r)
+    try: cmd_run_inner(a, r)
+    finally:
+        if a.asm_node: a.asm_node.stop()
+
+def cmd_run_inner(a, r):
     new = not os.path.exists(a.csv)
     with open(a.csv, "a", newline="") as f:
         w = csv.DictWriter(f, fieldnames=COLUMNS, extrasaction="ignore")
@@ -410,16 +526,27 @@ def cmd_run(a):
                 secs = populate(a.port, ds, a.scale); how = "populated"
             mb = r.info("memory")["used_memory"] // 2**20
             print(f"[{a.name}] {ds}: {r.dbsize()} keys, {mb} MB, {how} in {secs:.0f}s", file=sys.stderr)
-            t0 = time.time(); r.bgsave(); wait_save(r); est = time.time() - t0; time.sleep(2)   # untimed warm-up save
+            est = 0
+            if not (a.asm_bin and cache and os.path.exists(cache)):   # the migration benchmark needs the save only to build the cache
+                t0 = time.time(); r.bgsave(); wait_save(r); est = time.time() - t0; time.sleep(2)   # untimed warm-up save
             if cache and not os.path.exists(cache) and os.path.exists(dump):
                 os.makedirs(a.cache, exist_ok=True); shutil.copyfile(dump, cache)
+            if a.asm_bin:
+                # The migration benchmark needs no dump on tmpfs (the cache has it); the warm-up is a migration round trip.
+                if os.path.exists(dump): os.unlink(dump)
+                n = max(1, round(ASM_SLOTS * a.asm_slice))
+                m = asm_migrate(a.asm_flavor, r, a.asm_node.r, 0, n - 1); b = asm_migrate(a.asm_flavor, a.asm_node.r, r, 0, n - 1)
+                est = m["t1"] - m["t0"]
+                print(f"[{a.name}] {ds}: warm-up migration of {n} slots {est:.2f}s (back {b['t1'] - b['t0']:.2f}s) err {m['err']} {b['err']}", file=sys.stderr)
+                time.sleep(2)
             for rate in [int(x) for x in a.rates.split(",")]:
                 for rep in range(a.reps):
                     row = run_cell(a, ds, rate, est); w.writerow(row); f.flush()
-                    print(f"[{a.name}] {ds} r{rate} #{rep}: save {row['save_sec']}s fork {row['fork_ms']}ms extra_mem {row.get('extra_mem_peak_mb')}MB "
+                    print(f"[{a.name}] {ds} r{rate} #{rep}: save {row['save_sec']}s transfer {row.get('transfer_sec')}s fork {row['fork_ms']}ms extra_mem {row.get('extra_mem_peak_mb')}MB "
                           f"(parent +{row.get('parent_growth_peak_mb')}, child {row.get('child_pd_peak_mb')}) cow {row['cow_mb']}MB "
                           f"ping p99 {row.get('ping_p99_ms')} max {row.get('ping_max_ms')} load p99 {row.get('load_p99_ms')} max {row.get('load_max_ms')} stall {row.get('stall_s')} "
-                          f"cpu {row.get('cpu_mhz_min')}-{row.get('cpu_mhz_avg')} MHz {row.get('temp_c_max')}C", file=sys.stderr)
+                          f"cpu {row.get('cpu_mhz_min')}-{row.get('cpu_mhz_avg')} MHz {row.get('temp_c_max')}C"
+                          + (f" asm pause {row.get('asm_write_pause_ms')}ms back {row.get('asm_back_sec')}s redirects {row.get('load_redirects')} err {row.get('asm_err')}" if a.asm_bin else ""), file=sys.stderr)
                     time.sleep(a.cooldown)
 
 def cmd_report(a):
@@ -454,10 +581,14 @@ def main():
     p.add_argument("--cool-below", type=int, default=0, help="before each cell wait until the package temperature (C) is below this (0 = off)")
     p.add_argument("--cool-wait", type=int, default=120, help="max seconds to wait for the thermal gate")
     p.add_argument("--hot", type=float, default=1.0, help="fraction of each class's keys that receive the writes (1.0 = uniform over all keys)")
-    p.add_argument("--cache", default="/dev/shm/snap-bench-runs/cache", help="dir of cached dataset RDBs ('' to disable)")
+    p.add_argument("--cache", default=None, help="dir of cached dataset RDBs (default <workdir>/cache, '' to disable)")
     p.add_argument("--sync-bin", default="", help="measure a full sync to a fresh replica started from this binary instead of a BGSAVE (save_sec = time to link up)")
     p.add_argument("--sync-port", type=int, default=7601)
     p.add_argument("--sync-replica-args", default="", help="extra command-line arguments for the replica")
+    p.add_argument("--asm-bin", default="", help="measure an atomic slot migration to a second cluster node started from this binary instead of a BGSAVE (the server under test must run cluster-enabled)")
+    p.add_argument("--asm-port", type=int, default=7601)
+    p.add_argument("--asm-slice", type=float, default=0.05, help="fraction of the 16384 slots migrated per cell (slots 0..n-1), moved back unmeasured after the cell")
+    p.add_argument("--asm-node-args", default="", help="extra command-line arguments for the destination node")
     p.set_defaults(fn=cmd_run)
     p = sub.add_parser("report"); p.add_argument("csv"); p.set_defaults(fn=cmd_report)
     a = ap.parse_args(); a.fn(a)

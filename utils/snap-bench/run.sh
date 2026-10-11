@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start each binary with identical flags (pinned to cores 0-7), run bench.py (snapload.py traffic), stop it.
 #   run.sh <csv> [rates] [datasets] [scale] [reps]
-# CFGS env: space-separated subset of "base up up-1ch up-nocomp hybrid hybrid-nocomp hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
+# CFGS env: space-separated subset of "base up up-1ch up-nocomp hybrid hybrid-off hybrid-nocomp hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
 # Parity: small-value cap pinned to 4096 B on both POCs (ours save-small-max-bytes, theirs forkless-string-max);
 # retained-memory budgets left at each POC's default (ours 256 MB hard mark, theirs unlimited) and recorded in the CSV.
 cd "$(dirname "$0")"
@@ -13,6 +13,8 @@ HOT=${HOT:-1.0}                   # fraction of each class's keys the writes hit
 COOL=${COOL:-0}                   # thermal gate: wait before each cell until the package is below this many C (0 = off)
 SYNC=${SYNC:-0}                   # 1: measure a diskless full sync to a fresh replica (same binary, on LOAD_CPUS) instead of a BGSAVE
 SYNC_REPLICA_ARGS=${SYNC_REPLICA_ARGS:-}   # extra flags for the replica (e.g. "--dual-channel-replication-enabled yes" for valkey)
+ASM=${ASM:-0}                     # 1: measure an atomic slot migration of ASM_SLICE of the slots to a second cluster node (same binary and flags, on LOAD_CPUS) instead of a BGSAVE
+ASM_SLICE=${ASM_SLICE:-0.05}      # fraction of the 16384 slots migrated per cell
 BASE=${BASE:-/tmp/redis-base/src/redis-server}        # stock 0c1c74706 (M1 baseline)
 UP=${UP:-/tmp/redis-up/src/redis-server}              # stock upstream 0d6266f2d (current base)
 HYB=${HYB:-/home/moti/git/redis-bgsave/src/redis-server}
@@ -25,10 +27,12 @@ CLI=${CLI:-$(dirname "$HYB")/redis-cli}                 # any redis-cli
 
 start() {  # start <name> <binary> [flags...]
   local name=$1 bin=$2; shift 2
-  LAST_BIN=$bin
+  LAST_BIN=$bin; LAST_ARGS="$*"
+  local cluster=()
+  if [ "$ASM" = 1 ]; then rm -f "$D/$name-nodes.conf"; cluster=(--cluster-enabled yes --cluster-config-file "$D/$name-nodes.conf" --cluster-bus-port-protected-mode no --cluster-allow-replica-migration no); fi   # loopback only; an emptied node must stay a master
   taskset -c "$SERVER_CPUS" "$bin" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --activedefrag no --disable-thp yes \
     --io-threads 1 --latency-monitor-threshold 5 --jemalloc-bg-thread yes --daemonize yes --enable-debug-command yes \
-    --dir "$D" --dbfilename "$name.rdb" --logfile "$D/$name.log" "$@" || return 1
+    --dir "$D" --dbfilename "$name.rdb" --logfile "$D/$name.log" "$@" "${cluster[@]}" || return 1
   for i in $(seq 1 50); do $CLI -p $PORT ping 2>/dev/null | grep -q PONG && return 0; sleep 0.2; done
   return 1
 }
@@ -39,6 +43,7 @@ for cfg in ${CFGS:-base hybrid}; do
     base)            start base "$BASE" ;;
     up)              start up "$UP" ;;
     hybrid)          start hybrid "$HYB" --hybrid-snapshot yes ;;
+    hybrid-off)      start hybrid-off "$HYB" --hybrid-snapshot no ;;   # our tree on its stock paths (for features upstream lacks, e.g. slot migration)
     hybrid-nocomp)   start hybrid-nocomp "$HYB" --hybrid-snapshot yes --rdbcompression no ;;   # where does the serializer's time go: LZF or the rest
     up-nocomp)       start up-nocomp "$UP" --rdbcompression no ;;
     hybrid-q16)      start hybrid-q16 "$HYB" --hybrid-snapshot yes --hybrid-snapshot-max-queued-bytes 16mb ;;
@@ -57,6 +62,7 @@ for cfg in ${CFGS:-base hybrid}; do
   echo "=== $(date +%T) $cfg $($CLI -p $PORT info server | grep -E '^redis_git_sha1|^redis_version|^valkey_version' | tr -d '\r' | tr '\n' ' ')"
   SYNC_ARGS=()
   if [ "$SYNC" = 1 ]; then SYNC_ARGS=(--sync-bin "$LAST_BIN" --sync-port $((PORT + 1)) --sync-replica-args "$SYNC_REPLICA_ARGS"); fi
+  if [ "$ASM" = 1 ]; then SYNC_ARGS=(--asm-bin "$LAST_BIN" --asm-port $((PORT + 1)) --asm-slice "$ASM_SLICE" --asm-node-args "$LAST_ARGS"); fi
   taskset -c "$LOAD_CPUS" python3 bench.py run --name $cfg --port $PORT --csv "$CSV" --rates "$RATES" --datasets "$DATASETS" --scale "$SCALE" --reps "$REPS" --load-cpus "$LOAD_CPUS" --server-cpus "$SERVER_CPUS" --hot "$HOT" --cool-below "$COOL" --workdir "$D" "${SYNC_ARGS[@]}"
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 2
 done

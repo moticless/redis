@@ -8,7 +8,7 @@ status: In Progress
 assignee:
   - '@Claude'
 created_date: '2026-10-11 12:35'
-updated_date: '2026-10-11 19:51'
+updated_date: '2026-10-11 21:22'
 labels:
   - hybrid-bgsave
   - cluster
@@ -88,6 +88,9 @@ b. Slot filter in snapSaveCreate/snapScanFreezeStore; dispatch change in snapSav
 c. Tests: atomic-slot-migration.tcl in both modes; new tests: writes to migrating and non-migrating slots during the transfer (destination content = fork instant of the migrating slots, source unaffected), cancel mid-transfer, destination drop mid-transfer; unit/snapshot cluster harness check that slots_total equals the migrating slot count.
 d. Measurement on the AWS host (cluster of two nodes, multi-GB keyspace, migrate a few hundred slots under writes): fork stall and CoW stock vs hybrid, RESULTS.md.
 e. docs/hybrid-snapshot.md: entry-point table (slot snapshot: hybrid), interaction table (ASM row), the design note condensed; redis.conf/README mention.
+
+AC 4 MEASUREMENT PLAN (2026-10-12, user asked for Valkey forkless as a third configuration; instance 54.176.250.28)
+Harness: bench.py gets an --asm mode next to --sync-bin: the server under test runs cluster-enabled owning all 16384 slots (bench.py's keys carry no hashtags, so a contiguous slot range holds a proportional share of the keys; the RDB cache still loads with DEBUG RELOAD since the node owns every slot); a second node from the same binary starts on the load CPUs (port+1), CLUSTER MEET, cluster state ok; a cell = import a slice of the slots to the second node (Redis: CLUSTER MIGRATION IMPORT a b on the destination, poll CLUSTER MIGRATION STATUS ID until completed; Valkey: CLUSTER MIGRATESLOTS SLOTSRANGE a b NODE id on the source, poll CLUSTER GETSLOTMIGRATIONS), then migrate the slice back unmeasured so every cell starts from the same source; columns transfer s, fork ms (latest_fork_usec), CoW MB (rdb_last_cow_size, Valkey: cow_size of the job), RSS sampler peaks, retained/side peaks, CPU, ping and load latency; the traffic stays uniform over all keys and snapload tolerates MOVED replies after the hand-off (counted). run.sh gets ASM=1 and ASM_SLICE knobs and a hybrid-off config (our branch with hybrid-snapshot no = the unchanged stock slot-snapshot child; upstream 0d6266f2d has no ASM). Configs: hybrid-off, hybrid, valkey-forkless (Valkey's slot migration is fork-based whatever the forkless settings: cluster_migrateslots.c forks a child and forkless.h only covers forklessSaveToDisk; the row documents that). Datasets small 13.5 and mixed 16 (4 GB), rates 0/20k/50k, slices 5% and 25% of the slots (control: a fork child's CoW does not scale with the slice), 2 reps interleaved. Expected from run 12: small fork 34 ms stock vs 1.6 ms hybrid, mixed 37 vs 17; CoW hundreds of MB stock at 50k vs under 10 MB (small) or the fork-class share (mixed) for the hybrid.
 <!-- SECTION:PLAN:END -->
 
 ## Implementation Notes
