@@ -246,7 +246,18 @@ static int kvstoreDictShrinkAllowed(dict *d) {
     return kvs->snap_hooks->shrink_allowed(kvs->snap_priv, metadata->didx);
 }
 
-/* The snapshot's hooks on this store (kvstore.h kvstoreSnapHooks). */
+/* The snapshot's hooks on this store (kvstore.h kvstoreSnapHooks). NULL hooks
+ * turn the snapshot off for the store. While hooks are set, every access to a
+ * dict of the store that meets no overlay asks the guard (write = 1 for
+ * structural writes); the guard may attach an overlay (kvstoreOverlayAttach)
+ * and return it, or return NULL when the dict needs none (its scan is
+ * complete, or a read on a dict the scan thread is not reading). The overlays
+ * attached meanwhile call back with the same privdata, so the hooks struct
+ * must outlive every overlay attached while it was installed (a detached
+ * dict's overlay keeps pointing at it). With no hooks the fast path is one
+ * load. The rehash hooks run on the main thread inside the dict operation
+ * (both tables are set up at 'started'); shrink_allowed says whether a dict
+ * may shrink right now (a snapshot bitmap follows a split but not a merge). */
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata) {
     kvs->snap_hooks = hooks;
     kvs->snap_priv = privdata;
@@ -345,6 +356,14 @@ static void kvstoreUnref(kvstore *kvs) {
 
 static inline kvstoreDictMetaBase *dictMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
 
+/* References. A dict is owned by its store (one reference from creation) and
+ * may be held by a running save (one more, taken at freeze for every
+ * fork-instant dict). A store that frees, empties or moves a dict another
+ * holder references detaches it instead: the dict leaves the slot table and
+ * the store's bookkeeping, keeps its save state, and is released by the last
+ * holder. Every dict holds a reference on its store (its dictType lives
+ * there), so a store struct outlives its detached dicts. The counts are
+ * atomic: the lazyfree thread releases stores. */
 dict *kvstoreDictRetain(kvstore *kvs, int didx) {
     dict *d = kvs->dicts[didx];
     if (d) __atomic_add_fetch(&dictMeta(d)->refcount, 1, __ATOMIC_RELAXED);
