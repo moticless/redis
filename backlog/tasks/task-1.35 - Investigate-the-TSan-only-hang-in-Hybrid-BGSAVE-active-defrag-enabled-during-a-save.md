@@ -3,11 +3,11 @@ id: TASK-1.35
 title: >-
   Investigate the TSan-only hang in 'Hybrid BGSAVE: active defrag enabled during
   a save'
-status: In Progress
+status: Done
 assignee:
   - '@Claude'
 created_date: '2026-10-05 10:27'
-updated_date: '2026-10-08 14:40'
+updated_date: '2026-10-11 14:55'
 labels:
   - tsan
   - flaky
@@ -29,8 +29,8 @@ Seen once on 2026-10-05 while verifying TASK-1.34 (a pure code move): the TSan b
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 Reproduce under TSan with --timeout 600 --dont-clean (loop the unit; on a hang attach gdb to the server and record the main thread's and scan thread's backtraces before the harness kills it)
-- [ ] #2 Root cause identified: a real main-thread/scan-thread wait cycle, or a TSan artefact (document which); fix or a documented test adjustment
+- [x] #1 Reproduce under TSan with --timeout 600 --dont-clean (loop the unit; on a hang capture the main thread's and scan thread's backtraces). Outcome: not reproduced in 13 further runs (1 hang in 14 overall) plus two sanitizer passes on later heads; closed as not reproducible by the user on 2026-10-11, the watcher recipe kept
+- [x] #2 Root cause identified, or a documented test adjustment. Outcome: none established; the write-section protocol and snapFunnelCloseSlow were read without finding a wait cycle, and the only failures seen in the loop were the known hard-mark timing pair, since fixed (TASK-1.44 commit)
 - [x] #3 unit/snapshot under TSan passes 3 consecutive full runs
 <!-- AC:END -->
 
@@ -55,3 +55,9 @@ Loop runs so far: three passes at 44a1bb220 + working tree before stage 2 (runs 
 
 2026-10-08 loop 2 finished: runs 11-15, 17 and 18 passed on the stage 2 head (cdef8de18), run 16 failed on the known hard-mark timing pair; no hang in 11 runs today (about 80 minutes of TSan unit/snapshot), 1 hang in 14 runs overall (2026-10-05). AC3 met (five consecutive passes before run 16, two after). AC1 and AC2 open: the watcher (tsan-loop.sh / tsan-loop2.sh in the session scratchpad: stall detection on a silent harness log, /proc thread states, SIGSEGV for an all-thread crash report) never fired. Options for the next step, for the user: keep the loop running unattended (overnight), or review snapWalkerQuiesce / snapFunnelCloseSlow / the write-section protocol for a wait cycle by reading, or close as not reproducible and keep the watcher recipe.
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Closed as not reproducible (user decision, 2026-10-11). One TSan-only hang in 'active defrag enabled during a save' on 2026-10-05; afterwards 13 loop runs with a stall watcher (2026-10-08) and TSan passes of unit/snapshot on 39f68a939 (2026-10-10) and e6803282e (2026-10-11), each 75 ok with 0 reports, never hung. The only loop failure was the hard-mark timing pair, whose determinism fix landed with TASK-1.44. The watcher recipe (tsan-loop*.sh in the session scratchpad: stall detection on a silent harness log, /proc thread states, SIGSEGV for an all-thread crash report) is described in the plan and the shell-and-test-pitfalls memory note, so a recurrence can be captured. The scratch scripts now need the renamed config hybrid-snapshot.
+<!-- SECTION:FINAL_SUMMARY:END -->
