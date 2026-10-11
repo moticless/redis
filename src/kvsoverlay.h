@@ -72,27 +72,38 @@
 
 #include "kvstore.h"
 
-typedef struct kvstoreDictOverlay kvstoreDictOverlay;   /* the side table of a frozen dict (layout in kvsoverlay.c) */
-typedef kvstoreOvCursor ovCursor;                       /* side-table position: every LIVE and SHARED entry once */
+/* The side table of a frozen dict (layout in kvsoverlay.c) and a position in it (every LIVE and SHARED entry once). */
+typedef struct kvstoreDictOverlay kvstoreDictOverlay;
+typedef kvstoreOvCursor ovCursor;
 
-int ovActive(kvstoreDictOverlay *ov);   /* non-empty side table: reads must consult it (out of line: frozen dicts only) */
+/* ---- What the overlay may reach of its store (kvstore.c) ------------------ */
 
-/* What the overlay may reach of its store (kvstore.c). The dict of a slot is kvstoreGetDict(), the dict type is ov->d->type. */
-const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata);   /* NULL outside a save */
-void **kvstoreOverlaySlot(kvstore *kvs);   /* one opaque per-store slot, the overlay's (its drain list) */
-void ovStoreRelease(kvstore *kvs);         /* kvsoverlay.c: empties that slot; from kvstoreRelease */
-void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);   /* kvstore.c: the one key-count update; 'after' is the logical size */
+/* The store's snapshot hooks and privdata; NULL outside a save. */
+const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata);
+/* One opaque per-store slot, the overlay's (its drain list); ovStoreRelease empties it from kvstoreRelease. */
+void **kvstoreOverlaySlot(kvstore *kvs);
+void ovStoreRelease(kvstore *kvs);
+/* The one key-count update of the store; 'after' is the dict's logical size after the change. */
+void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);
 
-/* kvsoverlay.c, for the enumeration and the public wrappers in kvstore.c. */
-unsigned long ovDictSize(kvstore *kvs, int didx);                      /* logical size of dict didx (frozen or not) */
-dictEntry *ovMapFrozenEntry(kvstoreDictOverlay *ov, dictEntry *de);    /* a frozen entry's logical counterpart: clone, NULL (tomb) or itself */
-int ovSideEntryIsAdd(kvstoreDictOverlay *ov, dictEntry *te);           /* side entry whose key is not in the frozen dict */
-void ovDetachFromStore(dict *d);                                       /* the dict leaves its store: off the drain list */
+/* ---- The overlay for kvstore.c (kvsoverlay.c) ------------------------------ */
+
+/* Non-empty side table: reads must consult it (out of line; reached only for frozen dicts). */
+int ovActive(kvstoreDictOverlay *ov);
+/* Logical size of dict didx, frozen or not. */
+unsigned long ovDictSize(kvstore *kvs, int didx);
+/* A frozen entry's logical counterpart: its clone, NULL (tombstoned) or itself; a side entry whose key the frozen dict lacks. */
+dictEntry *ovMapFrozenEntry(kvstoreDictOverlay *ov, dictEntry *de);
+int ovSideEntryIsAdd(kvstoreDictOverlay *ov, dictEntry *te);
+/* The dict leaves its store (detachDict): off the drain list, the overlay follows the dict. */
+void ovDetachFromStore(dict *d);
+
+/* Enumeration: the side-table cursor (next is fetched first, the caller may delete what it got), scan, iterator (phase 0 frozen dict, 1 side table), random keys. */
 void ovCursorInit(kvstoreDictOverlay *ov, ovCursor *c);
-dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c);          /* next is fetched first: the caller may delete what it got */
+dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c);
 unsigned long long ovScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
                           dictScanFunction *scan_cb, void *privdata);
-dictEntry *ovIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);   /* phase 0 frozen dict, 1 side table */
+dictEntry *ovIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);
 dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
 unsigned int ovGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
 

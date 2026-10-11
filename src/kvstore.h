@@ -87,17 +87,23 @@ typedef struct _kvstoreDictIterator {
 
 /* ---- Snapshot overlay (hybrid BGSAVE; see KVSTORE OVERLAY above) ---------- */
 
-/* The snapshot's hooks on a store, one struct and one privdata; the struct must outlive every overlay attached while it was installed. */
-typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);   /* a dict with no overlay is accessed (write = structural): attach one, or NULL */
-typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);               /* a dict started / finished an incremental rehash (both tables set up at 'started') */
-typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);                  /* may the dict shrink now (a bitmap follows a split, not a merge) */
-typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);   /* private copy of a frozen key for the side table */
-typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);  /* release a frozen original after the drain */
-typedef void (kvstoreOverlayEnterFn)(void *privdata);                                 /* start of every main-thread write on a frozen dict (optional) */
+/* Guard: a dict with no overlay is accessed (write = structural): attach one and return it, or NULL. */
+typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
+/* Layout hooks: a dict started / finished an incremental rehash; may the dict shrink right now. */
+typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);
+typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);
+/* Overlay callbacks: a private copy of a frozen key for the side table, and the release of a frozen original after the drain. */
+typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig, int *value_shared);
+typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig, int value_shared);
+/* Start of every main-thread write on a frozen dict (optional). */
+typedef void (kvstoreOverlayEnterFn)(void *privdata);
+/* Before a structural write of 'key': may the frozen chain be written in place (optional: absent = DEFER). */
 #define KVSTORE_OV_DEFER   0   /* the scan thread is reading the bucket: the write goes to the side table */
-#define KVSTORE_OV_INPLACE 1   /* the snapshot holds the bucket (or just emitted it): write the frozen chain in place */
-typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key);    /* before a structural write of 'key' (optional: absent = DEFER) */
-typedef int (kvstoreOverlayDrainableFn)(void *privdata, int didx, dict *d, const void *key);  /* may 'key' leave the side table now (optional: absent = only at release) */
+#define KVSTORE_OV_INPLACE 1   /* the snapshot holds the bucket (or just emitted it): write in place */
+typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key);
+/* May the side entry of 'key' be applied to the frozen chain now (optional: absent = only at release). */
+typedef int (kvstoreOverlayDrainableFn)(void *privdata, int didx, dict *d, const void *key);
+/* The snapshot's hooks on a store, one struct and one privdata; it must outlive every overlay attached while installed. */
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;
     kvstoreSnapRehashFn *rehash_started;
@@ -109,21 +115,23 @@ typedef struct kvstoreSnapHooks {
     kvstoreOverlayPrepareFn *prepare;
     kvstoreOverlayDrainableFn *drainable;
 } kvstoreSnapHooks;
-void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);   /* NULL hooks turn the snapshot off for the store */
+/* Install the hooks on a store; NULL turns the snapshot off for it. */
+void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
 
 /* References: one from the store, one more per holder (a running save); a dict another holder references is detached, not freed. */
-dict *kvstoreDictRetain(kvstore *kvs, int didx);   /* the dict of slot didx with one more reference, NULL if none */
-void kvstoreDictUnref(dict *d);                     /* drop one; the dict is released at zero */
+dict *kvstoreDictRetain(kvstore *kvs, int didx);
+void kvstoreDictUnref(dict *d);
 int kvstoreDictRefcount(dict *d);
-int kvstoreDictDetached(dict *d);                   /* out of its store's slot table, kept by another holder */
-int kvstoreRefcount(kvstore *kvs);                  /* the owner plus one per allocated dict */
+int kvstoreDictDetached(dict *d);
+int kvstoreRefcount(kvstore *kvs);
 
-/* The overlay of a dict. */
-void kvstoreOverlayAttach(kvstore *kvs, int didx);    /* the store's hooks and privdata serve the overlay */
-void kvstoreOverlayRelease(dict *d);                  /* scan complete or save aborted: side table applied, overlay gone */
-int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);   /* overlay attached */
-long kvstoreOverlayDrain(kvstore *kvs);               /* apply every drainable side entry of the store; returns what is left */
-long kvstoreOverlayPending(kvstore *kvs);             /* side-table entries (clones, adds, tombstones) across the store */
+/* The overlay of a dict: attach (the store's hooks serve it), is it attached, release (scan complete or save aborted: side table applied). */
+void kvstoreOverlayAttach(kvstore *kvs, int didx);
+int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
+void kvstoreOverlayRelease(dict *d);
+/* Across the store: apply every drainable side entry (returns what is left); count the side entries waiting. */
+long kvstoreOverlayDrain(kvstore *kvs);
+long kvstoreOverlayPending(kvstore *kvs);
 
 typedef int (kvstoreScanShouldSkipDict)(dict *d, int didx);
 typedef int (kvstoreExpandShouldSkipDictIndex)(int didx);
