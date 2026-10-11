@@ -1,5 +1,4 @@
-# fork() less, not forkless: Innovative Redis BGSAVE without the CoW bill
- 
+# fork() less, not forkless: Redis snapshots without the CoW bill
 
 *Draft, 2026-09-26. Numbers are from the snapshot-hybrid-bgsave branch (POC), measured on an
 EC2 c7i.4xlarge against Redis unstable 0d6266f2d and Valkey unstable 06d35aca6. See
@@ -42,29 +41,56 @@ time:
 - **Serialization-unfriendly encodings.** Listpacks, intsets and short strings can be copied as
   a blob; hash tables, skiplists, quicklists and streams cannot be read while they change. A
   forkless design must lock the whole key for the whole serialization or redesign every encoding.
+  Valkey's shipping code draws the line much tighter than the encodings would allow: the only value
+  it ever copies before a write is a plain string of at most 512 bytes, from a copy budget of 1 MB
+  across the whole save. A 10-field listpack hash, an intset of three members, a one-entry stream:
+  none of these is copied. Every write to a non-string key that the scan has not reached yet hands
+  the live object to the save thread and blocks the client until it comes back. Once the 1 MB budget
+  is spent, strings block too. "Small values" in forkless means small strings.
+- **Writers wait on the save thread.** Every key blocks its first writer once per save; the
+  save thread serializes it, hands it back, and the main thread releases the client on its next
+  loop iteration. On a hot set that is a few stalls. On uniform writes over millions of hashes,
+  most writes early in the save pay it. The expedited keys wait in one FIFO behind whatever the
+  thread is doing, so a single large value at the head delays every small one behind it, and
+  anything that stalls the thread stalls every blocked writer with it: with the default
+  `rdb-save-incremental-fsync yes` the thread fsyncs every 4 MB, so a slow disk turns each
+  boundary into a pause for every client in the queue. The fork child fsyncs the same way, and
+  nobody waits for it.
 - **Big keys.** A key must be serialized atomically. For a 50-byte string that is nothing. For
-  a 100 MB hash the serializer holds the key for the whole duration and all the clients that wants to
-  write it must be blocked, or the value copied first. In Valkey the all related writers enters a blocked
-  state until the key is done; a Lua script that did not declare its keys cannot be blocked that
-  way and stalls the whole server instead. On our 4 GB datasets with 1M-field hashes, a write that
-  landed on the hash under serialization waited 20 to 35 seconds, up to 16 clients sat blocked at
-  once, and the server delivered 41% to 76% of the offered write rate for the length of the save.
+  a 100 MB hash the serializer holds the key for the whole duration, and every client that wants to
+  write it must be blocked, or the value copied first. In Valkey every such writer enters a blocked
+  state until the key is done; a Lua script or function that did not declare its keys cannot be
+  blocked that way and stalls the whole server instead: the main thread spins in a 100 µs sleep
+  loop until the save thread hands the key back, with every other client waiting behind it. On our
+  4 GB datasets with 1M-field hashes, a write that landed on the hash under serialization waited
+  20 to 35 seconds, up to 16 clients sat blocked at once, and the server delivered 41% to 76% of the
+  offered write rate for the length of the save. None of this shows up in INFO: the save exposes
+  its queue length, not how many clients it is holding or for how long, so the first symptom an
+  operator sees is command latency.
 - **The main thread pays.** Whatever the child no longer does, the main thread does: the
   snapshot cut, the pre-write copies, the iteration and coordination. Saving 4 GB of small values at 50k
   writes/s cost its main thread 26 CPU-seconds against 12 for the hybrid, write latency p99 was
   2-5x, and the save took 40-50% longer.
 - **Remembering what was already saved.** For every key a write touches, the save must know
   whether the snapshot has passed it. Valkey keeps a generation counter in the key itself: every
-  object grows by a 8-byte field for the life of the process, whether or not a save is running. 
+  object grows by an 8-byte field for the life of the process, whether or not a save is running. 
 - **Modules.** `rdb_save` used to run in a child with a consistent copy of everything. Forkless
   runs it on a background thread while the module's own commands keep mutating its values, so
   every module must certify thread safety and teach its write paths that a key open can now fail
   because the saver holds the key.
+- **The fork does not go away.** Forkless replaces the RDB save and nothing else. AOF rewrite
+  still forks, and with the RDB preamble its child writes the same snapshot of the same dataset, so
+  an instance with `appendonly yes` keeps the full copy-on-write bill and the full stall on every
+  rewrite. Cluster slot migration forks its own snapshot child; module forks fork. And the RDB
+  save itself falls back to the fork child whenever any loaded module has not opted in, or any
+  replica in the sync cohort is too old to speak the new protocol. An operator who provisioned for
+  "no more fork" still has to provision for fork; the headroom argument only holds for a cluster
+  without AOF, without slot migration, with every module certified and every replica upgraded.
 
 These costs follow from the decision to snapshot inside the live address space, and they are the
 reason we did not take that road.
 
-## 3. Hybrid BGSAVE: cut where the data already wants to be cut
+## 3. Hybrid snapshot: cut where the data already wants to be cut
 
 Forkless is the right answer for small values. The trouble starts with the values it cannot serialize atomically. A
 hash of a million fields is about 90 MB, and every client that writes to it while the saver holds
@@ -75,9 +101,11 @@ A few keys like that carry a large share of the writes, so blocking writers on b
 exactly the traffic the application cares about most. Whether that is acceptable
 depends on the data. And data changes: a keyspace that is all small values today grows one large
 hash behind next quarter's feature. A snapshot mechanism should absorb that seamlessly, without
-anyone having to notice which keys crossed a size line. Forkless cannot, and the decision is made
-at startup: whoever discovers at 3 a.m. that a big-value workload does not suit it cannot switch
-back with CONFIG SET. The server restarts, or it lives with the trade.
+anyone having to notice which keys crossed a size line. Forkless cannot, and half the decision is
+made at startup: the per-key field and the infrastructure behind it are an immutable boot flag.
+Whoever discovers at 3 a.m. that a big-value workload does not suit it can point the next save
+back at fork with CONFIG SET, and keeps paying the per-key memory until the next restart; whoever
+discovers that a workload would suit it cannot turn it on without one.
 
 There is a third option: keep `fork()` for exactly the values it is good at, and keep it away
 from everything else.
@@ -113,7 +141,7 @@ blocked. The "already saved" state is one bit per bucket, about 256 KB for a 2-m
 table, allocated with the save and freed with it: nothing in the object header, nothing between
 saves.
 
-![One hybrid save in flight](images/hybrid-bgsave-flow.png)
+![One hybrid save in flight](images/hybrid-snapshot-flow.png)
 
 *Figure 1. One hybrid save in flight. Blue memory is in the DONTFORK arena and never mapped in
 the child; pink is ordinary forkable memory. The scan thread reads the frozen dict through a
@@ -133,8 +161,10 @@ snapshot is the fork instant.*
   since its pages are not in the child: 8 MB instead of 3.3 GB in the same save. What remains is
   fork's cost on big values actually written during the save.
 - **Against forkless:** nobody waits. No blocked clients, no main-thread copy of a 10 MB hash, no
-  atomic-serialization requirement on hash tables or streams, no per-key field, no startup-only
-  mode: `bgsave-hybrid` is a runtime switch.
+  atomic-serialization requirement on hash tables or streams, no per-key field, no boot-time
+  commitment: `hybrid-snapshot` is a runtime switch in both directions. And the copy-before-write
+  line sits where the encodings put it, not at 512-byte strings: a listpack hash is one allocation
+  whichever side writes it, so the hybrid copies it and forkless locks it.
 - **Against both:** modules keep their contract. Callbacks run in a child, single-threaded, with
   the module's memory intact (section 5).
 
@@ -160,8 +190,9 @@ copy-on-write scales with the number of keys, not their size, and runs for the e
 
 In the hybrid both live in the DONTFORK arena for every key, big or small. The child never maps a
 header or a table; for a big value it receives a few dozen bytes of header copy over the channel,
-with a value pointer that is valid because the value is in forkable memory. Rehashing is paused
-and resizing refused for the dicts under a save.
+with a value pointer that is valid because the value is in forkable memory. The dict under the
+scan window is paused; a dict the scan has not reached may still grow, its per-save bitmap following
+the new table, and only shrinking is refused while a dict is under a save.
 
 Share of allocated memory in the arena, and so never in the child, after loading each dataset:
 
@@ -201,9 +232,9 @@ API need no new code.
 The one new rule: the child has no keyspace, so a save callback that opens another key faults
 instead of reading a stale copy. Save callbacks must serialize only the value they are given and
 module-owned memory. A module with a data type, key metadata or a persistence hook declares that it
-obeys with one option bit, `REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE`; until it does, saves take the
+obeys with one option bit, `REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT`; until it does, saves take the
 stock fork path and INFO names the module. In the child the keyspace APIs refuse and log rather
-than fault. We audited RedisJSON and RediSearch against the rule: both comply as they are.
+than fault. RedisJSON and RediSearch appear to comply as they are; the audit against the rule is pending.
 
 The forkless contract asks more. The author must certify that `rdb_save` is thread-safe, and
 every open of a key the command did not declare needs a new branch for a NULL handle. Both are
@@ -236,11 +267,14 @@ That moves the stream buffer from the primary to the replica, which is loading i
 empty process, so the primary sees no copy-on-write on small values and no output-buffer growth,
 with no new protocol. The same two-channel design carries Redis 8.2's atomic slot migration: the
 source forks and ships the slot snapshot on an rdb channel while streaming the slots' live writes
-on the main one. That snapshot is a replication save, so in cluster mode it is a hybrid save too,
-with the same cost profile. The one new interaction is the trim at the end of a migration, which
-moves the migrated slot dicts out of the keyspace while a hybrid save started earlier may still be
-reading them; the save holds a reference on every dict it froze, so the dicts stay with it until
-the scan passes and the dump keeps the fork instant.
+on the main one. That snapshot still runs through the stock fork child today, so a migration pays
+stock's fork and copy-on-write for its duration; taking it through the hybrid, freezing and scanning
+only the migrating slots, is the next step and a natural one, since the per-slot dicts are exactly
+the unit the scan freezes. What the hybrid already handles is the trim at the end of a migration,
+which moves the migrated slot dicts out of the keyspace. Keys of slots that were already under a
+trim job at the fork instant are skipped, as stock's child skips them; a trim that starts while a
+hybrid save is reading those dicts leaves them with the save, which holds a reference on every dict
+it froze, until the scan passes them.
 
 The buffer still exists, on one side or the other, and it grows with write rate times sync
 duration. Valkey's forkless full sync removes it with a good idea: the primary splices the
@@ -253,6 +287,19 @@ fork-instant records of its keys are ahead of it in the stream, so every command
 instant on is appended in order, the offset is the fork offset plus the spliced bytes, and the
 only additions are one opcode and one replica capability. Replicas without it get the rdb-channel
 path above.
+
+"Nothing waits anywhere" has one exception, and it is the primary's clients. Once the forkless
+save thread takes over the replica sockets it writes to them in blocking mode, with
+`repl-timeout` (60 seconds by default) as the socket send timeout. The same thread is the one
+every blocked writer on the primary is waiting for. A replica that stops reading freezes that
+thread, and with it every client that wrote to a not-yet-saved hash, until the timeout fires and
+the replica is dropped: up to a minute of blocked writes on the primary because of one replica's
+network. A replica that keeps reading slowly never times out at all, since the timeout is per
+write call, so for the length of the sync the primary's write latency on fresh keys tracks the
+slowest replica's read rate. The stock diskless child has the same blocking sockets and the same
+timeout, and the difference is who pays: a stalled replica slows a child process that nobody is
+waiting on. The cohort is also only as modern as its oldest member: one replica without the new
+capability sends the whole full sync, for every replica waiting on it, back to the fork child.
 
 Measured on the same 4 GB datasets, each cell a fresh replica loading the stream directly over the
 rdb channel while the primary takes 20k writes/s (stock Redis with its default rdb-channel sync, the
@@ -426,7 +473,7 @@ three, at 2.3 to 3.1 ms, because blocked writers do not answer pings.
 ## 8. Turning it on
 
 ```
-redis-cli CONFIG SET bgsave-hybrid yes
+redis-cli CONFIG SET hybrid-snapshot yes
 redis-cli BGSAVE
 redis-cli INFO persistence | grep -E "snap_saves|snap_save_keys_(nofork|fork)|snap_save_retained_bytes|snap_hard_mark_aborts"
 redis-cli INFO memory | grep allocator_allocated_nofork
@@ -436,9 +483,9 @@ One runtime switch. Turning it on changes where *new* values and headers are pla
 off makes the next save an ordinary fork save. `rdb_bgsave_in_progress`, `rdb_last_bgsave_status`
 and `stop-writes-on-bgsave-error` behave as before, since a child still writes the RDB. Three knobs:
 `save-small-max-bytes` (default 4 KB) is the size line within the eligible encodings,
-`bgsave-hybrid-max-retained-bytes` (default 256 MB) bounds the memory a save may hold for buckets
+`hybrid-snapshot-max-retained-bytes` (default 256 MB) bounds the memory a save may hold for buckets
 under the scan window before it is aborted and reported as failed, and
-`bgsave-hybrid-max-queued-bytes` (default 100 MB) bounds the records the scan thread may queue
+`hybrid-snapshot-max-queued-bytes` (default 100 MB) bounds the records the scan thread may queue
 while the child is busy with a large value before it waits; one large value's worth of scan output
 has to fit for the two to overlap fully (about 50 MB for a 90 MB hash). The memory is held only
 while the child is behind, is released when the save ends, and is not counted towards maxmemory. `allocator_allocated_nofork`
@@ -457,16 +504,17 @@ A proof of concept on a branch, measured at 4 GB on one host type. Before extrap
   the INCR file starts at the fork instant. With the RDB preamble the base file is the hybrid's RDB;
   without it the same producers write the command form, and the child emits SELECT only when the db
   changes. Disk-based and diskless full sync run through the hybrid (section 6); functions-only
-  snapshots still fork the stock child.
-- **Cluster mode** runs, but the bucket window has not been extended to per-slot dicts.
-- **FLUSHALL** during a hybrid BGSAVE ends it, as stock kills its child there. Everything else
+  snapshots and the slot snapshot of an atomic slot migration still fork the stock child.
+- **Cluster mode** runs with the bucket window over the per-slot dicts; an atomic slot
+  migration's trim during a save is handled, its slot snapshot is not yet a hybrid save (section 6).
+- **FLUSHALL** during a hybrid save ends it, as stock kills its child there. Everything else
   that empties the keyspace, DEBUG RELOAD included, hands the dbs to the save, which finishes with
   the fork-instant data as stock's child does; FLUSHDB hands over the flushed db and SWAPDB just
   moves it to the other db id, so both keep the save running (Valkey's forkless save cancels on
   FLUSHDB).
 - **The module opt-in flag** is implemented (fallback to the fork child, INFO naming the
-  module, child-side guards); the bundled modules have not declared it yet, so a server
-  loading JSON or Search saves through the stock child until they are rebuilt. The per-type
+  module, child-side guards); the bundled vector-sets module declares it, JSON and Search have
+  not been rebuilt with it yet, so a server loading them saves through the stock child. The per-type
   opt-in to the small-value class (section 5) is a design sketch only. The 4 KB cap and the
   encoding thresholds that feed it are untuned; the mixed dataset is the experiment.
 - **The scan thread** costs about one CPU-second per 260 MB save, on a core the fork child would
@@ -487,7 +535,9 @@ Fork-based snapshots are the right tool for large values, module types and every
 was never designed to be read while written. Their cost is applying the same mechanism to
 millions of tiny objects where it is pure overhead. Forkless fixes that overhead by moving all
 the work to the main thread, and inherits the problems of large values, blocked clients,
-encodings and modules in return, plus a permanent field in every key.
+encodings and modules in return, plus a permanent field in every key. It fixes it for the RDB
+save alone: AOF rewrite and slot migration still fork the same dataset, so the memory an operator
+was hoping to give back is still owed.
 
 The hybrid takes the split Redis's own encodings already suggest. Small values and all the
 metadata around them stay out of the child and stream from a scan thread with no locks and no
@@ -500,10 +550,13 @@ line between the halves can move as encodings evolve, one type at a time.
 |---|---|---|---|
 | Peak memory during a save | up to 2x: 7.3 GB to save 4 GB at 50k writes/s | baseline, plus a permanent per-key field | baseline plus copy-on-write on written big values only: 4.0 GB for the same save |
 | Main-thread pause at start | page-table copy: 34-40 ms on 4 GB | none | page tables of big values only: 1.6 ms on 4 GB of small values |
-| Write latency during a save | page fault per first-written page; the stall lands on one write | client blocked until the key is serialized: 20-35 s on 1M-field hashes | microseconds per first write to a bucket; never blocked |
+| Write latency during a save | page fault per first-written page; the stall lands on one write | first writer of every non-string key blocked until the save thread returns it; 20-35 s on 1M-field hashes; whole server stalls for scripts with undeclared keys | microseconds per first write to a bucket; never blocked |
 | Main-thread CPU during a save | none | the whole serialization: 1.6-2.7x | written buckets only: at or below fork |
-| Big values | copy-on-write per page | client blocked or value copied | as fork |
-| Modules | transparent | opt in; thread-safe serializers; NULL-handle branches | opt in; save callbacks must not read the keyspace |
-| Full sync | fork: copy-on-write plus the stream buffer | commands spliced into the RDB, required; new capability; offset sent at the end; no dual-channel | stock protocol on the rdb channel: 0.1-0.8 GB extra against stock's 1.1-1.4 GB at 20k writes/s, same sync time; the same splice as an option |
+| Values copied instead of locked | all, by the kernel, per page | strings up to 512 bytes, 1 MB budget per save; no hash, set, zset, list or stream of any size | every single-allocation value up to 4 KB, any type |
+| Big values | copy-on-write per page | client blocked | as fork |
+| What a slow disk or slow replica stalls | the child | the save thread and every client blocked behind it; up to `repl-timeout` per dead replica, unbounded for a slow one | the child |
+| Modules | transparent | opt in; thread-safe serializers; NULL-handle branches; one holdout sends every save to fork | opt in; save callbacks must not read the keyspace |
+| Full sync | fork: copy-on-write plus the stream buffer | commands spliced into the RDB, required; new capability on every replica or the cohort forks; offset sent at the end; no dual-channel | stock protocol on the rdb channel: 0.1-0.8 GB extra against stock's 1.1-1.4 GB at 20k writes/s, same sync time; the same splice as an option |
+| AOF rewrite, slot migration | fork | fork, unchanged, full copy-on-write | hybrid for AOF rewrite; the slot-migration snapshot still forks a stock child (hybrid path planned) |
 | Per-key state | none | 4 bytes declared, 8 in practice, always | one bit per bucket, per save |
-| Switching | n/a | startup flag | runtime |
+| Switching | n/a | infrastructure and per-key field at startup; method at runtime | runtime |
