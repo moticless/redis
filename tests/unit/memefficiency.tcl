@@ -109,7 +109,7 @@ run_solo {defrag} {
         }
     }
 
-    # bgsave-hybrid yes puts the keyspace in its own jemalloc arena, so keys no
+    # hybrid-snapshot yes puts the keyspace in its own jemalloc arena, so keys no
     # longer share slabs with scripts, pubsub channels, argv or field-expiry
     # structures and the fragmentation some tests below manufacture by
     # interleaving keys with them cannot arise (the ratio stays near 1.0).
@@ -117,11 +117,11 @@ run_solo {defrag} {
     # allocated afterwards live in the default arena); tests that fragment the
     # keyspace itself run with it on, which is the interesting case.
     proc defrag_hybrid_arena {mode} {
-        if {$::defrag_hybrid_started eq "yes"} { r config set bgsave-hybrid [expr {$mode eq "on" ? "yes" : "no"}] }
+        if {$::defrag_hybrid_started eq "yes"} { r config set hybrid-snapshot [expr {$mode eq "on" ? "yes" : "no"}] }
     }
 
     proc test_active_defrag {type} {
-        set ::defrag_hybrid_started [lindex [r config get bgsave-hybrid] 1]
+        set ::defrag_hybrid_started [lindex [r config get hybrid-snapshot] 1]
 
     # note: Disabling lookahead because it changes the number and order of allocations which interferes with defrag and causes tests to fail
     r config set lookahead 1

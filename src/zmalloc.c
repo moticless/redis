@@ -1350,7 +1350,7 @@ static void noforkTcacheFlush(void) {
  * that went idle (or while active defrag, which bypasses tcaches, runs) its
  * cached regions would pin their slabs indefinitely; active defrag then
  * cannot bring the arena's fragmentation down (found by unit/memefficiency
- * with bgsave-hybrid yes: 12.5 MB of the 12.9 MB it could not remove were in
+ * with hybrid-snapshot yes: 12.5 MB of the 12.9 MB it could not remove were in
  * the arena). */
 void zmalloc_nofork_tcache_flush(void) { noforkTcacheFlush(); }
 

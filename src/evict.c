@@ -375,8 +375,8 @@ size_t freeMemoryGetNotCountedMemory(void) {
         overhead += sdsAllocSize(server.aof_buf);
     }
 
-    /* A hybrid BGSAVE queues serialized records for its child while the
-     * child is inside a big value (bounded by bgsave-hybrid-max-queued-bytes,
+    /* A hybrid snapshot queues serialized records for its child while the
+     * child is inside a big value (bounded by hybrid-snapshot-max-queued-bytes,
      * plus what the main thread emitted ahead): memory the save holds for a
      * few seconds and releases, not the dataset's. Counting it would evict
      * keys during every save on an instance near its limit. */

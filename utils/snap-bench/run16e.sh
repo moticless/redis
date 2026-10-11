@@ -1,5 +1,5 @@
 #!/bin/bash
-# run16e.sh: queue bound 128 MB (hybrid = ~/redis-after4, bgsave-hybrid-max-queued-bytes default) vs
+# run16e.sh: queue bound 128 MB (hybrid = ~/redis-after4, hybrid-snapshot-max-queued-bytes default) vs
 # 256 MB (hybrid3 = ~/redis-after3, queue bounded by the retained limit), mixed1m idle and 20k, interleaved, 2 reps.
 set -u
 cd ~/redis-after4/utils/snap-bench || exit 1

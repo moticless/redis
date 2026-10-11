@@ -633,7 +633,7 @@ start_server {tags {"introspection"}} {
             syslog-enabled
             cluster-enabled
             disable-thp
-            bgsave-hybrid
+            hybrid-snapshot
             aclfile
             unixsocket
             pidfile

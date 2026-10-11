@@ -49,7 +49,7 @@ def load(port, cls, rate, secs, hot, conns, out):
     return subprocess.Popen(c, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
 
 def run_variant(a, variant):
-    extra = ["--bgsave-hybrid", a.hybrid]
+    extra = ["--hybrid-snapshot", a.hybrid]
     p, r = start(a.binary, a.port, f"cow-{variant}", extra)
     rep = None
     try:
@@ -61,7 +61,7 @@ def run_variant(a, variant):
             while r.info("persistence")["aof_rewrite_in_progress"]: time.sleep(0.1)
             time.sleep(1)
         if variant == "replica":
-            rp, rr = start(a.binary, a.port + 1, "cow-replica", ["--bgsave-hybrid", a.hybrid])
+            rp, rr = start(a.binary, a.port + 1, "cow-replica", ["--hybrid-snapshot", a.hybrid])
             rr.replicaof("127.0.0.1", a.port)
             for _ in range(600):
                 if rr.info("replication")["master_link_status"] == "up": break

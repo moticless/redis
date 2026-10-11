@@ -267,7 +267,7 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
 
     if (RedisModule_Init(ctx, "pkmeta", 1, REDISMODULE_APIVER_1) == REDISMODULE_ERR)
         return REDISMODULE_ERR;
-    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE);
+    RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT);
 
     RedisModuleKeyMetaClassConfig config = {0};
     config.version = REDISMODULE_KEY_META_VERSION;

@@ -296,7 +296,7 @@ void dbgRunAssertions(redisDb *db) {
 kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
     kvobj *val;
 
-    /* Write intent matters during a hybrid BGSAVE: a link lookup on an owed
+    /* Write intent matters during a hybrid snapshot: a link lookup on an owed
      * key clones it into the snapshot overlay (see kvstoreDictFindLink), so
      * reads use the plain find and never clone. */
     if (flags & LOOKUP_WRITE) {
@@ -677,7 +677,7 @@ static void dbSetValue(redisDb *db, robj *key, robj **valref, dictEntryLink link
         /* Set new to old to keep the old object. Set old to val to be freed below. */
         kvNew = old;
         old = val;
-        /* The adopted value was allocated by the command: place it (hybrid BGSAVE). */
+        /* The adopted value was allocated by the command: place it (hybrid snapshot). */
         snapPlaceValue(kvNew);
 
         /* Handle TTL in the optimization path */
@@ -1041,7 +1041,7 @@ long long emptyDbStructure(redisDb *dbarray, int dbnum, int async,
     for (int j = startdb; j <= enddb; j++) {
         removed += kvstoreSize(dbarray[j].keys);
         if (emptyDbDetachToSnapshot(&dbarray[j])) {
-            /* A hybrid BGSAVE is scanning this db: it took the structures,
+            /* A hybrid snapshot is scanning this db: it took the structures,
              * the db is empty from here on (see lazyfree.c). */
         } else if (async) {
             /* emptyDbAsync also swaps blessed_keys and frees the old one on BIO. */
@@ -2644,7 +2644,7 @@ void scanDatabaseForDeletedKeys(redisDb *emptied, redisDb *replaced_with, slotRa
  * Returns C_ERR if at least one of the DB ids are out of range, otherwise
  * C_OK is returned. */
 int dbSwapDatabases(int id1, int id2) {
-    /* A hybrid BGSAVE scans kvstores, not db ids: the swap moves a scanned
+    /* A hybrid snapshot scans kvstores, not db ids: the swap moves a scanned
      * kvstore to another db, its keys are still serialized under the db id
      * they had at the fork instant (stock and Valkey semantics), and the
      * overlay hooks resolve the owning db at call time. No abort needed. */

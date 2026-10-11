@@ -7,7 +7,7 @@ CLI=/home/moti/git/redis-bgsave/src/redis-cli; D=/dev/shm/aof-cow; mkdir -p $D
 for mode in on off; do
   $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 0.5; rm -rf $D/$mode; mkdir -p $D/$mode
   taskset -c 0-7 "$BIN" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --appenddirname aof --dir $D/$mode \
-    --daemonize yes --logfile $D/$mode/log --disable-thp yes --bgsave-hybrid $([ $mode = on ] && echo yes || echo no) || exit 1
+    --daemonize yes --logfile $D/$mode/log --disable-thp yes --hybrid-snapshot $([ $mode = on ] && echo yes || echo no) || exit 1
   for i in $(seq 1 50); do $CLI -p $PORT ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done
   # fill with memtier so the overwrite phase below hits the SAME keys (key:1 .. key:1200000)
   taskset -c 8-15 memtier_benchmark -s 127.0.0.1 -p $PORT --protocol redis -t 2 -c 4 -n 150000 --pipeline 32 \
@@ -22,7 +22,7 @@ for mode in on off; do
   while [ "$($CLI -p $PORT info persistence | grep -c 'aof_rewrite_in_progress:1')" = 1 ]; do sleep 0.05; done
   t1=$(date +%s.%N); wait
   info=$($CLI -p $PORT info | tr -d '\r')
-  echo "bgsave-hybrid $mode: $used; rewrite $(echo "$t1 - $t0" | bc) s; aof_last_cow_size=$(echo "$info" | grep '^aof_last_cow_size' | cut -d: -f2) B; latest_fork_usec=$(echo "$info" | grep '^latest_fork_usec' | cut -d: -f2); arena_forkable_now=$(echo "$info" | grep '^snap_nofork_arena_forkable' | cut -d: -f2); status=$(echo "$info" | grep '^aof_last_bgrewrite_status' | cut -d: -f2)"
+  echo "hybrid-snapshot $mode: $used; rewrite $(echo "$t1 - $t0" | bc) s; aof_last_cow_size=$(echo "$info" | grep '^aof_last_cow_size' | cut -d: -f2) B; latest_fork_usec=$(echo "$info" | grep '^latest_fork_usec' | cut -d: -f2); arena_forkable_now=$(echo "$info" | grep '^snap_nofork_arena_forkable' | cut -d: -f2); status=$(echo "$info" | grep '^aof_last_bgrewrite_status' | cut -d: -f2)"
   grep -c "arena made forkable" $D/$mode/log | sed 's/^/  arena flips logged: /'
 done
 $CLI -p $PORT shutdown nosave >/dev/null 2>&1

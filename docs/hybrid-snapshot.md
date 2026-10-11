@@ -1,6 +1,6 @@
-# Hybrid BGSAVE
+# Hybrid snapshot
 
-Hybrid BGSAVE is a `fork()`-based snapshot that keeps the fork for the values it is good at and
+Hybrid snapshot is a `fork()`-based snapshot that keeps the fork for the values it is good at and
 keeps everything else out of the child. This document describes the design as implemented, for
 a reader who knows Redis internals (kvstore, dict, rdb.c, the fork child) but has not seen this
 code. It is the reference; `src/snapshot.c` carries a shorter overview in its file header and
@@ -47,7 +47,7 @@ the extent hooks on allocation and recommit. Allocation goes through `zmalloc_no
 `MALLOCX_ARENA` and a per-thread explicit tcache; `zfree()` and `zrealloc()` recognise arena
 blocks by address range, so no caller needs to know the class to free. The arena exists whenever
 the platform supports it (64-bit Linux, jemalloc) so the switch can change at runtime; while
-`bgsave-hybrid` is off it is forkable and nothing new is placed in it. Without an arena (other
+`hybrid-snapshot` is off it is forkable and nothing new is placed in it. Without an arena (other
 platforms, `MALLOC=libc`) the hybrid still runs, with the class as a pure size decision and the
 child mapping everything; only the memory win is lost.
 
@@ -67,7 +67,7 @@ memory.
 | 5 | Drain side tables at the end of every write section and once per cron tick: entries whose bucket is now behind the window are applied to the dict. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, free the bitmaps, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, publish the empty window, quiesce once more, drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
 | 6 | `checkChildrenDone` -> the stock done handler -> `snapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
 
-![One hybrid save in flight](images/hybrid-bgsave-flow.png)
+![One hybrid save in flight](images/hybrid-snapshot-flow.png)
 
 *Blue memory is the arena, never mapped in the child; pink is forkable. The scan thread reads
 the frozen dict through a window. Behind the window writes go in place (kv1). Inside it a write
@@ -90,7 +90,7 @@ skips it, then writes in place. kv8 is deleted during the save and still reaches
  SNAP_FORK key written ahead:                                                             (child reads it to choose)
    header copy ──► mq ─────────────────► bq: big-channel queue ──► pipe B (KVOBJ, END, ABORT) ──► one big value at a time
                                         one bound over oq + bq:
-                                        bgsave-hybrid-max-queued-bytes
+                                        hybrid-snapshot-max-queued-bytes
                                         (the thread waits past it)
 ```
 
@@ -182,10 +182,10 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 | child page tables | child | proportional to the forkable range; sets the fork stall |
 | retained originals: fork-instant SNAP_NOFORK values kept alive by side-table clones and tombstones while their bucket is inside the window | parent | released as the window moves on |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded at the next window boundary |
-| the scan thread's queues to the child (`oq` + `bq`) | parent | `bgsave-hybrid-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
+| the scan thread's queues to the child (`oq` + `bq`) | parent | `hybrid-snapshot-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
 | per-dict bitmaps and side tables | parent | one bit per bucket per table of attached dicts; 32 KB side table for the dict under the window |
 
-The **hard mark**, `bgsave-hybrid-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
+The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
 retained originals plus the bytes the main thread has queued and the thread has not yet handed to
 its own queues. `snapSaveCron` aborts the save when it is exceeded, and reports the save as failed
 (`rdb_last_bgsave_status:err`, `snap_hard_mark_aborts`). The worst-case memory a save holds in the
@@ -198,7 +198,7 @@ value longer than `bound / scan rate` parks the thread for the remainder of that
 
 ## 5. Entry points
 
-Every consumer of a fork-based snapshot goes through the same dispatch rule: `bgsave-hybrid` on,
+Every consumer of a fork-based snapshot goes through the same dispatch rule: `hybrid-snapshot` on,
 the request has keyspace content, and every loaded module with save callbacks has opted in
 (section 7). Otherwise the stock child runs and `redisFork` flips the arena to `MADV_DOFORK` for
 that child's lifetime, flipping it back when no child of any kind is left; such a child pays stock
@@ -217,7 +217,7 @@ copy-on-write on the arena.
 | BGREWRITEAOF, `aof-use-rdb-preamble no` | hybrid, AOF child, command-form base file | the same producers call `rewriteObject` per record; the child writes the AOF prologue and emits `SELECT` only on a db change |
 | BACKUP | through BGREWRITEAOF | |
 | `RedisModule_Fork`, Lua debugger fork | stock child, arena flipped | |
-| `CONFIG SET bgsave-hybrid` | flips the arena | refused while any child or hybrid save runs |
+| `CONFIG SET hybrid-snapshot` | flips the arena | refused while any child or hybrid save runs |
 
 Mutual exclusion is the existing one-child rule. A BGSAVE issued while a stock child runs is
 scheduled and starts, on the hybrid path, after the flip back.
@@ -244,7 +244,7 @@ What happens when something else touches the keyspace or the child during a hybr
 | SHUTDOWN | kills the child; the hybrid abort runs through `killRDBChild` | yes |
 | child killed or crashed | the done handler aborts the scan, joins the thread, releases every state; the previous dump is untouched; a child crash report skips the keyspace sections it cannot read | yes |
 | hard mark exceeded | the save is aborted and reported as failed | hybrid-specific |
-| `CONFIG SET bgsave-hybrid` | refused while a child or save runs | hybrid-specific |
+| `CONFIG SET hybrid-snapshot` | refused while a child or save runs | hybrid-specific |
 
 ## 7. Module contract
 
@@ -257,7 +257,7 @@ child.
 The one difference from stock: **the hybrid child has no keyspace.** Dict tables, headers other
 than the copy handed to the callback, and small values are unmapped there.
 
-A module is compatible with `bgsave-hybrid yes` when:
+A module is compatible with `hybrid-snapshot yes` when:
 
 1. Its save-side callbacks (`rdb_save`, `aux_save`, `aux_save2`, key-metadata save, a PERSISTENCE
    event handler) do not touch the keyspace: no `RM_OpenKey`, `RM_KeyExists`, `RM_Scan`,
@@ -270,7 +270,7 @@ A module is compatible with `bgsave-hybrid yes` when:
    from a module thread only under the GIL. The write lookup emits or clones the owed bucket, so a
    later in-place write through a DMA pointer or a type API is covered.
 
-A module declares compliance with `REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE`. A module is relevant
+A module declares compliance with `REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT`. A module is relevant
 when it registers a data type, a key metadata class, or a PERSISTENCE or FORK_CHILD event handler;
 a relevant module without the bit sends every save to the stock child, with a warning at load and
 at save time, and `INFO persistence` names it in `snap_hybrid_blocked_by`. Modules with none of
@@ -285,11 +285,11 @@ declare the bit.
 
 | config | default | meaning |
 |---|---|---|
-| `bgsave-hybrid` | no | the switch; runtime, refused while a child or save runs |
+| `hybrid-snapshot` | no | the switch; runtime, refused while a child or save runs |
 | `save-small-max-bytes` | 4096 | the SNAP_NOFORK size cap for single-allocation values; affects values placed from then on |
-| `bgsave-hybrid-max-retained-bytes` | 256mb | the hard mark over retained originals plus main-thread queued bytes; 0 unlimited |
-| `bgsave-hybrid-max-queued-bytes` | 100mb | the bound over the scan thread's two queues; 0 unbounded |
-| `bgsave-hybrid-tag-all` | no | debug: every BUFFER depends on all big values sent before it |
+| `hybrid-snapshot-max-retained-bytes` | 256mb | the hard mark over retained originals plus main-thread queued bytes; 0 unlimited |
+| `hybrid-snapshot-max-queued-bytes` | 100mb | the bound over the scan thread's two queues; 0 unbounded |
+| `hybrid-snapshot-tag-all` | no | debug: every BUFFER depends on all big values sent before it |
 
 **INFO memory**
 
@@ -328,10 +328,10 @@ status fields are the stock ones.
 `SNAP-WINDOW-BUCKETS [n]` (get or set the window size; tests).
 
 **Log lines** worth knowing: `Hybrid background saving started by pid ... (scan thread streams to
-the child)`, `Hybrid AOF rewrite started ...`, `Hybrid BGSAVE done, N SNAP_FORK keys serialized by
-the child`, `Hybrid BGSAVE: ... past bgsave-hybrid-max-retained-bytes ...: aborting the save`,
-`Hybrid BGSAVE: scan aborted, keyspace overlay drained`, `Hybrid BGSAVE: db N flushed during the
-save, its keyspace stays with the save`, `Hybrid BGSAVE: falling back to the fork child, module
+the child)`, `Hybrid AOF rewrite started ...`, `Hybrid snapshot done, N SNAP_FORK keys serialized by
+the child`, `Hybrid snapshot: ... past hybrid-snapshot-max-retained-bytes ...: aborting the save`,
+`Hybrid snapshot: scan aborted, keyspace overlay drained`, `Hybrid snapshot: db N flushed during the
+save, its keyspace stays with the save`, `Hybrid snapshot: falling back to the fork child, module
 '...' has not declared ...`, `SNAP_NOFORK arena made forkable for a ... child` and `... back to
 MADV_DONTFORK`.
 

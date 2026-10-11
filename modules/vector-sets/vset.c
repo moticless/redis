@@ -2298,9 +2298,9 @@ int RedisModule_OnLoad(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) 
     }
 
     /* The RDB save callback serializes the value it is given and nothing else,
-     * so it runs in the hybrid BGSAVE child, which has no keyspace mapped. */
+     * so it runs in the hybrid snapshot child, which has no keyspace mapped. */
     RedisModule_SetModuleOptions(ctx, REDISMODULE_OPTIONS_HANDLE_IO_ERRORS|REDISMODULE_OPTIONS_HANDLE_REPL_ASYNC_LOAD|
-                                      REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE);
+                                      REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT);
 
     RedisModuleTypeMethods tm = {
         .version = REDISMODULE_TYPE_METHOD_VERSION,

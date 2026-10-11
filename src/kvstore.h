@@ -22,7 +22,7 @@
  *
  * KVSTORE OVERLAY
  * ---------------
- * The hybrid BGSAVE (snapshot.h) serializes the keyspace with a background
+ * The hybrid snapshot (snapshot.h) serializes the keyspace with a background
  * thread that reads the store's dicts while the main thread keeps writing.
  * The overlay is what makes that safe. While a scan runs over a store, a
  * snapshot guard is installed on it (kvstoreSnapGuardSet): every access to a
@@ -85,7 +85,7 @@ typedef struct _kvstoreDictIterator {
     kvstoreOvCursor ov_cur;     /* side-table position in phase 1 */
 } kvstoreDictIterator;
 
-/* ---- Snapshot overlay (hybrid BGSAVE; see KVSTORE OVERLAY above) ---------- */
+/* ---- Snapshot overlay (hybrid snapshot; see KVSTORE OVERLAY above) ---------- */
 
 /* Guard: a dict with no overlay is accessed (write = structural): attach one and return it, or NULL. */
 typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
@@ -170,7 +170,7 @@ typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
     int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
     /* The extension slot: owned by whatever extends the store's dicts (today the
-     * hybrid BGSAVE's save state, snapshot.c). The store never reads these two
+     * hybrid snapshot's save state, snapshot.c). The store never reads these two
      * fields; the extension stamps the word and allocates and frees the state,
      * with __atomic builtins where two threads meet. 0 / NULL when none. */
     uint64_t ext_word;

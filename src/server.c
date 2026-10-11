@@ -661,7 +661,7 @@ dictType dbDictType = {
     .keyFromStoredKey = kvGetKey,    /* get key from stored-key */
     .prefetchEntryKey = dbDictPrefetchEntryKey,
     .prefetchEntryValue = dbDictPrefetchEntryValue,
-    .nofork_alloc = 1,      /* hybrid BGSAVE: tables live in the SNAP_NOFORK arena */
+    .nofork_alloc = 1,      /* hybrid snapshot: tables live in the SNAP_NOFORK arena */
 };
 
 /* Db->expires */
@@ -676,7 +676,7 @@ dictType dbExpiresDictType = {
     .no_value = 1,              /* keys and values are unified (kvobj) */
     .keys_are_odd = 0,          /* simple kvobj (robj) struct */
     .keyFromStoredKey = kvGetKey,   /* get key from stored-key */
-    .nofork_alloc = 1,          /* hybrid BGSAVE: tables live in the SNAP_NOFORK arena */
+    .nofork_alloc = 1,          /* hybrid snapshot: tables live in the SNAP_NOFORK arena */
 };
 
 /* Command table. sds string -> command struct pointer. */
@@ -1466,7 +1466,7 @@ void checkChildrenDone(void) {
                 strChildType(server.child_type),
                 (int) server.child_pid);
         } else if (pid == server.child_pid) {
-            /* Hybrid BGSAVE: release the save (scan thread, overlays) before
+            /* Hybrid snapshot: release the save (scan thread, overlays) before
              * the type's done handler does the stock bookkeeping. */
             snapOnChildEnd(exitcode, bysignal);
             if (server.child_type == CHILD_TYPE_RDB) {
@@ -1990,7 +1990,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     updatePeakMemory();
 
-    /* Hybrid BGSAVE: keyspace writes outside call() (expire cycle, eviction,
+    /* Hybrid snapshot: keyspace writes outside call() (expire cycle, eviction,
      * module timers) end with the event loop iteration at the latest. */
     snapFunnelClose();
 
@@ -4554,7 +4554,7 @@ static void afterCommandEx(client *c, long duration, int ops_before) {
      * So the messages are not interleaved with transaction response. */
     if (!server.execution_nesting) {
         listJoin(c->reply, server.pending_push_messages);
-        /* Hybrid BGSAVE: links into frozen dicts are never held across
+        /* Hybrid snapshot: links into frozen dicts are never held across
          * commands, so the write section (if any) ends here. */
         snapFunnelClose();
     }
@@ -6839,7 +6839,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
     /* Persistence */
     if (all_sections || (dictFind(section_dict,"persistence") != NULL)) {
         if (sections++) info = sdscat(info,"\r\n");
-        /* Hybrid BGSAVE: the child only sees SNAP_FORK keys; progress is what
+        /* Hybrid snapshot: the child only sees SNAP_FORK keys; progress is what
          * the scan thread and the main thread have dispatched so far. */
         size_t save_keys_processed = snapSaveKeysProcessed(server.stat_current_save_keys_processed);
         double fork_perc = 0;
@@ -7927,7 +7927,7 @@ void dismissMemoryInChild(void) {
 
     /* Dismiss expires kvstore bucket arrays since the child process never
      * accesses them, expire times are embedded in key objects. */
-    /* Hybrid BGSAVE: the keyspace kvstores live in the DONTFORK arena and are
+    /* Hybrid snapshot: the keyspace kvstores live in the DONTFORK arena and are
      * not mapped in the child at all unless the arena was flipped forkable for
      * this (stock) child; touching them here would fault otherwise. */
     if ((!snapArenaAvailable() || snapArenaForkable()) &&

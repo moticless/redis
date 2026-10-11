@@ -9,7 +9,7 @@
  *
  * WHAT IS KVSOVERLAY?
  * -------------------
- * The implementation side of the kvstore snapshot overlay (hybrid BGSAVE, see
+ * The implementation side of the kvstore snapshot overlay (hybrid snapshot, see
  * the KVSTORE OVERLAY section of kvstore.h). While a background scan thread
  * reads a dict of the store, the dict is "frozen": its bucket layout may not
  * change and the chains the thread is reading may not be written. Writes to

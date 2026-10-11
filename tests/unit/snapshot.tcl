@@ -1,4 +1,4 @@
-start_server {tags {"snapshot"} overrides {bgsave-hybrid yes}} {
+start_server {tags {"snapshot"} overrides {hybrid-snapshot yes}} {
     test {save-small-max-bytes: default value and CONFIG SET with units} {
         assert_equal 4096 [lindex [r config get save-small-max-bytes] 1]
         r config set save-small-max-bytes 8kb
@@ -47,7 +47,7 @@ proc snap_assert_placement_clean {} {
     }
 }
 
-start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save "" repl-diskless-sync no}} {
     if {1} {
         r config set save-small-max-bytes 4096
 
@@ -174,22 +174,22 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_match {*encoding:listpack*} [r debug object hash:lp]
         }
 
-        proc wait_hybrid_bgsave_done {} {
+        proc wait_hybrid_snapshot_done {} {
             wait_for_condition 300 100 {
                 [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
-            } else { fail "hybrid bgsave did not finish" }
+            } else { fail "hybrid snapshot did not finish" }
         }
 
         proc populate_fillers {n} {
             for {set i 0} {$i < $n} {incr i} { r set filler:$i [string repeat f 60] }
         }
 
-        test {Hybrid BGSAVE: static dataset saves and reloads identically} {
+        test {Hybrid snapshot: static dataset saves and reloads identically} {
             populate_all_types
             populate_fillers 500
             set digest [debug_digest]
             r bgsave
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             assert_equal 0 [s rdb_changes_since_last_save]
             r debug reload nosave
@@ -197,7 +197,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE: INFO exposes progress while the save runs, CONFIG SET rdb-key-save-delay reaches the scan thread} {
+        test {Hybrid snapshot: INFO exposes progress while the save runs, CONFIG SET rdb-key-save-delay reaches the scan thread} {
             populate_fillers 3000
             r config set rdb-key-save-delay 100000   ;# 100 ms per key: 3000 keys would take 5 minutes
             r bgsave
@@ -205,7 +205,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert {[s snap_save_slots_total] >= 1}
             set t0 [clock milliseconds]
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert {[clock milliseconds] - $t0 < 5000}
             assert_equal ok [s rdb_last_bgsave_status]
             assert {[s snap_save_in_progress] == 0}
@@ -216,7 +216,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             return $size
         }
 
-        test {Hybrid BGSAVE: keyspace dicts keep their bucket layout during a save and resize afterwards} {
+        test {Hybrid snapshot: keyspace dicts keep their bucket layout during a save and resize afterwards} {
             r flushall
             populate_fillers 2000
             wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
@@ -238,7 +238,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [s snap_save_in_progress]
             assert_equal 8000 [r dbsize]
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             # unfrozen: the table catches up with its 8000 keys
             wait_for_condition 100 50 {[snap_main_table_size] > $size0 || [string match "*rehashing target*" [r debug htstats 9]]} else {
@@ -248,7 +248,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r flushall
         }
 
-        test {Hybrid BGSAVE: writes during the save land in the overlay, snapshot keeps the fork instant} {
+        test {Hybrid snapshot: writes during the save land in the overlay, snapshot keeps the fork instant} {
             populate_all_types
             populate_fillers 3000
             set digest [debug_digest]
@@ -300,7 +300,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 0 [r exists filler:2]
             assert_equal 1 [s snap_save_in_progress]
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             # after the merge the live keyspace is unchanged
             assert_equal changed [r get str:small]
@@ -335,7 +335,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
         }
 
         foreach policy {allkeys-lru allkeys-lfu} {
-            test "Hybrid BGSAVE: reads and writes during the save under $policy" {
+            test "Hybrid snapshot: reads and writes during the save under $policy" {
                 r config set maxmemory-policy $policy
                 populate_all_types
                 populate_fillers 3000
@@ -347,7 +347,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
                 r set str:small changed
                 r incr str:int
                 r config set rdb-key-save-delay 0
-                wait_hybrid_bgsave_done
+                wait_hybrid_snapshot_done
                 assert_equal ok [s rdb_last_bgsave_status]
                 assert_equal changed [r get str:small]
                 r debug reload nosave
@@ -356,7 +356,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             }
         }
 
-        test {Hybrid BGSAVE: active defrag enabled during a save} {
+        test {Hybrid snapshot: active defrag enabled during a save} {
             populate_all_types
             populate_fillers 3000
             set digest [debug_digest]
@@ -374,7 +374,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             for {set i 1000} {$i < 1500} {incr i} { r del filler:$i }
             after 300
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             r config set activedefrag no
             snap_assert_placement_clean
@@ -382,7 +382,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal $digest [debug_digest]
         }
 
-        test {Hybrid BGSAVE: FLUSHALL during the save aborts it and the next save works} {
+        test {Hybrid snapshot: FLUSHALL during the save aborts it and the next save works} {
             populate_all_types
             populate_fillers 3000
             r config set rdb-key-save-delay 300
@@ -391,18 +391,18 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r flushall
             assert_equal 0 [r dbsize]
             assert_equal 0 [s snap_save_in_progress]
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             r config set rdb-key-save-delay 0
             r set after 1
             r bgsave
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             r debug reload nosave
             assert_equal 1 [r get after]
             assert_equal 1 [r dbsize]
         }
 
-        test {Hybrid BGSAVE: DEBUG RELOAD during the save hands the dbs to it; the save completes with the fork instant} {
+        test {Hybrid snapshot: DEBUG RELOAD during the save hands the dbs to it; the save completes with the fork instant} {
             populate_all_types
             populate_fillers 3000
             r set marker before
@@ -418,14 +418,14 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [s snap_save_in_progress]
             assert_equal $digest_a [debug_digest]
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             r debug reload nosave               ;# the dump the save wrote
             assert_equal $digest_b [debug_digest]
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE: DEBUG LOADAOF during the save hands the dbs to it; the save completes with the fork instant} {
+        test {Hybrid snapshot: DEBUG LOADAOF during the save hands the dbs to it; the save completes with the fork instant} {
             populate_all_types
             populate_fillers 3000
             r config set appendonly yes          ;# the rewrite's base holds the data; no FLUSHALL in the AOF (a replayed
@@ -438,7 +438,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             assert_equal 1 [s snap_save_in_progress]
             assert_equal $digest [debug_digest]
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             r config set appendonly no
             r debug reload nosave               ;# the dump the save wrote
@@ -446,7 +446,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE: FLUSHDB during the save empties the live db at once and the save completes with the fork-instant keys} {
+        test {Hybrid snapshot: FLUSHDB during the save empties the live db at once and the save completes with the fork-instant keys} {
             foreach async {{} async} {
                 r flushall
                 populate_fillers 3000
@@ -463,7 +463,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
                 r set after:flush 1
                 assert_equal 1 [r dbsize]
                 r config set rdb-key-save-delay 0
-                wait_hybrid_bgsave_done
+                wait_hybrid_snapshot_done
                 assert_equal ok [s rdb_last_bgsave_status]
                 # the detached keyspace is freed (on BIO) once the save is done with it
                 wait_for_condition 100 50 {[s lazyfree_pending_objects] == 0 && [s used_memory] < $mem_full - 100000} else {
@@ -476,7 +476,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             }
         }
 
-        test {Hybrid BGSAVE: SWAPDB during the save keeps the save running, keys stay under their fork-instant db} {
+        test {Hybrid snapshot: SWAPDB during the save keeps the save running, keys stay under their fork-instant db} {
             r flushall
             populate_fillers 3000
             r select 10
@@ -495,7 +495,7 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r set filler:0 [string repeat s 60]    ;# in-place write on an owed key of the swapped store
             r select 9
             r config set rdb-key-save-delay 0
-            wait_hybrid_bgsave_done
+            wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
             # the dump holds the fork instant: 3000 fillers in db 9, 100 keys in db 10
             r debug reload nosave
@@ -507,10 +507,10 @@ start_server {tags {"snapshot placement"} overrides {bgsave-hybrid yes save "" r
             r flushall
         }
 
-        test {Hybrid BGSAVE: disk-based full sync places values on the replica and matches the master} {
+        test {Hybrid snapshot: disk-based full sync places values on the replica and matches the master} {
             populate_all_types
             set digest [debug_digest]
-            start_server {overrides {bgsave-hybrid yes}} {
+            start_server {overrides {hybrid-snapshot yes}} {
                 r replicaof [srv -1 host] [srv -1 port]
                 wait_for_condition 100 100 {
                     [s master_link_status] eq {up}
@@ -842,7 +842,7 @@ proc snap_cow_run {nkeys valsize delay writer} {
     return [s rdb_last_cow_size]
 }
 
-start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot yes save "" repl-diskless-sync no}} {
     if {[snap_hybrid_supported]} {
         r module load $::snap_module
 
@@ -853,7 +853,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
                 redis.register_function('snapf', function(keys, args) return 1 end)}
         }
 
-        test {Hybrid BGSAVE harness: mixed multi-db dataset with functions and module keys reloads identically} {
+        test {Hybrid snapshot harness: mixed multi-db dataset with functions and module keys reloads identically} {
             snap_populate_static
             set ref [debug_digest]
             set funcs [r function list]
@@ -877,9 +877,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             }
         }
 
-        test {Hybrid BGSAVE harness: hybrid RDB loads into a stock server and equals a stock save of the same dataset} {
+        test {Hybrid snapshot harness: hybrid RDB loads into a stock server and equals a stock save of the same dataset} {
             set ref [debug_digest]
-            start_server {overrides {bgsave-hybrid no save ""}} {
+            start_server {overrides {hybrid-snapshot no save ""}} {
                 r module load $::snap_module
                 snap_populate_static
                 assert_equal $ref [debug_digest]
@@ -895,19 +895,19 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
         }
 
         set iters [expr {$::accurate ? 100 : 3}]
-        test "Hybrid BGSAVE harness: randomized writers over every path race the save ($iters iterations)" {
+        test "Hybrid snapshot harness: randomized writers over every path race the save ($iters iterations)" {
             for {set it 0} {$it < $iters} {incr it} {
                 snap_race_iteration 400 [expr {!$::singledb}] 1
             }
         }
 
         foreach policy {allkeys-lru allkeys-lfu} {
-            test "Hybrid BGSAVE harness: randomized writers under $policy with eviction during the save" {
+            test "Hybrid snapshot harness: randomized writers under $policy with eviction during the save" {
                 snap_race_iteration 400 [expr {!$::singledb}] 1 $policy
             }
         }
 
-        test {Hybrid BGSAVE: writes to keys the scan already passed are applied in place, not cloned} {
+        test {Hybrid snapshot: writes to keys the scan already passed are applied in place, not cloned} {
             r flushall
             populate_fillers 3000
             set ref [debug_digest]
@@ -936,7 +936,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE: writes inside the window go to the side table and drain once the window has moved} {
+        test {Hybrid snapshot: writes inside the window go to the side table and drain once the window has moved} {
             r flushall
             populate 10000 sd: 40
             wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
@@ -973,7 +973,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE harness: keys with module metadata leave the arena, survive writes during the save and reload with their metadata} {
+        test {Hybrid snapshot harness: keys with module metadata leave the arena, survive writes during the save and reload with their metadata} {
             r module load [file normalize tests/modules/test_keymeta.so]
             r debug enable-keymeta-runtime-registration 1
             r keymeta.register SNPM 1 KEEPONCOPY:KEEPONRENAME:ALLOWIGNORE:RDBLOAD:RDBSAVE
@@ -1014,7 +1014,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r flushall
         }
 
-        test {Hybrid BGSAVE harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
+        test {Hybrid snapshot harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
             r flushall
             r himport prepare fieldset a b c d
             r himport set tmpl:small fieldset 1 2 3 4
@@ -1036,7 +1036,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE harness: FLUSHALL ASYNC during the save aborts it and the next save works} {
+        test {Hybrid snapshot harness: FLUSHALL ASYNC during the save aborts it and the next save works} {
             snap_populate_race 0 1
             r config set rdb-key-save-delay 400
             r bgsave
@@ -1054,14 +1054,14 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal 1 [r dbsize]
         }
 
-        test {Hybrid BGSAVE harness: passing the retained-bytes hard mark aborts the save, clients never wait} {
+        test {Hybrid snapshot harness: passing the retained-bytes hard mark aborts the save, clients never wait} {
             snap_populate_race 0 1
             # A mark the emit-ahead records of the first window cross whatever
             # the client's speed (sanitizer builds run the writes 10x slower
             # than the scan thread's sleep-based delay): 8 KB of records
             # against a 5 ms per key scan, so the thread forwards the queue
             # (at window boundaries) only every few seconds.
-            r config set bgsave-hybrid-max-retained-bytes 8192
+            r config set hybrid-snapshot-max-retained-bytes 8192
             r config set rdb-key-save-delay 5000
             r config set latency-monitor-threshold 50
             r latency reset
@@ -1076,13 +1076,13 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             # restore before asserting: a failed assertion must not leave the
             # tiny mark and the delay behind for the next tests
             r config set latency-monitor-threshold 0
-            r config set bgsave-hybrid-max-retained-bytes 256mb
+            r config set hybrid-snapshot-max-retained-bytes 256mb
             r config set rdb-key-save-delay 0
             assert_equal err [s rdb_last_bgsave_status]
             assert_equal [expr {$aborts0 + 1}] [s snap_hard_mark_aborts]
             assert {[s snap_last_save_retained_peak] > 8192}
             assert_equal 0 [s snap_save_retained_bytes]
-            verify_log_message 0 "*bgsave-hybrid-max-retained-bytes*" 0
+            verify_log_message 0 "*hybrid-snapshot-max-retained-bytes*" 0
             assert_equal {} [r latency history command]
             assert_equal [string repeat g 60] [r get filler:2999]
             set ref [debug_digest]
@@ -1093,7 +1093,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal $ref [debug_digest]
         }
 
-        test {Hybrid BGSAVE harness: the main thread's emit-ahead queue drains as the walker moves; its byte count does not drift with the emitted volume} {
+        test {Hybrid snapshot harness: the main thread's emit-ahead queue drains as the walker moves; its byte count does not drift with the emitted volume} {
             r flushall
             r config set rdbcompression no
             r debug populate 200000 ea 60
@@ -1126,7 +1126,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdbcompression yes
         }
 
-        test {Hybrid BGSAVE harness: a stalled child fills the scan thread's queue up to the bound, the thread waits, the save completes} {
+        test {Hybrid snapshot harness: a stalled child fills the scan thread's queue up to the bound, the thread waits, the save completes} {
             r flushall
             # rdb compression would shrink the repeated values to a few bytes
             # each; the point is volume: 100k records of about 75 bytes, 7 MB
@@ -1147,7 +1147,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             set ref [debug_digest]
             set used0 [s used_memory]
             # 256 KB bound; the pipe itself holds 1 MB before the queue grows
-            r config set bgsave-hybrid-max-queued-bytes 262144
+            r config set hybrid-snapshot-max-queued-bytes 262144
             r config set rdb-key-save-delay 20
             set aborts0 [s snap_hard_mark_aborts]
             r bgsave
@@ -1188,13 +1188,13 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal ok [s rdb_last_bgsave_status]
             assert {[s snap_last_save_queued_peak] >= 262144}
             assert_equal 0 [s snap_save_queued_bytes]
-            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set hybrid-snapshot-max-queued-bytes 100mb
             r config set rdbcompression yes
             r debug reload nosave
             assert_equal $ref [debug_digest]
         }
 
-        test {Hybrid BGSAVE harness: the queue absorbs scan output while the child serializes big fork-class values} {
+        test {Hybrid snapshot harness: the queue absorbs scan output while the child serializes big fork-class values} {
             r flushall
             r config set rdbcompression no
             set rd [redis_deferring_client]
@@ -1211,11 +1211,11 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             $rd close
             assert_equal hashtable [r object encoding bigh:0]
             set ref [debug_digest]
-            r config set bgsave-hybrid-max-queued-bytes 128mb
+            r config set hybrid-snapshot-max-queued-bytes 128mb
             r bgsave
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set hybrid-snapshot-max-queued-bytes 100mb
             # more than the 1 MB pipe was pending at some point: the scan thread ran ahead of the child
             assert {[s snap_last_save_queued_peak] > 1048576}
             assert_equal 0 [s snap_save_queued_bytes]
@@ -1224,7 +1224,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal $ref [debug_digest]
         }
 
-        test {Hybrid BGSAVE harness: child killed mid-save, the parent recovers and the next save works} {
+        test {Hybrid snapshot harness: child killed mid-save, the parent recovers and the next save works} {
             snap_populate_race 0 1
             r config set rdb-key-save-delay 400
             r bgsave
@@ -1250,7 +1250,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        snap_arena_test {Hybrid BGSAVE harness: child CoW stays flat under heavy writes versus stock BGSAVE} {
+        snap_arena_test {Hybrid snapshot harness: child CoW stays flat under heavy writes versus stock BGSAVE} {
             # baseline (no writes) first: the child dirties some pages of its
             # own, a noise of about 1 MB either way; 50000 small keys put
             # stock's copy-on-write well above it
@@ -1263,7 +1263,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             set hy_exp [snap_cow_run 20000 1000 50 expire]
             assert {[dict get [snap_placement] class_fork] >= 20000}
             r config set save-small-max-bytes 4096
-            start_server {overrides {bgsave-hybrid no save ""}} {
+            start_server {overrides {hybrid-snapshot no save ""}} {
                 set st_base_small [snap_cow_run 50000 60 50 none]
                 set st_set [snap_cow_run 50000 60 50 set]
                 set st_base_big [snap_cow_run 20000 1000 50 none]
@@ -1279,14 +1279,14 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {$hy_dexp * 2 < $st_dexp}
         }
 
-        test {Hybrid BGSAVE harness: the queue the save holds for its child is not counted for eviction} {
+        test {Hybrid snapshot harness: the queue the save holds for its child is not counted for eviction} {
             r flushall
             r config set rdbcompression no
             r config set maxmemory-policy allkeys-random
             populate 20000 ev: 100
             set digest [debug_digest]
             set ev0 [s evicted_keys]
-            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set hybrid-snapshot-max-queued-bytes 1mb
             r config set rdb-key-save-delay 50
             r bgsave
             snap_wait_save_started
@@ -1307,16 +1307,16 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal 20000 $size
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set hybrid-snapshot-max-queued-bytes 100mb
             r config set rdbcompression yes
             r debug reload nosave
             assert_equal $digest [debug_digest]
         }
 
-        test {Hybrid BGSAVE harness: a buffer that depends on big values waits for them (debug tag-all), the save completes and reloads equal} {
+        test {Hybrid snapshot harness: a buffer that depends on big values waits for them (debug tag-all), the save completes and reloads equal} {
             r flushall
             r config set rdbcompression no
-            r config set bgsave-hybrid-tag-all yes
+            r config set hybrid-snapshot-tag-all yes
             populate 60000 tg: 60
             for {set h 0} {$h < 4} {incr h} {
                 set args {}
@@ -1325,7 +1325,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             }
             assert_equal hashtable [r object encoding tgh:0]
             set digest [debug_digest]
-            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set hybrid-snapshot-max-queued-bytes 1mb
             r config set rdb-key-save-delay 20
             r bgsave
             snap_wait_save_started
@@ -1342,14 +1342,14 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            r config set bgsave-hybrid-tag-all no
-            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set hybrid-snapshot-tag-all no
+            r config set hybrid-snapshot-max-queued-bytes 100mb
             r config set rdbcompression yes
             r debug reload nosave
             assert_equal $digest [debug_digest]
         }
 
-        test {Hybrid BGSAVE harness: the bucket bitmaps exist only while a save runs, and only once a slot needs them} {
+        test {Hybrid snapshot harness: the bucket bitmaps exist only while a save runs, and only once a slot needs them} {
             snap_populate_race 0 0
             assert_equal 0 [s snap_save_bitmap_bytes]
             r config set rdb-key-save-delay 1000
@@ -1364,7 +1364,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert_equal 0 [s snap_save_bitmap_bytes]
         }
 
-        test {Hybrid BGSAVE harness: a crash in the hybrid child writes a full report without the keyspace sections; the stock child keeps them} {
+        test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the stock child keeps them} {
             r flushall
             populate 20000 cr: 60
             # the fast memory test of the crash report is not under test here
@@ -1385,14 +1385,14 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             assert {[count_log_message 0 "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped"] >= 1}
             assert_equal $keyspace0 [count_log_message 0 "# Keyspace"]
             # the stock child has the keyspace mapped and prints it
-            r config set bgsave-hybrid no
+            r config set hybrid-snapshot no
             r config set rdb-key-save-delay 300
             r bgsave
             wait_for_condition 100 50 {[s rdb_bgsave_in_progress] == 1} else { fail "stock save not started" }
             exec kill -SEGV [get_child_pid 0]
             wait_for_condition 300 100 {[s rdb_bgsave_in_progress] == 0} else { fail "stock save did not end" }
             r config set rdb-key-save-delay 0
-            r config set bgsave-hybrid yes
+            r config set hybrid-snapshot yes
             wait_for_condition 50 100 {[count_log_message 0 "# Keyspace"] == $keyspace0 + 1} else { fail "the stock child's report has no Keyspace section" }
             assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
             r config set crash-memcheck-enabled yes
@@ -1409,7 +1409,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
         # rewrite of its keys fails, in stock as here, so the preamble-off run
         # leaves module keys out.
         set module [expr {$preamble eq "yes"}]
-        test "Hybrid BGSAVE harness: BGREWRITEAOF (aof-use-rdb-preamble $preamble) under writes goes through the hybrid scan, the AOF replays to the live keyspace, a killed child fails it cleanly" {
+        test "Hybrid snapshot harness: BGREWRITEAOF (aof-use-rdb-preamble $preamble) under writes goes through the hybrid scan, the AOF replays to the live keyspace, a killed child fails it cleanly" {
             r flushall
             r config set aof-use-rdb-preamble $preamble
             snap_populate_race 0 $module
@@ -1450,7 +1450,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
         }
         r config set aof-use-rdb-preamble yes
 
-        test {Hybrid BGSAVE harness: BGREWRITEAOF without the preamble over three dbs emits SELECT only on a db change, the AOF reloads} {
+        test {Hybrid snapshot harness: BGREWRITEAOF without the preamble over three dbs emits SELECT only on a db change, the AOF reloads} {
             r config set aof-use-rdb-preamble no
             r flushall
             foreach db {0 1 2} {
@@ -1487,7 +1487,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set aof-use-rdb-preamble yes
         }
 
-        test {Hybrid BGSAVE harness: ten saves aborted by a killed child, then one that completes, reload equal} {
+        test {Hybrid snapshot harness: ten saves aborted by a killed child, then one that completes, reload equal} {
             snap_populate_race 0 1
             for {set k 0} {$k < 10} {incr k} {
                 r config set rdb-key-save-delay 400
@@ -1512,7 +1512,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE harness: a key created at the address of one deleted during the save (address reuse) reloads with the fork-instant key} {
+        test {Hybrid snapshot harness: a key created at the address of one deleted during the save (address reuse) reloads with the fork-instant key} {
             r flushall
             r config set rdbcompression no
             for {set i 0} {$i < 3000} {incr i} { r set ar:$i [string repeat x 40] }
@@ -1545,7 +1545,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE harness: read commands that write the value in place (PFCOUNT cache, XREADGROUP consumer state) during the save keep the fork instant} {
+        test {Hybrid snapshot harness: read commands that write the value in place (PFCOUNT cache, XREADGROUP consumer state) during the save keep the fork instant} {
             r flushall
             for {set i 0} {$i < 300} {incr i} { r pfadd hll:$i a$i b$i c$i d$i }
             set big {}
@@ -1573,7 +1573,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             snap_assert_placement_clean
         }
 
-        test {Hybrid BGSAVE harness: a child killed after it started writing leaves the previous dump untouched and loadable} {
+        test {Hybrid snapshot harness: a child killed after it started writing leaves the previous dump untouched and loadable} {
             r flushall
             r config set rdbcompression no
             populate 20000 fp: 60
@@ -1602,11 +1602,11 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdbcompression yes
         }
 
-        test {Hybrid BGSAVE harness: FLUSHALL while the scan thread waits at the queue bound (child stopped) returns at once and the next save works} {
+        test {Hybrid snapshot harness: FLUSHALL while the scan thread waits at the queue bound (child stopped) returns at once and the next save works} {
             r flushall
             r config set rdbcompression no
             populate 60000 cb: 60
-            r config set bgsave-hybrid-max-queued-bytes 1mb
+            r config set hybrid-snapshot-max-queued-bytes 1mb
             r config set rdb-key-save-delay 20
             r bgsave
             snap_wait_save_started
@@ -1619,7 +1619,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             set dt [expr {[clock milliseconds] - $t0}]
             exec kill -CONT $child
             r config set rdb-key-save-delay 0
-            r config set bgsave-hybrid-max-queued-bytes 100mb
+            r config set hybrid-snapshot-max-queued-bytes 100mb
             assert {$dt < 3000}
             snap_wait_bgsave_done
             assert_equal 0 [r dbsize]
@@ -1633,8 +1633,8 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             r config set rdbcompression yes
         }
 
-        test {Hybrid BGSAVE harness: SHUTDOWN NOSAVE during a save exits cleanly} {
-            start_server {overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+        test {Hybrid snapshot harness: SHUTDOWN NOSAVE during a save exits cleanly} {
+            start_server {overrides {hybrid-snapshot yes save "" repl-diskless-sync no}} {
                 set pid [srv 0 pid]
                 snap_populate_race 0 0
                 r config set rdb-key-save-delay 400
@@ -1646,12 +1646,12 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
             }
         }
 
-        test {Hybrid BGSAVE harness: SHUTDOWN NOSAVE while the scan thread waits at the queue bound (child stopped) exits cleanly} {
-            start_server {overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+        test {Hybrid snapshot harness: SHUTDOWN NOSAVE while the scan thread waits at the queue bound (child stopped) exits cleanly} {
+            start_server {overrides {hybrid-snapshot yes save "" repl-diskless-sync no}} {
                 set pid [srv 0 pid]
                 r config set rdbcompression no
                 populate 60000 sb: 60
-                r config set bgsave-hybrid-max-queued-bytes 1mb
+                r config set hybrid-snapshot-max-queued-bytes 1mb
                 r config set rdb-key-save-delay 20
                 r bgsave
                 snap_wait_save_started
@@ -1675,9 +1675,9 @@ start_server {tags {"snapshot harness external:skip"} overrides {bgsave-hybrid y
     }
 }
 
-start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no}} {
+start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-snapshot yes save "" repl-diskless-sync no}} {
     if {[snap_hybrid_supported]} {
-        test {Hybrid BGSAVE harness (cluster mode): per-slot progress is exposed} {
+        test {Hybrid snapshot harness (cluster mode): per-slot progress is exposed} {
             snap_populate_race 0 0
             r config set rdb-key-save-delay 400
             r bgsave
@@ -1688,7 +1688,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             assert_equal ok [s rdb_last_bgsave_status]
         }
 
-        test {Hybrid BGSAVE harness (cluster mode): a slot written before the scan reaches it keeps growing; its bitmap follows the table} {
+        test {Hybrid snapshot harness (cluster mode): a slot written before the scan reaches it keeps growing; its bitmap follows the table} {
             r flushall
             r config set rdbcompression no
             # a slot the walker reaches last (high index), non-empty at the fork
@@ -1719,7 +1719,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             r config set rdbcompression yes
         }
 
-        test {Hybrid BGSAVE harness (cluster mode): keys written into a slot empty at the fork instant never reach the snapshot} {
+        test {Hybrid snapshot harness (cluster mode): keys written into a slot empty at the fork instant never reach the snapshot} {
             r flushall
             populate 30000 cl: 20
             # a high slot (the walker reaches it last) with no key at the fork
@@ -1745,7 +1745,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             assert_equal 0 [r exists "$tag:0"]
         }
 
-        test {Hybrid BGSAVE harness (cluster mode): randomized writers race the per-slot scan} {
+        test {Hybrid snapshot harness (cluster mode): randomized writers race the per-slot scan} {
             snap_race_iteration 400 0 0
         }
     }
@@ -1761,9 +1761,9 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
 proc snap_all_slots_to_node0 {masters} {
     R 0 cluster addslotsrange 0 16383
 }
-start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hybrid yes save "" repl-diskless-sync no cluster-node-timeout 60000}} {
+start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-snapshot yes save "" repl-diskless-sync no cluster-node-timeout 60000}} {
     if {[snap_hybrid_supported]} {
-        test {Hybrid BGSAVE harness (cluster mode): slots trimmed by atomic slot migration during a save stay in the dump, the save frees them when it passes them} {
+        test {Hybrid snapshot harness (cluster mode): slots trimmed by atomic slot migration during a save stay in the dump, the save frees them when it passes them} {
             set nkeys 3000
             for {set i 0} {$i < $nkeys} {incr i} { R 0 set "key:$i" v }
             assert_equal $nkeys [R 0 dbsize]
@@ -1787,7 +1787,7 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
             R 0 config set rdb-key-save-delay 0
             wait_for_condition 300 100 {
                 [status [Rn 0] rdb_bgsave_in_progress] == 0 && [status [Rn 0] snap_save_in_progress] == 0
-            } else { fail "hybrid bgsave did not finish" }
+            } else { fail "hybrid snapshot did not finish" }
             assert_equal ok [status [Rn 0] rdb_last_bgsave_status]
             assert {[status [Rn 0] snap_retained_dicts] > 0}   ;# dicts the trim let go of before the save passed them
             assert_equal 0 [count_log_message 0 "crashed by signal"]
@@ -1804,7 +1804,7 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {bgsave-hyb
 # ---------------------------------------------------------------------------
 # Arena fork visibility (TASK-1.22): stock fork children (AOF rewrite, diskless
 # sync, module fork) map the SNAP_NOFORK arena while they run, the hybrid child
-# never does, and bgsave-hybrid is a runtime switch.
+# never does, and hybrid-snapshot is a runtime switch.
 # ---------------------------------------------------------------------------
 set ::snap_fork_module [file normalize tests/modules/fork.so]
 
@@ -1838,7 +1838,7 @@ proc snap_wait_link_up {{level 0}} {
 }
 
 foreach rdb_channel {yes no} {
-    start_server {tags {"snapshot diskless external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 10}} {
+    start_server {tags {"snapshot diskless external:skip"} overrides {hybrid-snapshot yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0 repl-timeout 10}} {
         r config set repl-rdb-channel $rdb_channel
         set master [srv 0 client]
         set master_host [srv 0 host]
@@ -1875,7 +1875,7 @@ foreach rdb_channel {yes no} {
 
         test "Hybrid diskless sync (rdb-channel $rdb_channel): a replica's own running hybrid save is aborted by the full-sync load" {
             snap_sync_dataset
-            start_server {overrides {save "" bgsave-hybrid yes}} {
+            start_server {overrides {save "" hybrid-snapshot yes}} {
                 populate 3000 old: 40
                 r config set rdb-key-save-delay 2000
                 r bgsave
@@ -1884,7 +1884,7 @@ foreach rdb_channel {yes no} {
                 snap_wait_link_up
                 # the load emptied every db: the save was stopped first, as stock kills its child
                 assert_equal 0 [s snap_save_in_progress]
-                assert {[count_log_message 0 "Hybrid BGSAVE: scan aborted"] >= 1}
+                assert {[count_log_message 0 "Hybrid snapshot: scan aborted"] >= 1}
                 wait_for_ofs_sync $master [srv 0 client]
                 assert_equal [$master dbsize] [r dbsize]
                 assert_equal [$master debug digest] [r debug digest]
@@ -1977,20 +1977,20 @@ foreach rdb_channel {yes no} {
     }
 }
 
-# ---- Module contract: REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE (TASK-1.25) ----
+# ---- Module contract: REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT (TASK-1.25) ----
 
 set ::snap_violate_module [file normalize tests/modules/hybridviolate.so]
 
-start_server {tags {"snapshot modules external:skip"} overrides {bgsave-hybrid yes save "" appendonly no}} {
-    test {Hybrid BGSAVE modules: the bundled modules do not block the hybrid path} {
+start_server {tags {"snapshot modules external:skip"} overrides {hybrid-snapshot yes save "" appendonly no}} {
+    test {Hybrid snapshot modules: the bundled modules do not block the hybrid path} {
         assert_equal {} [s snap_hybrid_blocked_by]
     }
 
-    test {Hybrid BGSAVE modules: a module with a data type and no opt-in is named and sends saves to the fork child} {
+    test {Hybrid snapshot modules: a module with a data type and no opt-in is named and sends saves to the fork child} {
         set loglines [count_log_lines 0]
         r module load $::snap_violate_module
         assert_equal hybridviolate [s snap_hybrid_blocked_by]
-        wait_for_log_messages 0 {"*has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE*"} $loglines 50 10
+        wait_for_log_messages 0 {"*has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT*"} $loglines 50 10
         r flushall
         r hv.set hv:1 hello
         r set hv:probe 1
@@ -2009,7 +2009,7 @@ start_server {tags {"snapshot modules external:skip"} overrides {bgsave-hybrid y
         assert_equal hello [r hv.get hv:1]
     }
 
-    test {Hybrid BGSAVE modules: once opted in the hybrid path runs and the child refuses keyspace calls} {
+    test {Hybrid snapshot modules: once opted in the hybrid path runs and the child refuses keyspace calls} {
         r hv.optin 1
         assert_equal {} [s snap_hybrid_blocked_by]
         set saves0 [s snap_saves]
@@ -2018,22 +2018,22 @@ start_server {tags {"snapshot modules external:skip"} overrides {bgsave-hybrid y
         snap_wait_bgsave_done
         assert_equal ok [s rdb_last_bgsave_status]
         assert_equal [expr {$saves0 + 1}] [s snap_saves]
-        wait_for_log_messages 0 {"*called RedisModule_OpenKey inside the hybrid BGSAVE child*"} $loglines 50 10
-        wait_for_log_messages 0 {"*called RedisModule_Call inside the hybrid BGSAVE child*"} $loglines 50 10
+        wait_for_log_messages 0 {"*called RedisModule_OpenKey inside the hybrid snapshot child*"} $loglines 50 10
+        wait_for_log_messages 0 {"*called RedisModule_Call inside the hybrid snapshot child*"} $loglines 50 10
         wait_for_log_messages 0 {"*hv_save: OpenKey=NULL Call=NULL*"} $loglines 50 10
         r debug reload nosave
         assert_equal hello [r hv.get hv:1]
         assert_equal 2002 [r dbsize]
     }
 
-    test {Hybrid BGSAVE modules: withdrawing the opt-in blocks the hybrid path again} {
+    test {Hybrid snapshot modules: withdrawing the opt-in blocks the hybrid path again} {
         r hv.optin 0
         assert_equal hybridviolate [s snap_hybrid_blocked_by]
         r hv.optin 1
         assert_equal {} [s snap_hybrid_blocked_by]
     }
 
-    test {Hybrid BGSAVE modules: RM_SetLRU and RM_SetLFU on a READ handle go through the write funnel during a save} {
+    test {Hybrid snapshot modules: RM_SetLRU and RM_SetLFU on a READ handle go through the write funnel during a save} {
         r flushall
         r set plain v
         populate 3000 k: 40
@@ -2058,7 +2058,7 @@ start_server {tags {"snapshot modules external:skip"} overrides {bgsave-hybrid y
     }
 }
 
-start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0}} {
+start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapshot yes save "" appendonly no repl-diskless-sync yes repl-diskless-sync-delay 0}} {
     r module load $::snap_fork_module
 
     proc snap_fallback_dataset {} {
@@ -2076,7 +2076,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
     }
 
-    test {BGREWRITEAOF with bgsave-hybrid on and the RDB preamble: the hybrid scan writes the base file, the arena stays DONTFORK, the AOF reloads} {
+    test {BGREWRITEAOF with hybrid-snapshot on and the RDB preamble: the hybrid scan writes the base file, the arena stays DONTFORK, the AOF reloads} {
         snap_fallback_dataset
         set digest [debug_digest]
         set saves0 [s snap_saves]
@@ -2130,7 +2130,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r config set appendonly no
     }
 
-    test {BGREWRITEAOF with bgsave-hybrid on and no preamble: the hybrid scan writes the command-form base file, the arena stays DONTFORK, the AOF reloads} {
+    test {BGREWRITEAOF with hybrid-snapshot on and no preamble: the hybrid scan writes the command-form base file, the arena stays DONTFORK, the AOF reloads} {
         r config set aof-use-rdb-preamble no
         snap_fallback_dataset
         set digest [debug_digest]
@@ -2150,11 +2150,11 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         r config set aof-use-rdb-preamble yes
     }
 
-    test {Diskless full sync with bgsave-hybrid on: the hybrid child streams the replica, the arena is never mapped} {
+    test {Diskless full sync with hybrid-snapshot on: the hybrid child streams the replica, the arena is never mapped} {
         snap_fallback_dataset
         set digest [debug_digest]
         set saves0 [s snap_saves]
-        start_server {overrides {bgsave-hybrid yes}} {
+        start_server {overrides {hybrid-snapshot yes}} {
             r replicaof [srv -1 host] [srv -1 port]
             wait_for_condition 100 100 {
                 [s master_link_status] eq {up}
@@ -2170,7 +2170,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         }
     }
 
-    test {Module fork with bgsave-hybrid on: the child runs and exits with its code} {
+    test {Module fork with hybrid-snapshot on: the child runs and exits with its code} {
         r fork.create 3 100000
         wait_for_condition 20 100 {
             [r fork.exitcode] != -1
@@ -2215,12 +2215,12 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         snap_wait_forkable 0
     }
 
-    test {CONFIG SET bgsave-hybrid is refused while a save runs} {
+    test {CONFIG SET hybrid-snapshot is refused while a save runs} {
         r config set rdb-key-save-delay 1000
         r bgsave
         snap_wait_save_started
-        assert_error {*cannot change*} {r config set bgsave-hybrid no}
-        assert_equal yes [lindex [r config get bgsave-hybrid] 1]
+        assert_error {*cannot change*} {r config set hybrid-snapshot no}
+        assert_equal yes [lindex [r config get hybrid-snapshot] 1]
         r config set rdb-key-save-delay 0
         snap_wait_bgsave_done
     }
@@ -2228,7 +2228,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
     test {Runtime switch: off takes the stock save path with a forkable arena, on is hybrid again, both reload} {
         snap_fallback_dataset
         set digest [debug_digest]
-        r config set bgsave-hybrid no
+        r config set hybrid-snapshot no
         snap_wait_forkable 1
         set saves [s snap_saves]
         r bgsave
@@ -2240,7 +2240,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
         assert_equal $digest [debug_digest]
         populate 500 off: 40                        ;# allocated outside the arena while off
         set digest2 [debug_digest]
-        r config set bgsave-hybrid yes
+        r config set hybrid-snapshot yes
         snap_wait_forkable 0
         # keys created while the feature was off keep their stock placement
         # (header outside the arena) until rewritten: expected drift, not a
@@ -2256,10 +2256,10 @@ start_server {tags {"snapshot fallback external:skip"} overrides {bgsave-hybrid 
     }
 
     test {Runtime switch: the arena is forkable from startup when the feature starts off} {
-        start_server {overrides {bgsave-hybrid no save ""}} {
+        start_server {overrides {hybrid-snapshot no save ""}} {
             if {[snap_arena_available]} {
                 assert_equal 1 [s snap_nofork_arena_forkable]
-                r config set bgsave-hybrid yes
+                r config set hybrid-snapshot yes
                 assert_equal 0 [s snap_nofork_arena_forkable]
             }
             populate 100 k: 40

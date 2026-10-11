@@ -721,7 +721,7 @@ void keyMetaTransition(kvobj *kvOld, kvobj *kvNew) {
     } while (mbitsOld);
 }
 
-/* Does 'module' own any key metadata class in use? (hybrid BGSAVE: such a
+/* Does 'module' own any key metadata class in use? (hybrid snapshot: such a
  * module has save callbacks that run in the child.) */
 int keyMetaClassModuleHasAny(RedisModule *module) {
     for (int i = 0; i < KEY_META_ID_MAX; i++)

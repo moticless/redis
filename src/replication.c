@@ -1144,7 +1144,7 @@ int startBgsaveForReplication(int mincapa, int req) {
      * otherwise slave will miss repl-stream-db. */
     if (rsiptr) {
         if (socket_target) {
-            /* Hybrid BGSAVE: the child streams the replicas from the scan
+            /* Hybrid snapshot: the child streams the replicas from the scan
              * thread's channels; the stock child when snapshot.c declines. */
             retval = snapSaveTryStart(SNAP_SAVE_SOCKETS, req, NULL, rsiptr, 0);
             if (retval == SNAP_NOT_TAKEN) retval = rdbSaveToSlavesSockets(req,rsiptr);

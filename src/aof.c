@@ -3244,7 +3244,7 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid BGSAVE: redisFork() flips the SNAP_NOFORK arena forkable for this
+    /* Hybrid snapshot: redisFork() flips the SNAP_NOFORK arena forkable for this
      * child (stock copy-on-write while it runs), see snapArenaBeforeFork(). */
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
         server.backup_state == BACKUP_STATE_INCREMENTING)
@@ -3284,7 +3284,7 @@ int rewriteAppendOnlyFileBackground(void) {
 
     server.stat_aof_rewrites++;
 
-    /* Hybrid BGSAVE: the base file is written by the hybrid scan thread and
+    /* Hybrid snapshot: the base file is written by the hybrid scan thread and
      * child like a BGSAVE, as an RDB with the preamble or in AOF command
      * form without it; the INCR file opened above takes the writes from the
      * fork instant on. The stock child below runs when snapshot.c declines. */

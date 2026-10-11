@@ -12,7 +12,7 @@ CLI=/home/moti/git/redis-bgsave/src/redis-cli; PORT=7602; OUT=${OUT:-/dev/shm/ca
 N=${N:-200000}; P=16; C=20; D=100; R=100000
 run() {  # run <mode> <phases: set | setget>
   local mode=$1 phases=$2 flag="" f=$OUT/cg-$mode-$phases.out
-  [ $mode = on ] && flag="--bgsave-hybrid yes"
+  [ $mode = on ] && flag="--hybrid-snapshot yes"
   rm -f $f
   valgrind --tool=callgrind --callgrind-out-file=$f --collect-atstart=no --toggle-collect=processCommand \
     "$BIN" --port $PORT --bind 127.0.0.1 --save "" --appendonly no --logfile /dev/null --dir /dev/shm --disable-thp yes $flag \

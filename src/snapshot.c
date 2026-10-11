@@ -1,5 +1,5 @@
 /*
- * snapshot.c - Hybrid BGSAVE (design: docs/hybrid-bgsave.md; API: snapshot.h).
+ * snapshot.c - Hybrid snapshot (design: docs/hybrid-snapshot.md; API: snapshot.h).
  *
  * A hybrid save splits the keyspace by value class. SNAP_NOFORK values (every
  * kvobj header, the keyspace hash tables and single-allocation values up to
@@ -57,17 +57,17 @@ void snapArenaInit(void) {
 #ifdef HAVE_NOFORK_ARENA
     if (!zmalloc_nofork_arena_init()) {
         serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
-                              "range or create the jemalloc arena; hybrid BGSAVE runs without it.");
+                              "range or create the jemalloc arena; hybrid snapshot runs without it.");
         return;
     }
-    zmalloc_nofork_set_active(server.bgsave_hybrid);       /* new headers, tables and values go there only when on */
-    if (!server.bgsave_hybrid) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
+    zmalloc_nofork_set_active(server.hybrid_snapshot);       /* new headers, tables and values go there only when on */
+    if (!server.hybrid_snapshot) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
     serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
                          "%s).", zmalloc_nofork_arena_index(), snapArenaVaReserved() >> 30,
-                         server.bgsave_hybrid ? "MADV_DONTFORK: hybrid BGSAVE on" : "forkable: bgsave-hybrid no");
+                         server.hybrid_snapshot ? "MADV_DONTFORK: hybrid snapshot on" : "forkable: hybrid-snapshot no");
 #else
     serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
-                         "with jemalloc); hybrid BGSAVE, if enabled, runs without it.");
+                         "with jemalloc); hybrid snapshot, if enabled, runs without it.");
 #endif
 }
 
@@ -79,16 +79,16 @@ static int snap_in_hybrid_child = 0;  /* this process is the hybrid save child: 
 int snapInHybridChild(void) { return snap_in_hybrid_child; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
- * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE; the stock child runs
+ * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the stock child runs
  * instead. Logged when the blocking module changes, not on every save. */
 static void snapHybridFallbackLog(void) {
     static sds last = NULL;
-    const char *who = moduleHybridBgsaveBlockedBy();
+    const char *who = moduleHybridSnapshotBlockedBy();
     if (last && !strcmp(last, who)) return;
     sdsfree(last);
     last = sdsnew(who);
-    serverLog(LL_WARNING, "Hybrid BGSAVE: falling back to the fork child, module '%s' has not declared "
-                          "REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE", who);
+    serverLog(LL_WARNING, "Hybrid snapshot: falling back to the fork child, module '%s' has not declared "
+                          "REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT", who);
 }
 
 /* Fork visibility of the arena. Normally DONTFORK: the hybrid save's child
@@ -139,11 +139,11 @@ void snapArenaChildExited(void) {
     if (!snap_arena_fallback) return;
     if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another stock child still runs */
     snap_arena_fallback = 0;
-    if (server.bgsave_hybrid && snapArenaSetForkable(0))
+    if (server.hybrid_snapshot && snapArenaSetForkable(0))
         serverLog(LL_NOTICE, "SNAP_NOFORK arena back to MADV_DONTFORK");
 }
 
-/* CONFIG SET bgsave-hybrid apply hook: flips the arena, refuses mid-save.
+/* CONFIG SET hybrid-snapshot apply hook: flips the arena, refuses mid-save.
  * Saves take the hybrid path whether or not the SNAP_NOFORK arena exists
  * (without it the CoW benefit is gone but the mechanics are identical, which
  * is what sanitizer builds exercise). Switching is O(1): the arena is flipped
@@ -152,20 +152,20 @@ void snapArenaChildExited(void) {
 int snapHybridConfigApply(const char **err) {
     if (server.loading) return 1;   /* applied again by the startup path */
     if (hasActiveChildProcess() || snapSaveInProgress() || ldbPendingChildren()) {
-        *err = "bgsave-hybrid cannot change while a save, rewrite, module fork or debugger child is running";
+        *err = "hybrid-snapshot cannot change while a save, rewrite, module fork or debugger child is running";
         return 0;
     }
     if (snapArenaAvailable()) {
         /* On: children stop mapping the arena; off: they must map it. Values
          * placed so far stay where they are, the switch itself is O(1). */
-        if (!snapArenaSetForkable(!server.bgsave_hybrid)) {
+        if (!snapArenaSetForkable(!server.hybrid_snapshot)) {
             *err = "SNAP_NOFORK arena: madvise failed, see the server log";
             return 0;
         }
-        zmalloc_nofork_set_active(server.bgsave_hybrid);
+        zmalloc_nofork_set_active(server.hybrid_snapshot);
         snap_arena_fallback = 0;
     }
-    serverLog(LL_NOTICE, "Hybrid BGSAVE switched %s at runtime%s", server.bgsave_hybrid ? "on" : "off",
+    serverLog(LL_NOTICE, "Hybrid snapshot switched %s at runtime%s", server.hybrid_snapshot ? "on" : "off",
               snapArenaAvailable() ? "" : " (no SNAP_NOFORK arena on this platform)");
     return 1;
 }
@@ -1557,7 +1557,7 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
 }
 
 /* ============================================================================
- * Hybrid BGSAVE: orchestration, channel, child writer
+ * Hybrid snapshot: orchestration, channel, child writer
  * ============================================================================
  *
  * Fork-instant sequence (main thread, nothing interleaves):
@@ -1641,7 +1641,7 @@ struct snapSave {
     int pipe_rd, pipe_wr;             /* small channel */
     int big_rd, big_wr;               /* big channel */
     snapShared *shared;
-    int tag_all;                      /* debug (bgsave-hybrid-tag-all): every BUFFER depends on all big values sent before it */
+    int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
     int child_type;            /* CHILD_TYPE_RDB (BGSAVE, full sync) or CHILD_TYPE_AOF (BGREWRITEAOF) */
@@ -1688,7 +1688,7 @@ struct snapSave {
     list *bq;                           /* big channel */
     list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
     size_t oq_head_off, bq_head_off;    /* bytes of each head message already written */
-    size_t oq_limit;                    /* bgsave-hybrid-max-queued-bytes at save start, 0 = none */
+    size_t oq_limit;                    /* hybrid-snapshot-max-queued-bytes at save start, 0 = none */
     redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for both pipes */
     size_t sq_bytes;                    /* of which the small channel's (scan thread; published to the child) */
     uint32_t kv_seq;                    /* KVOBJ messages sent so far (scan thread) */
@@ -1804,7 +1804,7 @@ sds snapInfoPersistence(sds info) {
         "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
         "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
         "snap_saves:%lld\r\n", server.stat_snap_saves,
-        "snap_hybrid_blocked_by:%s\r\n", moduleHybridBgsaveBlockedBy(),
+        "snap_hybrid_blocked_by:%s\r\n", moduleHybridSnapshotBlockedBy(),
         "snap_save_inplace_writes:%lld\r\n", snapSaveInplaceWrites(),
         "snap_last_save_inplace_writes:%lld\r\n", snapSaveLastInplaceWrites(),
         "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes));
@@ -1967,7 +1967,7 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
             sdsclear(sv->mscratch);
             rioInitWithBuffer(&r, sv->mscratch);
             if (snapSaveWriteRecord(sv, &r, kv, s) != 0)
-                serverPanic("Hybrid BGSAVE: failed to serialize a key on the main thread");
+                serverPanic("Hybrid snapshot: failed to serialize a key on the main thread");
             sv->mscratch = r.io.buffer.ptr;
             pthread_mutex_lock(&sv->mq_lock);
             if (sv->mstage_dbid != s || sv->mstage_slot != didx) {
@@ -2154,7 +2154,7 @@ int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *st
     int s = snapStoreIndexOf(sv, keys);
     if (s < 0 || sv->flushed[s].set) return 0;
     sv->flushed[s] = (snapFlushedDb){ 1, keys, expires, blessed, subexpires, stream_idmp_keys };
-    serverLog(LL_NOTICE, "Hybrid BGSAVE: db %d flushed during the save, its keyspace stays with the save until its slots complete", s);
+    serverLog(LL_NOTICE, "Hybrid snapshot: db %d flushed during the save, its keyspace stays with the save until its slots complete", s);
     return 1;
 }
 
@@ -2260,11 +2260,11 @@ static void snapSaveRetainedAdd(kvobj *orig, int value_shared) {
     snapSave *sv = snap_save;
     sv->retained_bytes += snapOriginalRetainedBytes(orig, value_shared);
     if (sv->retained_bytes > sv->retained_peak) sv->retained_peak = sv->retained_bytes;
-    if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit &&
-        sv->retained_bytes > server.bgsave_hybrid_max_retained_bytes) {
+    if (server.hybrid_snapshot_max_retained_bytes && !sv->hard_mark_hit &&
+        sv->retained_bytes > server.hybrid_snapshot_max_retained_bytes) {
         sv->hard_mark_hit = 1;
-        serverLog(LL_WARNING, "Hybrid BGSAVE: overlay retains %zu bytes, past bgsave-hybrid-max-retained-bytes (%zu): aborting the save",
-                  sv->retained_bytes, server.bgsave_hybrid_max_retained_bytes);
+        serverLog(LL_WARNING, "Hybrid snapshot: overlay retains %zu bytes, past hybrid-snapshot-max-retained-bytes (%zu): aborting the save",
+                  sv->retained_bytes, server.hybrid_snapshot_max_retained_bytes);
     }
 }
 
@@ -2293,11 +2293,11 @@ void snapSaveCron(void) {
      * the scan thread's queue waits for the child instead of growing. */
     size_t all_queued = snapSaveQueuedBytes();
     if (sv->retained_bytes + all_queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + all_queued;
-    if (server.bgsave_hybrid_max_retained_bytes && !sv->hard_mark_hit) {
-        if (sv->retained_bytes + queued > server.bgsave_hybrid_max_retained_bytes) {
+    if (server.hybrid_snapshot_max_retained_bytes && !sv->hard_mark_hit) {
+        if (sv->retained_bytes + queued > server.hybrid_snapshot_max_retained_bytes) {
             sv->hard_mark_hit = 1;
-            serverLog(LL_WARNING, "Hybrid BGSAVE: %zu bytes retained plus %zu queued for the child, past bgsave-hybrid-max-retained-bytes (%zu): aborting the save",
-                      sv->retained_bytes, queued, server.bgsave_hybrid_max_retained_bytes);
+            serverLog(LL_WARNING, "Hybrid snapshot: %zu bytes retained plus %zu queued for the child, past hybrid-snapshot-max-retained-bytes (%zu): aborting the save",
+                      sv->retained_bytes, queued, server.hybrid_snapshot_max_retained_bytes);
         }
     }
     if (!sv->hard_mark_hit) return;
@@ -2566,7 +2566,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
             delay -= slice;
         }
         if (snapSaveWriteRecord(sv, &r, kv, s) != 0) {
-            serverLog(LL_WARNING, "Hybrid BGSAVE: failed to serialize a key on the scan thread");
+            serverLog(LL_WARNING, "Hybrid snapshot: failed to serialize a key on the scan thread");
             snapScanRequestAbort(sv->scan);
         }
         sv->stage = r.io.buffer.ptr;
@@ -2664,7 +2664,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
         fp = fopen(tmpfile, "w");
         if (!fp) {
-            serverLog(LL_WARNING, "Hybrid BGSAVE: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
+            serverLog(LL_WARNING, "Hybrid snapshot: failed opening the temp RDB file %s: %s", tmpfile, strerror(errno));
             stopSaving(0);
             return C_ERR;
         }
@@ -2830,7 +2830,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     if (fclose(fp)) { fp = NULL; err_op = "fclose"; goto werr; }
     fp = NULL;
     if (rename(tmpfile, sv->filename) == -1) {
-        serverLog(LL_WARNING, "Hybrid BGSAVE: error moving temp DB file %s to %s: %s", tmpfile, sv->filename, strerror(errno));
+        serverLog(LL_WARNING, "Hybrid snapshot: error moving temp DB file %s to %s: %s", tmpfile, sv->filename, strerror(errno));
         unlink(tmpfile);
         stopSaving(0);
         return C_ERR;
@@ -2843,22 +2843,22 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         return C_OK;
     }
     if (fsyncFileDir(sv->filename) != 0) {
-        serverLog(LL_WARNING, "Hybrid BGSAVE: failed to fsync directory: %s", strerror(errno));
+        serverLog(LL_WARNING, "Hybrid snapshot: failed to fsync directory: %s", strerror(errno));
         stopSaving(0);
         return C_ERR;
     }
-    serverLog(LL_NOTICE, "Hybrid BGSAVE done, %ld SNAP_FORK keys serialized by the child, %zu bytes written.",
+    serverLog(LL_NOTICE, "Hybrid snapshot done, %ld SNAP_FORK keys serialized by the child, %zu bytes written.",
               key_counter, rdb->processed_bytes);
     stopSaving(1);
     return C_OK;
 
 werr:
     if (aborted)
-        serverLog(LL_NOTICE, "Hybrid BGSAVE aborted by the parent.");
+        serverLog(LL_NOTICE, "Hybrid snapshot aborted by the parent.");
     else if (errno == 0)
-        serverLog(LL_WARNING, "Hybrid BGSAVE: the parent closed the channel (%s)", err_op);
+        serverLog(LL_WARNING, "Hybrid snapshot: the parent closed the channel (%s)", err_op);
     else
-        serverLog(LL_WARNING, "Hybrid BGSAVE: write error (%s): %s", err_op, strerror(errno));
+        serverLog(LL_WARNING, "Hybrid snapshot: write error (%s): %s", err_op, strerror(errno));
     zfree(payload);
     zfree(bigbuf);
     if (fp) fclose(fp);
@@ -2885,7 +2885,7 @@ static void snapChildReserveArenaRange(void) {
 #endif
     void *p = mmap(lo, len, PROT_NONE, flags, -1, 0);
     if (p == MAP_FAILED)
-        serverLog(LL_WARNING, "Hybrid BGSAVE child: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
+        serverLog(LL_WARNING, "Hybrid snapshot child: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
 #endif
 }
 
@@ -3051,7 +3051,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
         }
     }
     /* Two pipes. The scan thread writes them non-blockingly and keeps what
-     * does not fit in its own queues (bounded by bgsave-hybrid-max-queued-bytes);
+     * does not fit in its own queues (bounded by hybrid-snapshot-max-queued-bytes);
      * the child's read ends stay blocking. Both pipes are deepened to 1 MB
      * (best effort). */
     int *ends[2] = { &sv->pipe_rd, &sv->big_rd };
@@ -3059,7 +3059,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     for (int c = 0; c < 2; c++) {
         int fds[2];
         if (pipe(fds) != 0) {
-            serverLog(LL_WARNING, "Hybrid BGSAVE: pipe() failed: %s", strerror(errno));
+            serverLog(LL_WARNING, "Hybrid snapshot: pipe() failed: %s", strerror(errno));
             snapSaveFree(sv);
             return NULL;
         }
@@ -3070,7 +3070,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
                                                   * sends many small KVOBJ headers between two child reads */
 #endif
         if (fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) == -1) {
-            serverLog(LL_WARNING, "Hybrid BGSAVE: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
+            serverLog(LL_WARNING, "Hybrid snapshot: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
             snapSaveFree(sv);
             return NULL;
         }
@@ -3078,7 +3078,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->shared = mmap(NULL, sizeof(snapShared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (sv->shared == MAP_FAILED) {
         sv->shared = NULL;
-        serverLog(LL_WARNING, "Hybrid BGSAVE: mmap(MAP_SHARED) failed: %s", strerror(errno));
+        serverLog(LL_WARNING, "Hybrid snapshot: mmap(MAP_SHARED) failed: %s", strerror(errno));
         snapSaveFree(sv);
         return NULL;
     }
@@ -3086,8 +3086,8 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->oq = listCreate();
     sv->bq = listCreate();
     sv->oq_pool = listCreate();
-    sv->oq_limit = server.bgsave_hybrid_max_queued_bytes;
-    sv->tag_all = server.bgsave_hybrid_tag_all;
+    sv->oq_limit = server.hybrid_snapshot_max_queued_bytes;
+    sv->tag_all = server.hybrid_snapshot_tag_all;
     snapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
@@ -3145,7 +3145,7 @@ static int snapSaveLaunch(snapSave *sv) {
     snap_save = sv;
     if (snapScanStartThread(sv->scan) != C_OK) {
         /* The child is waiting on the channel: kill it, unfreeze. */
-        serverLog(LL_WARNING, "Hybrid BGSAVE: cannot start the scan thread; aborting the save");
+        serverLog(LL_WARNING, "Hybrid snapshot: cannot start the scan thread; aborting the save");
         killRDBChild();   /* -> snapSaveAbort() unfreezes; the done handler releases */
     } else {
         aeCreateFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE, snapScanAeHandler, sv->scan);
@@ -3191,7 +3191,7 @@ int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rd
     /* A functions-only or slots-only transfer has no keyspace content for
      * the scan thread; the stock child serves it (redisFork maps the arena). */
     if (req & (SLAVE_REQ_RDB_EXCLUDE_DATA | SLAVE_REQ_SLOTS_SNAPSHOT)) return SNAP_NOT_TAKEN;
-    if (!moduleAllModulesHandleHybridBgsave()) {
+    if (!moduleAllModulesHandleHybridSnapshot()) {
         snapHybridFallbackLog();   /* a module's save callbacks need the keyspace */
         return SNAP_NOT_TAKEN;
     }
@@ -3211,7 +3211,7 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
         /* Only a Lua debugger session can leave the arena forkable with no
          * exclusive child around. The hybrid child never touches the arena, so
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
-        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+        serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
     }
     snapSave *sv = snapSaveCreate(req, filename, rsi, rdbflags);
     if (!sv) return C_ERR;
@@ -3240,7 +3240,7 @@ int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
      * drained the pipe. */
     if (server.rdb_pipe_conns) return C_ERR;
     if (snapArenaForkable())
-        serverLog(LL_NOTICE, "Hybrid BGSAVE: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+        serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
 
     snapSave *sv = snapSaveCreate(req, NULL, rsi, RDBFLAGS_REPLICATION);
     if (!sv) return C_ERR;
@@ -3351,7 +3351,7 @@ void snapSaveAbort(void) {
         aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
         sv->ae_registered = 0;
     }
-    serverLog(LL_NOTICE, "Hybrid BGSAVE: scan aborted, keyspace overlay drained.");
+    serverLog(LL_NOTICE, "Hybrid snapshot: scan aborted, keyspace overlay drained.");
 }
 
 /* The one child-end hook: called once for every child that ended, whatever
@@ -3392,7 +3392,7 @@ void snapOnChildEnd(int exitcode, int bysignal) {
     }
     snap_save = NULL;
     snapSaveFree(sv);   /* drains completions, joins, unregisters */
-    serverLog(LL_NOTICE, "Hybrid BGSAVE: scan thread joined and overlay released.");
+    serverLog(LL_NOTICE, "Hybrid snapshot: scan thread joined and overlay released.");
 }
 
 /* ---- Unit tests ---------------------------------------------------------- */
@@ -4461,7 +4461,7 @@ int snapshotTest(int argc, char **argv, int flags) {
     server.in_fork_child = CHILD_TYPE_NONE;
     server.logfile = "";
     server.verbosity = LL_DEBUG;
-    server.bgsave_hybrid = 1;
+    server.hybrid_snapshot = 1;
     snapArenaInit();
 
 #ifdef HAVE_NOFORK_ARENA

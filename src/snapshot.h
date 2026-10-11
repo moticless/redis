@@ -7,7 +7,7 @@
  * GNU Affero General Public License v3 (AGPLv3).
  *
  *
- * WHAT IS HYBRID BGSAVE?
+ * WHAT IS A HYBRID SNAPSHOT?
  * ----------------------
  * A point-in-time snapshot of the keyspace (BGSAVE, full sync, AOF rewrite)
  * that forks a child, as stock does, but keeps the bulk of the keyspace out of
@@ -17,7 +17,7 @@
  * child runs. Typical datasets are many small keys and a few big ones, so the
  * hybrid puts small values where the child cannot see them and serializes them
  * itself; only the big values still come from the child's copy-on-write image.
- * Switched at runtime with `bgsave-hybrid`; design in docs/hybrid-bgsave.md.
+ * Switched at runtime with `hybrid-snapshot`; design in docs/hybrid-snapshot.md.
  *
  * KEY CLASSES AND THE SNAP_NOFORK ARENA
  * -------------------------------------
@@ -60,7 +60,7 @@
  * 5. Completion: as the window moves on, side tables drain into their dicts;
  *    when a dict's scan is complete its overlay is released. The child exits
  *    after END; snapOnChildEnd joins the thread and the stock done handler
- *    runs. Abort (bgsave-hybrid-max-retained-bytes hard mark, FLUSHALL, a
+ *    runs. Abort (hybrid-snapshot-max-retained-bytes hard mark, FLUSHALL, a
  *    killed child) joins the thread, drains every overlay and leaves the
  *    previous dump untouched.
  *
@@ -79,8 +79,8 @@
  * ------
  * The hybrid keeps three things alive beyond stock: fork-instant originals
  * that were replaced or deleted while owed (retained bytes, bounded by
- * `bgsave-hybrid-max-retained-bytes`, the save aborts above it), records
- * queued for the child (`bgsave-hybrid-max-queued-bytes`, the thread waits
+ * `hybrid-snapshot-max-retained-bytes`, the save aborts above it), records
+ * queued for the child (`hybrid-snapshot-max-queued-bytes`, the thread waits
  * above it), and one bit per bucket of every dict the save touched. INFO
  * memory and persistence report all three (snapInfoMemory/Persistence).
  *
@@ -90,7 +90,7 @@
  * sync (disk or diskless) and rewriteAppendOnlyFileBackground call it; it
  * takes the hybrid path when the switch is on, the request has keyspace
  * content and every loaded module has opted in
- * (REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE), else the caller runs the stock
+ * (REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT), else the caller runs the stock
  * child. Functions-only and slot-snapshot transfers always keep the stock child.
  *
  * WHERE TO LOOK
@@ -100,7 +100,7 @@
  * thread); the save (queues, channels, stores vs dbs, hard mark); the child
  * writer; the parent orchestration; unit tests (redis-server test snapshot).
  * kvstore.h / kvsoverlay.c: the overlay (frozen dicts, side tables).
- * zmalloc.c: the arena. docs/hybrid-bgsave.md: the design, with figures.
+ * zmalloc.c: the arena. docs/hybrid-snapshot.md: the design, with figures.
  * All functions here are prefixed "snap".
  */
 
@@ -265,7 +265,7 @@ typedef struct snapRdbCfg {
 } snapRdbCfg;
 snapRdbCfg snapRdbCfgGet(void);
 
-/* ---- Hybrid BGSAVE: the save --------------------------------------------- */
+/* ---- Hybrid snapshot: the save --------------------------------------------- */
 
 /* The one dispatch decision for rdb.c, replication.c and aof.c: C_OK started, C_ERR taken but failed, SNAP_NOT_TAKEN run the stock child. */
 #define SNAP_SAVE_RDB     0   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
@@ -278,8 +278,8 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
 int snapSaveBackgroundAof(void);
 
-/* The runtime switch (bgsave-hybrid) and its CONFIG SET hook (flips the arena, refuses mid-save). */
-static inline int snapHybridEnabled(void) { return server.bgsave_hybrid; }
+/* The runtime switch (hybrid-snapshot) and its CONFIG SET hook (flips the arena, refuses mid-save). */
+static inline int snapHybridEnabled(void) { return server.hybrid_snapshot; }
 int snapHybridConfigApply(const char **err);
 /* A hybrid save is running / this process is its child (no keyspace mapped). */
 int snapSaveInProgress(void);

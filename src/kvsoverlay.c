@@ -12,7 +12,7 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-/* Snapshot overlay of a kvstore (hybrid BGSAVE): the side table that keeps
+/* Snapshot overlay of a kvstore (hybrid snapshot): the side table that keeps
  * main-thread writes out of the buckets the scan thread is reading, and the
  * overlay halves of the kvstore entry points. kvstore.c holds only the
  * dispatch into this file (the public wrappers, the iterators and the dict

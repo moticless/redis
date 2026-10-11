@@ -1,4 +1,4 @@
-# Hybrid BGSAVE benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid; run 10 = the same on a c7i.4xlarge with interleaved configurations; run 11 = mixed, our hybrid vs Valkey forkless on the c7i.4xlarge)
+# Hybrid snapshot benchmarks: save time, peak memory, idle vs traffic, item size (runs 4-5 vs 0c1c74706; run 6 vs upstream 0d6266f2d and Valkey; run 7 vs the teammate's forkless-hybrid POC; run 8 = run 7 on a single core; run 9 = new traffic generator, hot set, vs the teammate's hybrid; run 10 = the same on a c7i.4xlarge with interleaved configurations; run 11 = mixed, our hybrid vs Valkey forkless on the c7i.4xlarge)
 
 Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this directory).
 
@@ -7,7 +7,7 @@ Date: 2026-09-21. Tool: `utils/snap-bench/bench.py` driven by `run.sh` (this dir
 | | |
 |---|---|
 | stock | `0c1c74706` (merge base of this branch, upstream unstable), plain build, `/tmp/redis-base` worktree |
-| hybrid | branch `snapshot-hybrid-bgsave` (commit with the benchmark), plain build, `--bgsave-hybrid yes` |
+| hybrid | branch `snapshot-hybrid-bgsave` (commit with the benchmark), plain build, `--hybrid-snapshot yes` |
 | common flags | `save "" appendonly no activedefrag no disable-thp yes io-threads 1 latency-monitor-threshold 5 jemalloc-bg-thread yes`, dump dir on tmpfs (`/dev/shm`) so save time does not measure disk writeback |
 | host | i7-1260P (4P+8E, 16 threads), 31 GB RAM, kernel 6.8, governor powersave, THP madvise, 2 GB swap partly in use; server pinned to CPUs 0-7, memtier and harness to 8-15 |
 | reps | 2 per cell, medians reported with [min-max] |
@@ -94,7 +94,7 @@ the big values dominate).
 Absolute peak (server RSS + child private pages) on small at 50k writes/s: 509 MB stock vs
 325 MB hybrid on a 299 MB dataset. The hybrid's remaining extra memory is split between the parent
 (overlay clones of the keys written during the save, 4-9 MB, bounded by
-`bgsave-hybrid-max-retained-bytes`) and the child (4-6 MB of its own pages). On mixed the residual
+`hybrid-snapshot-max-retained-bytes`) and the child (4-6 MB of its own pages). On mixed the residual
 35-55 MB is the hashtable hashes, which stay SNAP_FORK and CoW in the child exactly as in stock:
 the design removes small-value, header and table CoW, not big-value CoW.
 
@@ -182,7 +182,7 @@ tmpfs, plain builds, medians of 2 reps with [min-max]. Raw rows appended to
 | config | binary |
 |---|---|
 | up | redis upstream `0d6266f2d` (the branch's merge base), `/tmp/redis-up` |
-| hybrid | this branch at `3da2cd28a`, `--bgsave-hybrid yes` |
+| hybrid | this branch at `3da2cd28a`, `--hybrid-snapshot yes` |
 | valkey-fork | `~/git/valkey` unstable `06d35aca6`, default fork-based BGSAVE |
 | valkey-forkless | same binary, `--forkless-infrastructure-enabled yes --bgsave-default-method forkless` (Valkey serializes on the main thread, no child) |
 
@@ -281,7 +281,7 @@ Raw: `run7.csv`. Same host, same flags and datasets as run 6, medians of 2 reps,
 | config | binary | save path |
 |---|---|---|
 | up | upstream unstable 0d6266f2d, plain build | stock fork |
-| hybrid | this branch 20aa93d06, plain build (`/tmp/redis-hyb` worktree), `--bgsave-hybrid yes` | our hybrid: scan thread serializes arena values, child serializes big values |
+| hybrid | this branch 20aa93d06, plain build (`/tmp/redis-hyb` worktree), `--hybrid-snapshot yes` | our hybrid: scan thread serializes arena values, child serializes big values |
 | yinon-fork | `yinon/forkless-hybrid` 1204d0970 (on dce0c76d4, 15 commits behind our base), plain build, `--bgsave-mode fork` | stock fork of the teammate's tree |
 | yinon-hybrid | same binary, `--bgsave-mode hybrid --forkless-string-max 4096` | child walks its CoW dict and serializes big values, parent helper thread serializes retained small values |
 | yinon-forkless | same binary, `--bgsave-mode forkless --forkless-string-max 4096` | no child: main thread cuts the snapshot and copies, helper serializes |
@@ -506,7 +506,7 @@ Run after the owed-bucket fix, to close TASK-1.21.5 on standalone.
 | `./runtest --single unit/snapshot --accurate` (randomized writers race the save, 100 iterations, plus eviction lru/lfu, module metadata, templated hashes, FLUSHALL, hard mark, killed child, SHUTDOWN, cluster-mode harness) | repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS` | 32/32 passed; the 100-iteration race took 500 s, every iteration byte-identical to the fork instant |
 | `./runtest --single unit/snapshot` | `SANITIZER=address MALLOC=libc` worktree (arena-free mode) | 26/26 passed, no sanitizer report |
 | `./src/redis-server test snapshot` | repo build | 160/160 (5 new checks for the window move inside a section) |
-| full stock suite with `--config bgsave-hybrid yes`, minus AOF / replication / cluster / fork-dependent units | repo build | 1433 tests passed; 5 failed, all replica-based (MASTERAUTH x2, bind-source-addr, pubsubshard setup, maxmemory slave buffers): with the arena on, a replica full sync is refused by design until TASK-1.22; the run then aborted on an untagged BGREWRITEAOF (same refusal). The feature-on suite is not runnable end to end before TASK-1.22 |
+| full stock suite with `--config hybrid-snapshot yes`, minus AOF / replication / cluster / fork-dependent units | repo build | 1433 tests passed; 5 failed, all replica-based (MASTERAUTH x2, bind-source-addr, pubsubshard setup, maxmemory slave buffers): with the arena on, a replica full sync is refused by design until TASK-1.22; the run then aborted on an untagged BGREWRITEAOF (same refusal). The feature-on suite is not runnable end to end before TASK-1.22 |
 | full stock suite, feature off (default config), `./runtest --clients 8` | repo build | all passed (6265 tests), no regression from the window layer being compiled in |
 
 ### Steady-state cost with no save running (feature on vs off, same plain binary 20aa93d06)
@@ -542,7 +542,7 @@ feature-on stock suite needs TASK-1.22 before it can run end to end.
 With the feature on, `redisFork()` flips the arena forkable for the AOF child (one flip logged) and back afterwards
 (`snap_nofork_arena_forkable` 0 when done).
 
-| bgsave-hybrid | rewrite s | aof_last_cow_size | latest_fork_usec |
+| hybrid-snapshot | rewrite s | aof_last_cow_size | latest_fork_usec |
 |---|---|---|---|
 | on (arena flipped forkable for the child) | 0.98 | 18.3 MB | 3.3 ms |
 | off (values in the default allocator) | 0.98 | 19.1 MB | 3.6 ms |
@@ -554,7 +554,7 @@ Nothing about the hybrid save path is involved in this measurement.
 ## Full stock suite with the feature on (TASK-1.22, 2026-09-25, commits f6f680f87 .. 4031dbf4b)
 
 Before the arena fork-visibility flip the feature-on suite could not run end to end (AOF rewrite, diskless sync and module
-forks were refused). After it, `./runtest --config bgsave-hybrid yes --clients 8` on the DEBUG_ASSERTIONS build found, in
+forks were refused). After it, `./runtest --config hybrid-snapshot yes --clients 8` on the DEBUG_ASSERTIONS build found, in
 order, and each was fixed the same day:
 
 | finding | cause | fix |
@@ -571,12 +571,12 @@ Final runs (repo build, `-DREDIS_TEST -DDEBUG_ASSERTIONS`, 8 clients):
 
 | suite | result |
 |---|---|
-| `./runtest --config bgsave-hybrid yes` (run 7 of the day, before the defrag fixes) | 6246 passed, 21 failed, all in unit/memefficiency (the two defrag findings above) |
+| `./runtest --config hybrid-snapshot yes` (run 7 of the day, before the defrag fixes) | 6246 passed, 21 failed, all in unit/memefficiency (the two defrag findings above) |
 | unit/memefficiency alone, feature on, after the fixes | 28 of 28 defrag tests pass (standalone and cluster) |
-| `./runtest --config bgsave-hybrid yes` (final) | 5781 passed, 0 failed, then the cluster harness aborted with "cluster config did not reach a consistent state" while three cluster units ran in parallel; those three units pass alone with the feature on (170 tests). A convergence timeout under load, seen with the feature off too on this laptop in earlier sessions |
+| `./runtest --config hybrid-snapshot yes` (final) | 5781 passed, 0 failed, then the cluster harness aborted with "cluster config did not reach a consistent state" while three cluster units ran in parallel; those three units pass alone with the feature on (170 tests). A convergence timeout under load, seen with the feature off too on this laptop in earlier sessions |
 | `./runtest` (feature off, final) | 6267 passed, 0 failed |
 | unit/snapshot, feature on | 41 of 41; unit tests 165 of 165 |
-| **after the save_gen removal (41868cb93): `./runtest` feature off / `./runtest --config bgsave-hybrid yes`** | **6283 passed, 0 failed / 6270 passed, 0 failed, end to end, no cluster-harness timeout this time** |
+| **after the save_gen removal (41868cb93): `./runtest` feature off / `./runtest --config hybrid-snapshot yes`** | **6283 passed, 0 failed / 6270 passed, 0 failed, end to end, no cluster-harness timeout this time** |
 
 
 ## Per-key save generation removed (TASK-1.21.4, 2026-09-25, commit 41868cb93)
@@ -864,7 +864,7 @@ writes hit a random existing field of the hashes, same-size overwrites elsewhere
 Raw: `run12.csv`, driver `run4g.sh` (per-dataset scale, tmpfs remounted to 24 GB, a watcher deleting the dump files of
 configurations not running so three 3 GB dumps plus two caches fit). Host: a fresh c7i.4xlarge (i-00fe113633e1d929e, 30 GB),
 server on vCPUs 0-3,8-11, load on 4-7,12-15, dumps and dataset cache on tmpfs. Binaries built on the instance: `up` = upstream
-0d6266f2d, `hybrid` = 54b7d4f0c (`--bgsave-hybrid yes`, cap 4 KB), `valkey-forkless` = Valkey unstable 06d35aca6
+0d6266f2d, `hybrid` = 54b7d4f0c (`--hybrid-snapshot yes`, cap 4 KB), `valkey-forkless` = Valkey unstable 06d35aca6
 (`--forkless-infrastructure-enabled yes --bgsave-default-method forkless`). Interleaved per cell, 2 reps, every save `ok`, no
 hard-mark aborts. Scales: small 13.5 (18.9 M keys, 4.1 GB), mixed 16 (19.5 M keys, 4.0 GB), big 16 (240 keys, 3.9 GB).
 **The big dataset changed for this run**: it now has a class of 1M-field hashes (16 x about 100 MB) beside 192 x 100k-field
@@ -1085,7 +1085,7 @@ growth of `used_memory` during the save, `queued peak MB` is `snap_last_save_que
 
 **What changed between the versions.** Before: the scan thread wrote the pipe with blocking `write()`, so while the child
 serialized one 90 MB hash the 1 MB pipe filled and the scan stalled. v1: every message is copied into an owned buffer and
-queued; the pipe write end is non-blocking; past `bgsave-hybrid-max-retained-bytes` the thread waits. v2: the staging
+queued; the pipe write end is non-blocking; past `hybrid-snapshot-max-retained-bytes` the thread waits. v2: the staging
 buffer is handed to the queue without a copy and drained buffers return to a pool (v1 cost 11% scan CPU on small). v3:
 exact allocations, pool for staging-sized buffers only, queue bytes are allocation sizes (v2 let 170-byte KVOBJ messages
 pin 160 KB pooled buffers and let greedy sds doubling make each 64 KB buffer a 160 KB allocation: `used_memory` grew by
@@ -1177,7 +1177,7 @@ in each pair below where a pass has two reps.
 
 ### Pass 5: the queue's own bound, 128 MB vs 256 MB (`run16e.csv`, `run16e.sh`, 41527cab3)
 
-`bgsave-hybrid-max-queued-bytes` (default 128 MB, `hybrid` = ~/redis-after4) against the queue bounded by the 256 MB
+`hybrid-snapshot-max-queued-bytes` (default 128 MB, `hybrid` = ~/redis-after4) against the queue bounded by the 256 MB
 retained limit (`hybrid3`), mixed1m, interleaved, 2 reps (first rep of each pair from a fresh populate).
 
 | rate | queue bound | save s | scan cpu s | child cpu s | extra MB | parent +MB | used_mem +MB | CoW MB | wp99 ms |
@@ -1353,7 +1353,7 @@ forkless` on the primary, the infrastructure flag on the replica) over the same 
 
 Raw: `run19.csv`, driver `run19.sh`. Same host as runs 16-18, later in the day and measurably slower (the 128 MB idle
 mixed1m cells took 32-38 s here against 26-29 in run 17 with the same binary; compare within rows only). BGSAVE, hybrid
-build c5183cd4b, `bgsave-hybrid-max-queued-bytes` 128 MB (the default until this run) vs 16 MB vs 2 MB, mixed1m and small
+build c5183cd4b, `hybrid-snapshot-max-queued-bytes` 128 MB (the default until this run) vs 16 MB vs 2 MB, mixed1m and small
 at 0 and 20k writes/s, interleaved per cell, 2 reps.
 
 | dataset | rate | queue bound | save s | extra MB | queue (parent +MB) | CoW MB | scan cpu s | child cpu s | wp99 ms | wmax ms |
@@ -1426,7 +1426,7 @@ overlay in the dict metadata, reads skip an empty side table). Two reps per cell
 
 Raw: `run21.csv` (BGSAVE) and `run21s.csv` (full sync), driver `~/run21.sh` on the host (recipe: run 17 for part A,
 run 18 for part B). Same instance as run 20 (18.144.225.10). `up` = 0d6266f2d, `hybrid` = e7062762b (TASK-1.21.3 drain,
-TASK-1.21.6 stage A, `bgsave-hybrid-max-queued-bytes` at its 16 MB default). mixed1m at scale 16 (19.2M keys, 4.0 GB),
+TASK-1.21.6 stage A, `hybrid-snapshot-max-queued-bytes` at its 16 MB default). mixed1m at scale 16 (19.2M keys, 4.0 GB),
 HOT=1.0, 2 reps interleaved per cell, every save and sync `ok`. Runs 17 and 18 measured the same cells with the queue
 bound at 128 MB; this run replaces their footnote. Values as rep a / rep b.
 
@@ -1526,7 +1526,7 @@ page-faults (child minor faults 5-167 per save).
 
 Raw: `run23.csv`, driver `~/run23.sh` on the host. Same instance and layout as runs 20-22. One binary, the spool
 commit c85968b09 as first built (every BUFFER message to the spool; the scan thread's close of the spool fixed in the
-same commit but after this run), `hybrid-nospool` = `--bgsave-hybrid-spool no` (pipe + 16 MB queue, run 21's shape),
+same commit but after this run), `hybrid-nospool` = `--hybrid-snapshot-spool no` (pipe + 16 MB queue, run 21's shape),
 `hybrid` = spool on. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates 0 / 20k, 1 rep.
 Values as rep a / rep b.
 
@@ -1562,7 +1562,7 @@ Values as rep a / rep b.
 ## Run 24 (2026-10-01): queue first, spool as the overflow (TASK-1.30 final), mixed1m at 4 GB and small, c7i.4xlarge
 
 Raw: `run24.csv`, driver `~/run24.sh`. Same instance and layout as runs 20-23. Binary bc33196f5: `hybrid-nospool` =
-`--bgsave-hybrid-spool no` (pipe + 16 MB queue, the scan thread waits at the bound), `hybrid` = the default: the queue
+`--hybrid-snapshot-spool no` (pipe + 16 MB queue, the scan thread waits at the bound), `hybrid` = the default: the queue
 fills first, BUFFER messages overflow to the unlinked spool once the queue is at its 16 MB bound, the scan thread
 returns to the queue when the child has drained it to half; the scan thread closes its spool end, the child's exit
 frees the pages. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates 0 / 20k, 1 rep.
@@ -1650,7 +1650,7 @@ The spool's pages are outside `used_memory` and RSS (page cache on disk, RAM on 
 ## Run 29 (2026-10-01): final spool (overflow, aligned punches, committed offset, frontier resume) vs pipe only, c7i.4xlarge
 
 Raw: `run29.csv` (header restored from run 28 after an interrupted first start), driver `~/run29.sh`. Binary fd2034f0b.
-`hybrid-nospool` = `--bgsave-hybrid-spool no`, `hybrid` = default. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps
+`hybrid-nospool` = `--hybrid-snapshot-spool no`, `hybrid` = default. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps
 interleaved; small scale 13.5, rates 0 / 20k, 1 rep. Every save `ok`. "spool peak" is the file's true footprint
 (allocated bytes not yet consumed by the child).
 
@@ -1685,8 +1685,8 @@ interleaved; small scale 13.5, rates 0 / 20k, 1 rep. Every save `ok`. "spool pea
 
 Raw: `run30.csv`, `run30s.csv` (full sync), driver `~/run30.sh`. The user's design: the scan thread feeds two pipes
 (BUFFER messages on a small channel, KVOBJ/END/ABORT on a big one), the child takes the small channel while the
-parent reports a small backlog of 1 MB or more and a big value otherwise, `bgsave-hybrid-max-queued-bytes` default
-100 MB, spool off by default. `hybrid` = that default; `hybrid-spool` = `--bgsave-hybrid-spool yes` (spool as the
+parent reports a small backlog of 1 MB or more and a big value otherwise, `hybrid-snapshot-max-queued-bytes` default
+100 MB, spool off by default. `hybrid` = that default; `hybrid-spool` = `--hybrid-snapshot-spool yes` (spool as the
 small channel's overflow past the bound, in stream order through SPOOL markers); `hybrid-q16` = the two channels
 with run 29's 16 MB bound. mixed1m scale 16, rates 0 / 20k / 50k, 2 reps interleaved; small scale 13.5, rates
 0 / 20k, 2 reps (`hybrid`, `hybrid-spool`); full sync (run 25 recipe) rates 0 / 20k, 1 rep, `hybrid`. Values as
@@ -1941,7 +1941,7 @@ CPU is up 15-20% for stock and hybrid alike (the instance). Valkey forkless on m
 against 49.7 / 53.7).
 
 **One hard-mark abort** (the only one of the run): small 50k, hybrid, rep a. 31 s into the save the server logged
-`0 bytes retained plus 268450621 queued for the child, past bgsave-hybrid-max-retained-bytes (268435456): aborting the save`.
+`0 bytes retained plus 268450621 queued for the child, past hybrid-snapshot-max-retained-bytes (268435456): aborting the save`.
 **The figure was an accounting drift, not memory (TASK-1.32, found 2026-10-04):** `snapSaveEmitBucket` counted every record it
 appended to the main thread's staging buffer in `mq_bytes`, and the hand-over of the stage as a message counted the whole stage
 again; the walker's forwarding subtracted once, so the counter grew by the total volume the main thread emitted ahead of the
@@ -2082,7 +2082,7 @@ and does active defrag recover it? Script `frag.py <binary> <port> <label> [serv
 keys of 3 KB strings (all under the cap), then 30% of the keys converted in pairs (one replaced by a 6 KB value, so it
 crosses the cap and moves to the default arena; the other deleted) so the data bytes stay equal, then `activedefrag yes`
 (ignore-bytes 1, threshold-lower 1, cycle 25-75) until the frag counters stop moving. INFO memory 12 s after each step,
-plus after MEMORY PURGE. Laptop, hybrid = 44a1bb220 (`--bgsave-hybrid yes`, DEBUG_ASSERTIONS build: memory layout
+plus after MEMORY PURGE. Laptop, hybrid = 44a1bb220 (`--hybrid-snapshot yes`, DEBUG_ASSERTIONS build: memory layout
 identical), stock = upstream 0d6266f2d.
 
 **Conversion by SET (exact-size allocation in both binaries), the fair comparison:**

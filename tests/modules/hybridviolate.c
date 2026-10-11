@@ -1,8 +1,8 @@
-/* Test module for the hybrid BGSAVE module contract (TASK-1.25).
+/* Test module for the hybrid snapshot module contract (TASK-1.25).
  *
  * A data type whose rdb_save deliberately reaches for the keyspace (RM_OpenKey
  * on another key and RM_Call) and logs what it got back, so a test can verify
- * (a) without REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE the server falls back
+ * (a) without REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT the server falls back
  * to the stock fork child, and (b) with it the hybrid child refuses those
  * calls (NULL / error) instead of faulting. hv.optin toggles the option at
  * runtime; hv.setlru exercises RM_SetLRU/RM_SetLFU on READ and WRITE handles. */
@@ -78,12 +78,12 @@ static int hv_get(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     return REDISMODULE_OK;
 }
 
-/* HV.OPTIN 0|1: declare (or withdraw) REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE at runtime. */
+/* HV.OPTIN 0|1: declare (or withdraw) REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT at runtime. */
 static int hv_optin(RedisModuleCtx *ctx, RedisModuleString **argv, int argc) {
     if (argc != 2) return RedisModule_WrongArity(ctx);
     long long on;
     if (RedisModule_StringToLongLong(argv[1], &on) != REDISMODULE_OK) return RedisModule_ReplyWithError(ctx, "ERR not an integer");
-    RedisModule_SetModuleOptions(ctx, on ? REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE : 0);
+    RedisModule_SetModuleOptions(ctx, on ? REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT : 0);
     return RedisModule_ReplyWithSimpleString(ctx, "OK");
 }
 

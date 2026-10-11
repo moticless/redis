@@ -84,7 +84,7 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     min_size += key_sds_size;
 
     /* Allocate object memory. Every kvobj header lives in the SNAP_NOFORK
-     * arena (hybrid BGSAVE): the fork child never reads headers directly. */
+     * arena (hybrid snapshot): the fork child never reads headers directly. */
     char *alloc = zmalloc_nofork(min_size);
     kvobj *kv = (kvobj *) (alloc + sizeMetas);
     kv->type = type;
@@ -335,7 +335,7 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
         keyMetaTransition((kvobj *) val, kv);
     
     decrRefCount(val);
-    /* Hybrid BGSAVE placement policy: small single-allocation values live in
+    /* Hybrid snapshot placement policy: small single-allocation values live in
      * the SNAP_NOFORK arena. kvobjSet() is the funnel for every keyspace
      * insertion (dbAdd, RDB/AOF load, RESTORE, overwrite). */
     snapPlaceValue(kv);
@@ -656,7 +656,7 @@ void incrRefCount(robj *o) {
 
 /* Free only the VALUE of an object (inner allocations reachable from o->ptr),
  * leaving the robj/kvobj header allocation and its key metadata alone. Used
- * by the hybrid BGSAVE merge to release a fork-instant original whose header
+ * by the hybrid snapshot merge to release a fork-instant original whose header
  * was cloned (the clone carries the key metadata) but whose value was not
  * shared with the clone. */
 void kvobjFreeValueOnly(robj *o) {

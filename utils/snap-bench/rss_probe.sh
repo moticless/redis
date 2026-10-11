@@ -8,7 +8,7 @@ BASE=/tmp/redis-base/src/redis-server; HYB=/home/moti/git/redis-bgsave/src/redis
 CLI=/home/moti/git/redis-bgsave/src/redis-cli
 FLAGS="--port $PORT --bind 127.0.0.1 --save '' --appendonly no --activedefrag no --disable-thp yes --io-threads 1 --jemalloc-bg-thread yes --daemonize yes --enable-debug-command yes --dir $D --dbfilename probe.rdb --logfile $D/probe-$CFG.log"
 $CLI -p $PORT shutdown nosave >/dev/null 2>&1; sleep 0.5
-if [ "$CFG" = base ]; then eval taskset -c 0-7 $BASE $FLAGS; else eval taskset -c 0-7 $HYB $FLAGS --bgsave-hybrid yes; fi
+if [ "$CFG" = base ]; then eval taskset -c 0-7 $BASE $FLAGS; else eval taskset -c 0-7 $HYB $FLAGS --hybrid-snapshot yes; fi
 for i in $(seq 1 50); do $CLI -p $PORT ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done
 python3 -c "
 import sys; sys.path.insert(0,'.'); import bench

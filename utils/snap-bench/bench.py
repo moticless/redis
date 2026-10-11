@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Hybrid BGSAVE vs stock BGSAVE: save time, peak memory, latency, idle vs traffic,
+Hybrid snapshot vs stock BGSAVE: save time, peak memory, latency, idle vs traffic,
 per dataset shape. One row per (config, dataset, write rate) in a CSV.
 
   bench.py run  --name <cfg> --port P --datasets small,mixed,big --rates 0,20000 --csv out.csv [--scale 1.0]
@@ -225,9 +225,9 @@ def class_weights(r, classes):
     return w
 
 def save_mode(r):
-    """Which save path this build uses: ours (bgsave-hybrid), the teammate POC (bgsave_mode) or valkey (bgsave-default-method)."""
-    cfg = r.config_get("bgsave-hybrid")
-    if "bgsave-hybrid" in cfg: return "hybrid" if cfg["bgsave-hybrid"] == "yes" else "fork"
+    """Which save path this build uses: ours (hybrid-snapshot), the teammate POC (bgsave_mode) or valkey (bgsave-default-method)."""
+    cfg = r.config_get("hybrid-snapshot")
+    if "hybrid-snapshot" in cfg: return "hybrid" if cfg["hybrid-snapshot"] == "yes" else "fork"
     p = r.info("persistence")
     if "bgsave_mode" in p: return p["bgsave_mode"]                      # teammate POC: fork | hybrid | forkless
     cfg = r.config_get("bgsave-default-method")
@@ -290,7 +290,7 @@ def run_cell(a, dataset, rate, est_save):
     row = {"name": a.name, "ts": time.strftime("%Y-%m-%d %H:%M:%S"), "sha": r.info("server").get("redis_git_sha1"),
            "dataset": dataset, "rate": rate, "hot": a.hot, "dbsize": r.dbsize(), "used_mb": mem0 // 2**20,
            "cooled_s": cooled, "temp_c_start": cpu_temp(),
-           "hybrid": int(r.config_get("bgsave-hybrid").get("bgsave-hybrid", "no") == "yes") if "bgsave-hybrid" in str(r.config_get("bgsave-hybrid")) else 0}
+           "hybrid": int(r.config_get("hybrid-snapshot").get("hybrid-snapshot", "no") == "yes") if "hybrid-snapshot" in str(r.config_get("hybrid-snapshot")) else 0}
     row["mode"] = save_mode(r)
     r.execute_command("LATENCY", "RESET")
     secs = int(a.warm + est_save * (3.0 if a.sync_bin else 1.6) + 8)

@@ -348,7 +348,7 @@ typedef uint64_t RedisModuleTimerID;
  * key metadata save, PERSISTENCE and FORK_CHILD server-event handlers) never
  * touch the keyspace: no RedisModule_OpenKey, KeyExists, Scan, ScanKey, Call,
  * DbSize, RandomKey or GetExpire on any key, only the value they are given,
- * module-owned memory and the IO context. A hybrid BGSAVE (bgsave-hybrid yes)
+ * module-owned memory and the IO context. A hybrid snapshot (hybrid-snapshot yes)
  * saves the module's data in a child process that has no keyspace mapped;
  * while a module that registers a data type, aux callbacks or such an event
  * handler is loaded without this flag, hybrid saves fall back to the stock
@@ -358,8 +358,8 @@ typedef uint64_t RedisModuleTimerID;
  * (a RedisModule_StringDMA result, a RedisModuleKey) that a save callback
  * dereferences, and keys are mutated only through a handle opened with
  * REDISMODULE_WRITE, from a module thread only under the GIL. Full contract:
- * docs/hybrid-bgsave.md, section 7. */
-#define REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE    (1<<4)
+ * docs/hybrid-snapshot.md, section 7. */
+#define REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT    (1<<4)
 
 /* Next option flag, must be updated when adding new module flags above!
  * This flag should not be used directly by the module.

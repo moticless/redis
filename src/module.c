@@ -2586,11 +2586,11 @@ void RM_Yield(RedisModuleCtx *ctx, int flags, const char *busy_reply) {
  * and fire nested key-space notifications. Notice: if enabled, the module
  * should protected itself from infinite recursion.
  *
- * REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE:
+ * REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT:
  * Declare that the module's save-side callbacks (rdb_save, aux_save,
  * aux_save2, key metadata save, PERSISTENCE and FORK_CHILD event handlers)
  * never touch the keyspace: they serialize only the value they are given,
- * module-owned memory and the IO context. A hybrid BGSAVE runs them in a child
+ * module-owned memory and the IO context. A hybrid snapshot runs them in a child
  * that has no keyspace mapped; a module that registers a data type, aux
  * callbacks or such an event handler without this flag makes hybrid saves fall
  * back to the stock fork child while it is loaded. */
@@ -4159,7 +4159,7 @@ int RM_SelectDb(RedisModuleCtx *ctx, int newid) {
     return (retval == C_OK) ? REDISMODULE_OK : REDISMODULE_ERR;
 }
 
-/* Module APIs that read the keyspace, refused inside the hybrid BGSAVE child
+/* Module APIs that read the keyspace, refused inside the hybrid snapshot child
  * (which has no keyspace mapped); each is logged once per child. */
 typedef enum {
     MODULE_HYBRID_GUARD_KEYEXISTS = 0,
@@ -6953,11 +6953,11 @@ RedisModuleCallReply *RM_Call(RedisModuleCtx *ctx, const char *cmdname, const ch
     }
     if (ctx->module) ctx->module->in_call++;
 
-    /* Hybrid BGSAVE child: no keyspace to run commands against. */
+    /* Hybrid snapshot child: no keyspace to run commands against. */
     if (moduleHybridChildGuard(ctx->module, MODULE_HYBRID_GUARD_CALL)) {
         errno = EPERM;
         if (error_as_call_replies) {
-            sds msg = sdsnew("the hybrid BGSAVE child has no keyspace; save callbacks must not call commands");
+            sds msg = sdsnew("the hybrid snapshot child has no keyspace; save callbacks must not call commands");
             reply = callReplyCreateError(msg, ctx);
         }
         goto cleanup;
@@ -7771,7 +7771,7 @@ int moduleAllModulesHandleReplAsyncLoad(void) {
     return 1;
 }
 
-/* Hybrid BGSAVE (bgsave-hybrid): does this module have callbacks that the
+/* Hybrid snapshot (hybrid-snapshot): does this module have callbacks that the
  * save child runs? Data types (rdb_save, aux_save), key metadata classes
  * (their save callback) and PERSISTENCE / FORK_CHILD event handlers. */
 static int moduleHasSaveCallbacks(struct RedisModule *module) {
@@ -7790,16 +7790,16 @@ static int moduleHasSaveCallbacks(struct RedisModule *module) {
 }
 
 /* The first loaded module with save callbacks that did not declare
- * REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE, or NULL when every module is fine
+ * REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT, or NULL when every module is fine
  * (or has nothing that runs in the save child). */
-static struct RedisModule *moduleHybridBgsaveBlocker(void) {
+static struct RedisModule *moduleHybridSnapshotBlocker(void) {
     dictIterator di;
     dictEntry *de;
     struct RedisModule *found = NULL;
     dictInitIterator(&di, modules);
     while ((de = dictNext(&di)) != NULL) {
         struct RedisModule *module = dictGetVal(de);
-        if (!(module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) && moduleHasSaveCallbacks(module)) {
+        if (!(module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) && moduleHasSaveCallbacks(module)) {
             found = module;
             break;
         }
@@ -7808,19 +7808,19 @@ static struct RedisModule *moduleHybridBgsaveBlocker(void) {
     return found;
 }
 
-/* Returns 1 when a hybrid BGSAVE may run with the loaded modules, 0 when it
+/* Returns 1 when a hybrid snapshot may run with the loaded modules, 0 when it
  * must fall back to the stock fork child. */
-int moduleAllModulesHandleHybridBgsave(void) {
-    return moduleHybridBgsaveBlocker() == NULL;
+int moduleAllModulesHandleHybridSnapshot(void) {
+    return moduleHybridSnapshotBlocker() == NULL;
 }
 
 /* Name of the module blocking hybrid saves, "" when none (INFO persistence). */
-const char *moduleHybridBgsaveBlockedBy(void) {
-    struct RedisModule *m = moduleHybridBgsaveBlocker();
+const char *moduleHybridSnapshotBlockedBy(void) {
+    struct RedisModule *m = moduleHybridSnapshotBlocker();
     return m ? m->name : "";
 }
 
-/* Hybrid BGSAVE child: the keyspace is not mapped there, so a module save
+/* Hybrid snapshot child: the keyspace is not mapped there, so a module save
  * callback that reaches for it is refused instead of faulting. Logged once
  * per API per child. Returns 1 when the caller must refuse. */
 static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardApi api) {
@@ -7838,8 +7838,8 @@ static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardA
     if (!snapInHybridChild()) return 0;
     if (!(logged & (1u << api))) {
         logged |= 1u << api;
-        serverLog(LL_WARNING, "Module %s called %s inside the hybrid BGSAVE child, which has no keyspace: refused. "
-                              "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE).",
+        serverLog(LL_WARNING, "Module %s called %s inside the hybrid snapshot child, which has no keyspace: refused. "
+                              "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT).",
                   module ? module->name : "?", names[api]);
     }
     return 1;
@@ -9393,7 +9393,7 @@ int moduleTryAcquireGIL(void) {
 }
 
 void moduleReleaseGIL(void) {
-    /* Hybrid BGSAVE: a module thread's keyspace writes end with the GIL. */
+    /* Hybrid snapshot: a module thread's keyspace writes end with the GIL. */
     snapFunnelClose();
     threadHoldsGIL = 0;
     pthread_mutex_unlock(&moduleGIL);
@@ -12662,7 +12662,7 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
 int RM_Fork(RedisModuleForkDoneHandler cb, void *user_data) {
     pid_t childpid;
 
-    /* Hybrid BGSAVE arena: redisFork() flips it forkable for this child. */
+    /* Hybrid snapshot arena: redisFork() flips it forkable for this child. */
     if ((childpid = redisFork(CHILD_TYPE_MODULE)) == 0) {
         /* Child */
         redisSetProcTitle("redis-module-fork");
@@ -13888,10 +13888,10 @@ int moduleOnLoad(int (*onload)(void *, void **, int), const char *path, void *ha
         ACLRecomputeCommandBitsFromCommandRulesAllUsers();
     }
     if (path) serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
-    if (snapHybridEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE) &&
+    if (snapHybridEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) &&
         moduleHasSaveCallbacks(ctx.module))
-        serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_BGSAVE: "
-                              "hybrid BGSAVE falls back to the fork child while it is loaded", ctx.module->name);
+        serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT: "
+                              "hybrid snapshot falls back to the fork child while it is loaded", ctx.module->name);
     ctx.module->onload = 0;
 
     int post_load_err = 0;
@@ -15245,7 +15245,7 @@ size_t moduleCount(void) {
  * ## Key eviction API
  * -------------------------------------------------------------------------- */
 
-/* RM_SetLRU / RM_SetLFU write the kvobj header, which the hybrid BGSAVE scan
+/* RM_SetLRU / RM_SetLFU write the kvobj header, which the hybrid snapshot scan
  * thread reads for the IDLE / FREQ opcodes while the key is owed to it. A
  * handle opened with REDISMODULE_WRITE already went through the write funnel
  * at open time; a READ handle (the documented way to set the idle time
@@ -15255,7 +15255,7 @@ size_t moduleCount(void) {
 static int moduleKeyPrepareLruWrite(RedisModuleKey *key) {
     if (!key->kv) return 0;
     if (key->mode & REDISMODULE_WRITE) return 1;
-    /* A READ handle: during a hybrid BGSAVE an owed key goes through the
+    /* A READ handle: during a hybrid snapshot an owed key goes through the
      * write funnel first, as a WRITE handle did at open time. */
     kvobj *kv = snapPrepareMutation(key->db, key->key, key->kv);
     if (!kv) return 0;

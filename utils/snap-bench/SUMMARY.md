@@ -1,9 +1,9 @@
-# Hybrid BGSAVE vs. stock Redis: current summary
+# Hybrid snapshot vs. stock Redis: current summary
 
 Benchmarks of 2026-09-26 to 2026-10-04 (runs 12, 13, 33, 34, 34b, 36 in `RESULTS.md`; raw CSVs
 alongside). Host: c7i.4xlarge, 4 GB datasets, two interleaved reps per cell, the load generator on
 separate vCPUs. `stock` is upstream `0d6266f2d`; `hybrid` is the `snapshot-hybrid-bgsave` branch with
-default settings (`bgsave-hybrid yes`, 256 MB retained-bytes hard mark, 4 KB small-value cap).
+default settings (`hybrid-snapshot yes`, 256 MB retained-bytes hard mark, 4 KB small-value cap).
 
 Datasets:
 

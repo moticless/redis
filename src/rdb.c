@@ -1346,7 +1346,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
         {
             /* Save min/next HFE expiration time if needed */
             if (o->encoding == OBJ_ENCODING_LISTPACK_EX) {
-                /* On the hybrid BGSAVE scan thread the ExpireMeta of a
+                /* On the hybrid snapshot scan thread the ExpireMeta of a
                  * fork-instant original may be rewritten by the main thread
                  * (ebuckets bookkeeping), so compute the min TTL from the
                  * listpack itself there. */
@@ -1692,7 +1692,7 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On error -1 is returned.
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
-    /* Hybrid BGSAVE: the scan thread serializes with the configuration frozen
+    /* Hybrid snapshot: the scan thread serializes with the configuration frozen
      * at save start and its own LRU clock (snapRdbCfg). */
     snapRdbCfg cfg = snapRdbCfgGet();
     int on_scan = cfg.on_scan;
@@ -2040,7 +2040,7 @@ werr:
  * integer pointed by 'error' is set to the value of errno just after the I/O
  * error. */
 /* Everything that precedes the databases: magic, aux fields, module aux
- * (before), functions. Shared by rdbSaveRio() and the hybrid BGSAVE child. */
+ * (before), functions. Shared by rdbSaveRio() and the hybrid snapshot child. */
 int rdbSaveRioHeader(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *rsi) {
     char magic[10];
 
@@ -2057,7 +2057,7 @@ int rdbSaveRioHeader(int req, rio *rdb, int *error, int rdbflags, rdbSaveInfo *r
     /* Save the hash template registry (id -> field names). Template encoded
      * hashes are then written in compact REF form (id + values) by
      * rdbSaveKeyValuePair. Part of the header so that every producer of the
-     * database records (this loop, the hybrid BGSAVE child) is preceded by it. */
+     * database records (this loop, the hybrid snapshot child) is preceded by it. */
     if (!(req & SLAVE_REQ_RDB_EXCLUDE_DATA)) {
         if (rdbSaveHashTemplates(rdb) == -1) goto werr;
     }
@@ -2264,7 +2264,7 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid BGSAVE: the scan thread and its child write the file; the
+    /* Hybrid snapshot: the scan thread and its child write the file; the
      * stock child below runs only when snapshot.c declines (switch off,
      * functions-only request, or a module without the opt-in). */
     int hybrid = snapSaveTryStart(SNAP_SAVE_RDB, req, filename, rsi, rdbflags);
@@ -5320,7 +5320,7 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
  * the child did not exit for an error, but because we wanted), and performs
  * the cleanup needed. */
 void killRDBChild(void) {
-    /* Hybrid BGSAVE: the scan thread must stop reading the frozen keyspace and
+    /* Hybrid snapshot: the scan thread must stop reading the frozen keyspace and
      * the overlay must be merged before anyone destroys or mutates the dicts. */
     snapSaveAbort();
     kill(server.child_pid, SIGUSR1);
@@ -5349,7 +5349,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     int slots_req = req & SLAVE_REQ_SLOTS_SNAPSHOT;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid BGSAVE: only functions-only and slots-snapshot transfers reach
+    /* Hybrid snapshot: only functions-only and slots-snapshot transfers reach
      * this stock child (see startBgsaveForReplication()); redisFork() flips
      * the SNAP_NOFORK arena forkable for it (see snapArenaBeforeFork()). */
 

@@ -38,16 +38,16 @@ for cfg in ${CFGS:-base hybrid}; do
   case $cfg in
     base)            start base "$BASE" ;;
     up)              start up "$UP" ;;
-    hybrid)          start hybrid "$HYB" --bgsave-hybrid yes ;;
-    hybrid-nocomp)   start hybrid-nocomp "$HYB" --bgsave-hybrid yes --rdbcompression no ;;   # where does the serializer's time go: LZF or the rest
+    hybrid)          start hybrid "$HYB" --hybrid-snapshot yes ;;
+    hybrid-nocomp)   start hybrid-nocomp "$HYB" --hybrid-snapshot yes --rdbcompression no ;;   # where does the serializer's time go: LZF or the rest
     up-nocomp)       start up-nocomp "$UP" --rdbcompression no ;;
-    hybrid-q16)      start hybrid-q16 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 16mb ;;
-    hybrid-q2)       start hybrid-q2 "$HYB" --bgsave-hybrid yes --bgsave-hybrid-max-queued-bytes 2mb ;;
-    hybrid-1ch)      start hybrid-1ch "$HYB" --bgsave-hybrid yes --repl-rdb-channel no ;;   # diskless sync on one connection (parent relays the child's pipe)
+    hybrid-q16)      start hybrid-q16 "$HYB" --hybrid-snapshot yes --hybrid-snapshot-max-queued-bytes 16mb ;;
+    hybrid-q2)       start hybrid-q2 "$HYB" --hybrid-snapshot yes --hybrid-snapshot-max-queued-bytes 2mb ;;
+    hybrid-1ch)      start hybrid-1ch "$HYB" --hybrid-snapshot yes --repl-rdb-channel no ;;   # diskless sync on one connection (parent relays the child's pipe)
     up-1ch)          start up-1ch "$UP" --repl-rdb-channel no ;;
-    hybrid-before)   start hybrid-before "$HYB_BEFORE" --bgsave-hybrid yes ;;
-    hybrid2)         start hybrid2 "$HYB2" --bgsave-hybrid yes ;;
-    hybrid3)         start hybrid3 "$HYB3" --bgsave-hybrid yes ;;
+    hybrid-before)   start hybrid-before "$HYB_BEFORE" --hybrid-snapshot yes ;;
+    hybrid2)         start hybrid2 "$HYB2" --hybrid-snapshot yes ;;
+    hybrid3)         start hybrid3 "$HYB3" --hybrid-snapshot yes ;;
     valkey-fork)     start valkey-fork "$VALKEY" ;;
     valkey-forkless) start valkey-forkless "$VALKEY" --forkless-infrastructure-enabled yes --bgsave-default-method forkless ;;
     yinon-fork)      start yinon-fork "$YINON" --bgsave-mode fork ;;
