@@ -12,6 +12,9 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
+/* Opt in to the private overlay header. */
+#define INCLUDE_KVSOVERLAY_H
+
 #include "fmacros.h"
 
 #include <string.h>

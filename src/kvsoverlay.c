@@ -20,6 +20,9 @@
  * state (bitmaps, pause) lives in the dict's extension slot and is
  * snapshot.c's. */
 
+/* Opt in to the private overlay header. */
+#define INCLUDE_KVSOVERLAY_H
+
 #include "fmacros.h"
 
 #include <string.h>

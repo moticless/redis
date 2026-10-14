@@ -19,7 +19,8 @@
  *
  * WHO INCLUDES THIS
  * -----------------
- * kvstore.c and kvsoverlay.c only; it is not an API. kvstore.c keeps the
+ * kvstore.c and kvsoverlay.c only, each after #define INCLUDE_KVSOVERLAY_H
+ * (any other includer gets an #error); it is not an API. kvstore.c keeps the
  * public entry points and decides, per access, whether the overlay steps in
  * (its inline ovRead/ovWrite/ovFrozen helpers, one load on the common path);
  * kvsoverlay.c holds the overlay halves of those entry points and the side
@@ -66,6 +67,10 @@
  *          takes its overlay along, off the store's drain list; the save
  *          releases it later wherever the dict is.
  */
+
+#ifndef INCLUDE_KVSOVERLAY_H
+#error "kvsoverlay.h is private to kvstore.c and kvsoverlay.c: define INCLUDE_KVSOVERLAY_H before including it"
+#endif
 
 #ifndef KVSOVERLAY_H
 #define KVSOVERLAY_H
