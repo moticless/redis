@@ -1082,13 +1082,13 @@ long long emptyData(int dbnum, int flags, void(callback)(dict*)) {
     /* A hybrid save scans the live dicts from a thread, so a db emptied
      * while it runs hands its structures to the save (emptyDbStructure,
      * emptyDbDetachToSnapshot) and the save finishes with the fork-instant
-     * data, as a stock fork child does from its copy. That holds for every
+     * data, as a classic fork child does from its copy. That holds for every
      * caller: FLUSHDB, and the dbnum == -1 callers (FLUSHALL, DEBUG
      * RELOAD/LOADAOF, a full-sync load, CLUSTER RESET, RM_ResetDataset).
-     * Where stock kills its RDB child (FLUSHALL after emptying, the full-sync
+     * Where the classic save kills its RDB child (FLUSHALL after emptying, the full-sync
      * load before it) the caller's killRDBChild() ends the hybrid save too
      * (snapSaveAbort is hooked into it); the other callers leave it running,
-     * as stock does. */
+     * as the classic save does. */
     int async = (flags & EMPTYDB_ASYNC);
     int with_functions = !(flags & EMPTYDB_NOFUNCTIONS);
     RedisModuleFlushInfoV1 fi = {REDISMODULE_FLUSHINFO_VERSION,!async,dbnum};

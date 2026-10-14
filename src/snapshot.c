@@ -23,7 +23,7 @@
  * takes the small backlog first, then one big value, until END; the parent
  * drains each dict's side table as the window moves past it and completes
  * the save when the child exits (checkChildrenDone -> snapOnChildEnd ->
- * the stock done handler). Abort (hard mark, FLUSHALL, killed child) joins
+ * the classic done handler). Abort (hard mark, FLUSHALL, killed child) joins
  * the thread, drains every overlay and leaves the previous dump untouched.
  *
  * Sections of this file: arena fork visibility; classification and
@@ -48,6 +48,416 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include "atomicvar.h"
+#include "ae.h"
+#include "eventnotifier.h"
+#include <pthread.h>
+#include <poll.h>
+
+/* ---- Constants -------------------------------------------------------- */
+
+/* Slot (dict) states, monotonic; the slot is owed to the save until DONE. */
+#define SNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
+#define SNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */
+#define SNAP_SLOT_SCANNED  2   /* Fully dispatched; waiting for the main thread to complete it. */
+#define SNAP_SLOT_DONE     3   /* Completed by the main thread: side table drained, dict unfrozen. */
+
+/* Bucket window size; per-dict word: save generation and slot state. */
+#define SNAP_WINDOW_BUCKETS_DEFAULT 1024
+#define SNAP_WORD(gen, st) (((uint64_t)(gen) << 8) | (uint64_t)(st))
+#define SNAP_WORD_GEN(w) ((w) >> 8)
+#define SNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
+/* A (store, dict) pair packed in one atomic. */
+#define SNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
+#define SNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
+#define SNAP_SCAN_DEC_DIDX(v) ((int)((v) & 0xffffffffu))
+
+/* Messages to the child and the staging buffers. */
+#define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
+#define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
+#define SNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
+#define SNAP_MSG_ABORT  4
+#define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
+#define SNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
+#define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
+
+/* Where the scan thread is relative to a bucket. */
+#define SNAP_POS_BEHIND 0   /* the thread already read this bucket */
+#define SNAP_POS_INSIDE 1   /* the thread is reading it now */
+#define SNAP_POS_AHEAD  2   /* the thread has not reached it */
+
+/* Outbound queue drain modes and buffer pool. */
+#define SNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
+#define SNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
+#define SNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
+#define SNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
+#define SNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
+
+/* ---- Types ------------------------------------------------------------ */
+
+typedef struct snapScanCtx snapScanCtx;
+/* Scan thread, once per fork-instant key of a slot; strictly read-only on the keyspace. */
+typedef void (snapScanDispatchFn)(void *privdata, int store_idx, int didx, kvobj *kv);
+/* Main thread, when a slot is complete, before its dict is unfrozen ('aborted': not fully scanned). */
+typedef void (snapScanSlotDoneFn)(void *privdata, int store_idx, int didx, int aborted);
+/* Scan thread, after the last slot or on abort, before the scan is published as finished. */
+typedef void (snapScanThreadDoneFn)(void *privdata, int aborted);
+typedef struct snapSave snapSave;
+
+/* Keyspace placement statistics (DEBUG SNAP-PLACEMENT, SNAP-DRIFT). */
+typedef struct snapPlacementStats {
+    long long keys;
+    long long headers_in_arena;        /* every kvobj header should be here */
+    long long headers_outside;
+    long long class_nofork;            /* snapKeyClass() == SNAP_NOFORK */
+    long long class_fork;
+    long long drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
+    long long drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
+    long long violations;              /* header outside, or multi-allocation value inside */
+    long long dict_tables_in_arena;    /* dict structs + bucket arrays of db->keys / db->expires */
+    long long dict_tables_outside;
+} snapPlacementStats;
+
+/* The privdata of every kvstore hook on store s (guard, layout and overlay
+ * callbacks alike, one convention): the scan and the store index, plus what
+ * the overlay's user handed to snapScanSetOverlay for that store. The redisDb
+ * owning a store is resolved at call time (SWAPDB moves a store to another db
+ * id; a FLUSHDB leaves it with no owner), the db id in the dump is always s. */
+struct snapGuardPriv { struct snapScanCtx *ctx; int s; void *user; };
+
+typedef struct snapWindow {
+    dict *d;                 /* NULL: no window (thread between dicts or finished) */
+    int table;               /* -1: the whole dict (the thread is about to read its layout) */
+    unsigned long lo, hi;    /* buckets [lo, hi) */
+} snapWindow;
+
+
+/* What the save keeps per dict in the kvstore extension slot, allocated the
+ * first time the save touches the dict (a write before the scan thread
+ * reached it, or the thread's window on it) and freed when the dict's scan
+ * completes. Meaningful only while the dict's word carries this save's
+ * generation. The side table lives next to it (kvstoreDictMetaBase.ov). */
+typedef struct snapDictState {
+    uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
+                                   bucket's fork-instant chain ahead of the scan thread; main thread
+                                   stores (release), scan thread loads (acquire) */
+    size_t bytes[2];
+    int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
+} snapDictState;
+
+
+/* The scan thread's chain-walk callback arguments. */
+struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
+
+
+struct snapScanCtx {
+    kvstore **stores;               /* One per db (db->keys). */
+    int num_stores;
+    int *num_dicts;                 /* kvstoreNumDicts() per store. */
+    int *frozen;                    /* Per store: 1 while our guard is installed on it (snapScanFreeze() until its last dict completes). */
+    dict ***dicts;                  /* Per store: the fork-instant dicts by slot, one reference each; NULL once completed. */
+    long *nrefs;                    /* Per store: table entries not completed yet; the guard comes off at zero. Main thread. */
+    size_t bitmap_bytes;            /* Bucket bitmaps attached to the table dicts. Main thread. */
+    long retained_dicts;            /* Table dicts their store let go of before the save completed them (freed here). Main thread. */
+    redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), SNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
+    int ended;                      /* Main thread: every store completed; nothing is owed any more. */
+    long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
+    uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
+    const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
+    struct snapGuardPriv *guards;   /* Per store: the privdata of every hook on that store. */
+
+    snapScanDispatchFn *dispatch;
+    snapScanSlotDoneFn *slot_done;
+    void *privdata;
+
+    /* SPSC completion ring, capacity == slots_total (allocated at freeze). */
+    uint64_t *ring;
+    redisAtomic long ring_wr;       /* Written by the thread. */
+    long ring_rd;                   /* Main thread only. */
+    eventNotifier *en;
+
+    pthread_t tid;
+    int started;
+    int joined;
+    redisAtomic int abort;          /* Main -> thread. */
+    redisAtomic int finished;       /* Thread -> main. */
+
+    long slots_total;               /* fork-instant dicts (non-empty at freeze) in the scanned stores */
+    redisAtomic long slots_scanned; /* dicts the thread passed */
+    long slots_done;                /* claimed dicts completed. Main thread only. */
+    redisAtomic long long keys_dispatched;
+
+    /* Keyspace overlay (optional). */
+    kvstoreSnapHooks hooks;         /* installed on every store: the scan's guard and layout hooks plus the user's overlay callbacks */
+    int has_ov;
+    void **ov_priv;                 /* Per store. */
+    int frozen_all;                 /* snapScanFreeze() done. */
+    unsigned long window_buckets;   /* copied from snap_window_buckets at create */
+    redisAtomic long long buckets_skipped;   /* buckets the thread skipped (already emitted) */
+    /* Optional hooks, set by the owner before start. */
+    snapScanThreadDoneFn *thread_done;   /* scan thread, after the last slot or on abort, before the scan is published as finished */
+    void (*thread_init)(void *privdata);   /* first thing on the scan thread */
+    void (*window_done)(void *privdata);   /* after every window, and before thread_done */
+    void (*store_done)(void *privdata, int s);   /* main thread, when a store's last slot completed */
+};
+
+
+typedef struct snapMsgHdr {
+    uint32_t type;
+    int32_t dbid;
+    int32_t slot;
+    uint32_t len;        /* payload bytes */
+    uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation.
+                          * BUFFER: dependency, the number of big values (KVOBJ messages) that
+                          * must precede this buffer in the output (0 = none; reserved for inline
+                          * replication, whose buffers carry commands on big keys) */
+    uint64_t src_addr;   /* KVOBJ: parent address of the copied allocation, to relocate
+                          * pointers into it (an EMBSTR value points inside its kvobj) */
+} snapMsgHdr;
+
+/* records the key and expire counts at the fork instant. RDB stream must announce 
+ * those counts before the keys they describe, and by then the live keyspace has changed. */
+typedef struct snapDbSizes {
+    unsigned long long keys, expires;
+    unsigned long long *slot_keys, *slot_expires;   /* cluster mode */
+    int nslots;
+} snapDbSizes;
+
+/* A db flushed during the save: its fork-instant structures, kept alive for
+ * the scan and freed (on BIO, as FLUSHDB ASYNC does) when the store completes. */
+typedef struct snapFlushedDb {
+    int set;
+    kvstore *keys, *expires, *blessed;
+    void *subexpires;
+    dict *stream_idmp_keys;
+} snapFlushedDb;
+
+/* One page shared with the child (MAP_SHARED, mapped before the fork). */
+typedef struct snapShared {
+    redisAtomic size_t small_queued;   /* small-channel bytes queued in the parent, for the child's choice of channel */
+} snapShared;
+
+struct snapSave {
+    snapScanCtx *scan;
+    void *tables;              /* one block: stores, flushed and sizes below, each dbnum entries */
+    void *bitmaps;             /* cluster mode, one block: slot_filter then trim_slots, CLUSTER_SLOTS bits each; NULL when neither is used */
+    kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
+    snapFlushedDb *flushed;    /* per store */
+    int dbnum;
+    /* Two channels to the child. The small channel carries the
+     * BUFFER messages, the big channel KVOBJ, END and
+     * ABORT, so the child can drain the small backlog first and take a big
+     * value only when that backlog is low: a bounded queue then never parks
+     * the scan thread while the child is inside a big value. */
+    int pipe_rd, pipe_wr;             /* small channel */
+    int big_rd, big_wr;               /* big channel */
+    snapShared *shared;
+    int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
+    snapDbSizes *sizes;
+    int req, rdbflags;
+    int rdb_child_type;        /* server.rdb_child_type once forked: RDB_CHILD_TYPE_DISK/SOCKET, NONE for an AOF rewrite */
+    int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
+    int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
+                                  RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
+    uint8_t *slot_filter;      /* slots_form: the migrating slots at the fork instant (CLUSTER_SLOTS bits); only they are frozen and scanned */
+    char *filename;
+    rdbSaveInfo rsi;
+    int has_rsi;
+    int ae_registered;
+    int aborted;               /* snapSaveAbort() ran; waiting for the child to exit */
+    int hard_mark_hit;         /* retained bytes passed the configured maximum */
+    int failed;                /* a defined failure of ours (hard mark): report status err */
+    size_t retained_bytes;     /* originals kept alive by the overlay (main thread) */
+    size_t retained_peak;
+    redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
+    int maxmemory_policy, rdb_compression;   /* config frozen at start for the scan thread */
+    long long inplace_writes;  /* writes served in place on scanned keys (main thread) */
+    /* Scan-thread staging buffer. */
+    sds stage;
+    int stage_dbid, stage_slot;
+    redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
+    /* Cluster mode: the slots an atomic slot migration was trimming at the
+     * fork instant, one bit each (NULL when none). Their keys are leaving the
+     * node: the classic child skips them, reading the fork-instant copy of the
+     * trim jobs, and so do the two producers here. A trim that starts during
+     * the save is not in the set, as in the classic save. */
+    uint8_t *trim_slots;
+    redisAtomic long long keys_skipped;
+    /* Main-thread emission (emit-ahead): records the main thread serialized
+     * before writing a bucket the thread had not reached. mq_lock guards
+     * mq (ready messages) and mstage (the partial BUFFER of one (db, slot));
+     * the scan thread takes both at every window boundary and forwards them. */
+    pthread_mutex_t mq_lock;
+    list *mq;                           /* complete messages: sds, header followed by payload, as on the pipe */
+    list *mq_ready;                     /* scan thread: the batch swapped out of mq, being forwarded */
+    sds mstage;                         /* a message in the making: header space reserved, records appended */
+    int mstage_dbid, mstage_slot;
+    sds mscratch;                       /* main thread only: one record at a time */
+    redisAtomic size_t mq_bytes;        /* allocation bytes of the messages in mq, not yet forwarded */
+    long long main_buckets;             /* main thread only */
+    redisAtomic long long main_keys;    /* keys the main thread emitted ahead (read by the scan thread: it owes their save delay) */
+    long long delayed_main_keys;        /* scan thread only: main-emitted keys it has slept the key-save delay for */
+    /* Outbound queue: every message the scan thread produces or
+     * forwards waits here for the pipe, which is written non-blockingly, so a
+     * child busy inside one huge fork-class value does not stall the scan.
+     * Owned by the scan thread; oq_bytes and queued_peak are read by INFO. */
+    list *oq;                           /* small channel: sds, header followed by payload */
+    list *bq;                           /* big channel */
+    list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
+    size_t oq_head_off, bq_head_off;    /* bytes of each head message already written */
+    size_t oq_limit;                    /* hybrid-snapshot-max-queued-bytes at save start, 0 = none */
+    redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for both pipes */
+    size_t sq_bytes;                    /* of which the small channel's (scan thread; published to the child) */
+    uint32_t kv_seq;                    /* KVOBJ messages sent so far (scan thread) */
+    uint64_t small_seq;                 /* small-channel messages sent so far (scan thread) */
+    redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
+    /* Output target. A BGSAVE or disk-based sync writes a temp
+     * file renamed at the end. A diskless sync writes the replicas' sockets:
+     * the child owns them, either directly (rdb-channel connections, blocking)
+     * or through the classic rdb pipe that the parent fans out non-blockingly. */
+    int rdb_channel;
+    connection **conns;        /* rdb-channel: the replica connections the child writes */
+    int numconns;
+    int rdb_pipe_write;        /* pipe shape: child's end of server.rdb_pipe_read */
+    int safe_to_exit_pipe;     /* pipe shape: the child waits on it before exiting */
+};
+static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
+
+
+/* What kind of save this is follows from rdb_child_type: NONE is a BGREWRITEAOF. */
+#define snapIsAof(sv) ((sv)->rdb_child_type == RDB_CHILD_TYPE_NONE)
+#define snapToSockets(sv) ((sv)->rdb_child_type == RDB_CHILD_TYPE_SOCKET)
+
+/* ---- Function declarations (used only in this file) ------------------- */
+
+/* ---- SNAP_NOFORK arena ------------------------------------------------ */
+
+/* Address range reserved for the arena, and the part handed to jemalloc so far (0 if unavailable). */
+static size_t snapArenaVaReserved(void);
+static size_t snapArenaVaUsed(void);
+static int snapArenaSetForkable(int forkable);
+
+/* ---- Classification and placement ------------------------------------- */
+
+/* Single-allocation encoding that MAY be SNAP_NOFORK (strings, listpacks, intsets). */
+static int snapEncodingIsNoforkClass(int type, int encoding);
+/* Placement policy: the class a value of this encoding and size should have. */
+static int snapClassify(int type, int encoding, size_t alloc_bytes);
+/* Actual class of a stored value, decided by where its memory is. */
+static int snapKeyClass(const robj *o);
+static void snapPlacementScan(redisDb *db, snapPlacementStats *st);
+static void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
+
+/* ---- Scan engine ------------------------------------------------------ */
+
+/* Create a scan over 'num_stores' kvstores; nothing is frozen or started yet. */
+static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores, snapScanDispatchFn *dispatch,
+                            snapScanSlotDoneFn *slot_done, void *privdata);
+/* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare, drainable). */
+static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
+/* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
+static void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap);
+/* Main thread: freeze every store (the fork instant) and spawn the thread; C_OK / C_ERR. */
+static int snapScanStart(snapScanCtx *ctx);
+/* The same in two steps: freeze first, spawn the thread later (the fork goes in between). */
+static void snapScanFreeze(snapScanCtx *ctx);
+static int snapScanStartThread(snapScanCtx *ctx);
+/* Main thread: complete the slots the thread finished since the last call; returns how many. */
+static int snapScanHandleCompletions(snapScanCtx *ctx);
+/* Readable when a slot completes or the thread exits (-1 if none); register the handler on it with ctx as client data. */
+static int snapScanReadEventFd(snapScanCtx *ctx);
+static void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask);
+/* 1 once the thread has exited (all slots scanned, or aborted). */
+static int snapScanIsFinished(snapScanCtx *ctx);
+/* Main thread: stop and join the thread, complete every slot. */
+static void snapScanAbort(snapScanCtx *ctx);
+/* Main thread: join if needed and free the ctx; every slot must be DONE. */
+static void snapScanRelease(snapScanCtx *ctx);
+/* The scan was aborted; complete every slot of every store (main thread). */
+static inline int snapScanAborted(snapScanCtx *ctx);
+static void snapScanFinishAll(snapScanCtx *ctx);
+/* SNAP_SLOT_* of (store, dict); progress counters for INFO and tests. */
+static int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
+static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
+                      long *slots_done, long long *keys_dispatched);
+
+/* ---- Bucket window and write sections --------------------------------- */
+
+/* Open the section (main thread, or a module thread holding the GIL): the first funnel hook of a command. */
+static void snapFunnelOpen(void);
+/* Inside a section: is the published window on the bucket this key maps to. */
+static int snapWindowCoversKey(dict *d, const void *key);
+/* Buckets per published window (DEBUG SNAP-WINDOW-BUCKETS; tests). */
+static void snapSetWindowBuckets(unsigned long n);
+static unsigned long snapGetWindowBuckets(void);
+
+/* ---- Bucket bitmaps and accounting ------------------------------------ */
+
+/* Per-save bucket bitmaps: a set bit means the main thread already emitted the bucket's chain. */
+static void snapScanMarkBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+static int snapScanBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+/* An attached dict started or finished rehashing: its bitmap follows the new table. */
+static void snapScanDictRehashStarted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
+static void snapScanDictRehashCompleted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
+/* Bitmap accounting: dicts that grew under the save, dicts retained past their store, bitmap bytes. */
+static long snapScanDictsGrown(snapScanCtx *ctx);
+static long snapScanRetainedDicts(snapScanCtx *ctx);
+static size_t snapScanBitmapBytes(snapScanCtx *ctx);
+
+/* ---- Keyspace overlay ------------------------------------------------- */
+
+/* Overlay callbacks (privdata = the store's snapGuardPriv): clone a kvobj into the arena, release a fork-instant original. */
+static void *snapOverlayCloneKey(void *privdata, int didx, void *orig, int *value_shared);
+static void snapOverlayFreeOriginal(void *privdata, int didx, void *orig, int value_shared);
+/* Retained-originals accounting, the db that owns a store, side-table drain. */
+static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
+static void snapSaveRetainedSub(kvobj *orig, int value_shared);
+static redisDb *snapStoreOwnerDb(snapSave *sv, int s);
+static void snapSaveDrainSideTables(void);
+
+/* ---- The save --------------------------------------------------------- */
+
+/* The three saves it dispatches to: same contracts as rdbSaveBackground, rdbSaveToSlavesSockets, rewriteAppendOnlyFileBackground. */
+static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
+static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
+static int snapSaveBackgroundAof(void);
+
+/* ---- Messages to the child -------------------------------------------- */
+
+static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
+static void snapStageFlush(snapSave *sv);
+static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type);
+static void snapOutRecycle(snapSave *sv, sds m);
+
+/* ---- Observability ---------------------------------------------------- */
+
+static size_t snapScanTableBytes(snapScanCtx *ctx);
+/* The running save: slots and keys. */
+static void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+                      long long *keys_fork, long long *bytes_sent);
+/* Retained originals (replaced or tombstoned) and side-table entries; the peak over the last save. */
+static size_t snapSaveRetainedBytes(void);
+static long snapSaveSideEntries(void);
+static size_t snapSaveLastRetainedPeak(void);
+/* Bytes queued for the child (main-thread queue plus the thread's outbound queue); the peak over the last save. */
+static size_t snapSaveQueuedBytes(void);
+static size_t snapSaveLastQueuedPeak(void);
+/* Bitmaps and dicts: bitmap bytes, dicts that grew, fork-instant dicts their store let go of (cumulative). */
+static size_t snapSaveBitmapBytes(void);
+static long snapSaveGrownDicts(void);
+static long snapSaveRetainedDicts(void);
+/* Main-thread work: buckets and keys emitted ahead of the window; in-place writes behind it (this save, last save). */
+static long long snapSaveMainBuckets(void);
+static long long snapSaveMainKeys(void);
+static long long snapSaveInplaceWrites(void);
+static long long snapSaveLastInplaceWrites(void);
+
+/* ---- Defined elsewhere ------------------------------------------------ */
+
+void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int64_t newsize);   /* db.c */
+
+/* ----------------------------------------------------------------------- */
 
 /* The arena itself (reserved DONTFORK address range, extent hooks, per-thread
  * tcache flags, range-aware zfree/zrealloc) lives in zmalloc.c so that sds,
@@ -61,7 +471,7 @@ void snapArenaInit(void) {
         return;
     }
     zmalloc_nofork_set_active(server.hybrid_snapshot);       /* new headers, tables and values go there only when on */
-    if (!server.hybrid_snapshot) snapArenaSetForkable(1);   /* nothing is placed in it; stock forks map it */
+    if (!server.hybrid_snapshot) snapArenaSetForkable(1);   /* nothing is placed in it; classic forks map it */
     serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
                          "%s).", zmalloc_nofork_arena_index(), snapArenaVaReserved() >> 30,
                          server.hybrid_snapshot ? "MADV_DONTFORK: hybrid snapshot on" : "forkable: hybrid-snapshot no");
@@ -79,7 +489,7 @@ static int snap_in_hybrid_child = 0;  /* this process is the hybrid save child: 
 int snapInHybridChild(void) { return snap_in_hybrid_child; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
- * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the stock child runs
+ * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the classic child runs
  * instead. Logged when the blocking module changes, not on every save. */
 static void snapHybridFallbackLog(void) {
     static sds last = NULL;
@@ -91,15 +501,12 @@ static void snapHybridFallbackLog(void) {
                           "REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT", who);
 }
 
-/* Fork visibility of the arena. Normally DONTFORK: the hybrid save's child
- * never maps it. Any other fork (stock RDB save while the feature is off,
- * diskless sync, AOF rewrite, module fork, Lua debugger) needs the keyspace
- * in the child, so redisFork() flips the range to DOFORK first
- * (snapArenaBeforeFork) and resetChildState() flips it back once no child is
- * left and the feature is on (snapArenaChildExited; also on the debugger
- * child reap path). One madvise each way, O(VMAs), O(1) in keys; the fallback
- * child pays stock copy-on-write. A hybrid save started while a debugger
- * child keeps the arena forkable simply maps it in its child. */
+/* Fork visibility of the arena: DONTFORK, so the hybrid child never maps it.
+ * Any other fork (classic save, diskless sync, AOF rewrite, module, Lua
+ * debugger) needs the keyspace, so redisFork() flips it to DOFORK
+ * (snapArenaBeforeFork) and the child reap path flips it back once no child is
+ * left (snapArenaChildExited). One madvise each way, O(1) in keys; that child
+ * pays classic copy-on-write. */
 int snapArenaForkable(void) {
 #ifdef HAVE_NOFORK_ARENA
     return snapArenaAvailable() && zmalloc_nofork_arena_forkable();
@@ -108,7 +515,7 @@ int snapArenaForkable(void) {
 #endif
 }
 
-int snapArenaSetForkable(int forkable) {
+static int snapArenaSetForkable(int forkable) {
 #ifdef HAVE_NOFORK_ARENA
     if (!snapArenaAvailable()) return 0;
     if (!zmalloc_nofork_arena_set_forkable(forkable)) {
@@ -126,18 +533,18 @@ int snapArenaSetForkable(int forkable) {
 void snapArenaBeforeFork(int purpose) {
     UNUSED(purpose);
     if (snap_forking_hybrid || !snapArenaAvailable() || snapArenaForkable()) return;
-    /* A stock child (RDB with the feature off, diskless sync, AOF rewrite,
+    /* A classic child (RDB with the feature off, diskless sync, AOF rewrite,
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
     if (snapArenaSetForkable(1)) {
         snap_arena_fallback = 1;
-        serverLog(LL_NOTICE, "SNAP_NOFORK arena made forkable for a %s child (stock copy-on-write applies)",
+        serverLog(LL_NOTICE, "SNAP_NOFORK arena made forkable for a %s child (classic copy-on-write applies)",
                   strChildType(purpose));
     }
 }
 
 void snapArenaChildExited(void) {
     if (!snap_arena_fallback) return;
-    if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another stock child still runs */
+    if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another classic child still runs */
     snap_arena_fallback = 0;
     if (server.hybrid_snapshot && snapArenaSetForkable(0))
         serverLog(LL_NOTICE, "SNAP_NOFORK arena back to MADV_DONTFORK");
@@ -171,7 +578,7 @@ int snapHybridConfigApply(const char **err) {
 }
 
 
-size_t snapArenaVaReserved(void) {
+static size_t snapArenaVaReserved(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t reserved = 0;
     if (snapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
@@ -181,7 +588,7 @@ size_t snapArenaVaReserved(void) {
 #endif
 }
 
-size_t snapArenaVaUsed(void) {
+static size_t snapArenaVaUsed(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t used = 0;
     if (snapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
@@ -192,10 +599,6 @@ size_t snapArenaVaUsed(void) {
 }
 
 
-
-
-
-
 /* ============================================================================
  * Classification and placement
  * ============================================================================ */
@@ -204,7 +607,7 @@ size_t snapArenaVaUsed(void) {
  * SNAP_NOFORK (strings; listpack list/set/zset/hash; intset; listpack-ex).
  * Multi-allocation encodings (hashtable, skiplist, quicklist, stream, module,
  * arrays) are always SNAP_FORK. */
-int snapEncodingIsNoforkClass(int type, int encoding) {
+static int snapEncodingIsNoforkClass(int type, int encoding) {
     switch (type) {
     case OBJ_STRING:
         return 1; /* int, embstr, raw */
@@ -229,7 +632,7 @@ static inline int snapValueIsInline(int type, int encoding) {
 /* Placement policy: SNAP_NOFORK iff the encoding qualifies and the value's
  * allocation is at most save-small-max-bytes (INT/EMBSTR values have no
  * separate allocation and are always SNAP_NOFORK). */
-int snapClassify(int type, int encoding, size_t alloc_bytes) {
+static int snapClassify(int type, int encoding, size_t alloc_bytes) {
     if (!snapEncodingIsNoforkClass(type, encoding)) return SNAP_FORK;
     if (snapValueIsInline(type, encoding)) return SNAP_NOFORK;
     return alloc_bytes <= server.save_small_max_bytes ? SNAP_NOFORK : SNAP_FORK;
@@ -254,7 +657,7 @@ static void *snapValueAllocPtr(const robj *o) {
  * SNAP_NOFORK arena; otherwise SNAP_FORK. The background scan serializes
  * SNAP_NOFORK keys itself and ships SNAP_FORK keys to the fork child, so this
  * is correct regardless of policy drift. */
-int snapKeyClass(const robj *o) {
+static int snapKeyClass(const robj *o) {
     if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return SNAP_FORK;
     if (snapValueIsInline(o->type, o->encoding)) return SNAP_NOFORK;
     /* No arena: nothing is placed, the class is a pure size decision. */
@@ -405,18 +808,6 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
     return kv;
 }
 
-static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
-/* The privdata of every kvstore hook on store s (guard, layout and overlay
- * callbacks alike, one convention): the scan and the store index, plus what
- * the overlay's user handed to snapScanSetOverlay for that store. The redisDb
- * owning a store is resolved at call time (SWAPDB moves a store to another db
- * id; a FLUSHDB leaves it with no owner), the db id in the dump is always s. */
-struct snapGuardPriv { struct snapScanCtx *ctx; int s; void *user; };
-typedef struct snapSave snapSave;
-static snapSave *snap_save;   /* defined with the save object below */
-static redisDb *snapStoreOwnerDb(snapSave *sv, int s);
-static void snapSaveRetainedSub(kvobj *orig, int value_shared);
-void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int64_t newsize);   /* db.c */
 
 /* Overlay callbacks for the server keyspace (privdata = the store's
  * snapGuardPriv). The clone copies the whole kvobj allocation into a fresh
@@ -424,7 +815,7 @@ void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int6
  * deep-copied, everything else is shared with the original. db->expires and
  * db->subexpires are pointed at the clone. snapOverlayFreeOriginal releases a
  * fork-instant original after the drain. */
-void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
+static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shared) {
     /* The db owning the store right now (NULL once FLUSHDB detached it: no
      * expires/subexpires to keep in step, and no writes reach it anyway). */
     redisDb *db = snap_save ? snapStoreOwnerDb(snap_save, ((struct snapGuardPriv *)privdata)->s) : NULL;
@@ -512,7 +903,7 @@ void *snapOverlayCloneKey(void *privdata, int didx, void *orig_, int *value_shar
  * when the scan already read it, only the header is kept (value_shared = 1).
  * Released through snapOverlayFreeOriginal. */
 
-void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_, int value_shared) {
+static void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_, int value_shared) {
     UNUSED(privdata);
     UNUSED(didx);
     kvobj *orig = orig_;
@@ -548,7 +939,7 @@ void snapValueDetachFromArena(robj *o) {
 
 /* Reply with up to 'limit' keys whose value placement disagrees with its
  * class: "key type encoding drift" per entry (test aid, DEBUG SNAP-DRIFT). */
-void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
+static void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
     kvstoreIterator kvs_it;
     dictEntry *de;
     void *replylen = addReplyDeferredLen(c);
@@ -584,7 +975,7 @@ void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
     setDeferredArrayLen(c, replylen, n);
 }
 
-void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
+static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
     memset(st, 0, sizeof(*st));
     snapPlacementScanTables(db->keys, st);
     snapPlacementScanTables(db->expires, st);
@@ -669,66 +1060,10 @@ void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
  * completes a slot by draining its side table and releasing its state.
  */
 
-#include "atomicvar.h"
-#include "ae.h"
-#include "eventnotifier.h"
-#include <pthread.h>
-#include <poll.h>
-
-struct snapScanCtx {
-    kvstore **stores;               /* One per db (db->keys). */
-    int num_stores;
-    int *num_dicts;                 /* kvstoreNumDicts() per store. */
-    int *frozen;                    /* Per store: 1 while our guard is installed on it (snapScanFreeze() until its last dict completes). */
-    dict ***dicts;                  /* Per store: the fork-instant dicts by slot, one reference each; NULL once completed. */
-    long *nrefs;                    /* Per store: table entries not completed yet; the guard comes off at zero. Main thread. */
-    size_t bitmap_bytes;            /* Bucket bitmaps attached to the table dicts. Main thread. */
-    long retained_dicts;            /* Table dicts their store let go of before the save completed them (freed here). Main thread. */
-    redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), SNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
-    int ended;                      /* Main thread: every store completed; nothing is owed any more. */
-    long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
-    uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
-    const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
-    struct snapGuardPriv *guards;   /* Per store: the privdata of every hook on that store. */
-
-    snapScanDispatchFn *dispatch;
-    snapScanSlotDoneFn *slot_done;
-    void *privdata;
-
-    /* SPSC completion ring, capacity == slots_total (allocated at freeze). */
-    uint64_t *ring;
-    redisAtomic long ring_wr;       /* Written by the thread. */
-    long ring_rd;                   /* Main thread only. */
-    eventNotifier *en;
-
-    pthread_t tid;
-    int started;
-    int joined;
-    redisAtomic int abort;          /* Main -> thread. */
-    redisAtomic int finished;       /* Thread -> main. */
-
-    long slots_total;               /* fork-instant dicts (non-empty at freeze) in the scanned stores */
-    redisAtomic long slots_scanned; /* dicts the thread passed */
-    long slots_done;                /* claimed dicts completed. Main thread only. */
-    redisAtomic long long keys_dispatched;
-
-    /* Keyspace overlay (optional). */
-    kvstoreSnapHooks hooks;         /* installed on every store: the scan's guard and layout hooks plus the user's overlay callbacks */
-    int has_ov;
-    void **ov_priv;                 /* Per store. */
-    int frozen_all;                 /* snapScanFreeze() done. */
-    unsigned long window_buckets;   /* copied from snap_window_buckets at create */
-    redisAtomic long long buckets_skipped;   /* buckets the thread skipped (already emitted) */
-    snapScanThreadDoneFn *thread_done;
-    void (*thread_init)(void *privdata);   /* first thing on the scan thread */
-    void (*window_done)(void *privdata);   /* after every window, and before thread_done */
-    void (*store_done)(void *privdata, int s);   /* main thread, when a store's last slot completed */
-};
 
 static __thread int snap_on_scan_thread = 0;
 static __thread int snap_scan_maxmemory_policy = 0;
 static __thread int snap_scan_rdb_compression = 0;
-int snapOnScanThread(void) { return snap_on_scan_thread; }
 static __thread int snap_main_emitting = 0;   /* main thread: inside an emit-ahead serialization */
 
 /* The RDB serializer's configuration, read through one call (rdb.c). On the
@@ -736,7 +1071,7 @@ static __thread int snap_main_emitting = 0;   /* main thread: inside an emit-ahe
  * frozen at save start, since the main thread may change the live ones while
  * the thread runs, and the LRU clock is computed by the thread itself
  * (LRU_CLOCK reads server.hz, which dynamic-hz adjusts on the main thread).
- * The key-save delay applies only in stock contexts: the scan thread applies
+ * The key-save delay applies only in classic contexts: the scan thread applies
  * its own atomic copy and the main thread's emit-ahead must not slow the
  * command that triggered it. */
 snapRdbCfg snapRdbCfgGet(void) {
@@ -750,16 +1085,10 @@ snapRdbCfg snapRdbCfgGet(void) {
 
 /* ---- Bucket window and write sections (see snapshot.h) ------------------ */
 
-#define SNAP_WINDOW_BUCKETS_DEFAULT 1024
 static unsigned long snap_window_buckets = SNAP_WINDOW_BUCKETS_DEFAULT;
-void snapSetWindowBuckets(unsigned long n) { snap_window_buckets = n ? n : 1; }
-unsigned long snapGetWindowBuckets(void) { return snap_window_buckets; }
+static void snapSetWindowBuckets(unsigned long n) { snap_window_buckets = n ? n : 1; }
+static unsigned long snapGetWindowBuckets(void) { return snap_window_buckets; }
 
-typedef struct snapWindow {
-    dict *d;                 /* NULL: no window (thread between dicts or finished) */
-    int table;               /* -1: the whole dict (the thread is about to read its layout) */
-    unsigned long lo, hi;    /* buckets [lo, hi) */
-} snapWindow;
 
 /* Double-buffered by sequence parity: the thread fills snap_win[(seq+1)&1]
  * and then publishes seq+1; the main thread reads snap_win[seq&1] inside a
@@ -784,7 +1113,6 @@ static void snapWindowPublish(dict *d, int table, unsigned long lo, unsigned lon
  * may have read the previous window is still open. A section opened after
  * this point has seen the new window (store-buffer argument, both sides
  * seq_cst). Sections are short (one command at most). */
-static inline int snapScanAborted(snapScanCtx *ctx);
 static void snapWalkerQuiesce(snapScanCtx *ctx) {
     uint64_t v;
     atomicGetWithSync(snap_funnel_seq, v);
@@ -812,14 +1140,12 @@ static void snapWalkerQuiesce(snapScanCtx *ctx) {
  * The scan thread waits for any section open at publication time to close
  * before it reads the new window, so a link obtained inside a section stays
  * valid until the section ends. Both sides use seq_cst store-then-load pairs. */
-void snapFunnelOpen(void) {
+static void snapFunnelOpen(void) {
     uint64_t v;
     atomicGet(snap_funnel_seq, v);          /* single writer: relaxed read of our own value */
     if (v & 1) return;
     atomicSetWithSync(snap_funnel_seq, v + 1);   /* seq_cst: pairs with snapWindowPublish */
 }
-
-static void snapSaveDrainSideTables(void);
 
 void snapFunnelCloseSlow(void) {
     uint64_t v;
@@ -834,7 +1160,7 @@ void snapFunnelCloseSlow(void) {
 
 /* 1 if the scan thread's published window covers the bucket 'key' maps to in
  * 'd'. Only meaningful inside an open write section. */
-int snapWindowCoversKey(dict *d, const void *key) {
+static int snapWindowCoversKey(dict *d, const void *key) {
     uint64_t seq;
     atomicGetWithSync(snap_win_seq, seq);
     if (seq == 0) return 0;
@@ -866,26 +1192,10 @@ static int snapWindowOnDict(dict *d) {
  * rest of the state (bitmaps, overlay, pause) is attached on first touch
  * and freed when the dict completes. */
 
-#define SNAP_WORD(gen, st) (((uint64_t)(gen) << 8) | (uint64_t)(st))
-#define SNAP_WORD_GEN(w) ((w) >> 8)
-#define SNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
-
 static inline kvstoreDictMetaBase *snapMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
 static inline uint64_t snapWordLoad(dict *d) { return __atomic_load_n(&snapMeta(d)->ext_word, __ATOMIC_ACQUIRE); }
 static inline void snapWordStore(dict *d, uint64_t w) { __atomic_store_n(&snapMeta(d)->ext_word, w, __ATOMIC_RELEASE); }
 /* The attached state, either thread (the main thread publishes it with release). */
-/* What the save keeps per dict in the kvstore extension slot, allocated the
- * first time the save touches the dict (a write before the scan thread
- * reached it, or the thread's window on it) and freed when the dict's scan
- * completes. Meaningful only while the dict's word carries this save's
- * generation. The side table lives next to it (kvstoreDictMetaBase.ov). */
-typedef struct snapDictState {
-    uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
-                                   bucket's fork-instant chain ahead of the scan thread; main thread
-                                   stores (release), scan thread loads (acquire) */
-    size_t bytes[2];
-    int paused;                 /* rehash and auto-resize paused for the thread's read of the layout */
-} snapDictState;
 static inline snapDictState *snapStateOf(dict *d) { return __atomic_load_n(&snapMeta(d)->ext, __ATOMIC_ACQUIRE); }
 
 /* The save's table of fork-instant dicts (filled at freeze, one reference
@@ -935,13 +1245,13 @@ static inline uint8_t *snapScanBitmap(snapScanCtx *ctx, int s, int didx, int tab
  * bucket's chain was already emitted into the snapshot by the main thread
  * (ahead of the window); the scan thread skips such buckets. Mark only
  * buckets ahead of the published window, inside a write section. */
-void snapScanMarkBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
+static void snapScanMarkBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
     uint8_t *bm = snapScanBitmap(ctx, s, didx, table);
     serverAssert(bm != NULL);
     __atomic_fetch_or(&bm[idx >> 3], (uint8_t)(1u << (idx & 7)), __ATOMIC_RELAXED);
 }
 
-int snapScanBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
+static int snapScanBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
     uint8_t *bm = snapScanBitmap(ctx, s, didx, table);
     if (!bm) return 0;
     return (__atomic_load_n(&bm[idx >> 3], __ATOMIC_RELAXED) >> (idx & 7)) & 1;
@@ -950,7 +1260,7 @@ int snapScanBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned
 /* Bucket bitmaps of this save (they live in the dicts' metadata; accounted
  * here, main thread). */
 /* The scan's own tables: the per-store dict tables and the completion ring. */
-size_t snapScanTableBytes(snapScanCtx *ctx) {
+static size_t snapScanTableBytes(snapScanCtx *ctx) {
     size_t n = ctx->slots_total ? ctx->slots_total : 1;
     size_t bytes = n * sizeof(uint64_t);   /* ring */
     for (int s = 0; s < ctx->num_stores; s++)
@@ -958,7 +1268,7 @@ size_t snapScanTableBytes(snapScanCtx *ctx) {
     return bytes;
 }
 
-size_t snapScanBitmapBytes(snapScanCtx *ctx) {
+static size_t snapScanBitmapBytes(snapScanCtx *ctx) {
     return ctx ? ctx->bitmap_bytes : 0;
 }
 
@@ -973,27 +1283,6 @@ static void snapScanBitmapAlloc(snapScanCtx *ctx, snapDictState *sn, dict *d) {
     }
 }
 
-/* Optional hooks on the scan thread: 'init' before the first slot, 'done'
- * after the last slot (or on abort) before the scan is published as finished. */
-void snapScanSetThreadDone(snapScanCtx *ctx, snapScanThreadDoneFn *fn) {
-    ctx->thread_done = fn;
-}
-
-void snapScanSetThreadInit(snapScanCtx *ctx, void (*fn)(void *privdata)) {
-    ctx->thread_init = fn;
-}
-
-/* Optional hook run on the scan thread after every bucket window and once
- * more before thread_done (with no window published and the main thread's
- * open write section closed): where the main-thread queue is drained. */
-void snapScanSetWindowDone(snapScanCtx *ctx, void (*fn)(void *privdata)) {
-    ctx->window_done = fn;
-}
-
-void snapScanSetStoreDone(snapScanCtx *ctx, void (*fn)(void *privdata, int s)) {
-    ctx->store_done = fn;
-}
-
 /* Attach the keyspace overlay (kvstore.h) to the scan: a dict gets an
  * overlay the first time the guard attaches it; its side table drains on
  * the main thread as the window moves and is released when its slot
@@ -1006,12 +1295,12 @@ void snapScanSetStoreDone(snapScanCtx *ctx, void (*fn)(void *privdata, int s)) {
  * mode; the bitmap must outlive the scan). Dicts outside the set are never
  * frozen: the guard treats them as not the save's, so their writes are plain
  * writes, and the thread's pass never visits them. */
-void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap) {
+static void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap) {
     serverAssert(!ctx->started);
     ctx->slot_filter = bitmap;
 }
 
-void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
+static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
 {
     serverAssert(!ctx->started);
     ctx->hooks.clone = hooks->clone;
@@ -1022,10 +1311,6 @@ void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **
     ctx->has_ov = 1;
     ctx->ov_priv = store_privdata;
 }
-
-#define SNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
-#define SNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
-#define SNAP_SCAN_DEC_DIDX(v) ((int)((v) & 0xffffffffu))
 
 static uint64_t snap_scan_gen = 0;   /* generation of the last scan context created */
 static long snap_stat_retained_dicts = 0;   /* table dicts freed by a save, across saves (INFO snap_retained_dicts) */
@@ -1038,7 +1323,7 @@ static long snap_stat_retained_dicts = 0;   /* table dicts freed by a save, acro
  * the main thread when a slot is complete, BEFORE its dict is unfrozen and
  * its state becomes DONE ('aborted' = 1 when the slot was not fully scanned);
  * the dict's side table is drained and its save state released right after. */
-snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
+static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata)
 {
@@ -1195,7 +1480,7 @@ static snapDictState *snapScanOwnState(snapScanCtx *ctx, dict *d) {
 
 /* An attached, unreached dict grew or finished rehashing: its bitmap follows
  * the table. */
-void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
+static void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
     snapDictState *sn = snapScanOwnState(ctx, d);
@@ -1235,7 +1520,7 @@ void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
 }
 
 /* The rehash completed: the new table is the table. */
-void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
+static void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
     snapDictState *sn = snapScanOwnState(ctx, d);
@@ -1250,12 +1535,10 @@ void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
     sn->bytes[1] = 0;
 }
 
-long snapScanDictsGrown(snapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
-long snapScanRetainedDicts(snapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
+static long snapScanDictsGrown(snapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
+static long snapScanRetainedDicts(snapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
 
 /* Chain-walk callback on the scan thread: decode the entry and dispatch. */
-struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
-
 static void snapScanEntryCb(void *privdata, const dictEntry *de, dictEntry **plink) {
     UNUSED(plink);
     struct snapScanEntryArgs *a = privdata;
@@ -1355,7 +1638,7 @@ static void *snapScanThreadMain(void *arg) {
  * may run on the main thread between this call and the fork of the writer
  * child. One pass per non-empty store: a reference and a pointer per
  * fork-instant dict, nothing allocated per dict. */
-void snapScanFreeze(snapScanCtx *ctx) {
+static void snapScanFreeze(snapScanCtx *ctx) {
     serverAssert(!ctx->started && !ctx->frozen_all);
     snapWindowPublish(NULL, 0, 0, 0);   /* no thread yet: drop any stale window of a previous save */
     for (int s = 0; s < ctx->num_stores; s++) snapScanFreezeStore(ctx, s);
@@ -1364,7 +1647,7 @@ void snapScanFreeze(snapScanCtx *ctx) {
 }
 
 /* Main thread. Spawn the scan thread over an already frozen keyspace. */
-int snapScanStartThread(snapScanCtx *ctx) {
+static int snapScanStartThread(snapScanCtx *ctx) {
     serverAssert(!ctx->started && ctx->frozen_all);
     if (pthread_create(&ctx->tid, NULL, snapScanThreadMain, ctx) != 0) {
         serverLog(LL_WARNING, "snapScanStartThread: pthread_create failed: %s", strerror(errno));
@@ -1373,8 +1656,6 @@ int snapScanStartThread(snapScanCtx *ctx) {
     ctx->started = 1;
     return C_OK;
 }
-
-static void snapScanFinishAll(snapScanCtx *ctx);
 
 /* Main thread. Installs the snapshot guard on every non-empty store
  * (kvstore.h) and spawns the scan thread. Nothing is visited, paused or
@@ -1386,7 +1667,7 @@ static void snapScanFinishAll(snapScanCtx *ctx);
  * dict goes through the overlay hooks: in place once the snapshot holds the
  * bucket, to the side table while the thread reads it.
  * snapScanStart() == snapScanFreeze() + snapScanStartThread(). */
-int snapScanStart(snapScanCtx *ctx) {
+static int snapScanStart(snapScanCtx *ctx) {
     snapScanFreeze(ctx);
     if (snapScanStartThread(ctx) != C_OK) {
         /* Nothing was scanned: complete whatever was attached as aborted
@@ -1459,7 +1740,7 @@ static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted)
  * each, calls slot_done, unfreezes the dict and publishes DONE. Returns the
  * number of slots completed. Also to be called once after
  * snapScanIsFinished() to drain the tail. */
-int snapScanHandleCompletions(snapScanCtx *ctx) {
+static int snapScanHandleCompletions(snapScanCtx *ctx) {
     int n = 0;
     long wr;
     atomicGetWithSync(ctx->ring_wr, wr);   /* acquire */
@@ -1491,7 +1772,7 @@ static void snapScanFinishAll(snapScanCtx *ctx) {
     ctx->ended = 1;
 }
 
-int snapScanIsFinished(snapScanCtx *ctx) {
+static int snapScanIsFinished(snapScanCtx *ctx) {
     int v;
     atomicGetWithSync(ctx->finished, v);
     return v;
@@ -1507,7 +1788,7 @@ static void snapScanJoin(snapScanCtx *ctx) {
 /* Main thread. Asks the thread to stop (it stops within one cursor step),
  * joins it, drains fully-scanned slots normally and completes every other
  * slot with aborted=1, unfreezing all dicts. */
-void snapScanAbort(snapScanCtx *ctx) {
+static void snapScanAbort(snapScanCtx *ctx) {
     if (!ctx->started) {
         /* Frozen but no thread (fork failure path): unfreeze everything. */
         if (ctx->frozen_all) snapScanFinishAll(ctx);
@@ -1524,7 +1805,7 @@ void snapScanAbort(snapScanCtx *ctx) {
 /* Main thread. Joins the thread if still running (does not abort it: call
  * snapScanAbort() first if the scan may be in progress) and frees the ctx.
  * Every slot must be DONE by then unless the ctx was never started. */
-void snapScanRelease(snapScanCtx *ctx) {
+static void snapScanRelease(snapScanCtx *ctx) {
     if (ctx == NULL) return;
     snapScanJoin(ctx);
     if (ctx->started) {
@@ -1549,7 +1830,7 @@ void snapScanRelease(snapScanCtx *ctx) {
 
 /* Either thread. DONE for a slot the save holds nothing of (empty at the
  * fork instant, created since, or completed). */
-int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
+static int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
     if (ctx->ended || !ctx->frozen[store_idx]) return SNAP_SLOT_DONE;
     dict *d = snapTableDict(ctx, store_idx, didx);
     if (!d) return SNAP_SLOT_DONE;
@@ -1559,11 +1840,11 @@ int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
 /* Readable fd that becomes ready whenever a slot completes or the thread
  * exits; register snapScanAeHandler() on it with AE_READABLE and 'ctx' as
  * client data. -1 if unavailable. */
-int snapScanReadEventFd(snapScanCtx *ctx) {
+static int snapScanReadEventFd(snapScanCtx *ctx) {
     return ctx->en ? getReadEventFd(ctx->en) : -1;
 }
 
-void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
+static void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
@@ -1574,7 +1855,7 @@ void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask)
 
 /* Progress for INFO / tests: dicts allocated at freeze in the scanned
  * stores, dicts the thread passed, dicts finished (completed or skipped). */
-void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
+static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched)
 {
     if (slots_total) *slots_total = ctx->slots_total;
@@ -1610,170 +1891,41 @@ void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
  * The child owns the output: RDB header, SELECTDB/RESIZEDB/SLOT_INFO (or
  * SELECT in AOF command form) tracked per message, records, footer, fsync,
  * rename; or the replica sockets for a diskless sync. Completion and abort
- * both flow through the stock child machinery (checkChildrenDone -> the done
+ * both flow through the classic child machinery (checkChildrenDone -> the done
  * handler -> snapOnChildEnd).
  */
 
-#define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
-#define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
-#define SNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
-#define SNAP_MSG_ABORT  4
-#define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
-#define SNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
-#define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
-
-typedef struct snapMsgHdr {
-    uint32_t type;
-    int32_t dbid;
-    int32_t slot;
-    uint32_t len;        /* payload bytes */
-    uint32_t robj_off;   /* KVOBJ: offset of the robj inside the copied allocation.
-                          * BUFFER: dependency, the number of big values (KVOBJ messages) that
-                          * must precede this buffer in the output (0 = none; reserved for inline
-                          * replication, whose buffers carry commands on big keys) */
-    uint64_t src_addr;   /* KVOBJ: parent address of the copied allocation, to relocate
-                          * pointers into it (an EMBSTR value points inside its kvobj) */
-} snapMsgHdr;
-
-typedef struct snapDbSizes {
-    unsigned long long keys, expires;
-    unsigned long long *slot_keys, *slot_expires;   /* cluster mode */
-    int nslots;
-} snapDbSizes;
-
-/* A db flushed during the save: its fork-instant structures, kept alive for
- * the scan and freed (on BIO, as FLUSHDB ASYNC does) when the store completes. */
-typedef struct snapFlushedDb {
-    int set;
-    kvstore *keys, *expires, *blessed;
-    void *subexpires;
-    dict *stream_idmp_keys;
-} snapFlushedDb;
-
-/* One page shared with the child (MAP_SHARED, mapped before the fork). */
-typedef struct snapShared {
-    redisAtomic size_t small_queued;   /* small-channel bytes queued in the parent, for the child's choice of channel */
-} snapShared;
-
-struct snapSave {
-    snapScanCtx *scan;
-    kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
-    snapFlushedDb *flushed;    /* per store */
-    int dbnum;
-    /* Two channels to the child. The small channel carries the
-     * BUFFER messages, the big channel KVOBJ, END and
-     * ABORT, so the child can drain the small backlog first and take a big
-     * value only when that backlog is low: a bounded queue then never parks
-     * the scan thread while the child is inside a big value. */
-    int pipe_rd, pipe_wr;             /* small channel */
-    int big_rd, big_wr;               /* big channel */
-    snapShared *shared;
-    int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
-    snapDbSizes *sizes;
-    int req, rdbflags;
-    int child_type;            /* CHILD_TYPE_RDB (BGSAVE, full sync) or CHILD_TYPE_AOF (BGREWRITEAOF) */
-    int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
-    int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
-                                  RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
-    uint8_t *slot_filter;      /* slots_form: the migrating slots at the fork instant (CLUSTER_SLOTS bits); only they are frozen and scanned */
-    char *filename;
-    rdbSaveInfo rsi;
-    int has_rsi;
-    int ae_registered;
-    int aborted;               /* snapSaveAbort() ran; waiting for the child to exit */
-    int hard_mark_hit;         /* retained bytes passed the configured maximum */
-    int failed;                /* a defined failure of ours (hard mark): report status err */
-    size_t retained_bytes;     /* originals kept alive by the overlay (main thread) */
-    size_t retained_peak;
-    redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
-    int maxmemory_policy, rdb_compression;   /* config frozen at start for the scan thread */
-    long long inplace_writes;  /* writes served in place on scanned keys (main thread) */
-    /* Scan-thread staging buffer. */
-    sds stage;
-    int stage_dbid, stage_slot;
-    redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
-    /* Cluster mode: the slots an atomic slot migration was trimming at the
-     * fork instant, one bit each (NULL when none). Their keys are leaving the
-     * node: stock's child skips them, reading the fork-instant copy of the
-     * trim jobs, and so do the two producers here. A trim that starts during
-     * the save is not in the set, as in stock. */
-    uint8_t *trim_slots;
-    redisAtomic long long keys_skipped;
-    /* Main-thread emission (emit-ahead): records the main thread serialized
-     * before writing a bucket the thread had not reached. mq_lock guards
-     * mq (ready messages) and mstage (the partial BUFFER of one (db, slot));
-     * the scan thread takes both at every window boundary and forwards them. */
-    pthread_mutex_t mq_lock;
-    list *mq;
-    sds mstage;
-    int mstage_dbid, mstage_slot;
-    sds mscratch;                       /* main thread only: one record at a time */
-    redisAtomic size_t mq_bytes;        /* payload bytes queued and not yet sent */
-    long long main_buckets;             /* main thread only */
-    redisAtomic long long main_keys;    /* keys the main thread emitted ahead (read by the scan thread: it owes their save delay) */
-    long long delayed_main_keys;        /* scan thread only: main-emitted keys it has slept the key-save delay for */
-    /* Outbound queue: every message the scan thread produces or
-     * forwards waits here for the pipe, which is written non-blockingly, so a
-     * child busy inside one huge fork-class value does not stall the scan.
-     * Owned by the scan thread; oq_bytes and queued_peak are read by INFO. */
-    list *oq;                           /* small channel: sds, header followed by payload */
-    list *bq;                           /* big channel */
-    list *oq_pool;                      /* drained message buffers kept for reuse (scan thread) */
-    size_t oq_head_off, bq_head_off;    /* bytes of each head message already written */
-    size_t oq_limit;                    /* hybrid-snapshot-max-queued-bytes at save start, 0 = none */
-    redisAtomic size_t oq_bytes;        /* allocation bytes of the messages queued for both pipes */
-    size_t sq_bytes;                    /* of which the small channel's (scan thread; published to the child) */
-    uint32_t kv_seq;                    /* KVOBJ messages sent so far (scan thread) */
-    uint64_t small_seq;                 /* small-channel messages sent so far (scan thread) */
-    redisAtomic size_t queued_peak;     /* max of oq_bytes + mq_bytes seen by the scan thread */
-    /* Output target. A BGSAVE or disk-based sync writes a temp
-     * file renamed at the end. A diskless sync writes the replicas' sockets:
-     * the child owns them, either directly (rdb-channel connections, blocking)
-     * or through the stock rdb pipe that the parent fans out non-blockingly. */
-    int to_sockets;
-    int rdb_channel;
-    connection **conns;        /* rdb-channel: the replica connections the child writes */
-    int numconns;
-    int rdb_pipe_write;        /* pipe shape: child's end of server.rdb_pipe_read */
-    int safe_to_exit_pipe;     /* pipe shape: the child waits on it before exiting */
-};
-
-typedef struct snapQueuedMsg {
-    snapMsgHdr h;
-    sds payload;
-} snapQueuedMsg;
-/* Thread-local: set by the main thread around a bucket emission; rdb.c reads
- * it on whichever thread serializes (the scan thread's copy is always 0). */
-
-static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 static size_t snap_last_retained_peak = 0;
 static size_t snap_last_queued_peak = 0;
 static long long snap_last_inplace_writes = 0;
 
-long long snapSaveInplaceWrites(void) { return snap_save ? snap_save->inplace_writes : 0; }
-long long snapSaveLastInplaceWrites(void) { return snap_last_inplace_writes; }
+static long long snapSaveInplaceWrites(void) { return snap_save ? snap_save->inplace_writes : 0; }
+static long long snapSaveLastInplaceWrites(void) { return snap_last_inplace_writes; }
 
 
-int snapSaveInProgress(void) { return snap_save != NULL && !snap_save->aborted; }
+int snapSaveInProgress(void) {
+    return snap_save != NULL && !snap_save->aborted;
+}
+
 /* Bytes the overlay currently keeps alive for the running save (replaced or
  * tombstoned originals); the peak of the last completed save and the
  * hard-mark abort counter are reported next to it. */
-size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
-size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
-size_t snapSaveBitmapBytes(void) {
+static size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
+static size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
+static size_t snapSaveBitmapBytes(void) {
     if (!snap_save || snap_in_hybrid_child) return 0;   /* the stores live in the arena, not mapped in the child (crash report INFO) */
     return snapScanBitmapBytes(snap_save->scan);
 }
 /* Fork-instant dicts their store let go of (freed, flushed, moved out by a
  * slot trim) before the save completed them: the save read them to the end
  * and freed them. */
-long snapSaveRetainedDicts(void) { return snap_stat_retained_dicts; }
-long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(snap_save->scan) : 0; }
+static long snapSaveRetainedDicts(void) { return snap_stat_retained_dicts; }
+static long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(snap_save->scan) : 0; }
 
 /* Main-thread emission (emit-ahead): bytes queued for the scan thread to
  * forward to the child (main-thread queue plus the thread's outbound queue),
  * and the peak of the two over the last save. */
-/* What the running save holds in the parent that stock's child would hold
+/* What the running save holds in the parent that the classic child would hold
  * in its own process, for the eviction calculation (evict.c): the records
  * queued for the child, the fork-instant originals the overlay keeps alive
  * while it reads them, the bucket bitmaps, and the fixed bookkeeping (the
@@ -1792,16 +1944,16 @@ size_t snapSaveOverheadBytes(void) {
     return bytes;
 }
 
-size_t snapSaveQueuedBytes(void) {
+static size_t snapSaveQueuedBytes(void) {
     if (!snap_save) return 0;
     size_t n, o;
     atomicGet(snap_save->mq_bytes, n);
     atomicGet(snap_save->oq_bytes, o);
     return n + o;
 }
-size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
-long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
-long long snapSaveMainKeys(void) { long long n = 0; if (snap_save) atomicGet(snap_save->main_keys, n); return n; }
+static size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
+static long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
+static long long snapSaveMainKeys(void) { long long n = 0; if (snap_save) atomicGet(snap_save->main_keys, n); return n; }
 
 /* ---- INFO, DEBUG and the crash report (server.c, debug.c call these) ---- */
 
@@ -1821,9 +1973,9 @@ sds snapInfoMemory(sds info) {
 
 /* current_save_keys_processed during a hybrid save: the child sees only the
  * SNAP_FORK keys, so the figure is what the scan thread and the main thread
- * dispatched so far; 'stock' otherwise. */
-size_t snapSaveKeysProcessed(size_t stock) {
-    if (!snapSaveInProgress()) return stock;
+ * dispatched so far; 'classic' otherwise. */
+size_t snapSaveKeysProcessed(size_t classic) {
+    if (!snapSaveInProgress()) return classic;
     long slots_total, slots_done;
     long long keys_nofork, keys_fork, bytes_sent;
     snapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
@@ -1927,14 +2079,6 @@ int snapDebugCommand(client *c) {
 
 /* ---- Bucket position and main-thread emission (emit-ahead) ---- */
 
-static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
-                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
-static void snapStageFlush(snapSave *sv);
-
-#define SNAP_POS_BEHIND 0   /* the thread already read this bucket */
-#define SNAP_POS_INSIDE 1   /* the thread is reading it now */
-#define SNAP_POS_AHEAD  2   /* the thread has not reached it */
-
 /* Main thread, inside a write section. */
 static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx) {
     uint8_t st = snapScanDictStateMain(ctx, s, didx, d);
@@ -1954,28 +2098,32 @@ static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int ta
     return SNAP_POS_INSIDE;
 }
 
-static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds payload, uint32_t robj_off, uint64_t src_addr) {
-    snapQueuedMsg *m = zmalloc(sizeof(*m));
-    m->h.type = type;
-    m->h.dbid = dbid;
-    m->h.slot = slot;
-    m->h.len = (uint32_t)sdslen(payload);
-    m->h.robj_off = robj_off;
-    m->h.src_addr = src_addr;
-    m->payload = payload;
+/* A message buffer holding only the header space; the payload is appended
+ * and the header filled in when the message is handed over. */
+static sds snapMsgNew(size_t payload) {
+    sds m = sdsMakeRoomForNonGreedy(sdsempty(), sizeof(snapMsgHdr) + payload);
+    sdsIncrLen(m, sizeof(snapMsgHdr));
+    return m;
+}
+
+/* mq_lock held: complete message 'm' (header space + payload) and queue it as
+ * it will go on the pipe, without another copy. */
+static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds m, uint32_t robj_off, uint64_t src_addr) {
+    snapMsgHdr h = { type, dbid, slot, (uint32_t)(sdslen(m) - sizeof(snapMsgHdr)), robj_off, src_addr };
+    memcpy(m, &h, sizeof(h));
     listAddNodeTail(sv->mq, m);
-    atomicIncr(sv->mq_bytes, sdslen(payload));
+    atomicIncr(sv->mq_bytes, sdsAllocSize(m));
 }
 
 /* Main thread, mq_lock held: hand the partial BUFFER over as a message. */
 static void snapSaveMainStageFlushLocked(snapSave *sv) {
-    if (sdslen(sv->mstage) == 0) return;
+    if (sdslen(sv->mstage) <= sizeof(snapMsgHdr)) return;
     snapSaveQueuePushLocked(sv, SNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0, 0);
-    sv->mstage = sdsempty();
+    sv->mstage = snapMsgNew(0);
 }
 
 /* Cluster mode: is slot didx one an atomic slot migration was trimming at the
- * fork instant? Its keys are skipped by every producer (stock parity). */
+ * fork instant? Its keys are skipped by every producer (classic parity). */
 static inline int snapSaveSlotTrimmed(snapSave *sv, int didx) {
     return sv->trim_slots && (sv->trim_slots[didx >> 3] & (1u << (didx & 7)));
 }
@@ -1997,6 +2145,8 @@ static int snapSaveWriteRecord(snapSave *sv, rio *r, kvobj *kv, int dbid) {
  * a not yet emitted bucket ahead of the thread was ever written in place). */
 static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table, unsigned long idx) {
     snap_main_emitting = 1;
+    long long keys = 0;
+    sdsclear(sv->mscratch);
     for (dictEntry *de = d->ht_table[table][idx]; de; de = dictGetNext(de)) {
         kvobj *kv = dictGetKV(de);
         if (snapSaveSlotTrimmed(sv, didx)) {
@@ -2010,40 +2160,46 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
             char *alloc = kvobjGetAllocPtr(kv);
             debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
                               !zmalloc_is_nofork(kv->ptr));
-            sds copy = sdsnewlen(alloc, zmalloc_size(alloc));
+            size_t len = zmalloc_size(alloc);
+            sds copy = snapMsgNew(len);
+            copy = sdscatlen(copy, alloc, len);
             pthread_mutex_lock(&sv->mq_lock);
             snapSaveQueuePushLocked(sv, SNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
             pthread_mutex_unlock(&sv->mq_lock);
         } else {
+            /* The chain's records pile up in mscratch (appended: a rio over
+             * the sds adds to it) and join the stage under one lock below. */
             rio r;
-            sdsclear(sv->mscratch);
             rioInitWithBuffer(&r, sv->mscratch);
             if (snapSaveWriteRecord(sv, &r, kv, s) != 0)
                 serverPanic("Hybrid snapshot: failed to serialize a key on the main thread");
             sv->mscratch = r.io.buffer.ptr;
-            pthread_mutex_lock(&sv->mq_lock);
-            if (sv->mstage_dbid != s || sv->mstage_slot != didx) {
-                snapSaveMainStageFlushLocked(sv);
-                sv->mstage_dbid = s;
-                sv->mstage_slot = didx;
-            }
-            sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
-            /* mq_bytes counts the stage when it is handed over as a message
-             * (snapSaveQueuePushLocked); counting the records here as well
-             * made the figure drift by the whole emitted volume and produced
-             * a false hard-mark abort. */
-            if (sdslen(sv->mstage) >= SNAP_STAGE_BYTES) snapSaveMainStageFlushLocked(sv);
-            pthread_mutex_unlock(&sv->mq_lock);
         }
-        atomicIncr(sv->main_keys, 1);
+        keys++;
     }
+    if (sdslen(sv->mscratch)) {
+        pthread_mutex_lock(&sv->mq_lock);
+        if (sv->mstage_dbid != s || sv->mstage_slot != didx) {
+            snapSaveMainStageFlushLocked(sv);
+            sv->mstage_dbid = s;
+            sv->mstage_slot = didx;
+        }
+        sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
+        /* mq_bytes counts the stage when it is handed over as a message
+         * (snapSaveQueuePushLocked); counting the records here as well
+         * made the figure drift by the whole emitted volume and produced
+         * a false hard-mark abort. */
+        if (sdslen(sv->mstage) - sizeof(snapMsgHdr) >= SNAP_STAGE_BYTES) snapSaveMainStageFlushLocked(sv);
+        pthread_mutex_unlock(&sv->mq_lock);
+    }
+    if (keys) atomicIncr(sv->main_keys, keys);
     sv->main_buckets++;
     snap_main_emitting = 0;
 }
 
 /* Scan thread, at every window boundary and before END: forward what the
  * main thread emitted. */
-/* Scan thread: rdb-key-save-delay for 'keys' fork-instant keys. Stock's
+/* Scan thread: rdb-key-save-delay for 'keys' fork-instant keys. The classic
  * child sleeps it per key, so a save of N keys takes N delays; here the
  * thread sleeps it for every key of the fork instant whoever produced the
  * record (itself, the child it shipped a big value to, or the main thread's
@@ -2068,27 +2224,29 @@ static int snapSaveKeyDelay(snapSave *sv, long long keys) {
 
 static void snapSaveWindowDone(void *priv) {
     snapSave *sv = priv;
+    list *ready = sv->mq_ready;   /* empty: drained by the previous call */
     pthread_mutex_lock(&sv->mq_lock);
-    list *ready = sv->mq;
-    sv->mq = listCreate();
-    if (sdslen(sv->mstage)) snapSaveMainStageFlushLocked(sv);
-    /* The flush above moved the stage into 'sv->mq': move it over too. */
-    if (listLength(sv->mq)) {
-        listJoin(ready, sv->mq);
-    }
+    snapSaveMainStageFlushLocked(sv);
+    sv->mq_ready = sv->mq;
+    sv->mq = ready;
+    ready = sv->mq_ready;
     pthread_mutex_unlock(&sv->mq_lock);
     if (listLength(ready)) snapStageFlush(sv);   /* this thread's partial buffer first (order is free anyway) */
     listNode *ln;
     while ((ln = listFirst(ready)) != NULL) {
-        snapQueuedMsg *m = listNodeValue(ln);
-        if (!snapScanAborted(sv->scan))
-            snapSendMsg(sv, m->h.type, m->h.dbid, m->h.slot, m->payload, m->h.len, m->h.robj_off, m->h.src_addr);
-        atomicDecr(sv->mq_bytes, m->h.len);
-        sdsfree(m->payload);
-        zfree(m);
+        sds m = listNodeValue(ln);
+        size_t a = sdsAllocSize(m);
         listDelNode(ready, ln);
+        if (snapScanAborted(sv->scan)) {
+            sdsfree(m);
+            atomicDecr(sv->mq_bytes, a);
+        } else {
+            uint32_t type;
+            memcpy(&type, m, sizeof(type));
+            snapOutEnqueue(sv, m, type);   /* the queue owns m now: it may be sent and freed already */
+            atomicDecr(sv->mq_bytes, a);
+        }
     }
-    listRelease(ready);
 }
 
 /* Inside a write section: is the frozen chain of bucket (table, idx) of dict
@@ -2183,7 +2341,7 @@ static void snapSaveDrainSideTables(void) {
 }
 
 /* Side-table entries (clones, adds, tombstones) of the running save. */
-long snapSaveSideEntries(void) {
+static long snapSaveSideEntries(void) {
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return 0;
     long n = 0;
@@ -2381,8 +2539,7 @@ void snapSaveCron(void) {
     killRDBChild();   /* -> snapSaveAbort(): drains the overlays; the done handler releases */
 }
 
-
-void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+static void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent)
 {
     *slots_total = *slots_done = 0;
@@ -2410,14 +2567,6 @@ static int snapReadAll(int fd, void *p, size_t n) {
 }
 
 /* ---- Outbound queue to the child (scan thread only) ---- */
-
-#define SNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
-#define SNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
-#define SNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
-
-static void snapOutRecycle(snapSave *sv, sds m);
-#define SNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
-#define SNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
 
 /* Scan thread: a message buffer with room for 'need' bytes. Allocation is
  * exact (no greedy doubling: these bytes are what the queue holds against the
@@ -2527,9 +2676,6 @@ static void snapOutClear(snapSave *sv) {
     atomicSet(sv->oq_bytes, 0);
     snapOutPublish(sv);
 }
-
-static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
-                       const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
 
 /* Scan thread: queue a complete message (header + payload in 'm', owned by
  * the queue from here on) on its channel and push the pipes. Past the bound
@@ -2641,7 +2787,7 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         sv->stage = r.io.buffer.ptr;
         atomicIncr(sv->keys_nofork, 1);
         /* Under rdb-key-save-delay the records stream one key at a time and
-         * the delay follows the key, as stock's child does (write, flush,
+         * the delay follows the key, as the classic child does (write, flush,
          * sleep): tests pace a transfer with it and cancel it after the first
          * key arrived. */
         int delay;
@@ -2699,7 +2845,7 @@ static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_
     if (sv->slots_form) {
         /* Slot snapshot stream: SELECT on a db change; the slot info once per
          * slot, before its first record, whichever producer delivers it (the
-         * fork-instant sizes the save recorded, as stock's child reads them). */
+         * fork-instant sizes the save recorded, as the classic child reads them). */
         static uint8_t announced[CLUSTER_SLOTS / 8];
         if (dbid != *cur_db) {
             static const char selectcmd[] = "*2\r\n$6\r\nSELECT\r\n";
@@ -2768,7 +2914,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
 
     startSaving(sv->rdbflags);
     if (!out) {
-        if (sv->child_type == CHILD_TYPE_AOF)
+        if (snapIsAof(sv))
             snprintf(tmpfile, sizeof(tmpfile), "temp-rewriteaof-%d.aof", (int)getpid());   /* as rewriteAppendOnlyFile() */
         else
             snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
@@ -2780,7 +2926,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         }
         rioInitWithFile(&filerio, fp);
         rdb = &filerio;
-        if (sv->child_type == CHILD_TYPE_AOF ? server.aof_rewrite_incremental_fsync : server.rdb_save_incremental_fsync) {
+        if (snapIsAof(sv) ? server.aof_rewrite_incremental_fsync : server.rdb_save_incremental_fsync) {
             rioSetAutoSync(rdb, REDIS_AUTOSYNC_BYTES);
             if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(rdb, 1);
         }
@@ -2817,6 +2963,11 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     int ended = 0;
     snapMsgHdr held;
     int have_held = 0;                 /* a BUFFER (in 'payload') waiting for big values */
+    /* rdb channel: replicas seen hanging up. Like the classic connset writer the
+     * transfer goes on for the others and fails only when none is left; the
+     * rio skips a dead connection by itself at its next write. */
+    char *conn_dead = zcalloc(sv->rdb_channel && sv->numconns ? sv->numconns : 1);
+    int ndead = 0;
     for (;;) {
         snapMsgHdr h;
         int src;   /* 0 = small channel, 1 = big channel */
@@ -2835,7 +2986,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             /* The two channels, then the replica connections we write
              * directly (rdb channel): a replica that hangs up is noticed here,
              * while we wait for the producers, not at our next write, which
-             * may be a key-save delay away. Stock's child learns it at its
+             * may be a key-save delay away. The classic child learns it at its
              * next write too, but writes continuously. */
             int nconns = sv->rdb_channel ? sv->numconns : 0;
             struct pollfd pfd[2 + nconns];
@@ -2847,10 +2998,10 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             const short hup = 0;
 #endif
             for (int i = 0; i < nconns; i++)
-                pfd[2 + i] = (struct pollfd){ .fd = sv->conns[i]->fd, .events = hup, .revents = 0 };
+                pfd[2 + i] = (struct pollfd){ .fd = conn_dead[i] ? -1 : sv->conns[i]->fd, .events = hup, .revents = 0 };
             /* About to wait for the producers: push what the socket rio
              * buffers in user space out now, so records reach the replica
-             * (or a migration's destination) as they are produced, as stock's
+             * (or a migration's destination) as they are produced, as the classic
              * child does when it flushes per key, rather than at END. */
             if (out && rioFlush(rdb) == 0) { err_op = "flush"; goto werr; }
             int pr = poll(pfd, 2 + nconns, -1);
@@ -2859,16 +3010,24 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
                 err_op = "channel poll";
                 goto werr;
             }
+            int newly_dead = 0;
             for (int i = 0; i < nconns; i++) {
-                if (pfd[2 + i].revents & (hup | POLLHUP | POLLERR)) {
-                    errno = ECONNRESET;
-                    err_op = "replica connection closed";
-                    goto werr;
+                if (!conn_dead[i] && (pfd[2 + i].revents & (hup | POLLHUP | POLLERR))) {
+                    conn_dead[i] = 1;
+                    newly_dead = 1;
+                    if (++ndead == nconns) {
+                        errno = ECONNRESET;
+                        err_op = "replica connection closed";
+                        goto werr;
+                    }
                 }
             }
             int small_ready = small_open && (pfd[0].revents & POLLIN);
             int big_ready = !ended && (pfd[1].revents & POLLIN);
-            if (!small_ready && !big_ready) { errno = 0; err_op = "channel closed"; goto werr; }
+            if (!small_ready && !big_ready) {
+                if (newly_dead) continue;   /* woken by a replica hanging up only */
+                errno = 0; err_op = "channel closed"; goto werr;
+            }
             size_t backlog;
             atomicGet(sv->shared->small_queued, backlog);
             if (!small_ready && big_ready && small_open && backlog >= SNAP_SMALL_BACKLOG) {
@@ -2912,7 +3071,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             if (snapSaveWriteRecord(sv, rdb, kv, h.dbid) != 0) { err_op = "record"; goto werr; }
             key_counter++;
             kv_written++;
-            /* As the stock child does after each key: drop the value's pages from
+            /* As the classic child does after each key: drop the value's pages from
              * this process once written, so later parent writes to them do not
              * leave us a private copy. The value is the parent's forkable
              * allocation, mapped in our CoW view. */
@@ -2941,7 +3100,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         if ((msgs++ & 1023) == 0) {
             long long now = mstime();
             if (now - info_updated_time >= 1000) {
-                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, sv->child_type == CHILD_TYPE_AOF ? "AOF rewrite" : "RDB");
+                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, snapIsAof(sv) ? "AOF rewrite" : "RDB");
                 info_updated_time = now;
             }
         }
@@ -2974,7 +3133,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         stopSaving(0);
         return C_ERR;
     }
-    if (sv->child_type == CHILD_TYPE_AOF) {
+    if (snapIsAof(sv)) {
         /* The parent's done handler renames it into the manifest and fsyncs the directory. */
         serverLog(LL_NOTICE, "Hybrid AOF rewrite done, %ld SNAP_FORK keys serialized by the child, %zu bytes written to %s.",
                   key_counter, rdb->processed_bytes, sv->filename);
@@ -3035,7 +3194,7 @@ static void snapSaveChild(snapSave *sv) {
     snapChildReserveArenaRange();
     close(sv->pipe_wr);
     close(sv->big_wr);
-    if (sv->to_sockets) {
+    if (snapToSockets(sv)) {
         if (sv->rdb_channel) {
             rioInitWithConnset(&sock, sv->conns, sv->numconns);
         } else {
@@ -3050,7 +3209,7 @@ static void snapSaveChild(snapSave *sv) {
          * of the compression flag was set from the same request at start.) */
         if (sv->req & SLAVE_REQ_RDB_NO_COMPRESS) server.rdb_compression = 0;
         if (sv->req & SLAVE_REQ_RDB_NO_CHECKSUM) server.rdb_checksum = 0;
-    } else if (sv->child_type == CHILD_TYPE_AOF) {
+    } else if (snapIsAof(sv)) {
         /* The name backgroundRewriteDoneHandler and aofRemoveTempFile expect. */
         snprintf(aofname, sizeof(aofname), "temp-rewriteaof-bg-%d.aof", (int)getpid());
         sv->filename = aofname;
@@ -3059,13 +3218,13 @@ static void snapSaveChild(snapSave *sv) {
     } else {
         redisSetProcTitle("redis-rdb-bgsave");
     }
-    if (sv->child_type == CHILD_TYPE_RDB) redisSetCpuAffinity(server.bgsave_cpulist);
-    int retval = snapSaveChildWrite(sv, sv->to_sockets ? &sock : NULL);
+    if (!snapIsAof(sv)) redisSetCpuAffinity(server.bgsave_cpulist);
+    int retval = snapSaveChildWrite(sv, snapToSockets(sv) ? &sock : NULL);
     if (retval == C_OK) {
-        if (sv->child_type == CHILD_TYPE_AOF) sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
+        if (snapIsAof(sv)) sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
         else sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
     }
-    if (sv->to_sockets) {
+    if (snapToSockets(sv)) {
         if (sv->rdb_channel) {
             rioFreeConnset(&sock);
         } else {
@@ -3113,22 +3272,14 @@ static void snapSaveFree(snapSave *sv) {
     if (sv->big_rd != -1) close(sv->big_rd);
     if (sv->shared) munmap(sv->shared, sizeof(snapShared));
     if (sv->sizes) {
-        for (int j = 0; j < sv->dbnum; j++) {
-            zfree(sv->sizes[j].slot_keys);
-            zfree(sv->sizes[j].slot_expires);
-        }
-        zfree(sv->sizes);
+        for (int j = 0; j < sv->dbnum; j++) zfree(sv->sizes[j].slot_keys);   /* slot_expires lives in the same block */
     }
     sdsfree(sv->stage);
     if (sv->mq) {
-        listNode *ln;
-        while ((ln = listFirst(sv->mq)) != NULL) {
-            snapQueuedMsg *m = listNodeValue(ln);
-            sdsfree(m->payload);
-            zfree(m);
-            listDelNode(sv->mq, ln);
-        }
+        snapOutClearList(sv->mq);
         listRelease(sv->mq);
+        snapOutClearList(sv->mq_ready);
+        listRelease(sv->mq_ready);
         pthread_mutex_destroy(&sv->mq_lock);
     }
     sdsfree(sv->mstage);
@@ -3137,10 +3288,8 @@ static void snapSaveFree(snapSave *sv) {
      * when the child ended before their slots completed): free them while
      * sv->stores is still there, snapSaveFreeFlushed clears the entry. */
     for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
-    zfree(sv->flushed);
-    zfree(sv->stores);
-    zfree(sv->trim_slots);
-    zfree(sv->slot_filter);
+    zfree(sv->bitmaps);
+    zfree(sv->tables);
     zfree(sv);
 }
 
@@ -3153,35 +3302,38 @@ static const kvstoreSnapHooks snap_server_hooks = {
 
 /* Main thread: the save object, its channel, queues and scan context for a
  * frozen-to-be keyspace. NULL on failure (logged). */
-static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static snapSave *snapSaveCreate(int rdb_child_type, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     serverAssert(snap_save == NULL);
 
     snapSave *sv = zcalloc(sizeof(*sv));
     sv->pipe_rd = sv->pipe_wr = sv->big_rd = sv->big_wr = -1;
     sv->dbnum = server.dbnum;
+    sv->rdb_child_type = rdb_child_type;
     sv->req = req;
     sv->rdbflags = rdbflags;
-    sv->child_type = CHILD_TYPE_RDB;
     sv->filename = filename;
     if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
-    sv->stores = zmalloc(sizeof(kvstore *) * sv->dbnum);
-    sv->flushed = zcalloc(sizeof(snapFlushedDb) * sv->dbnum);
-    sv->sizes = zcalloc(sizeof(snapDbSizes) * sv->dbnum);
+    sv->tables = zcalloc((sizeof(kvstore *) + sizeof(snapFlushedDb) + sizeof(snapDbSizes)) * sv->dbnum);
+    sv->stores = sv->tables;
+    sv->flushed = (snapFlushedDb *)(sv->stores + sv->dbnum);
+    sv->sizes = (snapDbSizes *)(sv->flushed + sv->dbnum);
     if (req & SLAVE_REQ_SLOTS_SNAPSHOT) {
         /* Atomic slot migration's slot snapshot: only the migrating slots, as
-         * stock's child reads them from its copy of the migrate task. */
+         * the classic child reads them from its copy of the migrate task. */
         sv->slots_form = 1;
-        sv->slot_filter = zcalloc(CLUSTER_SLOTS / 8);
+        sv->bitmaps = zcalloc(2 * (CLUSTER_SLOTS / 8));
+        sv->slot_filter = sv->bitmaps;
         if (asmMigratingSlotsBitmap(sv->slot_filter) == 0) {
             serverLog(LL_WARNING, "Hybrid snapshot: slot snapshot requested with no migrate task running");
-            zfree(sv->slot_filter); zfree(sv->stores); zfree(sv->flushed); zfree(sv->sizes); zfree(sv);
+            zfree(sv->bitmaps); zfree(sv->tables); zfree(sv);
             return NULL;
         }
     }
     if (server.cluster_enabled && asmIsTrimInProgress()) {
-        /* The fork-instant set of slots under a trim job (stock's child reads
+        /* The fork-instant set of slots under a trim job (the classic child reads
          * its copy-on-write copy of the same jobs). */
-        sv->trim_slots = zcalloc(CLUSTER_SLOTS / 8);
+        if (!sv->bitmaps) sv->bitmaps = zcalloc(2 * (CLUSTER_SLOTS / 8));
+        sv->trim_slots = (uint8_t *)sv->bitmaps + CLUSTER_SLOTS / 8;
         for (int slot = 0; slot < CLUSTER_SLOTS; slot++)
             if (isSlotInTrimJob(slot)) sv->trim_slots[slot >> 3] |= 1u << (slot & 7);
     }
@@ -3193,8 +3345,8 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
         if (server.cluster_enabled) {
             int n = kvstoreNumDicts(db->keys);
             sv->sizes[j].nslots = n;
-            sv->sizes[j].slot_keys = zmalloc(sizeof(unsigned long long) * n);
-            sv->sizes[j].slot_expires = zmalloc(sizeof(unsigned long long) * n);
+            sv->sizes[j].slot_keys = zmalloc(sizeof(unsigned long long) * 2 * n);   /* both tables, one block */
+            sv->sizes[j].slot_expires = sv->sizes[j].slot_keys + n;
             for (int didx = 0; didx < n; didx++) {
                 sv->sizes[j].slot_keys[didx] = kvstoreDictSize(db->keys, didx);
                 sv->sizes[j].slot_expires[didx] = kvstoreDictSize(db->expires, didx);
@@ -3243,7 +3395,8 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
     sv->mq = listCreate();
-    sv->mstage = sdsempty();
+    sv->mq_ready = listCreate();
+    sv->mstage = snapMsgNew(0);
     sv->mscratch = sdsempty();
     sv->mstage_dbid = sv->mstage_slot = -1;
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
@@ -3253,10 +3406,10 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
     sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
     if (sv->slot_filter) snapScanSetSlotFilter(sv->scan, sv->slot_filter);
     snapScanSetOverlay(sv->scan, &snap_server_hooks, NULL);
-    snapScanSetStoreDone(sv->scan, snapSaveStoreDone);
-    snapScanSetThreadDone(sv->scan, snapSaveThreadDone);
-    snapScanSetThreadInit(sv->scan, snapSaveThreadInit);
-    snapScanSetWindowDone(sv->scan, snapSaveWindowDone);
+    sv->scan->store_done = snapSaveStoreDone;
+    sv->scan->thread_done = snapSaveThreadDone;
+    sv->scan->thread_init = snapSaveThreadInit;
+    sv->scan->window_done = snapSaveWindowDone;
     return sv;
 }
 
@@ -3264,7 +3417,7 @@ static snapSave *snapSaveCreate(int req, char *filename, rdbSaveInfo *rsi, int r
  * thread. On a fork failure the keyspace is unfrozen and sv is freed; the
  * caller undoes its own state (replica states, pipes). */
 static int snapSaveLaunch(snapSave *sv) {
-    if (sv->child_type == CHILD_TYPE_RDB) {
+    if (!snapIsAof(sv)) {
         server.stat_rdb_saves++;
         server.dirty_before_bgsave = server.dirty;
         server.lastbgsave_try = time(NULL);
@@ -3277,14 +3430,14 @@ static int snapSaveLaunch(snapSave *sv) {
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
     snap_forking_hybrid = 1;
-    pid_t childpid = redisFork(sv->child_type);
+    pid_t childpid = redisFork(snapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
     snap_forking_hybrid = 0;
     if (childpid == 0) {
         snapSaveChild(sv);   /* never returns */
     }
     if (childpid == -1) {
-        if (sv->child_type == CHILD_TYPE_AOF) server.aof_lastbgrewrite_status = C_ERR;
-        else if (!sv->to_sockets) server.lastbgsave_status = C_ERR;
+        if (snapIsAof(sv)) server.aof_lastbgrewrite_status = C_ERR;
+        else if (!snapToSockets(sv)) server.lastbgsave_status = C_ERR;
         serverLog(LL_WARNING, "Can't save in background (hybrid): fork: %s", strerror(errno));
         snapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
         snapSaveFree(sv);
@@ -3295,6 +3448,7 @@ static int snapSaveLaunch(snapSave *sv) {
     close(sv->big_rd);
     sv->big_rd = -1;
     snap_save = sv;
+    server.rdb_child_type = sv->rdb_child_type;
     if (snapScanStartThread(sv->scan) != C_OK) {
         /* The child is waiting on the channel: kill it, unfreeze. */
         serverLog(LL_WARNING, "Hybrid snapshot: cannot start the scan thread; aborting the save");
@@ -3303,7 +3457,7 @@ static int snapSaveLaunch(snapSave *sv) {
         aeCreateFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE, snapScanAeHandler, sv->scan);
         sv->ae_registered = 1;
     }
-    if (sv->child_type == CHILD_TYPE_AOF) {
+    if (snapIsAof(sv)) {
         serverLog(LL_NOTICE, "Hybrid AOF rewrite started by pid %ld (scan thread streams the %s base file to the child)",
                   (long)childpid, sv->aof_cmd_form ? "AOF" : "RDB");
     } else {
@@ -3319,13 +3473,12 @@ static int snapSaveLaunch(snapSave *sv) {
  * emits SELECT on db change). The caller (rewriteAppendOnlyFileBackground)
  * has flushed the AOF and opened the new INCR file, so the fork instant below
  * is where the INCR file's history starts; backgroundRewriteDoneHandler does
- * the manifest work on the temp file the child leaves behind, as for the stock
+ * the manifest work on the temp file the child leaves behind, as for the classic
  * child. */
-int snapSaveBackgroundAof(void) {
+static int snapSaveBackgroundAof(void) {
     if (hasActiveChildProcess()) return C_ERR;
-    snapSave *sv = snapSaveCreate(SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
+    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_NONE, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
     if (!sv) return C_ERR;
-    sv->child_type = CHILD_TYPE_AOF;
     sv->aof_cmd_form = !server.aof_use_rdb_preamble;
     return snapSaveLaunch(sv);   /* the child names its own temp file */
 }
@@ -3333,15 +3486,15 @@ int snapSaveBackgroundAof(void) {
 /* The one decision whether a save takes the hybrid path, for every consumer
  * of a fork-based snapshot (rdbSaveBackground, startBgsaveForReplication,
  * rewriteAppendOnlyFileBackground): the switch is on, the request has
- * keyspace content (functions-only transfers keep the stock child; a slot
+ * keyspace content (functions-only transfers keep the classic child; a slot
  * snapshot is a hybrid save over the migrating slots) and every relevant module has opted in (otherwise the fallback
  * is logged once per blocking module). Returns C_OK when the hybrid save
  * started, C_ERR when it was taken and failed to start, SNAP_NOT_TAKEN when
- * the caller must run the stock fork child. */
+ * the caller must run the classic fork child. */
 int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (!snapHybridEnabled()) return SNAP_NOT_TAKEN;
     /* A functions-only transfer has no keyspace content for the scan thread;
-     * the stock child serves it (redisFork maps the arena). A slot snapshot
+     * the classic child serves it (redisFork maps the arena). A slot snapshot
      * (atomic slot migration) is a hybrid save over the migrating slots. */
     if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return SNAP_NOT_TAKEN;
     if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return SNAP_NOT_TAKEN;
@@ -3359,7 +3512,7 @@ int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rd
 
 /* Start a hybrid background save: freeze the keyspace (overlay), fork the
  * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
-int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (hasActiveChildProcess()) return C_ERR;
     if (snapArenaForkable()) {
         /* Only a Lua debugger session can leave the arena forkable with no
@@ -3367,11 +3520,9 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
         serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
     }
-    snapSave *sv = snapSaveCreate(req, filename, rsi, rdbflags);
+    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_DISK, req, filename, rsi, rdbflags);
     if (!sv) return C_ERR;
-    if (snapSaveLaunch(sv) != C_OK) return C_ERR;
-    server.rdb_child_type = RDB_CHILD_TYPE_DISK;
-    return C_OK;
+    return snapSaveLaunch(sv);
 }
 
 /* Diskless full sync through the hybrid save: the same scan and
@@ -3380,10 +3531,10 @@ int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) 
  * exact 'req' are set up for full resync at the current offset just before
  * the freeze-and-fork, so the offset is the snapshot's; with the rdb channel
  * the child writes the (blocking) replica connections directly, otherwise it
- * writes the stock rdb pipe that the parent fans out to the sockets, and
- * waits on the safe-to-exit pipe before exiting. The stock socket done
+ * writes the classic rdb pipe that the parent fans out to the sockets, and
+ * waits on the safe-to-exit pipe before exiting. The classic socket done
  * handler (RDB_CHILD_TYPE_SOCKET) does the replica bookkeeping afterwards. */
-int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
+static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listIter li;
     listNode *ln;
     int pipefds[2];
@@ -3396,9 +3547,8 @@ int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     if (snapArenaForkable())
         serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
 
-    snapSave *sv = snapSaveCreate(req, NULL, rsi, RDBFLAGS_REPLICATION);
+    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_SOCKET, req, NULL, rsi, RDBFLAGS_REPLICATION);
     if (!sv) return C_ERR;
-    sv->to_sockets = 1;
     sv->rdb_channel = rdb_channel;
     sv->rdb_pipe_write = sv->safe_to_exit_pipe = -1;
 
@@ -3474,7 +3624,6 @@ int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     sv->conns = NULL;
     serverLog(LL_NOTICE, "Background RDB transfer started by pid %ld to %s (hybrid: the scan thread streams to the child)",
               (long)server.child_pid, rdb_channel ? "replica socket" : "parent process pipe");
-    server.rdb_child_type = RDB_CHILD_TYPE_SOCKET;
     if (!rdb_channel) {
         close(sv->rdb_pipe_write); /* close write in parent so that it can detect the close on the child. */
         sv->rdb_pipe_write = -1;
@@ -3522,10 +3671,10 @@ void snapOnChildEnd(int exitcode, int bysignal) {
      * complete every remaining slot. Harmless after a clean finish. */
     if (!(!bysignal && exitcode == 0) || !snapScanIsFinished(sv->scan))
         snapScanAbort(sv->scan);
-    if (sv->failed && !sv->to_sockets && sv->child_type == CHILD_TYPE_RDB) {
+    if (sv->failed && !snapToSockets(sv) && !snapIsAof(sv)) {
         /* Our own defined failure (hard mark): the child was ended with the
          * whitelisted SIGUSR1, which the plain done handler does not count.
-         * A socket transfer reports through the replicas, as stock. */
+         * A socket transfer reports through the replicas, as the classic save. */
         server.lastbgsave_status = C_ERR;
         server.stat_rdb_consecutive_failures++;
     }
@@ -3533,7 +3682,7 @@ void snapOnChildEnd(int exitcode, int bysignal) {
     atomicGet(sv->queued_peak, snap_last_queued_peak);
     snap_last_inplace_writes = sv->inplace_writes;
     if (!bysignal && exitcode == 0 && !sv->failed) {
-        /* Stock's end-of-save line, from the side that knows the counts: the
+        /* The classic end-of-save line, from the side that knows the counts: the
          * keys the scan thread and the main thread produced, and the keys of
          * slots under a trim job at the fork instant that were skipped. */
         long long nofork, fork, skipped, main;
@@ -3542,7 +3691,7 @@ void snapOnChildEnd(int exitcode, int bysignal) {
         atomicGet(sv->keys_skipped, skipped);
         atomicGet(sv->main_keys, main);
         serverLog(LL_NOTICE, "%s done, %lld keys saved, %lld keys skipped.",
-                  sv->child_type == CHILD_TYPE_AOF ? "AOF rewrite" : sv->slots_form ? "Slot snapshot" : "BGSAVE",
+                  snapIsAof(sv) ? "AOF rewrite" : sv->slots_form ? "Slot snapshot" : "BGSAVE",
                   nofork + fork + main, skipped);
     }
     snap_save = NULL;
@@ -3559,6 +3708,32 @@ static int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
 #include "testhelp.h"
 #include <sys/wait.h>
 #include <time.h>
+
+/* Test declarations. */
+extern dictType KvstoreDictTestType;   /* kvstore.c (REDIS_TEST) */
+extern kvstoreType KvstoreTestType;
+
+#define SNAP_TEST_STORES 2
+#define SNAP_TEST_DICT_BITS 2
+#define SNAP_TEST_DICTS (1 << SNAP_TEST_DICT_BITS)
+#define SNAP_TEST_MAXKEYS 6000
+
+struct snapScanTestState {
+    unsigned char seen[SNAP_TEST_STORES][SNAP_TEST_DICTS][SNAP_TEST_MAXKEYS];
+    int inserted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    redisAtomic long dispatched;
+    redisAtomic long bad;             /* unparsable / out-of-range / duplicate */
+    int done_calls[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    int done_aborted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    int dispatch_sleep_us;
+    redisAtomic int wrong_state;      /* dispatch saw its slot not SCANNING */
+    snapScanCtx *ctx;
+    kvstore **stores;
+    int rehashing_at_done;
+};
+
+struct ovTestCounters { int clones; int frees; int frees_shared; };
+static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink);
 
 /* Fork a child that writes one byte to 'p'. The child reports over a pipe
  * that it reached the write ('r') and that it survived it ('d'), so a crash
@@ -3674,27 +3849,7 @@ static void snapTestPurgeArena(void) {
 
 
 /* ---- Scan tests ---- */
-extern dictType KvstoreDictTestType;   /* kvstore.c (REDIS_TEST) */
-extern kvstoreType KvstoreTestType;
 
-#define SNAP_TEST_STORES 2
-#define SNAP_TEST_DICT_BITS 2
-#define SNAP_TEST_DICTS (1 << SNAP_TEST_DICT_BITS)
-#define SNAP_TEST_MAXKEYS 6000
-
-struct snapScanTestState {
-    unsigned char seen[SNAP_TEST_STORES][SNAP_TEST_DICTS][SNAP_TEST_MAXKEYS];
-    int inserted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
-    redisAtomic long dispatched;
-    redisAtomic long bad;             /* unparsable / out-of-range / duplicate */
-    int done_calls[SNAP_TEST_STORES][SNAP_TEST_DICTS];
-    int done_aborted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
-    int dispatch_sleep_us;
-    redisAtomic int wrong_state;      /* dispatch saw its slot not SCANNING */
-    snapScanCtx *ctx;
-    kvstore **stores;
-    int rehashing_at_done;
-};
 
 /* Test keys are aligned C strings owned by the dict (no_value dicts need
  * aligned stored keys; the real keyspace stores kvobj pointers). */
@@ -3755,7 +3910,6 @@ static int snapTestAllState(snapScanCtx *ctx, int state) {
     return 1;
 }
 
-static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink);
 
 static void snapScanTests(int accurate) {
     dictType noval = KvstoreDictTestType;
@@ -4292,7 +4446,6 @@ static void snapPlacementTests(void) {
 }
 
 /* ---- Overlay tests (kvstore level: entries are plain C strings) ---- */
-struct ovTestCounters { int clones; int frees; int frees_shared; };
 
 static void *ovTestClone(void *priv, int didx, void *orig, int *shared) {
     UNUSED(didx);

@@ -12,7 +12,7 @@ Contents: 1 problem and classes, 2 one save end to end, 3 the write funnel and t
 
 ## 1. Problem and the two classes
 
-Stock BGSAVE forks and the child serializes the whole keyspace from its copy-on-write snapshot
+Classic BGSAVE forks and the child serializes the whole keyspace from its copy-on-write snapshot
 while the parent serves writes. Two costs scale with the dataset: the `fork()` page-table copy,
 a stall on the main thread, and copy-on-write amplification, where a write of a few bytes
 duplicates the whole 4 KB page it shares with unrelated neighbours, so that a long save under
@@ -23,7 +23,7 @@ The hybrid splits every key's **value** into one of two classes:
 | class | what | where it lives | who serializes it |
 |---|---|---|---|
 | SNAP_NOFORK | every kvobj header; the keyspace and expires hash tables; single-allocation values up to `save-small-max-bytes` (default 4096): strings, listpack, intset, listpackEx | the SNAP_NOFORK arena, a jemalloc arena whose extents carry `MADV_DONTFORK`; the child never maps it | a scan thread in the parent, reading the live memory |
-| SNAP_FORK | multi-allocation encodings (hash table, skiplist, quicklist, stream), module types, template hashes, any eligible encoding above the cap, any key with module key metadata | the default arena, forkable | the fork child, from its copy-on-write snapshot, exactly as stock |
+| SNAP_FORK | multi-allocation encodings (hash table, skiplist, quicklist, stream), module types, template hashes, any eligible encoding above the cap, any key with module key metadata | the default arena, forkable | the fork child, from its copy-on-write snapshot, exactly as the classic save |
 
 Because headers and tables are in the arena, the child cannot walk the keyspace at all. It is a
 serializer of SNAP_FORK values and the single writer of the output. The scan thread serializes
@@ -65,7 +65,7 @@ memory.
 | 3 | `redisFork()`. The arena stays `MADV_DONTFORK`. | | Inherits the SNAP_FORK values (copy-on-write), the forkable half of the server, no headers, no tables, no small values. Reserves the arena's address range `PROT_NONE` so its own mappings cannot land there. |
 | 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts. For each dict: publish a window of `W` buckets (default 1024), **quiesce** (wait for an open write section to close), read the window's chains with atomic loads, skipping buckets whose bitmap bit is set. SNAP_NOFORK keys are serialized into a 64 KB staging buffer; SNAP_FORK keys become KVOBJ messages. At each window boundary forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
 | 5 | Drain side tables at the end of every write section and once per cron tick: entries whose bucket is now behind the window are applied to the dict. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, free the bitmaps, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, publish the empty window, quiesce once more, drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
-| 6 | `checkChildrenDone` -> the stock done handler -> `snapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
+| 6 | `checkChildrenDone` -> the classic done handler -> `snapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
 
 ![One hybrid save in flight](images/hybrid-snapshot-flow.png)
 
@@ -99,7 +99,7 @@ large value never stalls the scan. The main thread's queue `mq` is the only plac
 and the scan thread meet under a mutex, and the thread takes it only at window boundaries.
 
 **Replication offset.** The snapshot is point in time at the fork instant, so the offset is the
-one stock records before forking; the wire protocol and the RDB format are unchanged, and any
+the one a classic save records before forking; the wire protocol and the RDB format are unchanged, and any
 replica version loads a hybrid dump.
 
 ## 3. The write funnel and the side table
@@ -160,7 +160,7 @@ swaps the dict's type pointer to a private copy for its duration, so that freein
 does not go through the store's shared destructor while the lazyfree thread may be releasing a
 sibling dict with the same type. When the thread publishes SCANNED for a dict, the main thread
 applies what is left, resumes rehashing and auto-resize, frees the bitmaps, marks the dict DONE
-and drops the save's reference. From then on writes to it are stock writes.
+and drops the save's reference. From then on writes to it are classic writes.
 
 **References.** A dict is owned by its store (one reference) and held by a running save (one
 more, taken at freeze). A store that frees, empties or moves a dict another holder references
@@ -192,7 +192,7 @@ its own queues. `snapSaveCron` aborts the save when it is exceeded, and reports 
 parent is the sum of the two bounds. The queues, the retained originals, the bitmaps and the save's
 fixed bookkeeping (per-slot size tables, dict tables, completion ring) are excluded from the eviction
 calculation, like the replication buffers, so a save never causes evictions by itself: that memory
-is what stock's child would hold in its own process.
+is what the classic child would hold in its own process.
 
 The small channel policy keeps the queue small in practice: the child drains the small backlog
 before each big value, so the queue peaks at about one big value's worth of scan output. A single
@@ -202,44 +202,44 @@ value longer than `bound / scan rate` parks the thread for the remainder of that
 
 Every consumer of a fork-based snapshot goes through the same dispatch rule: `hybrid-snapshot` on,
 the request has keyspace content, and every loaded module with save callbacks has opted in
-(section 7). Otherwise the stock child runs and `redisFork` flips the arena to `MADV_DOFORK` for
-that child's lifetime, flipping it back when no child of any kind is left; such a child pays stock
+(section 7). Otherwise the classic child runs and `redisFork` flips the arena to `MADV_DOFORK` for
+that child's lifetime, flipping it back when no child of any kind is left; such a child pays classic
 copy-on-write on the arena.
 
 | entry point | path with the hybrid on | notes |
 |---|---|---|
 | BGSAVE, save points, BGSAVE SCHEDULE | hybrid, RDB child, `dump.rdb` | the previous dump is untouched until the rename |
-| SAVE, DEBUG RELOAD's save, SHUTDOWN's save, FLUSHALL with save points | foreground `rdbSave` in the parent | the parent maps everything, so the stock serializer works unchanged |
+| SAVE, DEBUG RELOAD's save, SHUTDOWN's save, FLUSHALL with save points | foreground `rdbSave` in the parent | the parent maps everything, so the classic serializer works unchanged |
 | disk-based full sync | hybrid, via `rdbSaveBackground` | the file is then streamed as today |
 | diskless full sync, rdb channel | hybrid; the child writes the replicas' sockets | several replicas share one child; the replication stream buffers on the replica |
 | diskless full sync, one connection | hybrid; the child writes a pipe, the parent relays it | about 2 CPU-seconds of relay per 4 GB on the main thread |
-| functions-only transfer | stock child | no keyspace content |
+| functions-only transfer | classic child | no keyspace content |
 | atomic slot migration's slot snapshot | hybrid over the migrating slots only; the child writes the rdb-channel connection | a third record form: the stream is RESP (`FUNCTION RESTORE`, `SELECT`, `CLUSTER SYNCSLOTS CONF SLOT-INFO` once per slot, `RESTORE ... ABSTTL` from a `DUMP` payload per key, `CLUSTER SYNCSLOTS SNAPSHOT-EOF`), written by the same producers through `slotSnapshotSaveKeyValuePair`; only the migrating slots' dicts are frozen and scanned (`snapScanSetSlotFilter`), writes to every other slot are plain writes; the child never maps the arena, so the migration pays the fork-class page tables and fork-class copy-on-write, as a hybrid BGSAVE does |
 | BGREWRITEAOF, `aof-use-rdb-preamble yes` | hybrid, AOF child, RDB base file | the INCR file opens before the freeze, so the fork instant is where its history starts |
 | BGREWRITEAOF, `aof-use-rdb-preamble no` | hybrid, AOF child, command-form base file | the same producers call `rewriteObject` per record; the child writes the AOF prologue and emits `SELECT` only on a db change |
 | BACKUP | through BGREWRITEAOF | |
-| `RedisModule_Fork`, Lua debugger fork | stock child, arena flipped | |
+| `RedisModule_Fork`, Lua debugger fork | classic child, arena flipped | |
 | `CONFIG SET hybrid-snapshot` | flips the arena | refused while any child or hybrid save runs |
 
-Mutual exclusion is the existing one-child rule. A BGSAVE issued while a stock child runs is
+Mutual exclusion is the existing one-child rule. A BGSAVE issued while a classic child runs is
 scheduled and starts, on the hybrid path, after the flip back.
 
 ## 6. Interactions
 
 What happens when something else touches the keyspace or the child during a hybrid save.
 
-| event | behaviour | same as stock? |
+| event | behaviour | same as the classic save? |
 |---|---|---|
-| FLUSHALL (sync or ASYNC) | the dbs are handed to the save, then the caller's `killRDBChild` ends it; the next save works | yes, stock kills the RDB child there |
-| FLUSHDB | the db gets fresh empty structures at once; the fork-instant ones stay with the save and are freed on BIO when the store completes; the dump holds the fork instant | stock's child keeps its copy |
+| FLUSHALL (sync or ASYNC) | the dbs are handed to the save, then the caller's `killRDBChild` ends it; the next save works | yes, the classic save kills the RDB child there |
+| FLUSHDB | the db gets fresh empty structures at once; the fork-instant ones stay with the save and are freed on BIO when the store completes; the dump holds the fork instant | the classic child keeps its copy |
 | SWAPDB | the save scans kvstores, not db ids: keys stay under their fork-instant db id, writes through the new id take the funnel | yes |
 | DEBUG RELOAD, DEBUG LOADAOF, CLUSTER RESET HARD, `RedisModule_ResetDataset` | every db is handed to the save, which finishes with the fork-instant data | yes |
 | a replica's full-sync load | the replica's own running save is ended by its `killRDBChild` before the load | yes |
-| hybrid AOF rewrite and FLUSHALL | the rewrite finishes on the detached dbs; the FLUSHALL lands in the INCR file | yes, stock keeps its AOF child |
+| hybrid AOF rewrite and FLUSHALL | the rewrite finishes on the detached dbs; the FLUSHALL lands in the INCR file | yes, the classic save keeps its AOF child |
 | atomic slot migration's slot snapshot | start, success, failure and cancel run through replication's hooks into the migration's state machine (`asmSlotSnapshotAndStreamStart`, `asmSlotSnapshotSucceed`, `asmSlotSnapshotFailed`, `killRDBChild` on cancel), the same path a hybrid full sync takes; the slot set is fixed at the fork instant from the migrate task, like the trim set below | yes |
-| atomic slot migration's trim | keys of slots under a trim job at the fork instant are skipped and counted in the "keys skipped" log line, as stock's child skips them; a trim that starts during the save is not in that set, its moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete | yes |
-| rehash and resize | the dict under the window is paused; unreached dicts grow with their bitmap, shrink is refused for attached dicts | stock avoids resizing while a child exists |
-| active defrag | off while a child exists (stock rule); the arena's tcache is flushed once a second by cron | yes |
+| atomic slot migration's trim | keys of slots under a trim job at the fork instant are skipped and counted in the "keys skipped" log line, as the classic child skips them; a trim that starts during the save is not in that set, its moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete | yes |
+| rehash and resize | the dict under the window is paused; unreached dicts grow with their bitmap, shrink is refused for attached dicts | the classic save avoids resizing while a child exists |
+| active defrag | off while a child exists (classic rule); the arena's tcache is flushed once a second by cron | yes |
 | key expiry and eviction | active expiry and eviction continue; deletes go through the funnel; LRU/LFU updates on lookups are skipped while a child exists | yes |
 | hash-field expiry | active field expiry is suspended for the save; lazy field expiry and `HRANDFIELD` skip deletion on owed keys (expired fields are invisible, not deleted, as on a replica) | hybrid-specific |
 | `RM_SetLRU` / `RM_SetLFU` on a READ handle | routed through the write funnel first | hybrid-specific |
@@ -253,11 +253,11 @@ What happens when something else touches the keyspace or the child during a hybr
 
 Module code never runs on the scan thread: module values and every key with module key metadata
 are SNAP_FORK, serialized by the child from the header copy through the type's `rdb_save` and the
-metadata save callbacks, as stock does. `aux_save` runs in the child from the RDB header.
-Persistence events fire where stock fires them. Module allocations are forkable and mapped in the
+metadata save callbacks, as the classic save does. `aux_save` runs in the child from the RDB header.
+Persistence events fire where the classic save fires them. Module allocations are forkable and mapped in the
 child.
 
-The one difference from stock: **the hybrid child has no keyspace.** Dict tables, headers other
+The one difference from the classic save: **the hybrid child has no keyspace.** Dict tables, headers other
 than the copy handed to the callback, and small values are unmapped there.
 
 A module is compatible with `hybrid-snapshot yes` when:
@@ -275,7 +275,7 @@ A module is compatible with `hybrid-snapshot yes` when:
 
 A module declares compliance with `REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT`. A module is relevant
 when it registers a data type, a key metadata class, or a PERSISTENCE or FORK_CHILD event handler;
-a relevant module without the bit sends every save to the stock child, with a warning at load and
+a relevant module without the bit sends every save to the classic child, with a warning at load and
 at save time, and `INFO persistence` names it in `snap_hybrid_blocked_by`. Modules with none of
 those callbacks need no declaration. In the hybrid child the forbidden APIs are refused rather than
 faulting (`RM_OpenKey` returns NULL, `RM_Call` fails with EPERM, and so on), logged once per API per
@@ -300,7 +300,7 @@ declare the bit.
 |---|---|
 | `allocator_allocated_nofork`, `allocator_active_nofork`, `allocator_resident_nofork`, `allocator_frag_bytes_nofork` | jemalloc statistics of the arena; forkable memory is the process total minus these |
 | `snap_nofork_arena_available` | 1 when the arena exists |
-| `snap_nofork_arena_forkable` | 1 while a stock child has it mapped |
+| `snap_nofork_arena_forkable` | 1 while a classic child has it mapped |
 | `snap_nofork_va_reserved`, `snap_nofork_va_used` | the arena's address range and how much of it has been handed out |
 
 **INFO persistence**
@@ -320,11 +320,11 @@ declare the bit.
 | `snap_save_inplace_writes`, `snap_last_save_inplace_writes`, `snap_inplace_writes_total` | writes served in place on scanned keys |
 | `snap_hard_mark_aborts` | saves aborted at the hard mark |
 | `snap_saves` | hybrid saves started |
-| `snap_hybrid_blocked_by` | the module sending saves to the stock child, empty when none |
+| `snap_hybrid_blocked_by` | the module sending saves to the classic child, empty when none |
 
-`rdb_last_cow_size` and `current_cow_size` keep their stock meaning: the child's copy-on-write,
+`rdb_last_cow_size` and `current_cow_size` keep their classic meaning: the child's copy-on-write,
 now on the forkable half only. `rdb_bgsave_in_progress`, `aof_rewrite_in_progress` and the done
-status fields are the stock ones.
+status fields are the classic ones.
 
 **DEBUG**: `SNAP-PLACEMENT [dbid]` (placement statistics of the keyspace, arena versus class),
 `SNAP-DRIFT [dbid]` (up to 50 keys whose placement disagrees with their class),

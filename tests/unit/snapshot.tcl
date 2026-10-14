@@ -429,7 +429,7 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             populate_all_types
             populate_fillers 3000
             r config set appendonly yes          ;# the rewrite's base holds the data; no FLUSHALL in the AOF (a replayed
-            waitForBgrewriteaof r                ;# FLUSHALL kills the RDB child, in stock as here)
+            waitForBgrewriteaof r                ;# FLUSHALL kills the RDB child, in the classic save as here)
             set digest [debug_digest]
             r config set rdb-key-save-delay 300
             r bgsave
@@ -535,7 +535,7 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
 # Verification harness (spec 7.1 / 9 M1 deliverables): randomized writers over
 # every keyspace write path while a hybrid save runs, then reload-and-diff
 # against the fork-instant reference (DEBUG DIGEST taken right before BGSAVE),
-# static equivalence against a stock save, CoW comparison, child crash and
+# static equivalence against a classic save, CoW comparison, child crash and
 # shutdown during a save, and a cluster-mode (per-slot) run.
 # ---------------------------------------------------------------------------
 
@@ -813,7 +813,7 @@ proc snap_race_iteration {ops multidb module {policy ""}} {
 
 # Populate 'nkeys' strings of 'valsize' bytes, start a slow save, then either
 # overwrite every value or EXPIRE every key while it runs. Returns the child's
-# reported CoW bytes (works for both the hybrid and the stock save).
+# reported CoW bytes (works for both the hybrid and the classic save).
 proc snap_cow_run {nkeys valsize delay writer} {
     r flushall
     set rd [redis_deferring_client]
@@ -877,7 +877,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             }
         }
 
-        test {Hybrid snapshot harness: hybrid RDB loads into a stock server and equals a stock save of the same dataset} {
+        test {Hybrid snapshot harness: hybrid RDB loads into a classic server and equals a classic save of the same dataset} {
             set ref [debug_digest]
             start_server {overrides {hybrid-snapshot no save ""}} {
                 r module load $::snap_module
@@ -1250,10 +1250,10 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             snap_assert_placement_clean
         }
 
-        snap_arena_test {Hybrid snapshot harness: child CoW stays flat under heavy writes versus stock BGSAVE} {
+        snap_arena_test {Hybrid snapshot harness: child CoW stays flat under heavy writes versus classic BGSAVE} {
             # baseline (no writes) first: the child dirties some pages of its
             # own, a noise of about 1 MB either way; 50000 small keys put
-            # stock's copy-on-write well above it
+            # the classic copy-on-write well above it
             set hy_base_small [snap_cow_run 50000 60 50 none]
             set hy_set [snap_cow_run 50000 60 50 set]
             # SNAP_FORK dataset: 20000 values just over a lowered threshold, then
@@ -1273,7 +1273,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             set st_dset [expr {$st_set - $st_base_small}]
             set hy_dexp [expr {$hy_exp - $hy_base_big}]
             set st_dexp [expr {$st_exp - $st_base_big}]
-            set ::snap_cow_numbers "overwrite-storm: hybrid $hy_base_small -> $hy_set (+$hy_dset), stock $st_base_small -> $st_set (+$st_dset); expire-storm: hybrid $hy_base_big -> $hy_exp (+$hy_dexp), stock $st_base_big -> $st_exp (+$st_dexp)"
+            set ::snap_cow_numbers "overwrite-storm: hybrid $hy_base_small -> $hy_set (+$hy_dset), classic $st_base_small -> $st_set (+$st_dset); expire-storm: hybrid $hy_base_big -> $hy_exp (+$hy_dexp), the classic save $st_base_big -> $st_exp (+$st_dexp)"
             if {$::verbose} { puts "CoW bytes: $::snap_cow_numbers" }
             assert {$hy_dset * 2 < $st_dset}
             assert {$hy_dexp * 2 < $st_dexp}
@@ -1364,7 +1364,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             assert_equal 0 [s snap_save_bitmap_bytes]
         }
 
-        test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the stock child keeps them} {
+        test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the classic child keeps them} {
             r flushall
             populate 20000 cr: 60
             # the fast memory test of the crash report is not under test here
@@ -1384,16 +1384,16 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
             assert {[count_log_message 0 "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped"] >= 1}
             assert_equal $keyspace0 [count_log_message 0 "# Keyspace"]
-            # the stock child has the keyspace mapped and prints it
+            # the classic child has the keyspace mapped and prints it
             r config set hybrid-snapshot no
             r config set rdb-key-save-delay 300
             r bgsave
-            wait_for_condition 100 50 {[s rdb_bgsave_in_progress] == 1} else { fail "stock save not started" }
+            wait_for_condition 100 50 {[s rdb_bgsave_in_progress] == 1} else { fail "classic save not started" }
             exec kill -SEGV [get_child_pid 0]
-            wait_for_condition 300 100 {[s rdb_bgsave_in_progress] == 0} else { fail "stock save did not end" }
+            wait_for_condition 300 100 {[s rdb_bgsave_in_progress] == 0} else { fail "classic save did not end" }
             r config set rdb-key-save-delay 0
             r config set hybrid-snapshot yes
-            wait_for_condition 50 100 {[count_log_message 0 "# Keyspace"] == $keyspace0 + 1} else { fail "the stock child's report has no Keyspace section" }
+            wait_for_condition 50 100 {[count_log_message 0 "# Keyspace"] == $keyspace0 + 1} else { fail "the classic child's report has no Keyspace section" }
             assert_equal 0 [count_log_message 0 "Crashed running signal handler"]
             r config set crash-memcheck-enabled yes
             set digest [debug_digest]
@@ -1406,7 +1406,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
 
         foreach preamble {yes no} {
         # The datatype test module has no aof_rewrite callback: a command-form
-        # rewrite of its keys fails, in stock as here, so the preamble-off run
+        # rewrite of its keys fails, in the classic save as here, so the preamble-off run
         # leaves module keys out.
         set module [expr {$preamble eq "yes"}]
         test "Hybrid snapshot harness: BGREWRITEAOF (aof-use-rdb-preamble $preamble) under writes goes through the hybrid scan, the AOF replays to the live keyspace, a killed child fails it cleanly" {
@@ -1802,7 +1802,7 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
 } snap_all_slots_to_node0
 
 # ---------------------------------------------------------------------------
-# Arena fork visibility (TASK-1.22): stock fork children (AOF rewrite, diskless
+# Arena fork visibility (TASK-1.22): classic fork children (AOF rewrite, diskless
 # sync, module fork) map the SNAP_NOFORK arena while they run, the hybrid child
 # never does, and hybrid-snapshot is a runtime switch.
 # ---------------------------------------------------------------------------
@@ -1882,7 +1882,7 @@ foreach rdb_channel {yes no} {
                 wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started on the replica" }
                 r replicaof $master_host $master_port
                 snap_wait_link_up
-                # the load emptied every db: the save was stopped first, as stock kills its child
+                # the load emptied every db: the save was stopped first, as the classic save kills its child
                 assert_equal 0 [s snap_save_in_progress]
                 assert {[count_log_message 0 "Hybrid snapshot: scan aborted"] >= 1}
                 wait_for_ofs_sync $master [srv 0 client]
@@ -2002,7 +2002,7 @@ start_server {tags {"snapshot modules external:skip"} overrides {hybrid-snapshot
         assert_equal ok [s rdb_last_bgsave_status]
         assert_equal $saves0 [s snap_saves]
         wait_for_log_messages 0 {"*falling back to the fork child, module 'hybridviolate'*"} $loglines 50 10
-        # the stock child has the keyspace: the callback's probes succeeded there
+        # the classic child has the keyspace: the callback's probes succeeded there
         wait_for_log_messages 0 {"*hv_save: OpenKey=key Call=reply*"} $loglines 50 10
         if {[snap_arena_available]} { snap_wait_forkable 0 }
         r debug reload nosave
@@ -2199,7 +2199,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
 
     test {Mutual exclusion: BGSAVE during a fallback child is scheduled, the arena stays forkable until that child exits} {
         snap_fallback_dataset
-        r fork.create 0 1500000   ;# a module fork is a stock (fallback) child: the arena is made forkable for it; it exits after 1.5 s
+        r fork.create 0 1500000   ;# a module fork is a classic (fallback) child: the arena is made forkable for it; it exits after 1.5 s
         if {[snap_arena_available]} {
             wait_for_condition 100 20 {[s snap_nofork_arena_forkable] == 1} else { fail "arena not forkable for the module child" }
         }
@@ -2225,7 +2225,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_wait_bgsave_done
     }
 
-    test {Runtime switch: off takes the stock save path with a forkable arena, on is hybrid again, both reload} {
+    test {Runtime switch: off takes the classic save path with a forkable arena, on is hybrid again, both reload} {
         snap_fallback_dataset
         set digest [debug_digest]
         r config set hybrid-snapshot no
@@ -2234,7 +2234,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         r bgsave
         waitForBgsave r
         assert_equal ok [s rdb_last_bgsave_status]
-        assert_equal $saves [s snap_saves]          ;# stock path, not a hybrid save
+        assert_equal $saves [s snap_saves]          ;# classic path, not a hybrid save
         assert_equal 0 [s snap_save_in_progress]
         r debug reload
         assert_equal $digest [debug_digest]
@@ -2242,7 +2242,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         set digest2 [debug_digest]
         r config set hybrid-snapshot yes
         snap_wait_forkable 0
-        # keys created while the feature was off keep their stock placement
+        # keys created while the feature was off keep their classic placement
         # (header outside the arena) until rewritten: expected drift, not a
         # violation, and the hybrid save below must handle them.
         if {[snap_arena_available]} { assert {[dict get [snap_placement] headers_outside] > 0} }
