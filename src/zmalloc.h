@@ -9,6 +9,57 @@
  * Licensed under your choice of (a) the Redis Source Available License 2.0
  * (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
  * GNU Affero General Public License v3 (AGPLv3).
+ *
+ *
+ * WHAT IS ZMALLOC?
+ * ----------------
+ * Redis's allocator front end. zmalloc/zcalloc/zrealloc/zfree (and their
+ * ztry and usable variants) wrap the allocator picked at build time (jemalloc,
+ * tcmalloc, the Apple allocator or libc) and keep a count of the bytes in use
+ * (used_memory, via zmalloc_used_memory()), per thread so the hot path takes no
+ * lock. Where the allocator can report an allocation's real size
+ * (HAVE_MALLOC_SIZE, zmalloc_size()) the count is exact and callers can use
+ * the slack ('usable'). The rest is process and allocator introspection: RSS,
+ * private dirty pages, system memory size, jemalloc arena statistics, purge
+ * and background thread control, and the helpers active defrag needs.
+ * Out of memory aborts the server, unless a caller uses a ztry variant.
+ *
+ *
+ * SNAP_NOFORK ARENA
+ * -----------------
+ * Used by the hybrid snapshot (snapshot.h) to keep memory out of fork
+ * children. A dedicated jemalloc arena takes all its extents from ONE
+ * reserved virtual address range (64 GB to 16 TB, the largest that mmap
+ * grants, PROT_NONE and MAP_NORESERVE) marked MADV_DONTFORK, so a fork child
+ * never maps it: what lives there costs nothing at fork() and nothing in
+ * copy-on-write. 64-bit Linux with jemalloc only (HAVE_NOFORK_ARENA);
+ * elsewhere the zmalloc_nofork*() entry points are the default allocators and
+ * the hybrid save runs without an arena (see snapshot.h).
+ *
+ * - Ownership is an address test. The range is contiguous, so "is this block
+ *   in the arena" is two compares (zmalloc_is_nofork). zfree() and zrealloc()
+ *   use it to keep arena memory in the arena: a block stays there across
+ *   realloc, is freed back to it and never goes through a default-arena
+ *   thread cache. sds, listpack, dict and the rest need not know.
+ * - New arena allocations come only from the zmalloc_nofork*() entry points,
+ *   and only while zmalloc_nofork_enabled() (hybrid-snapshot on). With the
+ *   feature off they are plain zmalloc() and the layout is the classic one;
+ *   blocks already in the arena still route by address.
+ * - The arena's extents come from a bump pointer in the range through
+ *   jemalloc extent hooks. Address space is never returned (dalloc reports
+ *   failure) and decommit is reported unsupported, so jemalloc purges with
+ *   MADV_DONTNEED/MADV_FREE, which keep the DONTFORK flag; an mmap(MAP_FIXED)
+ *   decommit would replace the mapping and lose it.
+ * - Each thread has its own explicit tcache for the arena, so arena blocks
+ *   never mix with default allocations. serverCron flushes the calling
+ *   thread's cache once a second (zmalloc_nofork_tcache_flush).
+ * - Fork visibility is switchable. The range is DONTFORK normally; around
+ *   any other fork (classic child, module fork, Lua debugger) it is flipped
+ *   to MADV_DOFORK with zmalloc_nofork_arena_set_forkable() and back when no
+ *   child is left (driven by snapshot.c).
+ * - In the hybrid child the range is absent, so the kernel may hand its
+ *   addresses to the child's own mmaps; the child re-reserves the range
+ *   PROT_NONE first thing, so the address test keeps meaning "arena".
  */
 
 #ifndef __ZMALLOC_H
@@ -139,22 +190,7 @@ void zfree_with_flags(void *ptr, int flags);
 void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #endif
 
-/* ---- SNAP_NOFORK arena (hybrid snapshot, see snapshot.c) ----------------------
- *
- * A dedicated jemalloc arena whose data extents are carved out of ONE reserved
- * virtual address range that is madvise(MADV_DONTFORK)ed, so a fork child never
- * maps it. Because the range is contiguous, "does this pointer belong to the
- * arena" is a two-compare range check (zmalloc_is_nofork), and the generic
- * zfree()/zrealloc() paths use it to keep arena memory in the arena: a block
- * allocated in the arena stays there across realloc and is never recycled
- * through a default-arena thread cache. New allocations go to the arena only
- * through the explicit zmalloc_nofork*() entry points. */
-/* 64-bit Linux with jemalloc only. The arena is a single reservation of 64 GB
- * to 16 TB of address space (noforkReserve); a 32-bit process has 4 GB in
- * total, so neither the reservation nor the size ladder makes sense there and
- * the shifts would not even compile. Without the arena the hybrid save runs
- * in its arena-free mode (classification by encoding and size, values copied
- * on clone), which the sanitizer builds exercise. */
+/* ---- SNAP_NOFORK arena: see "SNAP_NOFORK ARENA" at the top of this file. ---- */
 #include <stdint.h>
 #include <limits.h>
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
@@ -169,11 +205,7 @@ extern int zmalloc_nofork_active;       /* 1 while NEW SNAP_NOFORK requests go t
 static inline int zmalloc_is_nofork(const void *p) {
     return (const char *)p < zmalloc_nofork_hi && (const char *)p >= zmalloc_nofork_lo;
 }
-/* Placement gate for new allocations: the arena exists whenever the platform
- * supports it (so hybrid-snapshot can be switched at runtime), but only fills
- * while the feature is on; with it off every zmalloc_nofork*() call is a plain
- * zmalloc() and the layout is stock. Frees and reallocs of blocks already in
- * the arena route by address whatever the gate says. */
+/* Placement gate for new allocations (hybrid-snapshot on). */
 static inline int zmalloc_nofork_enabled(void) { return zmalloc_nofork_active; }
 void zmalloc_nofork_set_active(int active);          /* follows CONFIG hybrid-snapshot; no-op without an arena */
 int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unavailable */
