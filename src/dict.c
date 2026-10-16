@@ -1734,6 +1734,22 @@ void dictWalkBucketRange(dict *d, int table, unsigned long lo, unsigned long hi,
     }
 }
 
+/* Prefetch the first entry of bucket 'i' of table 'table' (a hint: the pointer
+ * may be stale or the bucket concurrently written, a prefetch never faults). */
+void dictWalkPrefetchBucket(dict *d, int table, unsigned long i) {
+    dictEntry **tbl = d->ht_table[table];
+    if (!tbl || i >= DICTHT_SIZE(d->ht_size_exp[table])) return;
+    dictEntry *de = __atomic_load_n(&tbl[i], __ATOMIC_RELAXED);
+    if (de) __builtin_prefetch((const void *)((uintptr_t)de & ~(uintptr_t)ENTRY_PTR_MASK));
+}
+
+/* The first entry of bucket 'i' (atomic load), for a caller that owns the bucket. */
+dictEntry *dictWalkBucketHead(dict *d, int table, unsigned long i) {
+    dictEntry **tbl = d->ht_table[table];
+    if (!tbl || i >= DICTHT_SIZE(d->ht_size_exp[table])) return NULL;
+    return __atomic_load_n(&tbl[i], __ATOMIC_ACQUIRE);
+}
+
 /* ------------------------- private functions ------------------------------ */
 
 /* Because we may need to allocate huge memory chunk at once when dict

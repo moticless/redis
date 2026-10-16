@@ -64,6 +64,12 @@
 
 /* Bucket window size; per-dict word: save generation and slot state. */
 #define SNAP_WINDOW_BUCKETS_DEFAULT 1024
+#ifndef SNAP_SCAN_PREFETCH2
+#define SNAP_SCAN_PREFETCH2 8
+#endif
+#ifndef SNAP_SCAN_PREFETCH
+#define SNAP_SCAN_PREFETCH 16   /* buckets ahead of the scan whose first entry is prefetched */
+#endif
 #define SNAP_WORD(gen, st) (((uint64_t)(gen) << 8) | (uint64_t)(st))
 #define SNAP_WORD_GEN(w) ((w) >> 8)
 #define SNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
@@ -1566,7 +1572,28 @@ static int snapScanWalkDict(snapScanCtx *ctx, int s, int didx, dict *d) {
             snapWindowPublish(d, t, lo, hi);
             snapWalkerQuiesce(ctx);
             if (snapScanAborted(ctx)) return 1;
+            /* The first touch of each key's header is a cache miss: have the
+             * first entries of the next buckets on their way, then the values
+             * of the ones after. Only the window's buckets the scan reads are
+             * looked at: the main thread may be writing the others (and the
+             * ones it emitted ahead, which it keeps writing in place). */
+            for (unsigned long k = lo; k < lo + SNAP_SCAN_PREFETCH && k < hi; k++)
+                if (!snapScanBucketEmitted(ctx, s, didx, t, k)) dictWalkPrefetchBucket(d, t, k);
             for (unsigned long i = lo; i < hi; i++) {
+                if (i + SNAP_SCAN_PREFETCH < hi && !snapScanBucketEmitted(ctx, s, didx, t, i + SNAP_SCAN_PREFETCH))
+                    dictWalkPrefetchBucket(d, t, i + SNAP_SCAN_PREFETCH);
+#if SNAP_SCAN_PREFETCH2
+                /* The header of that bucket is in cache by now: a raw string's
+                 * value allocation is the next miss ('ptr' exists only for
+                 * encodings that have a separate allocation). */
+                if (i + SNAP_SCAN_PREFETCH2 < hi && !snapScanBucketEmitted(ctx, s, didx, t, i + SNAP_SCAN_PREFETCH2)) {
+                    dictEntry *de2 = dictWalkBucketHead(d, t, i + SNAP_SCAN_PREFETCH2);
+                    if (de2) {
+                        kvobj *kv2 = dictGetKV(de2);
+                        if (kv2->type == OBJ_STRING && kv2->encoding == OBJ_ENCODING_RAW) __builtin_prefetch(kv2->ptr);
+                    }
+                }
+#endif
                 if (snapScanBucketEmitted(ctx, s, didx, t, i)) {
                     atomicIncr(ctx->buckets_skipped, 1);
                     continue;
