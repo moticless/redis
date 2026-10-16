@@ -13,9 +13,10 @@
  * the KVSTORE OVERLAY section of kvstore.h). While a background scan thread
  * reads a dict of the store, the dict is "frozen": its bucket layout may not
  * change and the chains the thread is reading may not be written. Writes to
- * such a dict go to a per-dict side table instead, and every read, size and
- * enumeration of the dict describes the logical keyspace: the frozen dict
- * minus its tombstones, with clones substituted and adds appended.
+ * such a dict go to a duplicate of the bucket's chain instead (the bucket is
+ * "overlayed"), and every read, size and enumeration of the dict describes the
+ * logical keyspace: the dict with each overlayed bucket's chain in place of its
+ * own.
  *
  * WHO INCLUDES THIS
  * -----------------
@@ -23,46 +24,45 @@
  * (any other includer gets an #error); it is not an API. kvstore.c keeps the
  * public entry points and decides, per access, whether the overlay steps in
  * (its inline ovRead/ovWrite/ovFrozen helpers, one load on the common path);
- * kvsoverlay.c holds the overlay halves of those entry points and the side
- * table itself. The store struct is private to kvstore.c and the overlay
+ * kvsoverlay.c holds the overlay halves of those entry points and the
+ * overlayed buckets themselves. The store struct is private to kvstore.c and the overlay
  * struct is private to kvsoverlay.c: the two files meet only through the
  * prototypes below. The save's own per-dict state (bucket bitmaps, pause) is
  * snapshot.c's, in the dict's extension slot, and is not seen here.
  *
- * THE SIDE TABLE
- * --------------
- * A fixed array of slots, a key's slot being its hash modulo the array size,
- * with four chains of ordinary dict entries per slot:
+ * THE OVERLAYED BUCKETS
+ * ----------------------
+ * An overlayed bucket is named by (table, index) and holds:
  *
- *   LIVE         deep clones and adds: at drain they replace their original
- *                (freed in full) or are inserted.
- *   SHARED       clones whose value allocation is still the original's: at
- *                drain they replace the original, which is freed header-only.
- *   TOMB         tombstones: the key is the frozen original itself (borrowed,
- *                never destructed here); at drain the original leaves the
- *                dict and is freed in full.
- *   TOMB_SHARED  tombstones of keys whose clone shared the original's value
- *                (the clone's release took the value with it): header-only.
+ *   chain   the bucket's logical chain: detached entries (ordinary dict entry
+ *           nodes, so a position in it is a dictEntryLink for the callers)
+ *           holding the clones of the original keys, in order, and the adds.
+ *   origs   the original keys, and for each whether its clone shares the
+ *           value (then the clone's release took the value with it).
  *
- * A key is in at most one chain. Entries are allocated with the dict's own
- * entry kind, so a position in a chain is an ordinary dictEntryLink for the
- * callers. The array exists from the first deferred write to the release.
+ * The dict's slot and chain are not written while the bucket is overlayed:
+ * the scan thread reads them exactly as at the freeze. Only the main thread
+ * touches the overlay. A map from original key pointer to its bucket lets
+ * enumeration, random sampling and scans skip the originals without hashing.
  *
  * LIFECYCLE
  * ---------
  * attach   the store's snapshot guard decides a dict needs an overlay (first
  *          structural write to it while owed, or the window is on it):
- *          kvstoreOverlayAttach, the overlay copies the store's hooks.
+ *          kvstoreOverlayAttach, the overlay copies the store's hooks. An
+ *          overlay without overlayed buckets is only the carrier of the hooks.
  * write    'prepare' asks the snapshot whether the chain may be written in
  *          place (the window has passed, or the bucket was just emitted); if
- *          not, the write lands in the side table: the first write-lookup of a
- *          key calls 'clone' for a private copy, deletes leave a tombstone,
- *          adds go to the LIVE chain. Logical key counts are kept as it goes.
- * drain    on the owner thread, kvstoreOverlayDrain applies every entry whose
- *          bucket the thread will never read again ('drainable'); originals
- *          are released through 'free_orig'.
+ *          not, the bucket is overlayed on its first write (every key of the
+ *          chain through 'clone') and the write lands in the duplicate.
+ *          Rehash and auto-resize are held while any bucket is overlayed.
+ *          Logical key counts are kept as it goes. Reads never overlay.
+ * drain    on the owner thread, kvstoreOverlayDrain writes back every bucket
+ *          the thread will never read again ('drainable'): the duplicate
+ *          becomes the slot's chain, the originals are released through
+ *          'free_orig' and the original chain's nodes are freed.
  * release  when the dict's scan is complete (or the save aborted),
- *          kvstoreOverlayRelease applies what is left and the overlay goes.
+ *          kvstoreOverlayRelease writes back what is left and the overlay goes.
  * detach   a dict that leaves its store while frozen (freed, emptied, moved)
  *          takes its overlay along, off the store's drain list; the save
  *          releases it later wherever the dict is.
@@ -77,7 +77,7 @@
 
 #include "kvstore.h"
 
-/* The side table of a frozen dict (layout in kvsoverlay.c) and a position in it (every LIVE and SHARED entry once). */
+/* The overlay of a frozen dict (layout in kvsoverlay.c) and a position in its overlayed buckets' chains. */
 typedef struct kvstoreDictOverlay kvstoreDictOverlay;
 typedef kvstoreOvCursor ovCursor;
 
@@ -93,19 +93,14 @@ void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after)
 
 /* ---- The overlay for kvstore.c (kvsoverlay.c) ------------------------------ */
 
-/* Non-empty side table: reads must consult it (out of line; reached only for frozen dicts). */
+/* Some bucket is overlayed: reads must consult the overlay (out of line; reached only for frozen dicts). */
 int ovActive(kvstoreDictOverlay *ov);
 /* Logical size of dict didx, frozen or not. */
 unsigned long ovDictSize(kvstore *kvs, int didx);
-/* A frozen entry's logical counterpart: its clone, NULL (tombstoned) or itself; a side entry whose key the frozen dict lacks. */
-dictEntry *ovMapFrozenEntry(kvstoreDictOverlay *ov, dictEntry *de);
-int ovSideEntryIsAdd(kvstoreDictOverlay *ov, dictEntry *te);
 /* The dict leaves its store (detachDict): off the drain list, the overlay follows the dict. */
 void ovDetachFromStore(dict *d);
 
-/* Enumeration: the side-table cursor (next is fetched first, the caller may delete what it got), scan, iterator (phase 0 frozen dict, 1 side table), random keys. */
-void ovCursorInit(kvstoreDictOverlay *ov, ovCursor *c);
-dictEntry *ovCursorNext(kvstoreDictOverlay *ov, ovCursor *c);
+/* Enumeration: scan, iterator (phase 0 the dict, 1 a replaced bucket's chain, 2 buckets the dict has no entry for; next is fetched first, the caller may delete what it got), random keys. */
 unsigned long long ovScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
                           dictScanFunction *scan_cb, void *privdata);
 dictEntry *ovIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);

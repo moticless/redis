@@ -41,11 +41,11 @@
  *    resolves in its own memory. Two pipes: the small channel of buffers and
  *    the big channel of headers; the child takes the small backlog first.
  * 4. Writes meanwhile (main thread, the write funnel): a write to a frozen
- *    dict is in place once the window has passed the bucket; diverted into the
- *    dict's side table while the window is on it (kvstore.h, KVSTORE OVERLAY);
+ *    dict is in place once the window has passed the bucket; made on a
+ *    duplicate of the bucket's chain while the window is on it (kvstore.h, KVSTORE OVERLAY);
  *    and ahead of the window the bucket is serialized first (emit-ahead, the
  *    main thread produces it) and then written in place.
- * 5. Completion: as the window moves on, side tables drain into their dicts;
+ * 5. Completion: as the window moves on, the duplicated buckets are written back into their dicts;
  *    when a dict's scan is complete its overlay is released. The child exits
  *    after END; snapOnChildEnd joins the thread and the classic done handler
  *    runs. Abort (hybrid-snapshot-max-retained-bytes hard mark, FLUSHALL, a
@@ -89,7 +89,7 @@
  * the scan engine (windows, write sections, per-dict state, bitmaps, the
  * thread); the save (queues, channels, stores vs dbs, hard mark); the child
  * writer; the parent orchestration; unit tests (redis-server test snapshot).
- * kvstore.h / kvsoverlay.c: the overlay (frozen dicts, side tables).
+ * kvstore.h / kvsoverlay.c: the overlay (frozen dicts, overlayed buckets).
  * zmalloc.c: the arena. docs/hybrid-snapshot.md: the design, with figures.
  * All functions here are prefixed "snap".
  */

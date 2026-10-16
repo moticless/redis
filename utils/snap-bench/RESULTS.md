@@ -2256,3 +2256,139 @@ migrate-back restored the source's key count, no hard-mark aborts.
 - The 5% cells are short (0.8-1.2 s), so their copy-on-write figures are small in absolute terms; the 25% cells are the
   representative ones for a real rebalance, where a slice of this size at 50k writes/s costs the stock source a gigabyte
   of copy-on-write per migration.
+
+
+## Run 40 (2026-10-16): bucket-granular overlay vs the per-key side table vs stock upstream, mixed1m, mixed and small at 4 GB, fresh c7i.4xlarge
+
+Raw: `run40-mixed1m.csv`, `run40-mixed.csv`, `run40-mixed-hot.csv`, `run40-small.csv`; driver `run40.sh` (fresh instance at
+52.53.25.74). Three builds of the same tree: `up` = upstream 0d6266f2d, `hybrid` = the committed side-table design
+(ba5f0052d, "before"), `hybrid2` = the bucket overlay of TASK-1.50 (working tree of branch proto-bucket-cow, "after"): a
+write to a bucket the scan thread may be reading duplicates the bucket's chain and the dict's slot is never written inside
+the window. Same recipe as Run 34 (server on vCPUs 0-3,8-11, load on 4-7,12-15, 4 GB datasets, tmpfs 24 GB, 2 reps per
+cell, rates idle / 20k / 50k, mixed also at 50k with a 20% hot set).
+
+### mixed1m
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed1m | idle | stock upstream (0d6266f2d) | 48.2 | 42 | 3 | 3 | 0.7 | -0.0 | 48.0 | 39.1 | - | - | - | - | 0 |
+| mixed1m | idle | hybrid before (side table) | 28.1 | 14 | 85 | 4 | 0.4 | 19.9 | 25.6 | 12.8 | - | - | - | - | 0 |
+| mixed1m | idle | hybrid after (bucket overlay) | 26.3 | 17 | 76 | 7 | 0.4 | 19.8 | 25.4 | 14.1 | - | - | - | - | 0 |
+| mixed1m | 20k | stock upstream (0d6266f2d) | 46.6 / 42.5 | 30 | 2533 | 2534 | 10.8 / 9.8 | 0.0 | 46.5 / 42.4 | 26.8 / 31.0 | 0.7 | 32 | 19996 | 0.0 | 0 |
+| mixed1m | 20k | hybrid before (side table) | 25.3 / 23.0 | 15 / 18 | 985 / 908 | 924 / 863 | 5.9 / 5.4 | 21.1 | 25.1 / 22.8 | 14.7 / 18.4 | 0.7 | 17 / 19 | 19999 | 0.0 | 0 |
+| mixed1m | 20k | hybrid after (bucket overlay) | 23.5 / 26.0 | 15 | 946 | 878 / 942 | 5.8 / 6.6 | 21.3 | 23.2 / 25.8 | 13.0 / 14.4 | 0.7 | 17 | 19999 | 0.0 | 0 |
+| mixed1m | 50k | stock upstream (0d6266f2d) | 45.2 / 49.1 | 32 / 37 | 3284 | 3283 | 18.6 / 19.9 | 0.0 | 45.1 / 48.9 | 32.0 / 34.8 | 0.3 / 0.4 | 34 / 39 | 49989 | 0.0 | 0 |
+| mixed1m | 50k | hybrid before (side table) | 26.3 | 16 | 1584 | 1536 | 11.9 | 21.7 | 26.0 | 15.8 / 14.2 | 0.3 / 0.5 | 18 | 49998 | 0.0 | 0 |
+| mixed1m | 50k | hybrid after (bucket overlay) | 27.1 | 16 | 1611 | 1552 | 12.2 | 21.9 | 26.8 | 16.3 | 0.5 / 0.3 | 18 | 49998 | 0.0 | 0 |
+
+### mixed
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | idle | stock upstream (0d6266f2d) | 38.6 | 40 | 5 | 5 | 0.6 | 0.0 | 38.4 | 41.4 | - | - | - | - | 0 |
+| mixed | idle | hybrid before (side table) | 19.1 | 17 | 6 | 2 | 0.3 | 18.1 | 19.0 | 15.9 | - | - | - | - | 0 |
+| mixed | idle | hybrid after (bucket overlay) | 19.8 | 18 | 3 | 3 | 0.3 | 19.5 | 18.8 | 14.9 | - | - | - | - | 0 |
+| mixed | 20k | stock upstream (0d6266f2d) | 41.6 | 36 / 41 | 2486 | 2484 | 10.1 | 0.0 / 0.0 | 41.4 | 36.3 / 42.6 | 0.7 | 37 / 43 | 19996 | 0.0 | 0 |
+| mixed | 20k | hybrid before (side table) | 20.8 | 19 | 786 | 780 | 5.5 | 20.5 | 18.1 / 20.2 | 19.8 / 16.8 | 0.7 / 0.7 | 20 | 19999 | 0.0 | 0 |
+| mixed | 20k | hybrid after (bucket overlay) | 20.8 | 23 / 21 | 786 | 778 | 5.8 / 5.5 | 20.4 | 19.6 | 22.6 / 18.9 | 0.7 / 0.7 | 24 / 23 | 19998 | 0.0 | 0 |
+| mixed | 50k | stock upstream (0d6266f2d) | 40.5 | 42 / 37 | 3192 | 3190 | 17.6 | 0.0 | 40.4 | 41.1 / 36.3 | 0.4 / 0.3 | 44 / 39 | 49984 | 0.0 | 0 |
+| mixed | 50k | hybrid before (side table) | 21.7 / 20.4 | 19 / 20 | 1368 | 1354 | 10.4 | 21.4 / 20.0 | 18.7 | 18.5 | 0.4 / 0.5 | 22 | 49994 | 0.0 | 0 |
+| mixed | 50k | hybrid after (bucket overlay) | 21.1 | 23 / 18 | 1367 | 1358 | 10.6 | 20.9 | 18.2 | 21.5 / 15.4 | 0.5 / 0.4 | 26 / 21 | 49992 | 0.0 | 0 |
+
+### mixed, 50k writes/s, 20% hot set
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| mixed | 50k hot 0.2 | stock upstream (0d6266f2d) | 37.7 / 42.1 | 36 / 41 | 2015 | 2014 | 16.3 / 17.9 | 0.0 / 0.0 | 37.6 / 42.0 | 33.1 / 37.7 | 0.3 / 0.4 | 38 / 44 | 49984 | 0.0 | 0 |
+| mixed | 50k hot 0.2 | hybrid before (side table) | 20.1 / 21.6 | 19 / 18 | 504 | 496 | 9.4 / 10.2 | 19.8 / 21.3 | 18.8 | 16.2 / 17.6 | 0.4 | 21 / 20 | 49995 | 0.0 | 0 |
+| mixed | 50k hot 0.2 | hybrid after (bucket overlay) | 21.0 | 18 / 20 | 504 | 496 | 9.9 / 9.2 | 20.7 | 19.8 | 14.5 / 21.8 | 0.4 | 20 / 23 | 49995 | 0.0 | 0 |
+
+### small
+
+| dataset | rate | config | save s | fork ms | extra MB | CoW MB | main cpu s | threads cpu s | child cpu s | ping max ms | write p99 ms | write max ms | achieved/s | stall s | blocked |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| small | idle | stock upstream (0d6266f2d) | 36.2 | 42 | 3 | 3 | 0.5 | 0.0 | 36.1 | 39.0 | - | - | - | - | 0 |
+| small | idle | hybrid before (side table) | 34.7 | 2 | 2 | 1 | 0.5 | 34.5 | 3.1 | 0.9 | - | - | - | - | 0 |
+| small | idle | hybrid after (bucket overlay) | 34.5 | 2 | 2 | 1 | 0.3 | 34.3 | 3.1 | 0.9 | - | - | - | - | 0 |
+| small | 20k | stock upstream (0d6266f2d) | 37.8 / 35.9 | 32 / 36 | 2432 | 2432 | 8.5 / 7.6 | -0.0 / 0.0 | 37.7 / 35.7 | 29.2 / 32.4 | 0.6 / 0.7 | 33 / 37 | 19994 | 0.0 | 0 |
+| small | 20k | hybrid before (side table) | 33.5 | 2 | 7 / 8 | 1 | 7.5 | 33.3 | 3.4 | 1.2 / 1.1 | 0.7 | 3 / 3 | 20000 | 0.0 | 0 |
+| small | 20k | hybrid after (bucket overlay) | 33.6 | 2 | 8 | 1 | 7.4 | 33.4 | 3.5 | 1.2 / 1.0 | 0.7 | 2 / 3 | 20000 | 0.0 | 0 |
+| small | 50k | stock upstream (0d6266f2d) | 38.2 | 37 / 34 | 3352 | 3352 | 16.4 | 0.0 / -0.0 | 38.1 | 34.7 / 30.1 | 0.4 / 0.3 | 39 / 36 | 49984 | 0.0 | 0 |
+| small | 50k | hybrid before (side table) | 32.1 | 2 | 9 | 2 | 14.7 | 31.9 | 3.2 | 2.2 / 1.2 | 0.3 / 0.4 | 5 / 3 | 49999 | 0.0 | 0 |
+| small | 50k | hybrid after (bucket overlay) | 32.6 | 2 | 8 / 9 | 2 | 15.2 | 32.5 | 3.2 | 1.1 | 0.4 / 0.4 | 6 / 4 | 49999 | 0.0 | 0 |
+
+**Findings.**
+
+- **The bucket overlay equals the side table within noise on every metric.** Save time, extra and copy-on-write memory
+  (within 3% in every cell), CPU, write p99 (0.3-0.7 ms in all three builds) and achieved rate; e.g. mixed1m at 50k
+  27.1 s / 1611 MB against 26.3 s / 1584 MB, stock upstream 45-49 s / 3284 MB. Cloning the whole bucket instead of
+  one key costs nothing measurable at these write rates (a collision with the window is about 0.1% of the writes).
+- Both hybrids against stock upstream match Run 34: mixed1m 50k ratio 0.55 against 0.59, small 50k 0.85 against 0.84.
+- Watch item: in the mixed cells the new build's write max is 23-26 ms against 20-22 ms and its fork 18-23 ms against
+  17-20 ms. Within the spread between cells of this run and no code on the freeze path changed; not chased.
+- Not covered: one instance, 2 reps, the 8-vCPU server configuration only, no one-core, full-sync or atomic-slot-migration
+  cells, and the arena build was not run under a sanitizer (TSAN and ASAN ran the arena-free build, see TASK-1.51).
+
+## Run 41 (2026-10-16): insert-heavy writes during a hybrid save, rehash held by the overlay (local, TASK-1.54)
+
+Driver `rehash-pause.sh`: one dict of 1.04M keys (table 2^20, 8k keys short of
+the resize threshold), `redis-benchmark -t set -r 1e9 -P 8 -c 20 --threads 2`, 6-8M mostly new keys at about 700k/s
+while a save runs (`rdb-key-save-delay` makes the save last 67-121 s), local laptop, server and load share the
+machine. While any bucket of a dict is overlayed its rehash and auto-resize are held; this checks what that does to the
+chains when the dict has to grow several times during the save. Control: the same inserts with no save.
+
+| run | keys after | table size | max chain | avg chain | overlay buckets / clones | peak buckets | rehash held (dict-ms) | main-thread buckets emitted ahead |
+|---|---|---|---|---|---|---|---|---|
+| no save | 7.02M | 8.39M | 9 | 1.48 | - | - | - | - |
+| classic child | 7.02M | 8.39M | 9 | 1.48 | - | - | - | - |
+| hybrid, save 67 s | 7.02M | 8.39M | 9 | 1.48 | 1038 / 1069 | 50 | 2466 | 955k |
+| hybrid, save 121 s (slower scan) | 9.01M | 8.39M | 10 | 1.63 | 979 / 932 | 73 | 2858 | 990k |
+
+- **The hold is intermittent and does not stop the table growing.** The dict went 1M -> 8M buckets during the save in
+  the hybrid runs exactly as in the control: chain statistics are identical (max 9, avg 1.48) because overlayed buckets
+  exist only while the window is on them (a few to 70 at a time) and each resize happens in a gap. Only in the last
+  run, which ended with 9.0M keys in an 8.4M table, the next doubling (at 8.39M keys) had not happened yet when the
+  inserts stopped: average chain 1.63 where load alone says 1.07; still short chains.
+- **Collisions are rare, emit-ahead is not.** 1.0-1.1k buckets collided with the window in 6-8M writes (about 0.02%) and
+  cloned about one key each; the main thread serialized 955-990k of the 1.05M
+  fork-instant buckets ahead of the window (91-95%), by far the largest main-thread work item at this write rate (CPU not profiled here).
+  The control is a run without a save, not one with the hold disabled: there is no knob for that, since a bucket's
+  (table, index) name is only valid while the layout holds still.
+- **Decision (TASK-1.54): keep the hold unbounded within a dict; no bounded variant implemented.** The pause comes in
+  gaps and costs nothing visible at 700k inserts/s with a window of 1024 buckets; revisit if a workload keeps a bucket
+  overlayed continuously (slower scan with a much larger window), which the new INFO counters
+  (`snap_save_overlay_paused_ms`, `snap_save_overlay_peak_buckets`) would show.
+
+## Run 42 (2026-10-16): scan-thread profile and bucket prefetch, 10M keys x 64 B, fresh c7i.4xlarge (TASK-1.55)
+
+Single save, no writes: `debug populate 10000000 key 64`, hybrid snapshot, server pinned to cpus 0-3,8-11, scan thread
+CPU read from /proc (ticks of 10 ms, sampled at the save's end), 3 alternating rounds per build. "no prefetch" is the same
+tree before the change (stage 1 compiled out with `-DSNAP_SCAN_PREFETCH=0`).
+Prefetch: stage 1 = first entry of the bucket 16 ahead (`dictWalkPrefetchBucket`), stage 2 = the raw string value of the
+bucket 8 ahead; both only for window buckets the scan will read (not the ones the main thread emitted ahead).
+
+| rdbcompression | scan CPU, no prefetch | scan CPU, prefetch | save time, no prefetch | save time, prefetch |
+|---|---|---|---|---|
+| yes | 897-942 (avg 926) | 722-742 (avg 730) | 9-10 s | 7 s |
+| no | 367-385 (avg 375) | 280-282 (avg 281) | 4 s | 3 s |
+
+Scan-thread `perf record` (4 s at 5 kHz) after the save is under way:
+
+| function | no prefetch, no compression | prefetch, no compression | prefetch, compression |
+|---|---|---|---|
+| lzf_compress | - | - | 61% |
+| rdbSaveStringObject (stalls on the value) | 43% | 15% | 6% |
+| snapKeyClass (stalls on the kvobj header) | 23% | 7% | 6% |
+| memcpy (libc) | 5% | 35% | - |
+
+Findings:
+- The scan thread is the limit of an all-arena save here (8.7 s of CPU in a 9 s save on the laptop; 7-10 s on AWS).
+  With the default `rdbcompression yes`, LZF is 46-61% of that thread; without it the thread falls to 40%.
+- Without the prefetch two thirds of the uncompressed scan is waiting for memory (kvobj header, then the value);
+  the prefetch moves that to a `memcpy` of the value into the staging buffer (the value's remaining lines) and cuts scan
+  CPU by 21% (compressed) and 25% (uncompressed).
+- Not measured: the child writer and the main thread (this is the scan thread's profile only), mixed and big datasets,
+  save time under writes. Values here are `debug populate` strings, which LZF may handle unlike real data.
+- ASAN found a bug in the first stage 2 (it read `kv->ptr` of a kvobj whose allocation is shorter than the field); the
+  encoding check is back and TSAN found the scan reading buckets the main thread had emitted ahead (written in place
+  inside later windows): both prefetch stages skip them.

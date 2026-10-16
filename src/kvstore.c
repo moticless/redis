@@ -75,7 +75,7 @@ static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
  * touches a dict's content starts with exactly one of these three (grep
  * them to list every place the snapshot may step in):
  *   ovRead(kvs, didx)    reads and enumeration: the overlay only while its
- *                        side table is non-empty, a plain dict read otherwise;
+ *                        a bucket is overlayed, a plain dict read otherwise;
  *   ovWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
  *                        attached through the guard on first touch;
  *   ovFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
@@ -401,7 +401,7 @@ int kvstoreRefcount(kvstore *kvs) { return __atomic_load_n(&kvs->refcount, __ATO
  * the reference). A dict that lives on (moved, or held by a save) takes its
  * layout bookkeeping out of the store now, off the rehashing list first of
  * all (the cron must not touch it any more), and is cut loose from the
- * save's side-table bookkeeping of this store; a dict only a save still
+ * save's overlay bookkeeping of this store; a dict only a save still
  * holds is marked detached so the dict callbacks skip the store for it
  * from here on. The key count is the caller's business. */
 static void detachDict(kvstore *kvs, int didx, int moving) {
@@ -752,10 +752,10 @@ int kvstoreNumDicts(kvstore *kvs) {
 }
 
 /* Move dict from one kvstore to another. The dict's logical size moves with
- * it (what the source counted for it, side-table adds and tombstones
- * included). A dict a save is reading is moved as it is, its save state
- * with it: the save keeps reading the fork-instant layout, applies or drops
- * its side table when it completes the slot, and the dict stays out of the
+ * it (what the source counted for it, adds and deletes in overlayed
+ * buckets included). A dict a save is reading is moved as it is, its save state
+ * with it: the save keeps reading the fork-instant layout, writes back or drops
+ * its overlayed buckets when it completes the slot, and the dict stays out of the
  * destination's layout bookkeeping until then. */
 void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
     assert(kvs->num_dicts > didx);
@@ -794,6 +794,7 @@ void kvstoreIteratorInit(kvstoreIterator *kvs_it, kvstore *kvs) {
     kvs_it->kvs = kvs;
     kvs_it->didx = -1;
     kvs_it->ov_phase = 0;
+    memset(&kvs_it->ov_cur, 0, sizeof(kvs_it->ov_cur));
     kvs_it->next_didx = kvstoreGetFirstNonEmptyDictIndex(kvs_it->kvs); /* Finds first non-empty dict index. */
     dictInitSafeIterator(&kvs_it->di, NULL);
 }
@@ -827,6 +828,7 @@ dict *kvstoreIteratorNextDict(kvstoreIterator *kvs_it) {
     kvs_it->didx = kvs_it->next_didx;
     kvs_it->next_didx = kvstoreGetNextNonEmptyDictIndex(kvs_it->kvs, kvs_it->didx);
     kvs_it->ov_phase = 0;
+    memset(&kvs_it->ov_cur, 0, sizeof(kvs_it->ov_cur));
     return kvs_it->kvs->dicts[kvs_it->didx];
 }
 
@@ -924,6 +926,7 @@ void kvstoreInitDictIterator(kvstoreDictIterator *kvs_di, kvstore *kvs, int didx
     kvs_di->kvs = kvs;
     kvs_di->didx = didx;
     kvs_di->ov_phase = 0;
+    memset(&kvs_di->ov_cur, 0, sizeof(kvs_di->ov_cur));
     dict *d = kvstoreGetDict(kvs, didx);
     dictInitIterator(&kvs_di->di, d);
 }
@@ -933,6 +936,7 @@ void kvstoreInitDictSafeIterator(kvstoreDictIterator *kvs_di, kvstore *kvs, int 
     kvs_di->kvs = kvs;
     kvs_di->didx = didx;
     kvs_di->ov_phase = 0;
+    memset(&kvs_di->ov_cur, 0, sizeof(kvs_di->ov_cur));
     dict *d = kvstoreGetDict(kvs, didx);
     dictInitSafeIterator(&kvs_di->di, d);
 }

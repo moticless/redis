@@ -326,6 +326,7 @@ void dictSetKeyAtLink(dict *d, void *key __stored_key, dictEntryLink *link, int 
 dictEntry *dictEntryCreateDetached(dict *d, void *key __stored_key, dictEntry *next);
 void dictEntryFreeDetached(dict *d, dictEntry *de, int freeKey);   /* the node, and the key through the destructor when asked */
 dictEntryLink dictEntryNextLink(dictEntry *de);                    /* &next of an allocated entry */
+void dictChainFreeNodes(dict *d, dictEntry *head);                  /* the nodes of a chain that left its bucket, not its keys */
 
 /* API relevant only when dict is used as a hash-map (no_value=0) */ 
 void dictSetKey(dict *d, dictEntry* de, void *key __stored_key);

@@ -143,3 +143,19 @@ scenarios; runtime mode switching is still open.
 The migration's slot snapshot is a hybrid save over the migrating slots (TASK-1.49): the source pays the hybrid
 BGSAVE's fork stall and copy-on-write instead of the stock child's whole-heap ones. The child's copy-on-write scales with
 the migration's duration and write rate, not with the slice; the hybrid's with the fork-class writes only.
+
+## Bucket-granular overlay vs the per-key side table (run 40, 2026-10-16, 4 GB)
+
+| dataset | writes/s | save s: stock upstream / side table / bucket overlay | extra MB: stock / side table / bucket overlay |
+|---|---|---|---|
+| mixed1m | 20k | 46.6 / 25.3 / 23.5 | 2533 / 985 / 946 |
+| mixed1m | 50k | 45.2 / 26.3 / 27.1 | 3284 / 1584 / 1611 |
+| mixed | 20k | 41.6 / 20.8 / 20.8 | 2486 / 786 / 786 |
+| mixed | 50k | 40.5 / 21.7 / 21.1 | 3192 / 1368 / 1367 |
+| small | 20k | 37.8 / 33.5 / 33.6 | 2432 / 7 / 8 |
+| small | 50k | 38.2 / 32.1 / 32.6 | 3352 / 9 / 8 |
+
+Duplicating a whole bucket chain on a write inside the window (TASK-1.50) matches the per-key side table on save time,
+memory, CPU and write latency (p99 0.3-0.7 ms in all three builds). A write collides with the window about once in 1000;
+the main thread's emit-ahead of buckets ahead of the window is the larger cost (91-95% of the buckets at 700k inserts/s,
+run 41), and the overlay's rehash hold did not lengthen chains under insert-heavy writes.

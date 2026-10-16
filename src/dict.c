@@ -1091,6 +1091,16 @@ void dictEntryFreeDetached(dict *d, dictEntry *de, int freeKey) {
     zfree(decodeMaskedPtr(de));
 }
 
+/* Free the allocated nodes of a bucket chain that was replaced (not the keys; a bare key at the tail is not a node). */
+void dictChainFreeNodes(dict *d, dictEntry *head) {
+    dictEntry *de = head;
+    while (de && !entryIsKey(de)) {
+        dictEntry *next = de->next;
+        dictEntryFreeDetached(d, de, 0);
+        de = next;
+    }
+}
+
 dictEntryLink dictEntryNextLink(dictEntry *de) {
     assert(!entryIsKey(de));
     return &de->next;
