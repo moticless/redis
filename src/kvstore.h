@@ -40,10 +40,13 @@
  * overlay anything. Without them reads are plain dict reads, and a store
  * without a guard pays one load per access.
  *
- * kvstoreOverlayDrain() writes the duplicates back into the real dict, on the
- * owner thread, for every bucket the snapshot no longer reads ('drainable');
- * kvstoreOverlayRelease() writes back whatever is left and unfreezes the dict
- * once its scan is complete. The overlay hangs off the
+ * Every overlayed bucket belongs to the scan window that 'prepare' reported
+ * when it deferred the write (a run of buckets of one table, numbered by a
+ * sequence that only grows). kvstoreOverlayDrain() writes the duplicates back
+ * into the real dict, on the owner thread, for every bucket of the windows
+ * older than the sequence it is given: the snapshot no longer reads those.
+ * kvstoreOverlayRelease() writes back whatever is left of a dict and
+ * unfreezes it once its scan is complete. The overlay hangs off the
  * dict's metadata (kvstoreDictMetaBase.ov); the save's own per-dict state
  * (bucket bitmaps, pause) sits in the opaque extension slot next to it.
  *
@@ -97,12 +100,13 @@ typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig);
 /* Start of every main-thread write on a frozen dict (optional). */
 typedef void (kvstoreOverlayEnterFn)(void *privdata);
-/* Before a structural write of 'key': may the frozen chain be written in place (optional: absent = DEFER). */
+/* The scan window a deferred bucket belongs to: buckets [lo, lo + n) of one table, 'seq' its number (grows with every window). */
+typedef struct kvstoreOvWindow { uint64_t seq; int table; unsigned long lo, n; } kvstoreOvWindow;
+/* Before a structural write of 'key': may the frozen chain be written in place; on DEFER, the window the bucket is in
+ * (optional: absent = DEFER, the window the whole table with seq 0). */
 #define KVSTORE_OV_DEFER   0   /* the scan thread is reading the bucket: the write goes to the bucket's duplicate */
 #define KVSTORE_OV_INPLACE 1   /* the snapshot holds the bucket (or just emitted it): write in place */
-typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key);
-/* May the overlay's chain of bucket (table, idx) be written back to the dict now (optional: absent = only at release). */
-typedef int (kvstoreOverlayDrainableFn)(void *privdata, int didx, dict *d, int table, unsigned long idx);
+typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win);
 /* The snapshot's hooks on a store, one struct and one privdata; it must outlive every overlay attached while installed. */
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;
@@ -113,7 +117,6 @@ typedef struct kvstoreSnapHooks {
     kvstoreOverlayFreeOrigFn *free_orig;
     kvstoreOverlayEnterFn *enter;
     kvstoreOverlayPrepareFn *prepare;
-    kvstoreOverlayDrainableFn *drainable;
 } kvstoreSnapHooks;
 /* Install the hooks on a store; NULL turns the snapshot off for it. */
 void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *privdata);
@@ -129,9 +132,9 @@ int kvstoreRefcount(kvstore *kvs);
 void kvstoreOverlayAttach(kvstore *kvs, int didx);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
 void kvstoreOverlayRelease(dict *d);
-/* Across the store: write back every drainable bucket (returns what is left); count the overlayed buckets waiting. */
-long kvstoreOverlayDrain(kvstore *kvs);
-long kvstoreOverlayPending(kvstore *kvs);
+/* Across every store: write back the buckets of the windows older than 'seq' (returns what is left); count the overlayed buckets. */
+long kvstoreOverlayDrain(uint64_t seq);
+long kvstoreOverlayPending(void);
 
 /* Counters of the overlay's work since the last reset (main thread; a save resets them at its start). */
 typedef struct kvstoreOverlayStats {

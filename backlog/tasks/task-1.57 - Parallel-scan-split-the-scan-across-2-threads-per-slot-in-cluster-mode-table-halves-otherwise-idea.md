@@ -6,6 +6,7 @@ title: >-
 status: To Do
 assignee: []
 created_date: '2026-10-16 09:23'
+updated_date: '2026-10-17 10:31'
 labels:
   - hybrid-bgsave
   - performance
@@ -28,3 +29,9 @@ One scan thread walks every frozen dict. A faster scan also shortens the exposur
 - [ ] #1 Profile evidence that the scan thread is the bottleneck, recorded first
 - [ ] #2 If implemented: save time and write latency measured on mixed1m and small, harness and unit/snapshot pass, TSAN clean
 <!-- AC:END -->
+
+## Implementation Notes
+
+<!-- SECTION:NOTES:BEGIN -->
+Interaction (2026-10-17): TASK-1.60 (window-keyed overlay index) and TASK-1.62 (credit-based window) both assume one scan thread with one global window. Parallel scan would need one window, one overlay index and one lo/hi pair per scan thread.
+<!-- SECTION:NOTES:END -->

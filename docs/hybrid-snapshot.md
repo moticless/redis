@@ -139,11 +139,16 @@ a rehash the bitmap of the old table is replicated into the new one (bucket `i` 
 `i + j*n` of `k*n`), and emit-ahead on such a dict marks the whole bucket class in both tables.
 A shrink merges buckets, which a bitmap cannot follow, so it is refused for attached dicts.
 
-**The overlayed buckets.** A ring of 1024 slots, allocated on the first deferred write of a dict
-and freed with the overlay, so only the dict under the window carries one. An overlayed bucket
-is named by `(table, bucket index)` and sits in ring slot `index & 1023`; the window is at most
-as wide as the ring, so a slot holds one bucket in practice and a short chain of them otherwise.
-It owns the duplicate chain (ordinary dict entries, so a position in it is an ordinary
+**The overlayed buckets.** Indexed by the scan window they were deferred in: the overlay's
+`prepare` hook returns the window with its verdict (its table, `[lo, hi)` and the window's sequence
+number). One index serves the whole save: four slots, each the buckets of one window of one dict,
+a bucket at offset `index - lo` of its slot's array, with a bitmap of the offsets in use. Windows
+only move forward over a dict (`snapWindowPublish` asserts it) and a write is deferred only inside
+the current window, so at most three windows hold buckets at once: the two a write section can
+see (the thread may publish the next window while the section is open) and the one left over from
+the last write-back. The window is at most `SNAP_WINDOW_BUCKETS_MAX` (65536) buckets wide, so a
+slot's array is bounded too. An overlayed bucket is named by `(table, bucket index)` and
+owns the duplicate chain (ordinary dict entries, so a position in it is an ordinary
 `dictEntryLink`) and records nothing per original: the originals are found by walking the dict's
 own chain at that bucket, and whether a clone took over its original's value is recomputed from
 the original's header and the address of its value (`snapOriginalSharesValue`). There are no
@@ -163,8 +168,10 @@ why anything that serializes a fork-instant original must read field TTLs from t
 from the registered metadata.
 
 **Write-back and release.** A bucket stays overlayed only while the thread may still read it. At
-the end of every write section and once per cron tick the main thread writes back every
-overlayed bucket that is behind the window: the dict's slot is set to the duplicate chain, the
+the end of every write section and once per cron tick, if the window has moved since the last
+time, the main thread writes back every overlayed bucket of the windows before the current one
+(the thread publishes a window only once it has read the previous one), detached dicts included,
+with no per-bucket position check: the dict's slot is set to the duplicate chain, the
 dict's entry count is adjusted by the difference, and each original is released (its header; its
 value too unless the clone took it over). When the thread publishes SCANNED for a dict, the main
 thread writes back what is left, resumes rehashing and auto-resize, frees the bitmaps, marks the
@@ -191,7 +198,7 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 | retained originals: fork-instant SNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released as the window moves on |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded at the next window boundary |
 | the scan thread's queues to the child (`oq` + `bq`) | parent | `hybrid-snapshot-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
-| per-dict bitmaps and overlay rings | parent | one bit per bucket per table of attached dicts; an 8 KB ring for the dict under the window, plus the duplicated chains |
+| per-dict bitmaps and the overlay index | parent | one bit per bucket per table of attached dicts; per window holding buckets an array of one pointer per bucket of the window (8 KB at the default 1024) and its bitmap, plus the duplicated chains |
 
 The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
 retained originals plus the bytes the main thread has queued and the thread has not yet handed to
@@ -374,8 +381,8 @@ MADV_DONTFORK`.
 - **emit-ahead**: serializing a bucket's fork-instant chain on the main thread before writing it
   in place, marking it in the bitmap so the thread skips it.
 - **bitmap**: one bit per bucket per table of an attached dict; set means emitted.
-- **overlay** / **overlayed bucket**: the per-dict ring holding, for each bucket written while it
-  was inside the window, a duplicate of its chain (clones, adds, no deleted keys) that the main
+- **overlay** / **overlayed bucket**: for each bucket written while it was inside the window, a
+  duplicate of its chain, indexed by that window, (clones, adds, no deleted keys) that the main
   thread uses in place of the dict's chain until the write-back.
 - **retained**: fork-instant originals kept alive by overlayed buckets; **queued**: records waiting
   for the child; **hard mark**: the bound over both on the parent side.

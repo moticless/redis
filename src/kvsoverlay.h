@@ -37,13 +37,21 @@
  *   chain   the bucket's logical chain: detached entries (ordinary dict entry
  *           nodes, so a position in it is a dictEntryLink for the callers)
  *           holding the clones of the original keys, in order, and the adds.
- *   origs   the original keys, and for each whether its clone shares the
- *           value (then the clone's release took the value with it).
+ *   origs   the dict's own chain at that slot, untouched: the originals.
  *
  * The dict's slot and chain are not written while the bucket is overlayed:
  * the scan thread reads them exactly as at the freeze. Only the main thread
- * touches the overlay. A map from original key pointer to its bucket lets
- * enumeration, random sampling and scans skip the originals without hashing.
+ * touches the overlay.
+ *
+ * The buckets are indexed by the scan window they were deferred in, which
+ * 'prepare' reports (kvstoreOvWindow: a run [lo, lo + n) of one table and the
+ * window's sequence number). One index serves every store, there being one
+ * scan at a time: a few slots, each the buckets of one window of one dict, a
+ * bucket at offset index - lo, with a bitmap of the offsets in use. Windows
+ * only move forward and a write is only deferred inside the current one, so
+ * at most three windows hold buckets at once (the two a write section may
+ * see, and the one left over from the last drain). Lookup is a check of the
+ * slots and an array load; a drain visits only the buckets there are.
  *
  * LIFECYCLE
  * ---------
@@ -57,15 +65,16 @@
  *          chain through 'clone') and the write lands in the duplicate.
  *          Rehash and auto-resize are held while any bucket is overlayed.
  *          Logical key counts are kept as it goes. Reads never overlay.
- * drain    on the owner thread, kvstoreOverlayDrain writes back every bucket
- *          the thread will never read again ('drainable'): the duplicate
- *          becomes the slot's chain, the originals are released through
- *          'free_orig' and the original chain's nodes are freed.
+ * drain    on the owner thread, kvstoreOverlayDrain(seq) writes back every
+ *          bucket of the windows before 'seq', which the thread will never
+ *          read again: the duplicate becomes the slot's chain, the originals
+ *          are released through 'free_orig' and the original chain's nodes
+ *          are freed. Rehash and auto-resize resume with a dict's last bucket.
  * release  when the dict's scan is complete (or the save aborted),
  *          kvstoreOverlayRelease writes back what is left and the overlay goes.
  * detach   a dict that leaves its store while frozen (freed, emptied, moved)
- *          takes its overlay along, off the store's drain list; the save
- *          releases it later wherever the dict is.
+ *          takes its overlay along; its buckets drain like any others and the
+ *          save releases the overlay later wherever the dict is.
  */
 
 #ifndef INCLUDE_KVSOVERLAY_H
@@ -85,9 +94,6 @@ typedef kvstoreOvCursor ovCursor;
 
 /* The store's snapshot hooks and privdata; NULL outside a save. */
 const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata);
-/* One opaque per-store slot, the overlay's (its drain list); ovStoreRelease empties it from kvstoreRelease. */
-void **kvstoreOverlaySlot(kvstore *kvs);
-void ovStoreRelease(kvstore *kvs);
 /* The one key-count update of the store; 'after' is the dict's logical size after the change. */
 void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);
 
@@ -97,7 +103,7 @@ void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after)
 int ovActive(kvstoreDictOverlay *ov);
 /* Logical size of dict didx, frozen or not. */
 unsigned long ovDictSize(kvstore *kvs, int didx);
-/* The dict leaves its store (detachDict): off the drain list, the overlay follows the dict. */
+/* The dict leaves its store (detachDict): the overlay follows the dict. */
 void ovDetachFromStore(dict *d);
 
 /* Enumeration: scan, iterator (phase 0 the dict, 1 a replaced bucket's chain, 2 buckets the dict has no entry for; next is fetched first, the caller may delete what it got), random keys. */

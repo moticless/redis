@@ -45,7 +45,6 @@ struct _kvstore {
     size_t overhead_hashtable_rehashing;   /* The overhead of dictionaries rehashing. */
     int refcount;                          /* the owner plus one per allocated dict (atomic): the struct outlives
                                               its detached dicts, whose dictType it holds */
-    void *ov_state;                        /* the overlay's per-store state (kvsoverlay.c), opaque here */
     const kvstoreSnapHooks *snap_hooks;    /* Non-NULL while a snapshot scan runs over this store. */
     void *snap_priv;
     void *metadata[];                      /* conditionally allocated based on "flags" */
@@ -277,8 +276,6 @@ const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata) {
     return kvs->snap_hooks;
 }
 
-void **kvstoreOverlaySlot(kvstore *kvs) { return &kvs->ov_state; }
-
 /* Updates the bucket count for the given dictionary in a DB. It adds the new ht size
  * of the dictionary or removes the old ht size of the dictionary from the total
  * sum of buckets for a DB. */
@@ -471,7 +468,6 @@ void kvstoreRelease(kvstore *kvs) {
     zfree(kvs->dicts);
 
     listRelease(kvs->rehashing);
-    ovStoreRelease(kvs);
     if (kvs->dict_sizes)
         fwTreeDestroy(kvs->dict_sizes);
 

@@ -43,19 +43,22 @@
  * "overlayed": its chain is duplicated (every key through the 'clone' hook)
  * and the main thread works on the duplicate, the dict's own slot and chain
  * staying exactly as the thread reads them. The duplicate is written back to
- * the slot once the thread has moved on ('drainable'), and the originals are
- * released then. Until then the overlay's chain is the bucket: reads, sizes
- * and enumeration prefer it to the dict's. Only the main thread touches any of
- * this.
+ * the slot once the thread has moved past the bucket's window, and the
+ * originals are released then. Until then the overlay's chain is the bucket:
+ * reads, sizes and enumeration prefer it to the dict's. Only the main thread
+ * touches any of this.
  *
- * The overlayed buckets sit in a ring of OV_RING slots, a bucket at
- * ring[idx & mask] (the window is a run of consecutive indexes, so the buckets
- * of one window have distinct slots), a short chain per slot: a bucket the
- * scan has passed is written back when a new one needs its slot, and one that
- * is not evictable (a write that lands away from the window) just shares the
- * slot's chain. */
-#define OV_RING 1024
-#define OV_RING_MASK (OV_RING - 1)
+ * The overlayed buckets are indexed by the scan window they were deferred in
+ * ('prepare' reports it): one index slot per window that holds buckets, a
+ * bucket at offset idx - lo of its slot, with a bitmap of the offsets in use.
+ * The windows only move forward and a write is only deferred inside the
+ * current one, so few windows hold buckets at once: the ones a write section
+ * saw (at most two, the thread may publish the next window while the section
+ * is open) and the one left over from the last drain. Once the window
+ * sequence has passed a slot's window, every bucket of the slot is written
+ * back together. One index for every store: there is one scan at a time. */
+#define OV_SLOTS 4
+#define OV_SLOT_KEEP 4096   /* offsets a free slot keeps allocated for the next window */
 
 /* The overlay's work counters (main thread only), see kvstoreOverlayStats.
  * A pause still open is added at read time from its count and the sum of its
@@ -86,7 +89,8 @@ kvstoreOverlayStats kvstoreOverlayStatsGet(void) {
 }
 
 typedef struct ovBucket {
-    struct ovBucket *next;      /* in the ring slot */
+    struct kvstoreDictOverlay *ov;   /* the dict's overlay */
+    int slot;                   /* its index slot (ov_index) */
     int table;
     unsigned long idx;
     dictEntry *chain;           /* the bucket's logical chain: detached entries holding the clones and the adds */
@@ -100,7 +104,6 @@ typedef struct kvstoreDictOverlay {
                                    accesses through the store, the overlay only waits for the release) */
     int didx;                   /* the dict's slot */
     dict *d;                    /* the frozen dict itself (the store's dict of slot didx while owned) */
-    ovBucket **ring;            /* OV_RING slots, NULL until the first bucket */
     int nb;                     /* overlayed buckets */
     long delta;                 /* logical size - dict size: the adds minus the deletes of the overlayed buckets */
     const kvstoreSnapHooks *h;  /* the store's hooks at attach time (kvstore.h kvstoreSnapHooks) */
@@ -108,41 +111,25 @@ typedef struct kvstoreDictOverlay {
     long long paused_at;        /* when, us (ov_stats) */
     int unlink_frozen;          /* the pending two-phase unlink targets the frozen dict */
     ovBucket *unlink_ob;        /* ... or this overlayed bucket */
-    listNode *dirty_node;       /* node in the store's drain list while there are overlayed buckets */
     void *privdata;
 } kvstoreDictOverlay;
 
+/* The overlayed buckets of one window of one dict. */
+typedef struct ovSlot {
+    kvstoreDictOverlay *ov;     /* NULL: free */
+    uint64_t seq;               /* the window */
+    int table;
+    unsigned long lo, n;        /* buckets [lo, lo + n) */
+    long count;                 /* overlayed buckets in it */
+    ovBucket **b;               /* by offset idx - lo */
+    uint64_t *bits;             /* the offsets in use */
+    unsigned long cap;          /* offsets allocated in b and bits */
+} ovSlot;
+
+static ovSlot ov_index[OV_SLOTS];
+
 int ovActive(kvstoreDictOverlay *ov) {
     return ov && ov->nb > 0;
-}
-
-/* The store's list of overlays to drain, kept in the store's opaque overlay
- * slot (created on the first dirty overlay, released with the store). A
- * detached overlay (ov->kvs NULL) is on no list: nothing reaches it until the
- * save releases it. */
-static list *ovDirtyList(kvstore *kvs, int create) {
-    list **slot = (list **)kvstoreOverlaySlot(kvs);
-    if (!*slot && create) *slot = listCreate();
-    return *slot;
-}
-
-void ovStoreRelease(kvstore *kvs) {
-    list **slot = (list **)kvstoreOverlaySlot(kvs);
-    if (*slot) listRelease(*slot);
-    *slot = NULL;
-}
-
-static void ovMarkDirty(kvstore *kvs, kvstoreDictOverlay *ov) {
-    if (ov->dirty_node || !kvs) return;
-    list *dirty = ovDirtyList(kvs, 1);
-    listAddNodeTail(dirty, ov);
-    ov->dirty_node = listLast(dirty);
-}
-
-static void ovMarkClean(kvstore *kvs, kvstoreDictOverlay *ov) {
-    if (!ov->dirty_node) return;
-    listDelNode(ovDirtyList(kvs, 0), ov->dirty_node);
-    ov->dirty_node = NULL;
 }
 
 /* The key functions are the dict type's, which the frozen dict carries. */
@@ -164,13 +151,69 @@ static void ovKeyCountAdd(kvstore *kvs, int didx, long delta) {
     kvstoreKeyCountAdd(kvs, didx, delta, ovDictSize(kvs, didx));
 }
 
-/* ---- The ring of overlayed buckets ---- */
+/* ---- The index of overlayed buckets ---- */
 
 static ovBucket *ovLookup(kvstoreDictOverlay *ov, int table, unsigned long idx) {
     if (!ov->nb) return NULL;
-    for (ovBucket *ob = ov->ring[idx & OV_RING_MASK]; ob; ob = ob->next)
-        if (ob->table == table && ob->idx == idx) return ob;
+    for (int k = 0; k < OV_SLOTS; k++) {
+        ovSlot *s = &ov_index[k];
+        if (s->ov == ov && s->table == table && idx - s->lo < s->n && s->b[idx - s->lo]) return s->b[idx - s->lo];
+    }
     return NULL;
+}
+
+/* The first offset at or after 'from' that holds a bucket, s->n if none. */
+static unsigned long ovSlotNext(const ovSlot *s, unsigned long from) {
+    if (from >= s->n) return s->n;
+    unsigned long w = from >> 6, words = (s->n + 63) >> 6;
+    uint64_t word = s->bits[w] & (~0ULL << (from & 63));
+    while (!word) {
+        if (++w >= words) return s->n;
+        word = s->bits[w];
+    }
+    return (w << 6) + (unsigned long)__builtin_ctzll(word);
+}
+
+/* The slot of window 'w' of the dict, taken now if no slot has it yet. */
+static ovSlot *ovSlotFor(kvstoreDictOverlay *ov, const kvstoreOvWindow *w) {
+    ovSlot *free_slot = NULL;
+    for (int k = 0; k < OV_SLOTS; k++) {
+        ovSlot *s = &ov_index[k];
+        if (s->ov == ov && s->seq == w->seq && s->table == w->table && s->lo == w->lo && s->n == w->n) return s;
+        if (!s->ov && !free_slot) free_slot = s;
+    }
+    assert(free_slot != NULL);   /* more windows hold buckets than a drain per write section allows */
+    ovSlot *s = free_slot;
+    if (s->cap < w->n) {
+        zfree(s->b);
+        zfree(s->bits);
+        s->b = zcalloc(w->n * sizeof(*s->b));
+        s->bits = zcalloc(((w->n + 63) >> 6) * sizeof(*s->bits));
+        s->cap = w->n;
+    }
+    s->ov = ov;
+    s->seq = w->seq;
+    s->table = w->table;
+    s->lo = w->lo;
+    s->n = w->n;
+    return s;
+}
+
+/* Take ob out of its slot; a slot left empty is free again. */
+static void ovSlotRemove(ovBucket *ob) {
+    ovSlot *s = &ov_index[ob->slot];
+    unsigned long off = ob->idx - s->lo;
+    s->b[off] = NULL;
+    s->bits[off >> 6] &= ~(1ULL << (off & 63));
+    if (--s->count) return;
+    s->ov = NULL;
+    if (s->cap > OV_SLOT_KEEP) {
+        zfree(s->b);
+        zfree(s->bits);
+        s->b = NULL;
+        s->bits = NULL;
+        s->cap = 0;
+    }
 }
 
 /* Is 'key' (a stored key pointer) one of the originals of overlayed bucket ob? */
@@ -231,11 +274,23 @@ static void ovEntryFreeWithKey(kvstoreDictOverlay *ov, dictEntry *de) {
     dictEntryFreeDetached(ov->d, de, ov->d->type->keyDestructor != NULL);
 }
 
+/* The dict's last overlayed bucket is gone: its layout may change again. */
+static void ovResume(kvstoreDictOverlay *ov) {
+    if (!ov->paused) return;
+    dictResumeRehashing(ov->d);
+    dictResumeAutoResize(ov->d);
+    ov->paused = 0;
+    ov_stats.open--;
+    ov_stats.open_since_sum -= ov->paused_at;
+    ov_stats.s.paused_us += ovNowUs() - ov->paused_at;
+}
+
 /* Owner thread: the bucket goes back to the dict. The scan thread is done
  * with it, so the slot is written plainly; the originals, found on the dict's
  * own chain, are released (the hook knows what each one still owns) and the
  * dict's size follows. */
-static void ovWriteBack(kvstoreDictOverlay *ov, ovBucket *ob) {
+static void ovWriteBack(ovBucket *ob) {
+    kvstoreDictOverlay *ov = ob->ov;
     dict *d = ov->d;
     assert(d->ht_table[ob->table][ob->idx] == ob->orig_head);
     d->ht_table[ob->table][ob->idx] = ob->chain;
@@ -249,19 +304,27 @@ static void ovWriteBack(kvstoreDictOverlay *ov, ovBucket *ob) {
         e = next;
     }
     dictChainFreeNodes(d, ob->orig_head);
-    ovBucket **pp = &ov->ring[ob->idx & OV_RING_MASK];
-    while (*pp != ob) pp = &(*pp)->next;
-    *pp = ob->next;
-    ov->nb--;
+    ovSlotRemove(ob);
     ov_stats.cur--;
     zfree(ob);
+    if (--ov->nb == 0) ovResume(ov);
 }
 
-/* Duplicate the chain of bucket (table, idx): every key through the 'clone'
- * hook, same order. The dict is not written. The buckets in the way of its
- * ring slot that the scan has passed are written back first. */
-static ovBucket *ovBucketCreate(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int table, unsigned long idx) {
+/* Write back every bucket of slot s. */
+static void ovSlotWriteBack(ovSlot *s) {
+    unsigned long off = 0;
+    while (s->count) {   /* the last write-back frees the slot */
+        off = ovSlotNext(s, off);
+        ovWriteBack(s->b[off]);
+        off++;
+    }
+}
+
+/* Duplicate the chain of bucket (table, idx), deferred in window 'w': every
+ * key through the 'clone' hook, same order. The dict is not written. */
+static ovBucket *ovBucketCreate(int didx, kvstoreDictOverlay *ov, int table, unsigned long idx, const kvstoreOvWindow *w) {
     dict *d = ov->d;
+    assert(w->table == table && idx - w->lo < w->n);
     if (!ov->paused) {   /* the buckets are named by (table, idx): the layout holds still while any is overlayed */
         dictPauseRehashing(d);
         dictPauseAutoResize(d);
@@ -270,14 +333,10 @@ static ovBucket *ovBucketCreate(kvstore *kvs, int didx, kvstoreDictOverlay *ov, 
         ov_stats.open++;
         ov_stats.open_since_sum += ov->paused_at;
     }
-    if (!ov->ring) ov->ring = zcalloc(OV_RING * sizeof(*ov->ring));
-    if (ov->h->drainable) {
-        for (ovBucket *occ = ov->ring[idx & OV_RING_MASK], *next; occ; occ = next) {
-            next = occ->next;
-            if (ov->h->drainable(ov->privdata, didx, d, occ->table, occ->idx)) ovWriteBack(ov, occ);
-        }
-    }
+    ovSlot *s = ovSlotFor(ov, w);
     ovBucket *ob = zcalloc(sizeof(*ob));
+    ob->ov = ov;
+    ob->slot = (int)(s - ov_index);
     ob->table = table;
     ob->idx = idx;
     ob->orig_head = d->ht_table[table][idx];
@@ -292,12 +351,13 @@ static ovBucket *ovBucketCreate(kvstore *kvs, int didx, kvstoreDictOverlay *ov, 
         ob->nkeys++;
         ov_stats.s.clones++;
     }
-    ob->next = ov->ring[idx & OV_RING_MASK];
-    ov->ring[idx & OV_RING_MASK] = ob;
+    unsigned long off = idx - s->lo;
+    s->b[off] = ob;
+    s->bits[off >> 6] |= 1ULL << (off & 63);
+    s->count++;
     ov->nb++;
     ov_stats.s.buckets++;
     if (++ov_stats.cur > ov_stats.s.peak) ov_stats.s.peak = ov_stats.cur;
-    ovMarkDirty(kvs, ov);
     return ob;
 }
 
@@ -310,13 +370,19 @@ static inline void ovEnter(kvstoreDictOverlay *ov) {
     if (ov->h->enter) ov->h->enter(ov->privdata);
 }
 
-/* May the frozen chain of 'key' be written in place? Must be called after
+/* May the frozen chain of 'key' (in table 'table') be written in place? If
+ * not, *w is the window the bucket is deferred in. Must be called after
  * ovEnter() (the answer is only stable inside a write section). Without a
- * prepare hook the overlay is pure copy-on-write. */
-static inline int ovPrepare(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
-    (void)kvs;
-    if (!ov->h->prepare) return KVSTORE_OV_DEFER;
-    return ov->h->prepare(ov->privdata, didx, ov->d, key);
+ * prepare hook the overlay is pure copy-on-write, one window per table. */
+static inline int ovPrepare(int didx, kvstoreDictOverlay *ov, const void *key, int table, kvstoreOvWindow *w) {
+    if (!ov->h->prepare) {
+        w->seq = 0;
+        w->table = table;
+        w->lo = 0;
+        w->n = DICTHT_SIZE(ov->d->ht_size_exp[table]);
+        return KVSTORE_OV_DEFER;
+    }
+    return ov->h->prepare(ov->privdata, didx, ov->d, key, w);
 }
 
 /* Is 'bucket' (a link handed out as a bucket) one of dict d's own buckets? */
@@ -363,6 +429,7 @@ enum { OV_W_INPLACE = 0, OV_W_BUCKET = 1, OV_W_ABSENT = 2 };
  * chain. With 'miss_ok' false, a key the dict does not hold and no overlay
  * covers is OV_W_ABSENT and nothing is created. */
 static int ovWriteBucket(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int miss_ok, ovBucket **out) {
+    (void)kvs;
     dict *d = ov->d;
     /* The bucket of the key must not move while it is decided on (a lookup
      * steps a rehash): the dict's layout is held for the whole decision, and
@@ -372,15 +439,16 @@ static int ovWriteBucket(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const v
     unsigned long i;
     dictKeyBucket(d, key, &t, &i);
     ovBucket *ob = ovLookup(ov, t, i);
+    kvstoreOvWindow win;
     if (ob) {
         *out = ob;
         w = OV_W_BUCKET;
     } else if (!miss_ok && dictFind(d, key) == NULL) {
         w = OV_W_ABSENT;
-    } else if (ovPrepare(kvs, didx, ov, key) == KVSTORE_OV_INPLACE) {
+    } else if (ovPrepare(didx, ov, key, t, &win) == KVSTORE_OV_INPLACE) {
         w = OV_W_INPLACE;
     } else {
-        *out = ovBucketCreate(kvs, didx, ov, t, i);
+        *out = ovBucketCreate(didx, ov, t, i, &win);
         w = OV_W_BUCKET;
     }
     dictResumeRehashing(d);
@@ -400,70 +468,33 @@ unsigned long ovDictSize(kvstore *kvs, int didx) {
  * Write-back, release
  * ========================================================================== */
 
-/* Owner thread: write back the buckets the snapshot no longer needs kept out
- * of the dict (the 'drainable' hook decides; every bucket when 'force').
- * Returns what is left. */
-static long ovDrainOne(kvstore *kvs, kvstoreDictOverlay *ov, int force) {
-    for (int s = 0; ov->nb && s < OV_RING; s++) {
-        for (ovBucket *ob = ov->ring[s], *next; ob; ob = next) {
-            next = ob->next;
-            if (force || (ov->h->drainable && ov->h->drainable(ov->privdata, ov->didx, ov->d, ob->table, ob->idx)))
-                ovWriteBack(ov, ob);
-        }
-    }
-    if (ov->nb == 0 && ov->paused) {
-        dictResumeRehashing(ov->d);
-        dictResumeAutoResize(ov->d);
-        ov->paused = 0;
-        ov_stats.open--;
-        ov_stats.open_since_sum -= ov->paused_at;
-        ov_stats.s.paused_us += ovNowUs() - ov->paused_at;
-    }
-    if (ov->nb == 0 && kvs) ovMarkClean(kvs, ov);
-    return ov->nb;
-}
-
 /* The dict leaves its store (kvstore.c detachDict: freed while a save holds
  * it, emptied, moved): nothing reaches its overlay through the store any
- * more. Off the drain list; the overlay only waits for the save's release. */
+ * more. Its buckets stay in the index and are written back like any other
+ * once the window has passed them; the overlay waits for the save's release. */
 void ovDetachFromStore(dict *d) {
     kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
-    if (!ov) return;
-    if (ov->kvs) ovMarkClean(ov->kvs, ov);
-    ov->kvs = NULL;
+    if (ov) ov->kvs = NULL;
 }
 
-long kvstoreOverlayDrain(kvstore *kvs) {
-    list *dirty = ovDirtyList(kvs, 0);
-    if (!dirty) return 0;
-    long left = 0;
-    listNode *ln = listFirst(dirty);
-    while (ln) {
-        listNode *next = listNextNode(ln);   /* ovDrainOne may unlink ln */
-        left += ovDrainOne(kvs, listNodeValue(ln), 0);
-        ln = next;
-    }
-    return left;
+/* Owner thread: the windows before 'seq' are behind the scan thread, so are
+ * all their buckets. */
+long kvstoreOverlayDrain(uint64_t seq) {
+    for (int k = 0; k < OV_SLOTS; k++)
+        if (ov_index[k].ov && ov_index[k].seq < seq) ovSlotWriteBack(&ov_index[k]);
+    return ov_stats.cur;
 }
 
-long kvstoreOverlayPending(kvstore *kvs) {
-    list *dirty = ovDirtyList(kvs, 0);
-    if (!dirty) return 0;
-    long n = 0;
-    listIter li;
-    listNode *ln;
-    listRewind(dirty, &li);
-    while ((ln = listNext(&li)) != NULL) n += ((kvstoreDictOverlay *)listNodeValue(ln))->nb;
-    return n;
+long kvstoreOverlayPending(void) {
+    return ov_stats.cur;
 }
 
 /* Owner thread, after the scan of this dict is complete: write back whatever
  * is left and drop the overlay. */
 static void ovRelease(kvstoreDictOverlay *ov) {
-    long left = ovDrainOne(ov->kvs, ov, 1);   /* written to the dict itself; its holder decides what becomes of it */
-    assert(left == 0 && ov->delta == 0);
-    if (ov->kvs) ovMarkClean(ov->kvs, ov);
-    zfree(ov->ring);
+    for (int k = 0; k < OV_SLOTS; k++)   /* written to the dict itself; its holder decides what becomes of it */
+        if (ov_index[k].ov == ov) ovSlotWriteBack(&ov_index[k]);
+    assert(ov->nb == 0 && ov->delta == 0 && !ov->paused);
     zfree(ov);
 }
 
@@ -494,16 +525,48 @@ void kvstoreOverlayRelease(dict *d) {
  * bucket the dict has no entry for comes last.
  * ========================================================================== */
 
-/* The next overlayed bucket with no originals at or after ring slot *slot,
- * position *pos in its chain; advances both. */
+/* The next overlayed bucket of the dict with no originals, at or after
+ * offset *pos of index slot *slot; advances both. */
 static ovBucket *ovNextBare(kvstoreDictOverlay *ov, int *slot, long *pos) {
-    for (; *slot < OV_RING; (*slot)++, *pos = 0) {
-        long k = 0;
-        for (ovBucket *ob = ov->ring[*slot]; ob; ob = ob->next, k++) {
-            if (k >= *pos && !ob->norig) {
-                *pos = k + 1;
-                return ob;
+    for (; *slot < OV_SLOTS; (*slot)++, *pos = 0) {
+        ovSlot *s = &ov_index[*slot];
+        if (s->ov != ov) continue;
+        for (unsigned long off = ovSlotNext(s, (unsigned long)*pos); off < s->n; off = ovSlotNext(s, off + 1)) {
+            if (!s->b[off]->norig) {
+                *pos = (long)off + 1;
+                return s->b[off];
             }
+        }
+    }
+    return NULL;
+}
+
+/* The dict's overlayed buckets one by one, from a random index slot and a
+ * random offset in each slot, wrapping around; NULL at the end. */
+typedef struct { int k0, k, begun, wrapped; unsigned long start, off; } ovRandomWalk;
+static void ovRandomWalkInit(ovRandomWalk *rw) {
+    memset(rw, 0, sizeof(*rw));
+    rw->k0 = (int)(random() % OV_SLOTS);
+}
+static ovBucket *ovRandomNext(kvstoreDictOverlay *ov, ovRandomWalk *rw) {
+    for (; rw->k < OV_SLOTS; rw->k++, rw->begun = 0) {
+        ovSlot *s = &ov_index[(rw->k0 + rw->k) % OV_SLOTS];
+        if (s->ov != ov) continue;
+        if (!rw->begun) {
+            rw->begun = 1;
+            rw->wrapped = 0;
+            rw->start = rw->off = (unsigned long)random() % s->n;
+        }
+        for (;;) {
+            unsigned long off = ovSlotNext(s, rw->off);
+            if (!rw->wrapped && off >= s->n) {   /* to the end, then from offset 0 up to the start */
+                rw->wrapped = 1;
+                rw->off = 0;
+                continue;
+            }
+            if (rw->wrapped && off >= rw->start) break;
+            rw->off = off + 1;
+            return s->b[off];
         }
     }
     return NULL;
@@ -612,12 +675,12 @@ dictEntry *ovIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, 
     }
 }
 
-/* The chain head of the first non-empty overlayed bucket at or after a random ring slot, or NULL. */
+/* The chain head of the first non-empty overlayed bucket from a random start, or NULL. */
 static dictEntry *ovRandomChainHead(kvstoreDictOverlay *ov) {
-    int start = (int)(random() & OV_RING_MASK);
-    for (int k = 0; k < OV_RING; k++)
-        for (ovBucket *ob = ov->ring[(start + k) & OV_RING_MASK]; ob; ob = ob->next)
-            if (ob->chain) return ob->chain;
+    ovRandomWalk rw;
+    ovRandomWalkInit(&rw);
+    for (ovBucket *ob; (ob = ovRandomNext(ov, &rw)) != NULL;)
+        if (ob->chain) return ob->chain;
     return NULL;
 }
 
@@ -654,10 +717,10 @@ unsigned int ovGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned int
             if (!ovOriginalOf(ov, des[i])) des[n++] = des[i];
     }
     if (n < count && ov->nb) {
-        int start = (int)(random() & OV_RING_MASK);
-        for (int k = 0; k < OV_RING && n < count; k++)
-            for (ovBucket *ob = ov->ring[(start + k) & OV_RING_MASK]; ob && n < count; ob = ob->next)
-                for (dictEntry *te = ob->chain; te && n < count; te = dictGetNext(te)) des[n++] = te;
+        ovRandomWalk rw;
+        ovRandomWalkInit(&rw);
+        for (ovBucket *ob; n < count && (ob = ovRandomNext(ov, &rw)) != NULL;)
+            for (dictEntry *te = ob->chain; te && n < count; te = dictGetNext(te)) des[n++] = te;
     }
     return n;
 }
@@ -734,7 +797,6 @@ void ovDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, d
         ovChainPush(ov, ob, kv);
         ov->delta++;
         ovKeyCountAdd(kvs, didx, 1);
-        ovMarkDirty(kvs, ov);
         if (link) *link = &ob->chain;   /* the inserted entry's link, as dictSetKeyAtLink reports it */
     }
 }
@@ -754,7 +816,6 @@ dictEntry *ovDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *ke
     dictEntry *de = ovChainPush(ov, ob, key);
     ov->delta++;
     ovKeyCountAdd(kvs, didx, 1);
-    ovMarkDirty(kvs, ov);
     return de;
 }
 

@@ -64,6 +64,7 @@
 
 /* Bucket window size; per-dict word: save generation and slot state. */
 #define SNAP_WINDOW_BUCKETS_DEFAULT 1024
+#define SNAP_WINDOW_BUCKETS_MAX 65536   /* the overlay keeps an array of this many buckets per window */
 #ifndef SNAP_SCAN_PREFETCH2
 #define SNAP_SCAN_PREFETCH2 8
 #endif
@@ -359,7 +360,7 @@ static void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
 /* Create a scan over 'num_stores' kvstores; nothing is frozen or started yet. */
 static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores, snapScanDispatchFn *dispatch,
                             snapScanSlotDoneFn *slot_done, void *privdata);
-/* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare, drainable). */
+/* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare). */
 static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
 /* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
 static void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap);
@@ -1132,9 +1133,19 @@ static unsigned long snapGetWindowBuckets(void) { return snap_window_buckets; }
 static snapWindow snap_win[2];
 static redisAtomic uint64_t snap_win_seq = 0;
 redisAtomic uint64_t snap_funnel_seq = 0;
+static snapWindow snap_win_last;   /* the publisher's last window: the order check below */
 
-/* Scan thread: publish the window it is about to read. */
+/* Scan thread: publish the window it is about to read. Windows only move
+ * forward over a dict (the layout, then table 0, then table 1, each in
+ * increasing runs), which is what lets the main thread write back every
+ * overlayed bucket of a window as soon as a later one is published. */
 static void snapWindowPublish(dict *d, int table, unsigned long lo, unsigned long hi) {
+    if (d && d == snap_win_last.d)
+        serverAssert(table > snap_win_last.table || (table == snap_win_last.table && lo >= snap_win_last.hi));
+    snap_win_last.d = d;
+    snap_win_last.table = table;
+    snap_win_last.lo = lo;
+    snap_win_last.hi = hi;
     uint64_t seq;
     atomicGet(snap_win_seq, seq);
     snapWindow *w = &snap_win[(seq + 1) & 1];
@@ -1323,7 +1334,7 @@ static void snapScanBitmapAlloc(snapScanCtx *ctx, snapDictState *sn, dict *d) {
  * overlay the first time the guard attaches it; its overlayed buckets are written back on
  * the main thread as the window moves and is released when its slot
  * completes. Only the overlay callbacks of 'hooks' (clone, free_orig, enter,
- * prepare, drainable) are taken; the guard and layout hooks are the scan's
+ * prepare) are taken; the guard and layout hooks are the scan's
  * own. Every hook of store s receives the store's snapGuardPriv, whose 'user'
  * field is 'store_privdata[s]' (NULL array: NULL). Must be called before
  * snapScanStart(). */
@@ -1343,7 +1354,6 @@ static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, 
     ctx->hooks.free_orig = hooks->free_orig;
     ctx->hooks.enter = hooks->enter;
     ctx->hooks.prepare = hooks->prepare;
-    ctx->hooks.drainable = hooks->drainable;
     ctx->has_ov = 1;
     ctx->ov_priv = store_privdata;
 }
@@ -2127,7 +2137,7 @@ int snapDebugCommand(client *c) {
         if (c->argc == 3) {
             long long n;
             if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return 1;
-            if (n < 1 || n > (1LL << 30)) {
+            if (n < 1 || n > SNAP_WINDOW_BUCKETS_MAX) {
                 addReplyError(c, "Out of range");
                 return 1;
             }
@@ -2141,8 +2151,9 @@ int snapDebugCommand(client *c) {
 
 /* ---- Bucket position and main-thread emission (emit-ahead) ---- */
 
-/* Main thread, inside a write section. */
-static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx) {
+/* Main thread, inside a write section. When the bucket is inside the window
+ * and 'win' is given, *win receives the window. */
+static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
     uint8_t st = snapScanDictStateMain(ctx, s, didx, d);
     if (st == SNAP_SLOT_PENDING) return SNAP_POS_AHEAD;
     if (st != SNAP_SLOT_SCANNING) return SNAP_POS_BEHIND;
@@ -2158,6 +2169,12 @@ static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int ta
     if (table != w->table) return table < w->table ? SNAP_POS_BEHIND : SNAP_POS_AHEAD;
     if (idx < w->lo) return SNAP_POS_BEHIND;
     if (idx >= w->hi) return SNAP_POS_AHEAD;
+    if (win) {
+        win->seq = seq;
+        win->table = w->table;
+        win->lo = w->lo;
+        win->n = w->hi - w->lo;
+    }
     return SNAP_POS_INSIDE;
 }
 
@@ -2322,16 +2339,16 @@ static void snapSaveWindowDone(void *priv) {
  * window over that bucket and then waits for the section to close. A later
  * look in the same section sees the bucket inside the window, but the thread
  * will skip it (snapScanWalkDict reads the bit), so it is not owed. */
-static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos) {
-    *pos = snapBucketPosition(ctx, s, didx, d, table, idx);
+static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos, kvstoreOvWindow *win) {
+    *pos = snapBucketPosition(ctx, s, didx, d, table, idx, win);
     if (*pos == SNAP_POS_BEHIND) return 0;
     return !snapScanBucketEmitted(ctx, s, didx, table, idx);
 }
 
 /* Overlay 'prepare' hook (privdata = the store's snapGuardPriv): may the frozen chain of
  * 'key' be written in place? Emits the bucket first when the thread has not
- * reached it. */
-static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key) {
+ * reached it; defers it, in the window *win, when the thread is reading it. */
+static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
     int s = ((struct snapGuardPriv *)privdata)->s;
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
@@ -2364,7 +2381,7 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
         }
         return KVSTORE_OV_INPLACE;
     }
-    if (!snapBucketOwed(sv->scan, s, didx, d, table, idx, &pos)) {
+    if (!snapBucketOwed(sv->scan, s, didx, d, table, idx, &pos, win)) {
         sv->inplace_writes++;
         server.stat_snap_inplace_writes++;
         return KVSTORE_OV_INPLACE;
@@ -2375,18 +2392,9 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
     return KVSTORE_OV_INPLACE;
 }
 
-/* Overlay 'drainable' hook: may the overlay's chain of bucket (table, idx) be
- * written back to the dict now? Yes once the scan thread has passed it (the
- * position is stable inside the section the caller holds). */
-static int snapOverlayDrainable(void *privdata, int didx, dict *d, int table, unsigned long idx) {
-    int s = ((struct snapGuardPriv *)privdata)->s;
-    snapSave *sv = snap_save;
-    if (!sv) return 1;
-    return snapBucketPosition(sv->scan, s, didx, d, table, idx) == SNAP_POS_BEHIND;
-}
-
 /* Main thread, inside a write section: write back the overlayed buckets the
- * scan thread has passed (once the window has moved on).
+ * scan thread has passed, i.e. those of the windows before the current one
+ * (a window is published only once the thread has read the previous one).
  * Called at the end of every section and from cron; a no-op until the window
  * has moved since the last drain, since nothing new can be drainable. */
 static uint64_t snap_drain_seq = 0;
@@ -2397,17 +2405,14 @@ static void snapSaveDrainSideTables(void) {
     atomicGetWithSync(snap_win_seq, seq);
     if (seq == snap_drain_seq) return;
     snap_drain_seq = seq;
-    for (int j = 0; j < sv->dbnum; j++) kvstoreOverlayDrain(server.db[j].keys);
+    kvstoreOverlayDrain(seq);
 }
 
 /* Overlayed buckets of the running save. */
 static long snapSaveSideEntries(void) {
     snapSave *sv = snap_save;
     if (!sv || sv->aborted) return 0;
-    long n = 0;
-    for (int s = 0; s < sv->dbnum; s++)
-        if (sv->stores[s]) n += kvstoreOverlayPending(sv->stores[s]);
-    return n;
+    return kvstoreOverlayPending();
 }
 
 /* ---- Stores versus dbs (SWAPDB, FLUSHDB during a save) ---- */
@@ -2488,7 +2493,7 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (!snapBucketOwed(sv->scan, s, slot, d, table, idx, &pos)) return 0;
+    if (!snapBucketOwed(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
     /* Ahead and not emitted, or being read: the frozen entry itself is owed,
      * its clone in an overlayed bucket is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
@@ -3357,7 +3362,7 @@ static void snapSaveFree(snapSave *sv) {
 static void snapOverlayEnter(void *privdata) { UNUSED(privdata); snapFunnelOpen(); }
 static const kvstoreSnapHooks snap_server_hooks = {
     .clone = snapOverlayCloneKey, .free_orig = snapOverlayFreeOriginal, .enter = snapOverlayEnter,
-    .prepare = snapOverlayPrepare, .drainable = snapOverlayDrainable,
+    .prepare = snapOverlayPrepare,
 };
 
 /* Main thread: the save object, its channel, queues and scan context for a
@@ -4294,12 +4299,12 @@ static void snapScanTests(int accurate) {
         snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNING));   /* as the thread's claim would */
         snapWindowPublish(d, 0, 0, mid);            /* the thread reads [0, mid) */
         snapFunnelOpen();                           /* a command opens its write section */
-        int owed_ahead = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos); p_ahead = pos;
+        int owed_ahead = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
         snapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
         snapWindowPublish(d, 0, mid, size);         /* the thread moves on; it would quiesce now */
-        int owed_after = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos); p_after = pos;
-        int owed_other = snapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos); p_other = pos;
-        int owed_behind = snapBucketOwed(ctx, 0, 3, d, 0, 0, &pos); p_behind = pos;
+        int owed_after = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
+        int owed_other = snapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
+        int owed_behind = snapBucketOwed(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
         snapFunnelClose();
         snapWindowPublish(NULL, 0, 0, 0);
         test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == SNAP_POS_AHEAD);
@@ -4318,7 +4323,7 @@ static void snapScanTests(int accurate) {
             unsigned long tsize = DICTHT_SIZE(d->ht_size_exp[t]);
             unsigned long probe[3] = { 0, tsize / 2, tsize - 1 };
             for (int j = 0; j < 3; j++) {
-                int owed = snapBucketOwed(ctx, 0, 3, d, t, probe[j], &pos);
+                int owed = snapBucketOwed(ctx, 0, 3, d, t, probe[j], &pos, NULL);
                 if (pos != SNAP_POS_AHEAD) layout_ahead = 0;
                 if (!owed) layout_owed = 0;
             }
@@ -4835,11 +4840,6 @@ static void snapOverlayTests(int abort_variant) {
     zfree(st);
 }
 
-static int ovTestDrainAll(void *priv, int didx, dict *d, int table, unsigned long idx) {
-    UNUSED(priv); UNUSED(didx); UNUSED(d); UNUSED(table); UNUSED(idx);
-    return 1;
-}
-
 static int ovTestKeyIndex(const char *k) {
     int i = -1;
     return sscanf(k, "k:0:0:%d", &i) == 1 ? i : -1;
@@ -4872,8 +4872,7 @@ static void snapOverlayBucketTests(void) {
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter,
-                               .drainable = ovTestDrainAll };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
     snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
     st->ctx = ctx;
     snapScanSetOverlay(ctx, &hooks, privs);
@@ -4953,13 +4952,13 @@ static void snapOverlayBucketTests(void) {
     int steps = 0;
     do {
         cursor = kvstoreScan(ks, cursor, 0, ovTestScanSeen, NULL, seen);
-        if (++steps == 3) kvstoreOverlayDrain(ks);   /* the buckets go back to the dict mid-scan */
+        if (++steps == 3) kvstoreOverlayDrain(UINT64_MAX);   /* the buckets go back to the dict mid-scan */
     } while (cursor);
     int all = 1;
     for (int i = 0; i < N; i++) if (i != idx1 && seen[i] == 0) all = 0;
     test_cond("overlay buckets: a scan spanning the write-back returns every key that was there throughout", all && seen[idx1] == 0);
     test_cond("overlay buckets: the write-back moved the chains into the dict",
-              kvstoreOverlayPending(ks) == 0 && dictSize(d) == (unsigned long)N && kvstoreDictSize(ks, 0) == (unsigned long)N &&
+              kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)N && kvstoreDictSize(ks, 0) == (unsigned long)N &&
               dictFind(d, newkey) != NULL && dictFind(d, k1name) == NULL && cnt.frees == cnt.clones);
 
     snapFunnelClose();
@@ -4967,6 +4966,132 @@ static void snapOverlayBucketTests(void) {
     snapScanRelease(ctx);
     test_cond("overlay buckets: after the release the dict holds the logical keys and every original was freed",
               !kvstoreOverlayIsFrozen(ks, 0) && kvstoreDictSize(ks, 0) == (unsigned long)N && cnt.frees == cnt.clones);
+    kvstoreRelease(ks);
+    zfree(st);
+}
+
+/* The window the test 'prepare' hook defers every write in: half a table
+ * (the half the bucket is in) of window number ov_test_seq. */
+static uint64_t ov_test_seq;
+static int ovTestPrepareHalves(void *priv, int didx, dict *d, const void *key, kvstoreOvWindow *w) {
+    UNUSED(priv); UNUSED(didx);
+    int t;
+    unsigned long i;
+    dictKeyBucket(d, key, &t, &i);
+    unsigned long half = DICTHT_SIZE(d->ht_size_exp[t]) / 2;
+    w->seq = ov_test_seq;
+    w->table = t;
+    w->lo = i < half ? 0 : half;
+    w->n = half;
+    return KVSTORE_OV_DEFER;
+}
+
+/* A key of dict didx (k:0:didx:i, i < n) in a table-0 bucket of the lower or
+ * upper half not used yet; its name in 'name'. */
+static int ovTestKeyInHalf(dict *d, int didx, int n, int upper, char *used, char *name, size_t len) {
+    unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]);
+    for (int i = 0; i < n; i++) {
+        snprintf(name, len, "k:0:%d:%d", didx, i);
+        unsigned long b = dictGetHash(d, name) & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+        if ((b >= size / 2) == upper && !used[b]) {
+            used[b] = 1;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* The index of overlayed buckets: one slot per (dict, window), a drain writes
+ * back exactly the windows before the sequence it is given, a dict that left
+ * its store is drained like the others, and four windows hold buckets at once.
+ * No scan thread: a test 'prepare' hook defers every write in a window it
+ * chooses. */
+static void snapOverlayWindowTests(void) {
+    dictType noval = KvstoreDictTestType;
+    noval.no_value = 1;
+    noval.keyCompare = snapTestKeyCompare;
+    kvstore *stores[1];
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstore *ks = stores[0];
+    const int N = 200;
+    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+        for (int i = 0; i < N; i++) serverAssert(kvstoreDictAddRaw(ks, didx, snapTestKey(0, didx, i), NULL) != NULL);
+        dict *d = kvstoreGetDict(ks, didx);
+        while (dictIsRehashing(d)) dictRehash(d, 1000);
+    }
+    dict *d0 = kvstoreGetDict(ks, 0), *d1 = kvstoreGetDict(ks, 1), *d2 = kvstoreGetDict(ks, 2);
+    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) st->inserted[0][didx] = N;
+    st->stores = stores;
+    struct ovTestCounters cnt = {0, 0};
+    void *privs[1] = { &cnt };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter,
+                               .prepare = ovTestPrepareHalves };
+    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    st->ctx = ctx;
+    snapScanSetOverlay(ctx, &hooks, privs);
+    snapScanFreeze(ctx);
+    char *used[SNAP_TEST_DICTS];
+    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+        used[didx] = zcalloc(DICTHT_SIZE(kvstoreGetDict(ks, didx)->ht_size_exp[0]));
+    char lo0[32], hi0[32], k1[32], lo2[32], hi2[32];
+    serverAssert(ovTestKeyInHalf(d0, 0, N, 0, used[0], lo0, sizeof(lo0)) && ovTestKeyInHalf(d0, 0, N, 1, used[0], hi0, sizeof(hi0)) &&
+                 ovTestKeyInHalf(d1, 1, N, 0, used[1], k1, sizeof(k1)));
+
+    /* Window 10 over both halves of dict 0, window 11 over dict 1: three slots. */
+    ov_test_seq = 10;
+    serverAssert(kvstoreDictDelete(ks, 0, lo0) == DICT_OK && kvstoreDictDelete(ks, 0, hi0) == DICT_OK);
+    ov_test_seq = 11;
+    serverAssert(kvstoreDictDelete(ks, 1, k1) == DICT_OK);
+    test_cond("overlay window: three buckets in three windows, the deletes logical only",
+              kvstoreOverlayPending() == 3 && kvstoreDictFind(ks, 0, lo0) == NULL && kvstoreDictFind(ks, 0, hi0) == NULL &&
+              kvstoreDictFind(ks, 1, k1) == NULL && dictFind(d0, lo0) && dictFind(d0, hi0) && dictFind(d1, k1) &&
+              kvstoreDictSize(ks, 0) == (unsigned long)N - 2 && kvstoreDictSize(ks, 1) == (unsigned long)N - 1);
+    test_cond("overlay window: a drain at the current window writes back nothing", kvstoreOverlayDrain(10) == 3);
+    test_cond("overlay window: a drain past window 10 writes back dict 0's buckets only",
+              kvstoreOverlayDrain(11) == 1 && !dictFind(d0, lo0) && !dictFind(d0, hi0) && dictSize(d0) == (unsigned long)N - 2 &&
+              dictFind(d1, k1) != NULL && kvstoreDictFind(ks, 1, k1) == NULL);
+
+    /* Dict 1 leaves its store (the slot-trim move) with its bucket still overlayed: drained all the same. */
+    kvstore *tmp = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstoreMoveDict(ks, tmp, 1);
+    test_cond("overlay window: the moved dict keeps its overlayed bucket", kvstoreDictDetached(d1) && kvstoreOverlayPending() == 1);
+    test_cond("overlay window: a drain past window 11 writes back the moved dict's bucket",
+              kvstoreOverlayDrain(12) == 0 && !dictFind(d1, k1) && dictSize(d1) == (unsigned long)N - 1 && cnt.frees == cnt.clones);
+    kvstoreRelease(tmp);
+
+    /* Four windows at once: both halves of dict 0 (window 20) and of dict 2 (window 21). */
+    serverAssert(ovTestKeyInHalf(d0, 0, N, 0, used[0], lo0, sizeof(lo0)) && ovTestKeyInHalf(d0, 0, N, 1, used[0], hi0, sizeof(hi0)) &&
+                 ovTestKeyInHalf(d2, 2, N, 0, used[2], lo2, sizeof(lo2)) && ovTestKeyInHalf(d2, 2, N, 1, used[2], hi2, sizeof(hi2)));
+    ov_test_seq = 20;
+    serverAssert(kvstoreDictDelete(ks, 0, lo0) == DICT_OK && kvstoreDictDelete(ks, 0, hi0) == DICT_OK);
+    ov_test_seq = 21;
+    serverAssert(kvstoreDictDelete(ks, 2, lo2) == DICT_OK && kvstoreDictDelete(ks, 2, hi2) == DICT_OK);
+    /* A second write into an overlayed bucket goes to the same bucket, and an add lands in it too. */
+    dictEntryLink bucket = NULL;
+    kvstoreDictFindLink(ks, 0, lo0, &bucket);
+    kvstoreDictSetAtLink(ks, 0, zstrdup(lo0), &bucket, 1);
+    test_cond("overlay window: four windows hold buckets at once; a re-add lands in the overlayed bucket",
+              kvstoreOverlayPending() == 4 && kvstoreDictFind(ks, 0, lo0) != NULL && kvstoreDictSize(ks, 0) == (unsigned long)N - 3);
+    long scanned = 0;
+    unsigned long long cursor = 0;
+    do { cursor = kvstoreScan(ks, cursor, -1, ovTestScanCb, NULL, &scanned); } while (cursor);
+    int has_new = 0;
+    long iterated = ovTestCountIter(ks, &has_new, NULL);
+    unsigned long long logical = kvstoreSize(ks);
+    test_cond("overlay window: scan and iteration see the logical keyspace across the windows",
+              (unsigned long long)scanned == logical && (unsigned long long)iterated == logical && logical == 3ULL * N - 5);
+    test_cond("overlay window: windows 20 and 21 drain in turn",
+              kvstoreOverlayDrain(21) == 2 && dictFind(d0, lo0) != NULL && dictFind(d0, hi0) == NULL && dictFind(d2, lo2) != NULL &&
+              kvstoreOverlayDrain(22) == 0 && dictFind(d2, lo2) == NULL && dictFind(d2, hi2) == NULL && cnt.frees == cnt.clones);
+
+    snapFunnelClose();
+    snapScanAbort(ctx);
+    snapScanRelease(ctx);
+    test_cond("overlay window: after the release nothing is overlayed and nothing is frozen",
+              kvstoreOverlayPending() == 0 && !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 2) &&
+              kvstoreSize(ks) == 3ULL * N - 5);
+    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) zfree(used[didx]);
     kvstoreRelease(ks);
     zfree(st);
 }
@@ -5000,8 +5125,7 @@ static void snapOverlayRehashTests(void) {
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter,
-                               .drainable = ovTestDrainAll };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
     snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
     st->ctx = ctx;
     snapScanSetOverlay(ctx, &hooks, privs);
@@ -5022,7 +5146,7 @@ static void snapOverlayRehashTests(void) {
     int ndel = 0;
     for (int i = 0; i < N; i++) ndel += gone[i];
     test_cond("overlay rehash: writes overlayed buckets and the rehash stayed paused",
-              kvstoreOverlayPending(ks) > 0 && dictIsRehashing(d) &&
+              kvstoreOverlayPending() > 0 && dictIsRehashing(d) &&
               kvstoreDictSize(ks, 0) == (unsigned long)(N - ndel + added));
 
     /* Enumeration: each logical key once. */
@@ -5052,13 +5176,13 @@ static void snapOverlayRehashTests(void) {
     int steps = 0;
     do {
         cursor = kvstoreScan(ks, cursor, 0, ovTestScanSeen, NULL, seen);
-        if (++steps == 3) kvstoreOverlayDrain(ks);
+        if (++steps == 3) kvstoreOverlayDrain(UINT64_MAX);
     } while (cursor);
     int all = 1;
     for (int i = 0; i < N; i++) if (!gone[i] && seen[i] == 0) all = 0;
     test_cond("overlay rehash: a scan spanning the write-back returns every key that was there throughout", all);
     test_cond("overlay rehash: the write-back left the dict with exactly the logical keys",
-              kvstoreOverlayPending(ks) == 0 && dictSize(d) == (unsigned long)(N - ndel + added) && cnt.frees == cnt.clones);
+              kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)(N - ndel + added) && cnt.frees == cnt.clones);
 
     snapFunnelClose();
     snapScanAbort(ctx);
@@ -5109,6 +5233,7 @@ int snapshotTest(int argc, char **argv, int flags) {
     snapOverlayTests(0);
     snapOverlayTests(1);
     snapOverlayBucketTests();
+    snapOverlayWindowTests();
     snapOverlayRehashTests();
     test_report();
     return 0;
@@ -5285,6 +5410,7 @@ int snapshotTest(int argc, char **argv, int flags) {
     snapOverlayTests(0);
     snapOverlayTests(1);
     snapOverlayBucketTests();
+    snapOverlayWindowTests();
     snapOverlayRehashTests();
 
     test_report();
