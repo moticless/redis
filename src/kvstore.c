@@ -16,6 +16,7 @@
 #define INCLUDE_KVSOVERLAY_H
 
 #include "fmacros.h"
+#include "config.h"
 
 #include <string.h>
 #include <stddef.h>
@@ -57,13 +58,13 @@ struct _kvstore {
  * so the snapshot sees every access, reads included), or whatever the guard
  * decides (it may attach one now). */
 static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
-    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
+    if (likely(kvs->snap_hooks == NULL)) return NULL;
     dict *d = kvs->dicts[didx];
     return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
 }
 
 static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
-    if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
+    if (likely(kvs->snap_hooks == NULL)) return NULL;
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
     kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
@@ -1059,7 +1060,7 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
 
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
     kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictFind(ov, key);
+    if (unlikely(ov != NULL)) return ovDictFind(ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1093,7 +1094,7 @@ dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
 dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLink *bucket) {
     if (bucket) *bucket = NULL;    
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictFindLink(kvs, didx, ov, key, bucket);
+    if (unlikely(ov != NULL)) return ovDictFindLink(kvs, didx, ov, key, bucket);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d) return NULL;
     return dictFindLink(d, key, bucket);
@@ -1115,7 +1116,7 @@ dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLi
 void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link, int newItem) {
     dict *d;
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) { ovDictSetAtLink(kvs, didx, ov, kv, link, newItem); return; }
+    if (unlikely(ov != NULL)) { ovDictSetAtLink(kvs, didx, ov, kv, link, newItem); return; }
     if (newItem) {
         d = createDictIfNeeded(kvs, didx);
         dictSetKeyAtLink(d, kv, link, newItem);
@@ -1128,7 +1129,7 @@ void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link,
 
 dictEntry *kvstoreDictAddRaw(kvstore *kvs, int didx, void *key, dictEntry **existing) {
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictAddRaw(kvs, didx, ov, key, existing);
+    if (unlikely(ov != NULL)) return ovDictAddRaw(kvs, didx, ov, key, existing);
     dict *d = createDictIfNeeded(kvs, didx);
     dictEntry *ret = dictAddRaw(d, key, existing);
     if (ret)
@@ -1155,7 +1156,7 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
 
 dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index) {
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictTwoPhaseUnlinkFind(kvs, didx, ov, key, table_index);
+    if (unlikely(ov != NULL)) return ovDictTwoPhaseUnlinkFind(kvs, didx, ov, key, table_index);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1168,7 +1169,7 @@ void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, i
 
 void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) { ovDictTwoPhaseUnlinkFreeKey(kvs, didx, ov, link, table_index, key); return; }
+    if (unlikely(ov != NULL)) { ovDictTwoPhaseUnlinkFreeKey(kvs, didx, ov, link, table_index, key); return; }
     dict *d = kvstoreGetDict(kvs, didx);
     dictTwoPhaseUnlinkFree(d, link, table_index);
     cumulativeKeyCountAdd(kvs, didx, -1);
@@ -1177,7 +1178,7 @@ void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link
 
 int kvstoreDictDelete(kvstore *kvs, int didx, const void *key) {
     kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (__builtin_expect(ov != NULL, 0)) return ovDictDelete(kvs, didx, ov, key);
+    if (unlikely(ov != NULL)) return ovDictDelete(kvs, didx, ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return DICT_ERR;

@@ -193,6 +193,7 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 /* ---- SNAP_NOFORK arena: see "SNAP_NOFORK ARENA" at the top of this file. ---- */
 #include <stdint.h>
 #include <limits.h>
+#include "config.h"   /* likely / unlikely */
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
 #define HAVE_NOFORK_ARENA 1
 /* Three globals exported for the two inline hot-path checks below only (one
@@ -220,13 +221,13 @@ __attribute__((malloc)) void *zmalloc_nofork_slow(size_t size);
 __attribute__((malloc)) void *zcalloc_nofork_slow(size_t size);
 void *zmalloc_nofork_usable_slow(size_t size, size_t *usable);
 static inline void *zmalloc_nofork(size_t size) {
-    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zmalloc_nofork_slow(size) : zmalloc(size);
+    return unlikely(zmalloc_nofork_enabled()) ? zmalloc_nofork_slow(size) : zmalloc(size);
 }
 static inline void *zcalloc_nofork(size_t size) {
-    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zcalloc_nofork_slow(size) : zcalloc(size);
+    return unlikely(zmalloc_nofork_enabled()) ? zcalloc_nofork_slow(size) : zcalloc(size);
 }
 static inline void *zmalloc_nofork_usable(size_t size, size_t *usable) {
-    return __builtin_expect(zmalloc_nofork_enabled(), 0) ? zmalloc_nofork_usable_slow(size, usable) : zmalloc_usable(size, usable);
+    return unlikely(zmalloc_nofork_enabled()) ? zmalloc_nofork_usable_slow(size, usable) : zmalloc_usable(size, usable);
 }
 void *zrealloc_nofork(void *ptr, size_t size);   /* zrealloc, which keeps an arena block in the arena; NULL allocates in the arena */
 __attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);

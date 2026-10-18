@@ -730,7 +730,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
     }
 #ifdef HAVE_NOFORK_ARENA
     /* SNAP_NOFORK arena memory must stay in the arena. */
-    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) return noforkRealloc(ptr, size, usable, old_usable);
+    if (unlikely(zmalloc_is_nofork(ptr))) return noforkRealloc(ptr, size, usable, old_usable);
 #endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     newptr = realloc_with_usize(ptr, size, &oldsize, &size);
@@ -842,7 +842,7 @@ static void __attribute__((noinline, cold)) zfreeNoforkUsableCold(void *ptr, siz
 void zfree(void *ptr) {
     if (ptr == NULL) return;
 #ifdef HAVE_NOFORK_ARENA
-    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkCold(ptr); return; }
+    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkCold(ptr); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -873,7 +873,7 @@ void zfree_usable(void *ptr, size_t *usable) {
         return;
     }
 #ifdef HAVE_NOFORK_ARENA
-    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkUsableCold(ptr, usable); return; }
+    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkUsableCold(ptr, usable); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -900,7 +900,7 @@ void zfree_with_size(void *ptr, size_t size) {
 #ifdef USE_JEMALLOC
     update_zmalloc_stat_free(size);
 #ifdef HAVE_NOFORK_ARENA
-    if (__builtin_expect(zmalloc_is_nofork(ptr), 0)) { zfreeNoforkSizeCold(ptr, size); return; }
+    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkSizeCold(ptr, size); return; }
 #endif
     je_sdallocx(ptr, size, 0);
 #else
