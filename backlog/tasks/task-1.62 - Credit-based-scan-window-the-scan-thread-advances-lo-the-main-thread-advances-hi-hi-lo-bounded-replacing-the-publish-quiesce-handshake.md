@@ -3,11 +3,11 @@ id: TASK-1.62
 title: >-
   Credit-based scan window: the scan thread advances lo, the main thread
   advances hi (hi - lo bounded), replacing the publish/quiesce handshake
-status: In Progress
+status: Done
 assignee:
   - '@claude'
 created_date: '2026-10-17 10:31'
-updated_date: '2026-10-17 23:47'
+updated_date: '2026-10-18 12:46'
 labels:
   - hybrid-bgsave
   - performance
@@ -49,8 +49,8 @@ Constraint: single scan thread; TASK-1.57 (parallel scan) would need one window 
 
 ## Acceptance Criteria
 <!-- AC:BEGIN -->
-- [ ] #1 TASK-1.61's numbers justify the change (recorded in this task's notes); otherwise the task is closed with them
-- [ ] #2 docs/hybrid-snapshot.md contains the memory-ordering argument covering busy, idle and wakeup transitions, abort, and module threads holding the GIL, reviewed before implementation
+- [x] #1 TASK-1.61's numbers justify the change (recorded in this task's notes); otherwise the task is closed with them
+- [x] #2 docs/hybrid-snapshot.md contains the memory-ordering argument covering busy, idle and wakeup transitions, abort, and module threads holding the GIL, reviewed before implementation
 - [x] #3 With no traffic, save time is within noise of the current protocol (an idle main thread does not slow the scan)
 - [x] #4 Under TASK-1.61's long-command workload the scan thread's waiting time drops to near zero
 - [x] #5 Existing scan, abort and abort-in-section tests pass; new tests cover the idle-to-capped transition and a window crossing tables and dicts
@@ -106,4 +106,25 @@ Idle-save regression investigation (AWS c7i.4xlarge, 2026-10-18; perf on the sca
 - Controlled comparison (8 runs each from one RDB, scan thread pinned): base 30.09 G cycles / 9170 ms; new +1.2% / +1.1% (about one standard error); new2, with the batch announced together with its prefetch lookahead so prefetching continues across batches, +0.3% / +0.4% (noise). The earlier 2-3% was mostly run-to-run noise. AC #3 met with new2.
 - False sharing found and fixed: snap_cur/snap_lo (stored by the thread after every bucket) shared a cache line with snap_funnel_seq (read by the main thread after every command) and snap_hi. They now sit on their own cache line (snap_pos_thread).
 - Under SET/GET traffic (6 runs each from one RDB): scan cycles base 38.3 G, new2 37.2 G (-2.9%), new3 (cache-line fix) 37.1 G (-3.1%); save 11.78 / 11.46 / 11.44 s; ops/s during the save 145.6k / 149.1k / 152.5k (+4.8% for new3).
+
+Closing (2026-10-18). AC #1: justified by this task's own A/B rather than TASK-1.61 (still open; its remaining half, the main thread's write-back cost, feeds TASK-1.63). Long write scripts during a save, 2M keys: 49 s -> 2.0 s, so the quiesce wait was ~96% of the old save time; idle +0.3% scan cycles (noise); traffic -3.1% cycles, 11.78 -> 11.44 s. The old code had no stall counter, so its wait share is inferred from the save-time difference. AC #2: the memory-ordering argument (busy, idle, wakeup, abort, module threads under the GIL, the end) is in docs/hybrid-snapshot.md section 4; the user accepted the pre-implementation review of doc-1 as covering it. Committed as c3ad92db6 (plus 8270aa81a, likely/unlikely cleanup).
 <!-- SECTION:NOTES:END -->
+
+## Final Summary
+
+<!-- SECTION:FINAL_SUMMARY:BEGIN -->
+Replaced the publish/quiesce handshake between the scan thread and the main thread with a credit-based window (commit c3ad92db6).
+
+What changed:
+- The thread announces `cur` and publishes `lo`; only the main thread writes `hi`, which is INF outside write sections. A section caps `hi` at advance(lo, W) on open (a seq_cst store-load pair against `cur`: a dict the thread has already entered is paused), grants more as `lo` passes the midpoint (up to 16 overlay slots), and drains below `lo` and resets `hi` to INF on close. The thread waits once, at END.
+- Positions are SNAP_POS(ord, phase, idx) over the real (db, slot), so ASM slot-filter gaps are never compared. Buckets are classified BEHIND / INSIDE / AHEAD by position; the emitted bitmap records only main-thread emit-ahead.
+- The overlay index grows on demand, keyed by each window's last position; reads through an attached overlay call the `enter` hook, so read-only scripts refill `hi`.
+- snap_cur/snap_lo moved to their own cache line; the prefetch lookahead stays below `hi`; stores with dbnum * slots >= 2^22 fall back to the classic child.
+- New INFO fields: snap_save_scan_stalls, snap_save_scan_stall_ms, snap_save_window_grants. docs/hybrid-snapshot.md describes the protocol and its race-freedom argument; design in doc-1.
+
+Why: the scan thread used to stall for the whole of any long command running when it published a window. AWS c7i, long write scripts during a save: 49 s -> 2.0 s. Idle and traffic saves stay within noise (traffic slightly better: -3.1% scan cycles, ops/s 145.6k -> 152.5k).
+
+Tests: new unit tests (credit, positions/grants/cap, owed, a 10-window overlay) and a tcl test for a long read script; redis-server test snapshot 212/212, unit/snapshot 82 ok, ASan and TSan clean on unit/snapshot, full suite passed on the pre-final code.
+
+Follow-ups: TASK-1.61 (main-thread write-back cost), which TASK-1.63 depends on.
+<!-- SECTION:FINAL_SUMMARY:END -->
