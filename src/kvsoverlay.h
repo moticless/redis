@@ -43,20 +43,20 @@
  * the scan thread reads them exactly as at the freeze. Only the main thread
  * touches the overlay.
  *
- * The buckets are indexed by the scan window they were deferred in, which
+ * The buckets are indexed by the window they were deferred in, which
  * 'prepare' reports (kvstoreOvWindow: a run [lo, lo + n) of one table and the
- * window's sequence number). One index serves every store, there being one
- * scan at a time: a few slots, each the buckets of one window of one dict, a
- * bucket at offset index - lo, with a bitmap of the offsets in use. Windows
- * only move forward and a write is only deferred inside the current one, so
- * at most three windows hold buckets at once (the two a write section may
- * see, and the one left over from the last drain). Lookup is a check of the
- * slots and an array load; a drain visits only the buckets there are.
+ * scan position of its last bucket). One index serves every store, there
+ * being one scan at a time: slots, each the buckets of one window of one
+ * dict, a bucket at offset index - lo, with a bitmap of the offsets in use.
+ * The index grows on demand; the snapshot keeps it small (it drains at the
+ * end of every write section and holds the scan back once many slots are in
+ * use). Lookup is a check of the slots and an array load; a drain visits only
+ * the buckets there are.
  *
  * LIFECYCLE
  * ---------
  * attach   the store's snapshot guard decides a dict needs an overlay (first
- *          structural write to it while owed, or the window is on it):
+ *          structural write to it while owed, or the scan thread is on it):
  *          kvstoreOverlayAttach, the overlay copies the store's hooks. An
  *          overlay without overlayed buckets is only the carrier of the hooks.
  * write    'prepare' asks the snapshot whether the chain may be written in
@@ -65,8 +65,9 @@
  *          chain through 'clone') and the write lands in the duplicate.
  *          Rehash and auto-resize are held while any bucket is overlayed.
  *          Logical key counts are kept as it goes. Reads never overlay.
- * drain    on the owner thread, kvstoreOverlayDrain(seq) writes back every
- *          bucket of the windows before 'seq', which the thread will never
+ * drain    on the owner thread, kvstoreOverlayDrain(below) writes back every
+ *          bucket of the windows whose last position is below 'below' (the
+ *          scan has passed them), which the thread will never
  *          read again: the duplicate becomes the slot's chain, the originals
  *          are released through 'free_orig' and the original chain's nodes
  *          are freed. Rehash and auto-resize resume with a dict's last bucket.

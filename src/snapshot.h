@@ -137,9 +137,9 @@ void snapValueDetachFromArena(robj *o);
 
 /* ---- Per-slot background scan ------------------------------------------- */
 
-/* ---- Bucket window and write sections ------------------------------------ */
+/* ---- Credit window and write sections ------------------------------------ */
 
-/* Odd while the main thread is inside a write section. */
+/* Odd while the main thread is inside a write section (it caps the scan thread then; see snapshot.c). */
 extern redisAtomic uint64_t snap_funnel_seq;
 /* Close it: end of the outermost command, beforeSleep, GIL release. */
 void snapFunnelCloseSlow(void);

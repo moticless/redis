@@ -985,6 +985,36 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             snap_assert_placement_clean
         }
 
+        test {Hybrid snapshot: a long script that keeps reading keys does not hold the scan thread back} {
+            r flushall
+            populate 100000 sl: 10
+            r set probe x
+            set ref [debug_digest]
+            r config set rdb-key-save-delay 20   ;# 20 us x 100k keys: about 2 s of scan
+            r bgsave
+            snap_wait_save_started
+            # One write section for the whole script: before the credit window
+            # the thread waited for it to end; now each read raises hi.
+            set t0 [clock milliseconds]
+            # (TIME is frozen inside a script: a fixed number of reads instead)
+            r eval {
+                for i = 1, 3000000 do redis.call('get', 'probe') end
+                return 1
+            } 0
+            set script_ms [expr {[clock milliseconds] - $t0}]
+            set stall_ms [s snap_save_scan_stall_ms]
+            if {$::verbose} { puts "long script: $script_ms ms, scan stalled $stall_ms ms, [s snap_save_window_grants] grants" }
+            assert {$script_ms >= 200}
+            assert {[s snap_save_window_grants] > 0}
+            assert {$stall_ms < $script_ms / 4}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            snap_assert_placement_clean
+        }
+
         test {Hybrid snapshot harness: keys with module metadata leave the arena, survive writes during the save and reload with their metadata} {
             r module load [file normalize tests/modules/test_keymeta.so]
             r debug enable-keymeta-runtime-registration 1

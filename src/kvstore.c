@@ -53,7 +53,8 @@ struct _kvstore {
 /* Save state exists on a dict only while its store is under a save (the save
  * releases every state it attached before the hooks come off): no save, one
  * load. ovPeek: the attached overlay or NULL, no side effects. ovGet: what a
- * dict access must go through: the attached overlay, or whatever the guard
+ * dict access must go through: the attached overlay (after the 'enter' hook,
+ * so the snapshot sees every access, reads included), or whatever the guard
  * decides (it may attach one now). */
 static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
     if (__builtin_expect(kvs->snap_hooks == NULL, 1)) return NULL;
@@ -66,7 +67,10 @@ static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
     kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
-    if (ov) return ov;
+    if (ov) {
+        if (kvs->snap_hooks->enter) kvs->snap_hooks->enter(kvs->snap_priv);
+        return ov;
+    }
     return kvs->snap_hooks->guard(kvs->snap_priv, kvs, didx, write);
 }
 
