@@ -22,40 +22,39 @@
  *
  * KVSTORE OVERLAY
  * ---------------
- * The hybrid snapshot (snapshot.h) serializes the keyspace with a background
- * thread that reads the store's dicts while the main thread keeps writing.
- * The overlay is what makes that safe. While a scan runs over a store, a
- * snapshot guard is installed on it (kvstoreSnapGuardSet): every access to a
- * dict that has no overlay yet asks the guard first, which may attach one.
+ * The contract between a store and the hybrid snapshot (snapshot.h), which
+ * reads the store's dicts on a background thread while the main thread keeps
+ * writing. The implementation is kvsoverlay.c; kvsoverlay.h, the private
+ * header kvstore.c and kvsoverlay.c share, describes its data structures and
+ * lifecycle. The public entry points are in this file.
  *
- * A dict with an overlay is "frozen": its bucket layout is fixed (no resize,
- * rehash steps are reported to the snapshot) and every write first asks the
- * snapshot ('prepare') whether the chain may be written in place. When the
- * scan thread is reading that bucket right now, the bucket is "overlayed": its
- * chain is duplicated (every key through 'clone', so in-place mutation by
- * callers lands on the clone) and the write goes to the duplicate; the dict's
- * own chain stays exactly as the thread reads it. While a dict has overlayed
- * buckets, reads, sizes and enumeration describe the logical keyspace (the
- * dict with each overlayed bucket's chain in place of its own); reads never
- * overlay anything. Without them reads are plain dict reads, and a store
- * without a guard pays one load per access.
+ * While a scan runs over a store, the snapshot's hooks are installed on it
+ * (kvstoreSnapGuardSet): every access to a dict without an overlay asks the
+ * guard first, which may attach one. A dict with an overlay is "frozen": its
+ * bucket layout is fixed (no resize; rehash steps are reported to the
+ * snapshot), and before every structural write the snapshot's 'prepare' hook
+ * says whether the bucket's chain may be written in place. If not (DEFER:
+ * the scan thread may be reading the bucket), the bucket is "overlayed": its
+ * chain is duplicated, every key through 'clone' so in-place mutation by the
+ * caller lands on the clone, and the write goes to the duplicate; the dict's
+ * own chain stays exactly as the thread reads it. Reads, sizes and
+ * enumeration describe the logical keyspace (each overlayed bucket's chain in
+ * place of the dict's); reads never overlay anything. A store without hooks
+ * pays one load per access.
  *
- * Every overlayed bucket belongs to the window that 'prepare' reported when
- * it deferred the write (a run of buckets of one table, tagged with the scan
- * position of its last bucket; positions only grow along the scan).
- * kvstoreOverlayDrain() writes the duplicates back into the real dict, on the
- * owner thread, for every bucket of the windows whose last position is below
- * the one it is given: the snapshot no longer reads those.
- * kvstoreOverlayRelease() writes back whatever is left of a dict and
- * unfreezes it once its scan is complete. The overlay hangs off the
- * dict's metadata (kvstoreDictMetaBase.ov); the save's own per-dict state
- * (bucket bitmaps, pause) sits in the opaque extension slot next to it.
+ * DEFER also reports the window the bucket is in (kvstoreOvWindow: a run of
+ * buckets of one table and the scan position of its last bucket; positions
+ * only grow along the scan). On the owner thread kvstoreOverlayDrain(below)
+ * writes back every window whose last position is below 'below' (the
+ * snapshot no longer reads them), and kvstoreOverlayRelease() writes back
+ * what is left of a dict and unfreezes it once its scan is complete.
  *
  * Dicts are reference counted so a save can keep reading a dict its store
  * let go of (FLUSHDB, SWAPDB, a freed empty dict): the store detaches the
- * dict instead of freeing it and the last holder releases it. The
- * implementation is kvsoverlay.c (kvsoverlay.h is the private header the two
- * files share); the public entry points are in this file.
+ * dict instead of freeing it and the last holder releases it. The overlay
+ * hangs off the dict's metadata (kvstoreDictMetaBase.ov); the save's own
+ * per-dict state (bucket bitmaps, pause) sits in the opaque extension slot
+ * next to it.
  *
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
@@ -68,7 +67,11 @@
 
 typedef struct _kvstore kvstore;
 
-typedef struct kvstoreOvCursor { int slot, last, skipn; long bucket; dictEntry *next; } kvstoreOvCursor;   /* snapshot overlay: iterator position in the overlay's bucket chains (phases 1, 2) */
+typedef struct kvstoreOvCursor {
+    int slot, last, skipn;
+    long bucket;
+    dictEntry *next;
+} kvstoreOvCursor;   /* snapshot overlay: iterator position in the overlay's bucket chains (phases 1, 2) */
 
 /* Structure for kvstore iterator that allows iterating across multiple dicts. */
 typedef struct _kvstoreIterator {

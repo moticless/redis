@@ -8,11 +8,11 @@
  *
  *
  * WHAT IS HYBRID SNAPSHOT?
- * --------------------------
+ * ------------------------
  * A point-in-time snapshot (BGSAVE, full sync, AOF rewrite) that cuts fork()
- * page-table and copy-on-write cost. Unlike the classic fork(), small values 
- * and selected structures live in a dedicated jemalloc arena such that pages are 
- * marked MADV_DONTFORK and are serialized by a background thread of the parent. 
+ * page-table and copy-on-write cost. Unlike the classic fork(), small values
+ * and selected structures live in a dedicated jemalloc arena such that pages are
+ * marked MADV_DONTFORK and are serialized by a background thread of the parent.
  * The fork child serializes only the big ones. Toggled at runtime with `hybrid-snapshot`.
  *
  * Every value has a class, decided by where its memory is:
@@ -37,33 +37,49 @@
  *    keyspace store (kvstoreSnapGuardSet), every fork-instant dict gets a
  *    reference and a generation stamp. Nothing is copied.
  * 2. Fork: the child maps the SNAP_FORK values and nothing of the keyspace.
- * 3. Scan (background thread): every frozen dict is read one bucket window
- *    at a time; SNAP_NOFORK keys are serialized into 64 KB buffers, SNAP_FORK
+ * 3. Scan (background thread): the frozen dicts are read bucket by bucket in
+ *    a fixed order, below a limit the main thread sets (the credit window,
+ *    below). SNAP_NOFORK keys are serialized into 64 KB buffers, SNAP_FORK
  *    keys are shipped to the child as header copies whose values the child
  *    resolves in its own memory. Two pipes: the small channel of buffers and
- *    the big channel of headers; the child takes the small backlog first.
- * 4. Writes meanwhile (main thread, the write funnel): a write to a frozen
- *    dict is in place once the window has passed the bucket; made on a
- *    duplicate of the bucket's chain while the window is on it (kvstore.h, KVSTORE OVERLAY);
- *    and ahead of the window the bucket is serialized first (emit-ahead, the
- *    main thread produces it) and then written in place.
- * 5. Completion: as the window moves on, the duplicated buckets are written back into their dicts;
- *    when a dict's scan is complete its overlay is released. The child exits
- *    after END; snapOnChildEnd joins the thread and the classic done handler
- *    runs. Abort (hybrid-snapshot-max-retained-bytes hard mark, FLUSHALL, a
- *    killed child) joins the thread, drains every overlay and leaves the
- *    previous dump untouched.
+ *    the big channel of headers; the child drains the small backlog first.
+ * 4. Writes meanwhile (main thread, the write funnel): what a write to a
+ *    frozen dict does depends on where the scan thread is (below).
+ * 5. Completion: buckets the thread has passed are written back as it moves
+ *    on; when a dict's scan is complete its overlay is released and the dict
+ *    unfrozen. The child exits after END; snapOnChildEnd joins the thread and
+ *    the classic done handler runs. Abort (hybrid-snapshot-max-retained-bytes
+ *    hard mark, FLUSHALL, a killed child) joins the thread, drains every
+ *    overlay and leaves the previous dump untouched.
  *
- * THE BUCKET WINDOW AND WRITE SECTIONS
+ * THE CREDIT WINDOW AND WRITE SECTIONS
  * ------------------------------------
- * The scan thread publishes the window (dict, table, [lo, hi)) before it
- * reads it. The main thread writes to frozen buckets only inside a "write
- * section", opened by the first funnel hook of a command and closed when the
- * outermost command returns (also at beforeSleep and when a module thread
- * releases the GIL). The thread waits for an open section to close before
- * reading a new window, so a bucket link obtained inside a section stays
- * valid until the section ends: one seq_cst store-then-load pair each side.
- * A slot (dict) is "owed" to the save until its state is SNAP_SLOT_DONE.
+ * Every bucket has a position in the scan order (store, dict, table, bucket
+ * as one integer). The scan thread publishes lo (every position below it is
+ * read) and announces in cur the batch it reads next; it never reads at or
+ * past hi, which only the main thread moves.
+ *
+ * The main thread touches frozen dicts only inside a "write section": opened
+ * by the first guard or funnel hook of a command, closed when the outermost
+ * command returns, at beforeSleep and when a module thread releases the GIL.
+ * Outside sections hi is unlimited and the thread runs free. Opening a
+ * section caps hi about W buckets past lo (default 1024, DEBUG
+ * SNAP-WINDOW-BUCKETS); while it stays open the main thread raises hi each
+ * time lo passes half the grant, unless many overlay windows are in use;
+ * closing it writes back the overlayed buckets below lo and lifts the cap.
+ * Inside a section a bucket the main thread writes is:
+ *   behind  below lo: written in place;
+ *   inside  in [lo, hi): the thread may be reading it, so the write goes to
+ *           a duplicate of the bucket's chain (kvstore.h, KVSTORE OVERLAY);
+ *   ahead   hi and above: serialized by the main thread first (emit-ahead,
+ *           marked so the thread skips it), then written in place.
+ * The thread waits only when it reaches hi during a long section, and once at
+ * the end for an open section to close; the main thread never waits. The cap
+ * is a seq_cst store-load pair on each side (thread: store cur, load hi;
+ * main: store hi, load cur): either the main thread sees where the thread is,
+ * or the thread sees the cap. A slot (dict) is "owed" to the save until its
+ * state is SNAP_SLOT_DONE. The full argument: docs/hybrid-snapshot.md
+ * section 3; the encoding and the code: snapshot.c, "Scan positions".
  *
  * MEMORY
  * ------
@@ -87,11 +103,10 @@
  *
  * WHERE TO LOOK
  * -------------
- * snapshot.c: classification and placement; clone-on-write for the overlay;
- * the scan engine (windows, write sections, per-dict state, bitmaps, the
- * thread); the save (queues, channels, stores vs dbs, hard mark); the child
- * writer; the parent orchestration; unit tests (redis-server test snapshot).
- * kvstore.h / kvsoverlay.c: the overlay (frozen dicts, overlayed buckets).
+ * snapshot.c: the implementation (its head lists its sections) and the unit
+ * tests (redis-server test snapshot). kvstore.h, KVSTORE OVERLAY: the overlay
+ * contract (frozen dicts, overlayed buckets); kvsoverlay.h / kvsoverlay.c: its
+ * implementation.
  * zmalloc.c: the arena. docs/hybrid-snapshot.md: the design, with figures.
  * All functions here are prefixed "snap".
  */
@@ -137,16 +152,14 @@ int snapChildNoKeyspace(void);
 void snapPlaceValueArena(robj *o);
 
 static inline void snapPlaceValue(robj *o) {
-    if (__builtin_expect(zmalloc_nofork_enabled(), 0)) snapPlaceValueArena(o);
+    if (unlikely(zmalloc_nofork_enabled())) snapPlaceValueArena(o);
 }
 /* Move a value out of the arena */
 void snapValueDetachFromArena(robj *o);
 
-/* ---- Per-slot background scan ------------------------------------------- */
-
 /* ---- Credit window and write sections ------------------------------------ */
 
-/* Odd while the main thread is inside a write section (it caps the scan thread then; see snapshot.c). */
+/* Odd while the main thread is inside a write section (see THE CREDIT WINDOW AND WRITE SECTIONS above). */
 extern redisAtomic uint64_t snap_funnel_seq;
 /* Close it: end of the outermost command, beforeSleep, GIL release. */
 void snapFunnelCloseSlow(void);
@@ -154,7 +167,7 @@ void snapFunnelCloseSlow(void);
 static inline void snapFunnelClose(void) {
     uint64_t v;
     atomicGet(snap_funnel_seq, v);
-    if (__builtin_expect(v & 1, 0)) snapFunnelCloseSlow();
+    if (unlikely(v & 1)) snapFunnelCloseSlow();
 }
 
 /* ---- The server keyspace on the scan ------------------------------------- */

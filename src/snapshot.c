@@ -1,37 +1,22 @@
 /*
- * snapshot.c - Hybrid snapshot (design: docs/hybrid-snapshot.md; API: snapshot.h).
+ * snapshot.c - Hybrid snapshot: the implementation.
  *
- * A hybrid save splits the keyspace by value class. SNAP_NOFORK values (every
- * kvobj header, the keyspace hash tables and single-allocation values up to
- * save-small-max-bytes) live in a jemalloc arena the fork child never maps
- * (MADV_DONTFORK, zmalloc.c) and are serialized by a scan thread in the
- * parent; SNAP_FORK values (hash tables, skiplists, quicklists, streams,
- * module types, large encodings) stay in forkable memory and the child
- * serializes them from its copy-on-write snapshot. The child is the single
- * writer of the output (RDB file, replica sockets or an AOF base file).
+ * The design overview (value classes, one save end to end, the credit window
+ * and write sections, memory, entry points) is the comment at the top of
+ * snapshot.h; the full design, with figures and the race-freedom argument, is
+ * docs/hybrid-snapshot.md. This file keeps the implementation details next to
+ * the code they describe; each section below opens with its own.
  *
- * One save, in order: the main thread captures the per-db sizes, freezes the
- * keyspace (one reference and a generation stamp per fork-instant dict, a
- * guard on every store), forks the child, then starts the scan thread. The
- * thread reads the frozen dicts bucket by bucket in a fixed order, below a
- * limit (hi) that the main thread sets only while it works on the keyspace
- * (the credit window); the main thread keeps serving writes through the write
- * funnel: in place behind the thread, made on a duplicate of the bucket's
- * chain between the thread and hi, and beyond hi the bucket is serialized
- * first (emit-ahead) and then written in place. Records reach the child over two pipes: a small
- * channel of 64 KB buffers of pre-encoded records, a big channel of kvobj
- * header copies whose values the child resolves in its own memory. The child
- * takes the small backlog first, then one big value, until END; the parent
- * writes back each dict's duplicated buckets once the thread has passed them and completes
- * the save when the child exits (checkChildrenDone -> snapOnChildEnd ->
- * the classic done handler). Abort (hard mark, FLUSHALL, killed child) joins
- * the thread, drains every overlay and leaves the previous dump untouched.
- *
- * Sections of this file: arena fork visibility; classification and
- * placement; clone-on-write for the overlay; the scan engine (positions,
- * the credit window, write sections, per-dict state, bitmaps, the thread); the save
- * (queues, channels, stores vs dbs, hard mark); the child writer; the
- * parent orchestration; unit tests (redis-server test snapshot).
+ * Sections, in order:
+ *   - fork visibility of the arena;
+ *   - classification and placement;
+ *   - clone-on-write for the keyspace overlay;
+ *   - the scan engine: scan positions, the credit window and write sections,
+ *     per-dict save state and bucket bitmaps, the thread;
+ *   - the save: INFO/DEBUG, bucket position and emit-ahead, stores versus
+ *     dbs, the outbound queue to the child;
+ *   - the child writer, then the parent orchestration;
+ *   - unit tests (redis-server test snapshot).
  *
  * Copyright (c) 2026-Present, Redis Ltd.
  * All rights reserved.
@@ -133,6 +118,17 @@ typedef struct snapPlacementStats {
  * id; a FLUSHDB leaves it with no owner), the db id in the dump is always s. */
 struct snapGuardPriv { struct snapScanCtx *ctx; int s; void *user; };
 
+/* What the scan keeps per store (one per db: db->keys). */
+typedef struct snapScanStore {
+    kvstore *kvs;
+    dict **dicts;                 /* the fork-instant dicts by slot, one reference each; NULL once completed (allocated at freeze) */
+    long nrefs;                   /* dicts not completed yet; the guard comes off at zero. Main thread. */
+    int num_dicts;                /* kvstoreNumDicts() */
+    int ord_base;                 /* the ordinal of its dict 0 in the scan positions */
+    int frozen;                   /* 1 while our guard is installed (snapScanFreeze() until its last dict completes) */
+    struct snapGuardPriv guard;   /* the privdata of every hook on the store */
+} snapScanStore;
+
 /* What the save keeps per dict in the kvstore extension slot, allocated the
  * first time the save touches the dict (a write before the scan thread
  * reached it, a pause before hi may pass its layout, or any access while the
@@ -153,12 +149,8 @@ struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
 
 
 struct snapScanCtx {
-    kvstore **stores;               /* One per db (db->keys). */
+    snapScanStore *store;           /* num_stores entries, one per db. */
     int num_stores;
-    int *num_dicts;                 /* kvstoreNumDicts() per store. */
-    int *frozen;                    /* Per store: 1 while our guard is installed on it (snapScanFreeze() until its last dict completes). */
-    dict ***dicts;                  /* Per store: the fork-instant dicts by slot, one reference each; NULL once completed. */
-    long *nrefs;                    /* Per store: table entries not completed yet; the guard comes off at zero. Main thread. */
     size_t bitmap_bytes;            /* Bucket bitmaps attached to the table dicts. Main thread. */
     long retained_dicts;            /* Table dicts their store let go of before the save completed them (freed here). Main thread. */
     redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), SNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
@@ -166,7 +158,6 @@ struct snapScanCtx {
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
     uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
     const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
-    struct snapGuardPriv *guards;   /* Per store: the privdata of every hook on that store. */
 
     snapScanDispatchFn *dispatch;
     snapScanSlotDoneFn *slot_done;
@@ -196,7 +187,6 @@ struct snapScanCtx {
     int frozen_all;                 /* snapScanFreeze() done. */
     unsigned long window_buckets;   /* copied from snap_window_buckets at create: the thread's credit W */
     unsigned long ov_block;         /* overlay windows: aligned runs of this many buckets (W rounded up to a power of two) */
-    int *ord_base;                  /* Per store: the ordinal of its dict 0 in the scan positions. */
     uint64_t pos_end;               /* the position past every dict: the thread's lo and cur at the end */
     uint64_t hi;                    /* main thread: its own last store of snap_hi */
     uint64_t mid;                   /* main thread: the next grant is due once lo reaches this */
@@ -1121,18 +1111,11 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
  * save layer plugs in through the dispatch, slot-done, window-done and
  * store-done callbacks.
  *
- * Reading contract: the thread reads dicts in a fixed order (store, dict,
- * layout, table 0, table 1, bucket: one integer position) and stays below hi,
- * which only the main thread moves; it announces each batch in cur before
- * reading it and publishes lo behind it. The main thread never writes a chain
- * at a position in [lo, hi) (such writes go to a duplicate of the bucket
- * through the kvstore overlay) and waits for no one; a write at or beyond hi
- * serializes the bucket first (emit-ahead, marked in the per-save bitmap so
- * the thread skips it) and then goes in place; a write below lo is a plain
- * write. A dict's layout is paused before hi may pass it; a dict beyond hi
- * may grow (its bitmap follows the new table) but not shrink. The thread
- * reads the chains with atomic loads (dictWalkBucketRange) and never writes
- * to a dict.
+ * Reading contract: the credit window of snapshot.h (behind lo in place,
+ * [lo, hi) through the overlay, hi and beyond emit-ahead). Beyond it: a
+ * dict's layout is paused before hi may pass it; a dict beyond hi may grow
+ * (its bitmap follows the new table) but not shrink. The thread reads the
+ * chains with atomic loads (dictWalkBucketRange) and never writes to a dict.
  *
  * Publication: slot states are atomics written with release semantics by the
  * thread (SCANNING, SCANNED) and by the main thread (PENDING, DONE), and read
@@ -1193,14 +1176,11 @@ static inline uint8_t snapDictStateOf(snapScanCtx *ctx, dict *d);
 #define SNAP_ADVANCE_DICTS 64              /* dicts one grant may open */
 #define SNAP_OV_SLOTS_SOFT 16              /* overlay windows in use past which a section stops granting */
 
-/* The credit window (doc: "Scan window"). The thread announces in cur the
- * last position it may read next, then reads hi and stays below it; it
- * publishes lo once every position below lo is read. The main thread alone
- * writes hi: unlimited outside write sections, capped when a section opens
- * (snapWindowCap) and raised inside one as the thread advances
- * (snapWindowRefill). cur/hi form a store-load pair on each side (seq_cst):
- * after the cap, the thread is at most on cur, and any later position it
- * reaches sees the cap. */
+/* The credit window (snapshot.h; docs/hybrid-snapshot.md section 3). Here:
+ * cur is the last position of the batch the thread reads next (its prefetch
+ * lookahead included), lo is stored after every bucket. hi is capped by
+ * snapWindowCap at section open and raised by snapWindowRefill; after the cap
+ * the thread is at most on cur, and any later position it reaches sees it. */
 /* The thread's words on a cache line of their own: it stores lo after every
  * bucket, and the main thread reads snap_funnel_seq after every command. */
 static struct {
@@ -1216,12 +1196,12 @@ redisAtomic uint64_t snap_funnel_seq = 0;
 static inline uint64_t snapPosLoLoad(void) { return __atomic_load_n(&snap_lo, __ATOMIC_ACQUIRE); }
 
 /* A dict's ordinal and back. */
-static inline uint64_t snapOrd(snapScanCtx *ctx, int s, int didx) { return (uint64_t)ctx->ord_base[s] + (uint64_t)didx; }
+static inline uint64_t snapOrd(snapScanCtx *ctx, int s, int didx) { return (uint64_t)ctx->store[s].ord_base + (uint64_t)didx; }
 static void snapOrdDecode(snapScanCtx *ctx, uint64_t ord, int *s, int *didx) {
     int k = 0;
-    while (k + 1 < ctx->num_stores && ord >= (uint64_t)ctx->ord_base[k + 1]) k++;
+    while (k + 1 < ctx->num_stores && ord >= (uint64_t)ctx->store[k + 1].ord_base) k++;
     *s = k;
-    *didx = (int)(ord - (uint64_t)ctx->ord_base[k]);
+    *didx = (int)(ord - (uint64_t)ctx->store[k].ord_base);
 }
 
 static void snapScanPauseLayout(snapScanCtx *ctx, dict *d);
@@ -1242,8 +1222,8 @@ static uint64_t snapWindowAdvance(snapScanCtx *ctx, uint64_t from, unsigned long
     int phase = SNAP_POS_PHASE(from);
     unsigned long idx = SNAP_POS_IDX(from);
     for (; s < ctx->num_stores; s++, didx = 0) {
-        for (; didx < ctx->num_dicts[s]; didx++, phase = 0, idx = 0) {
-            dict *d = ctx->frozen[s] ? snapTableDict(ctx, s, didx) : NULL;
+        for (; didx < ctx->store[s].num_dicts; didx++, phase = 0, idx = 0) {
+            dict *d = ctx->store[s].frozen ? snapTableDict(ctx, s, didx) : NULL;
             if (!d) continue;
             uint8_t st = snapDictStateOf(ctx, d);
             if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) continue;
@@ -1282,7 +1262,7 @@ static void snapWindowCap(snapScanCtx *ctx) {
     if (c >= h && c < ctx->pos_end) {
         int s, didx;
         snapOrdDecode(ctx, SNAP_POS_ORD(c), &s, &didx);
-        dict *d = ctx->frozen[s] ? snapTableDict(ctx, s, didx) : NULL;
+        dict *d = ctx->store[s].frozen ? snapTableDict(ctx, s, didx) : NULL;
         if (d && snapDictStateOf(ctx, d) == SNAP_SLOT_SCANNING) snapScanPauseLayout(ctx, d);
         h = c + 1;
         __atomic_store_n(&snap_hi, h, __ATOMIC_RELEASE);
@@ -1437,7 +1417,7 @@ static inline snapDictState *snapStateOf(dict *d) { return __atomic_load_n(&snap
  * each). Entries are cleared at completion, on the main thread, after the
  * thread published SCANNED for the slot or was joined. */
 static inline dict *snapTableDict(snapScanCtx *ctx, int s, int didx) {
-    return ctx->dicts[s] ? __atomic_load_n(&ctx->dicts[s][didx], __ATOMIC_RELAXED) : NULL;
+    return ctx->store[s].dicts ? __atomic_load_n(&ctx->store[s].dicts[didx], __ATOMIC_RELAXED) : NULL;
 }
 
 /* Either thread: the state of a table dict (its word carries this save's generation). */
@@ -1451,7 +1431,7 @@ static inline uint8_t snapDictStateOf(snapScanCtx *ctx, dict *d) {
  * store that is not scanned (empty at the fork instant, or completed), after
  * the end, and for a dict that is not the save's. */
 static uint8_t snapScanDictStateMain(snapScanCtx *ctx, int s, int didx, dict *d) {
-    if (ctx->ended || !ctx->frozen[s]) return SNAP_SLOT_DONE;
+    if (ctx->ended || !ctx->store[s].frozen) return SNAP_SLOT_DONE;
     if (d != snapTableDict(ctx, s, didx)) return SNAP_SLOT_DONE;
     return snapDictStateOf(ctx, d);
 }
@@ -1499,7 +1479,7 @@ static size_t snapScanTableBytes(snapScanCtx *ctx) {
     size_t n = ctx->slots_total ? ctx->slots_total : 1;
     size_t bytes = n * sizeof(uint64_t);   /* ring */
     for (int s = 0; s < ctx->num_stores; s++)
-        if (ctx->dicts[s]) bytes += (size_t)ctx->num_dicts[s] * sizeof(dict *);
+        if (ctx->store[s].dicts) bytes += (size_t)ctx->store[s].num_dicts * sizeof(dict *);
     return bytes;
 }
 
@@ -1562,23 +1542,17 @@ static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
                             snapScanSlotDoneFn *slot_done, void *privdata)
 {
     snapScanCtx *ctx = zcalloc(sizeof(*ctx));
-    ctx->stores = zmalloc(sizeof(kvstore*) * num_stores);
-    memcpy(ctx->stores, stores, sizeof(kvstore*) * num_stores);
+    ctx->store = zcalloc(sizeof(snapScanStore) * num_stores);
     ctx->num_stores = num_stores;
-    ctx->num_dicts = zmalloc(sizeof(int) * num_stores);
-    ctx->ord_base = zmalloc(sizeof(int) * num_stores);
-    ctx->frozen = zcalloc(sizeof(int) * num_stores);
-    ctx->dicts = zcalloc(sizeof(dict **) * num_stores);
-    ctx->nrefs = zcalloc(sizeof(long) * num_stores);
-    ctx->guards = zmalloc(sizeof(struct snapGuardPriv) * num_stores);
     long long ords = 0;
     for (int s = 0; s < num_stores; s++) {
-        ctx->num_dicts[s] = kvstoreNumDicts(stores[s]);
-        ctx->ord_base[s] = (int)ords;
-        ords += ctx->num_dicts[s];
-        ctx->guards[s].ctx = ctx;
-        ctx->guards[s].s = s;
-        ctx->guards[s].user = NULL;
+        snapScanStore *st = &ctx->store[s];
+        st->kvs = stores[s];
+        st->num_dicts = kvstoreNumDicts(stores[s]);
+        st->ord_base = (int)ords;
+        ords += st->num_dicts;
+        st->guard.ctx = ctx;
+        st->guard.s = s;
     }
     serverAssert(ords < (1LL << SNAP_POS_ORD_BITS));   /* snapScanFits() */
     ctx->pos_end = SNAP_POS(ords, 0, 0);
@@ -1635,7 +1609,7 @@ static inline int snapDictPaused(dict *d) {
  * (kvstore shrinkAllowed). Returns the overlay (NULL without one). */
 static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d, int pause) {
     snapScanState(ctx, d);
-    if (ctx->has_ov && !snapMeta(d)->ov) kvstoreOverlayAttach(ctx->stores[s], didx);
+    if (ctx->has_ov && !snapMeta(d)->ov) kvstoreOverlayAttach(ctx->store[s].kvs, didx);
     if (pause) snapScanPauseLayout(ctx, d);
     return snapMeta(d)->ov;
 }
@@ -1678,7 +1652,7 @@ static void snapGuardRehashCompleted(void *privdata, int didx, dict *d) {
 }
 static int snapGuardShrinkAllowed(void *privdata, int didx) {
     struct snapGuardPriv *g = privdata;
-    dict *d = kvstoreGetDict(g->ctx->stores[g->s], didx);
+    dict *d = kvstoreGetDict(g->ctx->store[g->s].kvs, didx);
     return !d || snapMeta(d)->ext == NULL;   /* a bitmap cannot follow a merge of buckets */
 }
 
@@ -1691,37 +1665,39 @@ static int snapGuardShrinkAllowed(void *privdata, int didx) {
  * when their slot completes. A dict empty now, or allocated later, is not in
  * the table: nothing of the fork instant is in it, the guard leaves it alone. */
 static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
-    kvstore *kvs = ctx->stores[s];
+    snapScanStore *st = &ctx->store[s];
+    kvstore *kvs = st->kvs;
     if (kvstoreSize(kvs) == 0) return;
-    int n = ctx->num_dicts[s];
-    ctx->dicts[s] = zcalloc(sizeof(dict *) * n);
+    int n = st->num_dicts;
+    st->dicts = zcalloc(sizeof(dict *) * n);
     for (int didx = 0; didx < n; didx++) {
         if (ctx->slot_filter && !(ctx->slot_filter[didx >> 3] & (1u << (didx & 7)))) continue;   /* not ours: a plain dict throughout */
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d || dictSize(d) == 0) continue;
         kvstoreDictRetain(kvs, didx);
         snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_PENDING));
-        ctx->dicts[s][didx] = d;
-        ctx->nrefs[s]++;
+        st->dicts[didx] = d;
+        st->nrefs++;
     }
-    ctx->slots_total += ctx->nrefs[s];
+    ctx->slots_total += st->nrefs;
     ctx->hooks.guard = snapOverlayGuard;
     ctx->hooks.rehash_started = snapGuardRehashStarted;
     ctx->hooks.rehash_completed = snapGuardRehashCompleted;
     ctx->hooks.shrink_allowed = snapGuardShrinkAllowed;
-    ctx->guards[s].user = ctx->ov_priv ? ctx->ov_priv[s] : NULL;
-    kvstoreSnapGuardSet(kvs, &ctx->hooks, &ctx->guards[s]);
-    ctx->frozen[s] = 1;
+    st->guard.user = ctx->ov_priv ? ctx->ov_priv[s] : NULL;
+    kvstoreSnapGuardSet(kvs, &ctx->hooks, &st->guard);
+    st->frozen = 1;
 }
 
 /* The store's last dict completed: the guard comes off now, not at release,
  * because the caller of an abort (FLUSHALL, SWAPDB, DEBUG RELOAD) frees or
  * replaces the store right after, before snapScanRelease() runs. */
 static void snapScanStoreDone(snapScanCtx *ctx, int s) {
-    if (!ctx->frozen[s]) return;
-    serverAssert(ctx->nrefs[s] == 0);
-    kvstoreSnapGuardSet(ctx->stores[s], NULL, NULL);
-    ctx->frozen[s] = 0;
+    snapScanStore *st = &ctx->store[s];
+    if (!st->frozen) return;
+    serverAssert(st->nrefs == 0);
+    kvstoreSnapGuardSet(st->kvs, NULL, NULL);
+    st->frozen = 0;
     if (ctx->store_done) ctx->store_done(ctx->privdata, s);
 }
 
@@ -1904,8 +1880,8 @@ static void *snapScanThreadMain(void *arg) {
 
     unsigned long since_done = 0;   /* buckets read since the last window_done */
     for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
-        if (!ctx->frozen[s]) continue;   /* nothing of the fork instant in it (snapScanFreezeStore) */
-        for (int didx = 0; didx < ctx->num_dicts[s]; didx++) {
+        if (!ctx->store[s].frozen) continue;   /* nothing of the fork instant in it (snapScanFreezeStore) */
+        for (int didx = 0; didx < ctx->store[s].num_dicts; didx++) {
             if (snapScanAborted(ctx)) break;
             /* The save's own table: the fork-instant dicts, referenced,
              * whatever the store did with them since. */
@@ -2041,11 +2017,11 @@ static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted)
     ctx->bitmap_bytes -= snapScanStateRelease(d);
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
     if (kvstoreDictRefcount(d) == 1) { ctx->retained_dicts++; snap_stat_retained_dicts++; }   /* the save outlived the store's hold on it */
-    __atomic_store_n(&ctx->dicts[s][didx], NULL, __ATOMIC_RELAXED);
+    __atomic_store_n(&ctx->store[s].dicts[didx], NULL, __ATOMIC_RELAXED);
     kvstoreDictUnref(d);
-    ctx->nrefs[s]--;
+    ctx->store[s].nrefs--;
     ctx->slots_done++;
-    if (ctx->nrefs[s] == 0) snapScanStoreDone(ctx, s);
+    if (ctx->store[s].nrefs == 0) snapScanStoreDone(ctx, s);
 }
 
 /* Main thread. Handles slots the thread finished since the last call: for
@@ -2076,9 +2052,10 @@ static void snapScanFinishAll(snapScanCtx *ctx) {
         snapScanCompleteSlot(ctx, SNAP_SCAN_DEC_STORE((uint64_t)cur), SNAP_SCAN_DEC_DIDX((uint64_t)cur), 1);
     }
     for (int s = 0; s < ctx->num_stores; s++) {
-        if (!ctx->frozen[s]) continue;
-        for (int didx = 0; ctx->nrefs[s] > 0 && didx < ctx->num_dicts[s]; didx++)
-            if (ctx->dicts[s][didx]) snapScanCompleteSlot(ctx, s, didx, 1);
+        snapScanStore *st = &ctx->store[s];
+        if (!st->frozen) continue;
+        for (int didx = 0; st->nrefs > 0 && didx < st->num_dicts; didx++)
+            if (st->dicts[didx]) snapScanCompleteSlot(ctx, s, didx, 1);
         snapScanStoreDone(ctx, s);   /* a no-op when the last completion did it */
     }
     ctx->ended = 1;
@@ -2130,15 +2107,9 @@ static void snapScanRelease(snapScanCtx *ctx) {
         snapScanFinishAll(ctx);
     }
     for (int s = 0; s < ctx->num_stores; s++)
-        serverAssert(!ctx->frozen[s]);   /* every slot completed: the guard is already off */
-    zfree(ctx->guards);
-    for (int s = 0; s < ctx->num_stores; s++) zfree(ctx->dicts[s]);
-    zfree(ctx->dicts);
-    zfree(ctx->nrefs);
-    zfree(ctx->num_dicts);
-    zfree(ctx->ord_base);
-    zfree(ctx->frozen);
-    zfree(ctx->stores);
+        serverAssert(!ctx->store[s].frozen);   /* every slot completed: the guard is already off */
+    for (int s = 0; s < ctx->num_stores; s++) zfree(ctx->store[s].dicts);
+    zfree(ctx->store);
     zfree(ctx->ring);
     freeEventNotifier(ctx->en);
     zfree(ctx);
@@ -2147,7 +2118,7 @@ static void snapScanRelease(snapScanCtx *ctx) {
 /* Either thread. DONE for a slot the save holds nothing of (empty at the
  * fork instant, created since, or completed). */
 static int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
-    if (ctx->ended || !ctx->frozen[store_idx]) return SNAP_SLOT_DONE;
+    if (ctx->ended || !ctx->store[store_idx].frozen) return SNAP_SLOT_DONE;
     dict *d = snapTableDict(ctx, store_idx, didx);
     if (!d) return SNAP_SLOT_DONE;
     return snapDictStateOf(ctx, d);

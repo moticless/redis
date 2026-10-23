@@ -9,14 +9,10 @@
  *
  * WHAT IS KVSOVERLAY?
  * -------------------
- * The implementation side of the kvstore snapshot overlay (hybrid snapshot, see
- * the KVSTORE OVERLAY section of kvstore.h). While a background scan thread
- * reads a dict of the store, the dict is "frozen": its bucket layout may not
- * change and the chains the thread is reading may not be written. Writes to
- * such a dict go to a duplicate of the bucket's chain instead (the bucket is
- * "overlayed"), and every read, size and enumeration of the dict describes the
- * logical keyspace: the dict with each overlayed bucket's chain in place of its
- * own.
+ * The implementation of the kvstore snapshot overlay. What it does for its
+ * user (frozen dicts, 'prepare' and DEFER, overlayed buckets, windows, drain
+ * and release, dict references) is the KVSTORE OVERLAY section of kvstore.h;
+ * read that first. This header covers how it is built.
  *
  * WHO INCLUDES THIS
  * -----------------
@@ -43,36 +39,31 @@
  * the scan thread reads them exactly as at the freeze. Only the main thread
  * touches the overlay.
  *
- * The buckets are indexed by the window they were deferred in, which
- * 'prepare' reports (kvstoreOvWindow: a run [lo, lo + n) of one table and the
- * scan position of its last bucket). One index serves every store, there
- * being one scan at a time: slots, each the buckets of one window of one
- * dict, a bucket at offset index - lo, with a bitmap of the offsets in use.
- * The index grows on demand; the snapshot keeps it small (it drains at the
- * end of every write section and holds the scan back once many slots are in
- * use). Lookup is a check of the slots and an array load; a drain visits only
- * the buckets there are.
+ * The buckets are indexed by the window 'prepare' reported for them (the
+ * kvstoreOvWindow a DEFER carries). One index serves every store, there being
+ * one scan at a time: slots, each the buckets of one window of one dict, a
+ * bucket at offset index - lo, with a bitmap of the offsets in use. A slot is
+ * written back whole once the scan has passed its last bucket. The index
+ * grows on demand; the snapshot keeps it small (it drains at the end of every
+ * write section and stops granting the scan more once many slots are in use,
+ * kvstoreOverlaySlotsInUse). Lookup is a check of the slots and an array
+ * load; a drain visits only the buckets there are.
  *
  * LIFECYCLE
  * ---------
- * attach   the store's snapshot guard decides a dict needs an overlay (first
- *          structural write to it while owed, or the scan thread is on it):
- *          kvstoreOverlayAttach, the overlay copies the store's hooks. An
- *          overlay without overlayed buckets is only the carrier of the hooks.
- * write    'prepare' asks the snapshot whether the chain may be written in
- *          place (the window has passed, or the bucket was just emitted); if
- *          not, the bucket is overlayed on its first write (every key of the
- *          chain through 'clone') and the write lands in the duplicate.
- *          Rehash and auto-resize are held while any bucket is overlayed.
- *          Logical key counts are kept as it goes. Reads never overlay.
- * drain    on the owner thread, kvstoreOverlayDrain(below) writes back every
- *          bucket of the windows whose last position is below 'below' (the
- *          scan has passed them), which the thread will never
- *          read again: the duplicate becomes the slot's chain, the originals
- *          are released through 'free_orig' and the original chain's nodes
- *          are freed. Rehash and auto-resize resume with a dict's last bucket.
- * release  when the dict's scan is complete (or the save aborted),
- *          kvstoreOverlayRelease writes back what is left and the overlay goes.
+ * attach   kvstoreOverlayAttach, when the guard decides (kvstore.h): the
+ *          overlay copies the store's hooks. An overlay without overlayed
+ *          buckets is only the carrier of the hooks.
+ * write    on DEFER the bucket is overlayed on its first write (every key of
+ *          the chain through 'clone') and the write lands in the duplicate;
+ *          later writes to it go there directly. Rehash and auto-resize are
+ *          held while any bucket of the dict is overlayed. Logical key counts
+ *          are kept as it goes.
+ * drain    the write-back of a bucket: the duplicate becomes the slot's
+ *          chain, the originals are released through 'free_orig' and the
+ *          original chain's nodes are freed. Rehash and auto-resize resume
+ *          with a dict's last overlayed bucket.
+ * release  kvstoreOverlayRelease drains what is left and the overlay goes.
  * detach   a dict that leaves its store while frozen (freed, emptied, moved)
  *          takes its overlay along; its buckets drain like any others and the
  *          save releases the overlay later wherever the dict is.

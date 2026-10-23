@@ -12,13 +12,10 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-/* Snapshot overlay of a kvstore (hybrid snapshot): the duplicated bucket
- * chains that keep main-thread writes out of the buckets the scan thread is
- * reading, and the overlay halves of the kvstore entry points. kvstore.c holds
- * only the dispatch into this file (the public wrappers, the iterators and
- * the dict hooks); kvsoverlay.h is what the two files share. The save's own
- * per-dict state (bitmaps, pause) lives in the dict's extension slot and is
- * snapshot.c's. */
+/* Snapshot overlay of a kvstore (hybrid snapshot): the contract is the
+ * KVSTORE OVERLAY section of kvstore.h, the design of this file (who includes
+ * what, the overlayed buckets and their index, the lifecycle) is the head of
+ * kvsoverlay.h. */
 
 /* Opt in to the private overlay header. */
 #define INCLUDE_KVSOVERLAY_H
@@ -37,26 +34,9 @@
  * Snapshot overlay
  * ========================================================================== */
 
-/* The overlay of a frozen dict (public API: kvstoreOverlay* in kvstore.h;
- * kvstore.c sees only the forward declaration): the buckets the main thread
- * wrote while the scan thread was reading them. A written bucket is
- * "overlayed": its chain is duplicated (every key through the 'clone' hook)
- * and the main thread works on the duplicate, the dict's own slot and chain
- * staying exactly as the thread reads them. The duplicate is written back to
- * the slot once the thread has moved past the bucket's window, and the
- * originals are released then. Until then the overlay's chain is the bucket:
- * reads, sizes and enumeration prefer it to the dict's. Only the main thread
- * touches any of this.
- *
- * The overlayed buckets are indexed by the window they were deferred in
- * ('prepare' reports it: a run [lo, lo + n) of one table, and 'last', the
- * scan position of its last bucket): one index slot per window that holds
- * buckets, a bucket at offset idx - lo of its slot, with a bitmap of the
- * offsets in use. Once the scan has passed a slot's last bucket, every bucket
- * of the slot is written back together. The index grows on demand; the
- * owner keeps it small by draining at the end of every write section and by
- * holding the scan back once many slots are in use (kvstoreOverlaySlotsInUse).
- * One index for every store: there is one scan at a time. */
+/* The overlay of a frozen dict and the one index of overlayed buckets, by
+ * window (kvsoverlay.h, THE OVERLAYED BUCKETS). kvstore.c sees only the
+ * forward declaration. Only the main thread touches any of this. */
 #define OV_SLOT_KEEP 4096   /* offsets a free slot keeps allocated for the next window */
 
 /* The overlay's work counters (main thread only), see kvstoreOverlayStats.
