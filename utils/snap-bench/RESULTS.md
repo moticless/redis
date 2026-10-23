@@ -2392,3 +2392,22 @@ Findings:
 - ASAN found a bug in the first stage 2 (it read `kv->ptr` of a kvobj whose allocation is shorter than the field); the
   encoding check is back and TSAN found the scan reading buckets the main thread had emitted ahead (written in place
   inside later windows): both prefetch stages skip them.
+
+## Run 43 (2026-10-16): committed hybrid (6df646b93 + prefetch) vs stock upstream (0d6266f2d) vs Valkey forkless (06d35aca6), 4 GB datasets, fresh c7i.4xlarge, partial
+
+Same matrix as Run 40 (server on 0-3,8-11, 1 rep at 0 writes/s, 2 reps otherwise, writes/s 0/20k/50k, mixed also at hot 0.2). **Partial:** the instance was terminated during the small dataset's 20k cell (no timer was set; likely the FinOps untagged-instance sweep), so small has only the 0 and one 20k stock cell. CSVs: run43-mixed1m.csv, run43-mixed.csv, run43-mixed-hot.csv, run43-small.csv. Mean save seconds / extra memory MB (peak) / ping p99 ms / ping max ms:
+
+| dataset, writes/s | stock | hybrid | Valkey forkless |
+|---|---|---|---|
+| mixed1m, 0 | 45.0 / 4 / 0.61 / 41.6 | 25.8 / 92 / 0.63 / 15.9 | 52.7 / 1 / 1.75 / 2.0 |
+| mixed1m, 20k | 43.6 / 2508 / 0.64 / 31.7 | 23.1 / 881 / 0.65 / 10.5 | 49.4 / 4 / 1.55 / 2.0 |
+| mixed1m, 50k | 44.1 / 3260 / 0.40 / 35.2 | 24.8 / 1532 / 0.45 / 15.9 | 47.6 / 8 / 1.38 / 1.8 |
+| mixed, 0 | 37.2 / 4 / 0.62 / 38.7 | 19.1 / 7 / 0.56 / 17.5 | 41.1 / 0 / 1.20 / 6.2 |
+| mixed, 20k | 38.8 / 2407 / 0.65 / 33.3 | 17.5 / 699 / 0.67 / 16.4 | 45.4 / 8 / 1.31 / 1.7 |
+| mixed, 50k | 37.7 / 3156 / 0.28 / 40.4 | 19.2 / 1312 / 0.39 / 17.2 | 45.9 / 16 / 1.25 / 1.6 |
+| mixed hot 0.2, 50k | 39.2 / 2008 / 0.35 / 38.8 | 18.0 / 499 / 0.41 / 18.3 | 46.0 / 14 / 0.82 / 2.2 |
+| small, 0 (1 rep) | 33.3 / 4 / 0.61 / 40.0 | 27.9 / 2 / 0.64 / 1.0 | 37.7 / 1 / 1.26 / 1.9 |
+
+- Hybrid saves in about 55% of stock's time on mixed and mixed1m and uses 40-60% of stock's copy-on-write memory under writes; on small (all in the arena) it is 16% faster with no fork pause (1.6 ms vs 41 ms).
+- Valkey forkless is slower than stock here (7-27%), uses almost no extra memory, and has the lowest max stall (1.6-6 ms) but a higher ping p99 (0.8-1.75 ms vs 0.3-0.65).
+- Hybrid's max stall on mixed (10-18 ms) is the fork of the remaining non-arena memory (15-18 ms), well under stock's 32-41 ms.
