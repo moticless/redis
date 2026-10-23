@@ -265,7 +265,7 @@ struct snapSave {
     int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
     snapDbSizes *sizes;
     int req, rdbflags;
-    int rdb_child_type;        /* server.rdb_child_type once forked: RDB_CHILD_TYPE_DISK/SOCKET, NONE for an AOF rewrite */
+    int kind;                  /* SNAP_SAVE_RDB/SOCKETS/AOF */
     int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
     int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
                                   RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
@@ -334,9 +334,8 @@ struct snapSave {
 static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
 
 
-/* What kind of save this is follows from rdb_child_type: NONE is a BGREWRITEAOF. */
-#define snapIsAof(sv) ((sv)->rdb_child_type == RDB_CHILD_TYPE_NONE)
-#define snapToSockets(sv) ((sv)->rdb_child_type == RDB_CHILD_TYPE_SOCKET)
+#define snapIsAof(sv) ((sv)->kind == SNAP_SAVE_AOF)
+#define snapToSockets(sv) ((sv)->kind == SNAP_SAVE_SOCKETS)
 
 /* ---- Function declarations (used only in this file) ------------------- */
 
@@ -3577,14 +3576,14 @@ static const kvstoreSnapHooks snap_server_hooks = {
 
 /* Main thread: the save object, its channel, queues and scan context for a
  * frozen-to-be keyspace. NULL on failure (logged). */
-static snapSave *snapSaveCreate(int rdb_child_type, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     serverAssert(snap_save == NULL);
 
     kvstoreOverlayStatsReset();   /* the overlay counters of INFO describe this save */
     snapSave *sv = zcalloc(sizeof(*sv));
     sv->pipe_rd = sv->pipe_wr = sv->big_rd = sv->big_wr = -1;
     sv->dbnum = server.dbnum;
-    sv->rdb_child_type = rdb_child_type;
+    sv->kind = kind;
     sv->req = req;
     sv->rdbflags = rdbflags;
     sv->filename = filename;
@@ -3724,7 +3723,8 @@ static int snapSaveLaunch(snapSave *sv) {
     close(sv->big_rd);
     sv->big_rd = -1;
     snap_save = sv;
-    server.rdb_child_type = sv->rdb_child_type;
+    /* The classic done handlers branch on it; an AOF rewrite leaves it NONE. */
+    if (!snapIsAof(sv)) server.rdb_child_type = snapToSockets(sv) ? RDB_CHILD_TYPE_SOCKET : RDB_CHILD_TYPE_DISK;
     if (snapScanStartThread(sv->scan) != C_OK) {
         /* The child is waiting on the channel: kill it, unfreeze. */
         serverLog(LL_WARNING, "Hybrid snapshot: cannot start the scan thread; aborting the save");
@@ -3753,7 +3753,7 @@ static int snapSaveLaunch(snapSave *sv) {
  * child. */
 static int snapSaveBackgroundAof(void) {
     if (hasActiveChildProcess()) return C_ERR;
-    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_NONE, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
+    snapSave *sv = snapSaveCreate(SNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
     if (!sv) return C_ERR;
     sv->aof_cmd_form = !server.aof_use_rdb_preamble;
     return snapSaveLaunch(sv);   /* the child names its own temp file */
@@ -3803,7 +3803,7 @@ static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdb
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
         serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
     }
-    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_DISK, req, filename, rsi, rdbflags);
+    snapSave *sv = snapSaveCreate(SNAP_SAVE_RDB, req, filename, rsi, rdbflags);
     if (!sv) return C_ERR;
     return snapSaveLaunch(sv);
 }
@@ -3830,7 +3830,7 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     if (snapArenaForkable())
         serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
 
-    snapSave *sv = snapSaveCreate(RDB_CHILD_TYPE_SOCKET, req, NULL, rsi, RDBFLAGS_REPLICATION);
+    snapSave *sv = snapSaveCreate(SNAP_SAVE_SOCKETS, req, NULL, rsi, RDBFLAGS_REPLICATION);
     if (!sv) return C_ERR;
     sv->rdb_channel = rdb_channel;
     sv->rdb_pipe_write = sv->safe_to_exit_pipe = -1;
