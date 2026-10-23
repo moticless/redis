@@ -7820,9 +7820,10 @@ const char *moduleHybridSnapshotBlockedBy(void) {
     return m ? m->name : "";
 }
 
-/* Hybrid snapshot child: the keyspace is not mapped there, so a module save
- * callback that reaches for it is refused instead of faulting. Logged once
- * per API per child. Returns 1 when the caller must refuse. */
+/* A child forked without the keyspace (the hybrid snapshot child, a
+ * REDISMODULE_FORK_NO_KEYSPACE module fork): the keyspace is not mapped there,
+ * so a module call that reaches for it is refused instead of faulting. Logged
+ * once per API per child. Returns 1 when the caller must refuse. */
 static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardApi api) {
     static const char *const names[MODULE_HYBRID_GUARD_COUNT] = {
         [MODULE_HYBRID_GUARD_KEYEXISTS] = "RedisModule_KeyExists",
@@ -7835,12 +7836,17 @@ static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardA
         [MODULE_HYBRID_GUARD_CALL]      = "RedisModule_Call",
     };
     static unsigned logged = 0;   /* one bit per api, this child only */
-    if (!snapInHybridChild()) return 0;
+    if (!snapChildNoKeyspace()) return 0;
     if (!(logged & (1u << api))) {
         logged |= 1u << api;
-        serverLog(LL_WARNING, "Module %s called %s inside the hybrid snapshot child, which has no keyspace: refused. "
-                              "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT).",
-                  module ? module->name : "?", names[api]);
+        if (server.in_fork_child == CHILD_TYPE_MODULE)
+            serverLog(LL_WARNING, "Module %s called %s inside a module fork child created with "
+                                  "REDISMODULE_FORK_NO_KEYSPACE, which has no keyspace: refused.",
+                      module ? module->name : "?", names[api]);
+        else
+            serverLog(LL_WARNING, "Module %s called %s inside the hybrid snapshot child, which has no keyspace: refused. "
+                                  "Save callbacks must not touch the keyspace (see REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT).",
+                      module ? module->name : "?", names[api]);
     }
     return 1;
 }
@@ -12648,6 +12654,33 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
  * ## Module fork API
  * -------------------------------------------------------------------------- */
 
+/* RM_Fork() and RM_ForkWithFlags(): 'module' names the caller in the log (NULL
+ * when unknown, RM_Fork takes no context). */
+static int moduleFork(struct RedisModule *module, int flags, RedisModuleForkDoneHandler cb, void *user_data) {
+    pid_t childpid;
+    int no_keyspace = (flags & REDISMODULE_FORK_NO_KEYSPACE) != 0;
+
+    /* Hybrid snapshot arena: redisFork() flips it forkable for this child,
+     * unless the child declared it does not need the keyspace. */
+    childpid = no_keyspace ? snapForkNoKeyspace(CHILD_TYPE_MODULE) : redisFork(CHILD_TYPE_MODULE);
+    if (childpid == 0) {
+        /* Child */
+        redisSetProcTitle("redis-module-fork");
+    } else if (childpid == -1) {
+        serverLog(LL_WARNING,"Can't fork for module: %s", strerror(errno));
+    } else {
+        /* Parent */
+        moduleForkInfo.done_handler = cb;
+        moduleForkInfo.done_handler_user_data = user_data;
+        if (module)
+            serverLog(LL_VERBOSE, "Module fork started pid: %ld (module %s%s)", (long) childpid,
+                      module->name, no_keyspace ? ", no keyspace" : "");
+        else
+            serverLog(LL_VERBOSE, "Module fork started pid: %ld ", (long) childpid);
+    }
+    return childpid;
+}
+
 /* Create a background child process with the current frozen snapshot of the
  * main process where you can do some processing in the background without
  * affecting / freezing the traffic and no need for threads and GIL locking.
@@ -12660,21 +12693,37 @@ int RM_ScanKey(RedisModuleKey *key, RedisModuleScanCursor *cursor, RedisModuleSc
  * of the child, and the child process will get 0.
  */
 int RM_Fork(RedisModuleForkDoneHandler cb, void *user_data) {
-    pid_t childpid;
+    return moduleFork(NULL, 0, cb, user_data);
+}
 
-    /* Hybrid snapshot arena: redisFork() flips it forkable for this child. */
-    if ((childpid = redisFork(CHILD_TYPE_MODULE)) == 0) {
-        /* Child */
-        redisSetProcTitle("redis-module-fork");
-    } else if (childpid == -1) {
-        serverLog(LL_WARNING,"Can't fork for module: %s", strerror(errno));
-    } else {
-        /* Parent */
-        moduleForkInfo.done_handler = cb;
-        moduleForkInfo.done_handler_user_data = user_data;
-        serverLog(LL_VERBOSE, "Module fork started pid: %ld ", (long) childpid);
+/* Like RM_Fork(), with flags describing the child:
+ *
+ * * REDISMODULE_FORK_NO_KEYSPACE: the child never touches the keyspace; it
+ *   works on module-owned memory only (an index, a cache, the module's own
+ *   data structures). With `hybrid-snapshot yes` the child is forked like the
+ *   hybrid snapshot child: the memory of the keyspace (key headers, small
+ *   values, the keyspace tables) is not mapped in it, so the fork copies fewer
+ *   page tables and the parent pays no copy-on-write on that memory while the
+ *   child runs. In any configuration the keyspace APIs (RM_OpenKey,
+ *   RM_KeyExists, RM_GetExpire, RM_DbSize, RM_RandomKey, RM_Scan, RM_ScanKey,
+ *   RM_Call) are refused in the child and logged once per API, so a module
+ *   sees the same contract with the feature on or off. The child must also not
+ *   dereference or free pointers it kept into Redis key memory (a
+ *   RM_StringDMA result, a RedisModuleKey, a key name or value taken from a
+ *   key): with the feature on that memory is not mapped in the child.
+ *
+ * `ctx` is the calling module's context; a thread safe context works too.
+ * Flags 0 is RM_Fork(). Unknown flags fail with errno EINVAL and no child is
+ * created; the other failures and the return value are those of RM_Fork().
+ * A module that must also run on servers without this API checks
+ * RMAPI_FUNC_SUPPORTED(RedisModule_ForkWithFlags) and calls RedisModule_Fork
+ * otherwise. */
+int RM_ForkWithFlags(RedisModuleCtx *ctx, int flags, RedisModuleForkDoneHandler cb, void *user_data) {
+    if (flags & ~(_REDISMODULE_FORK_FLAGS_NEXT - 1)) {
+        errno = EINVAL;
+        return -1;
     }
-    return childpid;
+    return moduleFork(ctx ? ctx->module : NULL, flags, cb, user_data);
 }
 
 /* The module is advised to call this function from the fork child once in a while,
@@ -16150,6 +16199,7 @@ void moduleRegisterCoreAPI(void) {
     REGISTER_API(CommandFilterArgDelete);
     REGISTER_API(CommandFilterGetClientId);
     REGISTER_API(Fork);
+    REGISTER_API(ForkWithFlags);
     REGISTER_API(SendChildHeartbeat);
     REGISTER_API(ExitFromChild);
     REGISTER_API(KillForkChild);

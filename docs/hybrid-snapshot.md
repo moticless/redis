@@ -293,6 +293,7 @@ copy-on-write on the arena.
 | BGREWRITEAOF, `aof-use-rdb-preamble no` | hybrid, AOF child, command-form base file | the same producers call `rewriteObject` per record; the child writes the AOF prologue and emits `SELECT` only on a db change |
 | BACKUP | through BGREWRITEAOF | |
 | `RedisModule_Fork`, Lua debugger fork | classic child, arena flipped | |
+| `RedisModule_ForkWithFlags` with `REDISMODULE_FORK_NO_KEYSPACE` | module child forked like the hybrid child: arena not flipped, its range reserved in the child, keyspace APIs refused there | for module children that work on module memory only, such as a search index GC; see section 7 |
 | `CONFIG SET hybrid-snapshot` | flips the arena | refused while any child or hybrid save runs |
 
 Mutual exclusion is the existing one-child rule. A BGSAVE issued while a classic child runs is
@@ -355,6 +356,20 @@ those callbacks need no declaration. In the hybrid child the forbidden APIs are 
 faulting (`RM_OpenKey` returns NULL, `RM_Call` fails with EPERM, and so on), logged once per API per
 child, so a violation by an opted-in module costs a message, not a crash. The bundled modules
 declare the bit.
+
+A module's own forks are a separate declaration, made per fork call. `RedisModule_Fork` is a
+classic child: it may walk the keyspace, so the arena is flipped forkable for it. A child that
+works on module memory only (an index, a cache) is forked with
+`RedisModule_ForkWithFlags(ctx, REDISMODULE_FORK_NO_KEYSPACE, cb, user_data)`. It is forked the way
+the hybrid child is (`snapForkNoKeyspace`): the arena stays `MADV_DONTFORK`, the child reserves its
+range, the same keyspace APIs are refused there with the same once-per-API log, and the crash
+report skips the INFO sections that read the keyspace. The refusals apply with the feature on or
+off, so the contract does not depend on the configuration. Rule 2 above applies to the whole
+child, not only to callbacks: it must not dereference or free pointers it kept into key memory.
+`HANDLE_HYBRID_SNAPSHOT` does not imply the fork flag, and the flag cannot be module-wide: a
+module may have compliant save callbacks and a fork that does walk keys, and `RedisModule_Fork`
+takes no context, so the server cannot tell which module forked. Unknown flags fail with `EINVAL`;
+the single-child rule applies as for any fork.
 
 ## 8. Observability
 

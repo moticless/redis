@@ -2300,9 +2300,12 @@ void logServerInfo(void) {
     int argc = 0;
     const char *const *keep = snapCrashReportInfoSections();
     if (keep) {
-        /* The hybrid save child has no keyspace mapped: only the sections
-         * that do not read it are safe inside this handler. */
-        serverLogRaw(LL_WARNING|LL_RAW, "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n");
+        /* A child forked without the keyspace (the hybrid save child, a
+         * REDISMODULE_FORK_NO_KEYSPACE module fork) has none mapped: only the
+         * sections that do not read it are safe inside this handler. */
+        serverLogRaw(LL_WARNING|LL_RAW, server.in_fork_child == CHILD_TYPE_MODULE ?
+            "module fork child without keyspace: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n" :
+            "hybrid save child: INFO memory, keyspace, keysizes and hotkeys skipped (the keyspace is not mapped in this process)\n");
         for (int i = 0; keep[i]; i++) argv[argc++] = createStringObject(keep[i], strlen(keep[i]));
     } else {
         argv[argc++] = createStringObject("all", strlen("all"));

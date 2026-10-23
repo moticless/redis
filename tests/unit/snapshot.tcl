@@ -2221,6 +2221,31 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_wait_forkable 0
     }
 
+    test {Module fork with REDISMODULE_FORK_NO_KEYSPACE: the arena stays DONTFORK for the child's whole life, its keyspace calls are refused} {
+        snap_fallback_dataset
+        set digest [debug_digest]
+        set loglines [count_log_lines 0]
+        set flips [count_log_message 0 "SNAP_NOFORK arena made forkable for a MODULE child"]
+        r fork.nokeyspace k:1 1500000   ;# probes the keyspace APIs on an existing key, then lives 1.5 s
+        wait_for_log_messages 0 {"*nokeyspace child started*"} $loglines 50 100
+        if {[snap_arena_available]} {
+            # sampled through the child's life: never flipped for it
+            for {set i 0} {$i < 10} {incr i} {
+                assert_equal 0 [s snap_nofork_arena_forkable]
+                after 50
+            }
+        }
+        # writes while it runs land in the live keyspace as usual
+        r set during:nokeyspace 1
+        wait_for_condition 100 100 {[r fork.exitcode] != -1} else { fail "module fork did not exit" }
+        assert_equal 0 [r fork.exitcode]
+        wait_for_log_messages 0 {"*called RedisModule_OpenKey inside a module fork child created with REDISMODULE_FORK_NO_KEYSPACE*"} $loglines 50 10
+        assert_equal $flips [count_log_message 0 "SNAP_NOFORK arena made forkable for a MODULE child"]
+        snap_wait_forkable 0
+        r del during:nokeyspace
+        assert_equal $digest [debug_digest]
+    }
+
     test {Mutual exclusion: a hybrid save keeps the arena DONTFORK, a rewrite asked meanwhile is scheduled and runs after} {
         snap_fallback_dataset
         r config set rdb-key-save-delay 1000

@@ -27,7 +27,9 @@
  * through zmalloc_nofork*(); frees and reallocs route by address.
  * Any other fork (module, Lua debugger, a classic child while the feature is
  * off) needs the keyspace in the child, so the arena is flipped forkable around
- * it (snapArenaBeforeFork / snapArenaChildExited).
+ * it (snapArenaBeforeFork / snapArenaChildExited); a module fork that declares
+ * REDISMODULE_FORK_NO_KEYSPACE is forked like the hybrid child instead
+ * (snapForkNoKeyspace).
  *
  * ONE SAVE, END TO END
  * --------------------
@@ -117,12 +119,17 @@ void snapArenaInit(void);
 /* 1 if the arena exists (DONTFORK or currently forkable). */
 static inline int snapArenaAvailable(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
 
-/* Fork visibility: DONTFORK for the hybrid child, flipped forkable around any other fork. */
+/* Fork visibility: DONTFORK for a child forked without the keyspace, flipped forkable around any other fork. */
 int snapArenaForkable(void);
-/* redisFork(), parent side: a non-hybrid child needs the arena mapped. */
+/* redisFork(), parent side: a child that walks the keyspace needs the arena mapped. */
 void snapArenaBeforeFork(int purpose);
 /* After a child of any type was reaped: back to DONTFORK when the feature is on. */
 void snapArenaChildExited(void);
+/* redisFork() for a child that never touches the keyspace (the hybrid save child, a
+ * REDISMODULE_FORK_NO_KEYSPACE module fork): the arena stays unmapped in it. */
+int snapForkNoKeyspace(int purpose);
+/* This process is such a child: the keyspace module APIs are refused, the crash report skips the keyspace. */
+int snapChildNoKeyspace(void);
 
 /* ---- Classification and placement ---------------------------------------- */
 
@@ -174,10 +181,8 @@ static inline int snapHybridEnabled(void) { return server.hybrid_snapshot; }
 
 int snapHybridConfigApply(const char **err);
 
-/* A hybrid save is running / this process is its child (no keyspace mapped). */
+/* A hybrid save is running. */
 int snapSaveInProgress(void);
-
-int snapInHybridChild(void);
 
 /* Events during a save: a store the save is scanning; FLUSHDB/SWAPDB hand their dbs to the save. */
 int snapSaveOwnsKvstore(kvstore *kvs);

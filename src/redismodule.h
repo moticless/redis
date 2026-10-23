@@ -366,6 +366,21 @@ typedef uint64_t RedisModuleTimerID;
  * Use RedisModule_GetModuleOptionsAll instead. */
 #define _REDISMODULE_OPTIONS_FLAGS_NEXT (1<<5)
 
+/* Flags for RedisModule_ForkWithFlags. */
+
+/* The child never touches the keyspace: it works on module-owned memory only.
+ * With hybrid-snapshot it is forked like the hybrid snapshot child (the
+ * keyspace's arena is not mapped in it, the fork and the parent's
+ * copy-on-write are cheaper); in any configuration the keyspace APIs
+ * (RedisModule_OpenKey, RedisModule_KeyExists, RedisModule_Call, RedisModule_Scan,
+ * ...) are refused in the child, and the child must not dereference or free
+ * pointers it kept into Redis key memory. */
+#define REDISMODULE_FORK_NO_KEYSPACE (1<<0)
+
+/* Next fork flag, must be updated when adding new fork flags above!
+ * This flag should not be used directly by the module. */
+#define _REDISMODULE_FORK_FLAGS_NEXT (1<<1)
+
 /* Definitions for RedisModule_SetCommandInfo. */
 
 typedef enum {
@@ -1473,6 +1488,7 @@ REDISMODULE_API int (*RedisModule_CommandFilterArgReplace)(RedisModuleCommandFil
 REDISMODULE_API int (*RedisModule_CommandFilterArgDelete)(RedisModuleCommandFilterCtx *fctx, int pos) REDISMODULE_ATTR;
 REDISMODULE_API unsigned long long (*RedisModule_CommandFilterGetClientId)(RedisModuleCommandFilterCtx *fctx) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_Fork)(RedisModuleForkDoneHandler cb, void *user_data) REDISMODULE_ATTR;
+REDISMODULE_API int (*RedisModule_ForkWithFlags)(RedisModuleCtx *ctx, int flags, RedisModuleForkDoneHandler cb, void *user_data) REDISMODULE_ATTR;
 REDISMODULE_API void (*RedisModule_SendChildHeartbeat)(double progress) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_ExitFromChild)(int retcode) REDISMODULE_ATTR;
 REDISMODULE_API int (*RedisModule_KillForkChild)(int child_pid) REDISMODULE_ATTR;
@@ -1879,6 +1895,7 @@ static int RedisModule_Init(RedisModuleCtx *ctx, const char *name, int ver, int 
     REDISMODULE_GET_API(CommandFilterArgDelete);
     REDISMODULE_GET_API(CommandFilterGetClientId);
     REDISMODULE_GET_API(Fork);
+    REDISMODULE_GET_API(ForkWithFlags);
     REDISMODULE_GET_API(SendChildHeartbeat);
     REDISMODULE_GET_API(ExitFromChild);
     REDISMODULE_GET_API(KillForkChild);

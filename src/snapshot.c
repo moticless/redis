@@ -492,10 +492,10 @@ void snapArenaInit(void) {
 
 /* ---- Fork visibility of the arena (see snapshot.h) ---------------------- */
 
-static int snap_arena_fallback = 0;   /* flipped forkable for a non-hybrid child, flip back on reap */
-static int snap_forking_hybrid = 0;   /* set around the hybrid save's own redisFork() */
-static int snap_in_hybrid_child = 0;  /* this process is the hybrid save child: no keyspace mapped */
-int snapInHybridChild(void) { return snap_in_hybrid_child; }
+static int snap_arena_fallback = 0;        /* flipped forkable for a non-hybrid child, flip back on reap */
+static int snap_forking_no_keyspace = 0;   /* set around snapForkNoKeyspace()'s redisFork() */
+static int snap_child_no_keyspace = 0;     /* this process is a child forked without the keyspace */
+int snapChildNoKeyspace(void) { return snap_child_no_keyspace; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
  * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the classic child runs
@@ -510,12 +510,13 @@ static void snapHybridFallbackLog(void) {
                           "REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT", who);
 }
 
-/* Fork visibility of the arena: DONTFORK, so the hybrid child never maps it.
- * Any other fork (classic save, diskless sync, AOF rewrite, module, Lua
- * debugger) needs the keyspace, so redisFork() flips it to DOFORK
- * (snapArenaBeforeFork) and the child reap path flips it back once no child is
- * left (snapArenaChildExited). One madvise each way, O(1) in keys; that child
- * pays classic copy-on-write. */
+/* Fork visibility of the arena: DONTFORK, so a child forked without the
+ * keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module fork:
+ * snapForkNoKeyspace) never maps it. Any other fork (classic save, diskless
+ * sync, AOF rewrite, module, Lua debugger) needs the keyspace, so redisFork()
+ * flips it to DOFORK (snapArenaBeforeFork) and the child reap path flips it
+ * back once no child is left (snapArenaChildExited). One madvise each way,
+ * O(1) in keys; that child pays classic copy-on-write. */
 int snapArenaForkable(void) {
 #ifdef HAVE_NOFORK_ARENA
     return snapArenaAvailable() && zmalloc_nofork_arena_forkable();
@@ -541,7 +542,7 @@ static int snapArenaSetForkable(int forkable) {
 
 void snapArenaBeforeFork(int purpose) {
     UNUSED(purpose);
-    if (snap_forking_hybrid || !snapArenaAvailable() || snapArenaForkable()) return;
+    if (snap_forking_no_keyspace || !snapArenaAvailable() || snapArenaForkable()) return;
     /* A classic child (RDB with the feature off, diskless sync, AOF rewrite,
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
     if (snapArenaSetForkable(1)) {
@@ -557,6 +558,48 @@ void snapArenaChildExited(void) {
     snap_arena_fallback = 0;
     if (server.hybrid_snapshot && snapArenaSetForkable(0))
         serverLog(LL_NOTICE, "SNAP_NOFORK arena back to MADV_DONTFORK");
+}
+
+/* Child forked without the keyspace, first thing after the fork: the arena's
+ * range is not mapped here (MADV_DONTFORK), so the kernel would hand its
+ * addresses to our own allocations as the heap grows; zmalloc routes frees and
+ * reallocs by address (zmalloc_is_nofork), so such a block would be
+ * reallocated in the parent-only arena and the write would fault (seen as a
+ * crash in the hybrid child's pipe reader). Reserve the whole range PROT_NONE
+ * so nothing of ours can land in it. */
+static void snapChildReserveArenaRange(void) {
+#ifdef HAVE_NOFORK_ARENA
+    void *lo; size_t len;
+    if (!zmalloc_nofork_arena_range(&lo, &len)) return;
+    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
+#ifdef MAP_FIXED_NOREPLACE
+    flags |= MAP_FIXED_NOREPLACE;
+#else
+    flags |= MAP_FIXED;
+#endif
+    void *p = mmap(lo, len, PROT_NONE, flags, -1, 0);
+    if (p == MAP_FAILED)
+        serverLog(LL_WARNING, "Child without keyspace: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
+#endif
+}
+
+/* redisFork() for a child that never touches the keyspace: the hybrid save
+ * child and a REDISMODULE_FORK_NO_KEYSPACE module fork. The arena is left
+ * DONTFORK (no page tables copied for it, no copy-on-write on it while the
+ * child runs); in the child the arena's range is reserved and the keyspace
+ * module APIs are refused (snapChildNoKeyspace). When the arena is forkable
+ * anyway (feature off, a debugger child) the child has it mapped and needs no
+ * reservation, but the refusals apply all the same: one contract whatever the
+ * configuration. Same return as redisFork(). */
+int snapForkNoKeyspace(int purpose) {
+    snap_forking_no_keyspace = 1;
+    int childpid = redisFork(purpose);
+    snap_forking_no_keyspace = 0;
+    if (childpid == 0) {
+        snap_child_no_keyspace = 1;
+        if (snapArenaAvailable() && !snapArenaForkable()) snapChildReserveArenaRange();
+    }
+    return childpid;
 }
 
 /* CONFIG SET hybrid-snapshot apply hook: flips the arena, refuses mid-save.
@@ -2186,7 +2229,7 @@ int snapSaveInProgress(void) {
 static size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
 static size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
 static size_t snapSaveBitmapBytes(void) {
-    if (!snap_save || snap_in_hybrid_child) return 0;   /* the stores live in the arena, not mapped in the child (crash report INFO) */
+    if (!snap_save || snap_child_no_keyspace) return 0;   /* the stores live in the arena, not mapped in the child (crash report INFO) */
     return snapScanBitmapBytes(snap_save->scan);
 }
 /* Fork-instant dicts their store let go of (freed, flushed, moved out by a
@@ -2297,13 +2340,14 @@ sds snapInfoPersistence(sds info) {
         "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes));
 }
 
-/* The INFO sections a crash report may generate inside the hybrid save
- * child, which has no keyspace mapped (memory, keyspace, keysizes and hotkeys
- * would fault); NULL in every other process, meaning "all". */
+/* The INFO sections a crash report may generate inside a child forked without
+ * the keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module
+ * fork: memory, keyspace, keysizes and hotkeys would fault); NULL in every
+ * other process, meaning "all". */
 const char *const *snapCrashReportInfoSections(void) {
     static const char *const keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
                                        "cpu", "module_list", "errorstats", "cluster", NULL};
-    return snapInHybridChild() ? keep : NULL;
+    return snapChildNoKeyspace() ? keep : NULL;
 }
 
 static redisDb *snapDebugDbArg(client *c) {
@@ -3439,33 +3483,9 @@ werr:
     return aborted ? SERVER_CHILD_NOERROR_RETVAL : C_ERR;
 }
 
-/* Hybrid child, first thing after the fork: the arena's range is not mapped
- * here (MADV_DONTFORK), so the kernel would hand its addresses to our own
- * allocations as the heap grows; zmalloc routes frees and reallocs by address
- * (zmalloc_is_nofork), so such a block would be reallocated in the parent-only
- * arena and the write would fault (seen as a crash in the pipe reader). Reserve
- * the whole range PROT_NONE so nothing of ours can land in it. */
-static void snapChildReserveArenaRange(void) {
-#ifdef HAVE_NOFORK_ARENA
-    void *lo; size_t len;
-    if (!zmalloc_nofork_arena_range(&lo, &len)) return;
-    int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
-#ifdef MAP_FIXED_NOREPLACE
-    flags |= MAP_FIXED_NOREPLACE;
-#else
-    flags |= MAP_FIXED;
-#endif
-    void *p = mmap(lo, len, PROT_NONE, flags, -1, 0);
-    if (p == MAP_FAILED)
-        serverLog(LL_WARNING, "Hybrid snapshot child: cannot re-reserve the arena range (%s); allocations may collide with it", strerror(errno));
-#endif
-}
-
 static void snapSaveChild(snapSave *sv) {
     rio sock;
     char aofname[256];
-    snap_in_hybrid_child = 1;
-    snapChildReserveArenaRange();
     close(sv->pipe_wr);
     close(sv->big_wr);
     if (snapToSockets(sv)) {
@@ -3704,9 +3724,7 @@ static int snapSaveLaunch(snapSave *sv) {
     snapScanFreeze(sv->scan);
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
-    snap_forking_hybrid = 1;
-    pid_t childpid = redisFork(snapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
-    snap_forking_hybrid = 0;
+    pid_t childpid = snapForkNoKeyspace(snapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
     if (childpid == 0) {
         snapSaveChild(sv);   /* never returns */
     }
