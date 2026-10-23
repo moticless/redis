@@ -78,14 +78,6 @@ time:
   runs it on a background thread while the module's own commands keep mutating its values, so
   every module must certify thread safety and teach its write paths that a key open can now fail
   because the saver holds the key.
-- **The fork does not go away.** Forkless replaces the RDB save and nothing else. AOF rewrite
-  still forks, and with the RDB preamble its child writes the same snapshot of the same dataset, so
-  an instance with `appendonly yes` keeps the full copy-on-write bill and the full stall on every
-  rewrite. Cluster slot migration forks its own snapshot child; module forks fork. And the RDB
-  save itself falls back to the fork child whenever any loaded module has not opted in, or any
-  replica in the sync cohort is too old to speak the new protocol. An operator who provisioned for
-  "no more fork" still has to provision for fork; the headroom argument only holds for a cluster
-  without AOF, without slot migration, with every module certified and every replica upgraded.
 
 These costs follow from the decision to snapshot inside the live address space, and they are the
 reason we did not take that road.
