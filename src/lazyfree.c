@@ -335,13 +335,13 @@ void emptyDbAsync(redisDb *db) {
  * them. Stock keeps its child alive on FLUSHDB; this keeps the save alive.
  * Returns 1 when the save took them, 0 when the caller must empty the db. */
 int emptyDbDetachToSnapshot(redisDb *db) {
-    if (!snapSaveOwnsKvstore(db->keys)) return 0;
+    if (!hybsnapSaveOwnsKvstore(db->keys)) return 0;
     kvstore *oldkeys, *oldexpires, *oldblessed;
     estore *oldsubexpires;
     dict *old_stream_idmp_keys;
     dbSwapInFreshStructures(db, &oldkeys, &oldexpires, &oldsubexpires, &old_stream_idmp_keys, &oldblessed);
     protectClientReplyObjects();
-    serverAssert(snapSaveDetachDb(oldkeys, oldexpires, oldsubexpires, old_stream_idmp_keys, oldblessed));
+    serverAssert(hybsnapSaveDetachDb(oldkeys, oldexpires, oldsubexpires, old_stream_idmp_keys, oldblessed));
     return 1;
 }
 

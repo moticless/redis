@@ -1679,7 +1679,7 @@ unsigned long dictScanDefrag(dict *d,
  * increment/decrement). The caller must guarantee that the dict is frozen for
  * the whole scan: rehashing paused and no insertions/deletions. This is the
  * only scan primitive that may be used from a thread other than the owner of
- * the dict (see snapshot.c): dictScan() performs a non-atomic read-modify-write
+ * the dict (see hybrid_snapshot.c): dictScan() performs a non-atomic read-modify-write
  * on d->pauserehash which would race with the owner's own dictScan/iterators. */
 unsigned long dictScanNoPause(dict *d,
                               unsigned long v,
@@ -1723,7 +1723,7 @@ void dictKeyBucket(dict *d, const void *key, int *table, unsigned long *idx) {
  * order, calling fn(privdata, de, NULL). Chain pointers are read with atomic
  * loads and the dict is not written, so this may run on a thread other than
  * the owner's while the owner keeps rehashing paused and resizing disabled and
- * confines its own chain writes to buckets outside [lo, hi) (snapshot.c, the
+ * confines its own chain writes to buckets outside [lo, hi) (hybrid_snapshot.c, the
  * bucket window). 'hi' is clamped to the table size. */
 void dictWalkBucketRange(dict *d, int table, unsigned long lo, unsigned long hi,
                          dictScanFunction *fn, void *privdata)

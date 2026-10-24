@@ -160,7 +160,7 @@ void* activeDefragAllocWithoutFree(void *ptr) {
      * pointers we try to free */
     size = zmalloc_usable_size(ptr);
 #ifdef HAVE_NOFORK_ARENA
-    /* SNAP_NOFORK arena memory must stay in the arena. */
+    /* HYBSNAP_NOFORK arena memory must stay in the arena. */
     newptr = zmalloc_is_nofork(ptr) ? zmalloc_nofork_no_tcache(size) : zmalloc_no_tcache(size);
 #else
     newptr = zmalloc_no_tcache(size);

@@ -264,7 +264,7 @@ if {$system_name eq {linux} && $page_size == 4096} {
 start_server {overrides {save ""}} {
     # Hybrid snapshot (hybrid-snapshot yes): small values are not mapped in the
     # child, so writes during the save create no copy-on-write and this test's
-    # premise does not hold; progress reporting is covered by unit/snapshot.
+    # premise does not hold; progress reporting is covered by unit/hybrid_snapshot.
     if {[lindex [r config get hybrid-snapshot] 1] eq "yes"} {
         test {Test child sending info (skipped: hybrid-snapshot yes, no CoW by design)} { } {}
     } else {

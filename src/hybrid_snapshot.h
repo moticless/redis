@@ -16,30 +16,30 @@
  * The fork child serializes only the big ones. Toggled at runtime with `hybrid-snapshot`.
  *
  * Every value has a class, decided by where its memory is:
- *   SNAP_NOFORK  single-allocation value (string, listpack, intset) of at most
+ *   HYBSNAP_NOFORK  single-allocation value (string, listpack, intset) of at most
  *                `save-small-max-bytes`, in the arena. Scan thread serializes it.
- *   SNAP_FORK    everything else (multi-allocation encodings, big values), in
+ *   HYBSNAP_FORK    everything else (multi-allocation encodings, big values), in
  *                forkable memory. The fork child serializes it.
  * Every kvobj header and keyspace dict table is in the arena whatever the
  * value's class, so the child never touches the parent's dicts. Placement is
  * applied on each insertion and when a value grows or changes encoding
- * (snapPlaceValue): only the value moves, never the header. Allocation goes
+ * (hybsnapPlaceValue): only the value moves, never the header. Allocation goes
  * through zmalloc_nofork*(); frees and reallocs route by address.
  * Any other fork (module, Lua debugger, a classic child while the feature is
  * off) needs the keyspace in the child, so the arena is flipped forkable around
- * it (snapArenaBeforeFork / snapArenaChildExited); a module fork that declares
+ * it (hybsnapArenaBeforeFork / hybsnapArenaChildExited); a module fork that declares
  * REDISMODULE_FORK_NO_KEYSPACE is forked like the hybrid child instead
- * (snapForkNoKeyspace).
+ * (hybsnapForkNoKeyspace).
  *
  * ONE SAVE, END TO END
  * --------------------
  * 1. Freeze (main thread, the "fork instant"): a guard is installed on every
  *    keyspace store (kvstoreSnapGuardSet), every fork-instant dict gets a
  *    reference and a generation stamp. Nothing is copied.
- * 2. Fork: the child maps the SNAP_FORK values and nothing of the keyspace.
+ * 2. Fork: the child maps the HYBSNAP_FORK values and nothing of the keyspace.
  * 3. Scan (background thread): the frozen dicts are read bucket by bucket in
  *    a fixed order, below a limit the main thread sets (the credit window,
- *    below). SNAP_NOFORK keys are serialized into 64 KB buffers, SNAP_FORK
+ *    below). HYBSNAP_NOFORK keys are serialized into 64 KB buffers, HYBSNAP_FORK
  *    keys are shipped to the child as header copies whose values the child
  *    resolves in its own memory. Two pipes: the small channel of buffers and
  *    the big channel of headers; the child drains the small backlog first.
@@ -47,7 +47,7 @@
  *    frozen dict does depends on where the scan thread is (below).
  * 5. Completion: buckets the thread has passed are written back as it moves
  *    on; when a dict's scan is complete its overlay is released and the dict
- *    unfrozen. The child exits after END; snapOnChildEnd joins the thread and
+ *    unfrozen. The child exits after END; hybsnapOnChildEnd joins the thread and
  *    the classic done handler runs. Abort (hybrid-snapshot-max-retained-bytes
  *    hard mark, FLUSHALL, a killed child) joins the thread, drains every
  *    overlay and leaves the previous dump untouched.
@@ -78,8 +78,8 @@
  * is a seq_cst store-load pair on each side (thread: store cur, load hi;
  * main: store hi, load cur): either the main thread sees where the thread is,
  * or the thread sees the cap. A slot (dict) is "owed" to the save until its
- * state is SNAP_SLOT_DONE. The full argument: docs/hybrid-snapshot.md
- * section 3; the encoding and the code: snapshot.c, "Scan positions".
+ * state is HYBSNAP_SLOT_DONE. The full argument: docs/hybrid-snapshot.md
+ * section 3; the encoding and the code: hybrid_snapshot.c, "Scan positions".
  *
  * MEMORY
  * ------
@@ -88,11 +88,11 @@
  * `hybrid-snapshot-max-retained-bytes`, the save aborts above it), records
  * queued for the child (`hybrid-snapshot-max-queued-bytes`, the thread waits
  * above it), and one bit per bucket of every dict the save touched. INFO
- * memory and persistence report all three (snapInfoMemory/Persistence).
+ * memory and persistence report all three (hybsnapInfoMemory/Persistence).
  *
  * ENTRY POINTS
  * ------------
- * One decision, snapSaveTryStart(): rdbSaveBackground, the replication full
+ * One decision, hybsnapSaveTryStart(): rdbSaveBackground, the replication full
  * sync (disk or diskless) and rewriteAppendOnlyFileBackground call it; it
  * takes the hybrid path when the switch is on, the request has keyspace
  * content and every loaded module has opted in
@@ -103,7 +103,7 @@
  *
  * WHERE TO LOOK
  * -------------
- * snapshot.c: the implementation (its head lists its sections) and the unit
+ * hybrid_snapshot.c: the implementation (its head lists its sections) and the unit
  * tests (redis-server test snapshot). kvstore.h, KVSTORE OVERLAY: the overlay
  * contract (frozen dicts, overlayed buckets); kvsoverlay.h / kvsoverlay.c: its
  * implementation.
@@ -111,8 +111,8 @@
  * All functions here are prefixed "snap".
  */
 
-#ifndef __SNAPSHOT_H
-#define __SNAPSHOT_H
+#ifndef __HYBRID_SNAPSHOT_H
+#define __HYBRID_SNAPSHOT_H
 
 #include <stddef.h>
 #include "server.h"   /* kvobj, kvstore, listpackEx; server.h includes this header at its end */
@@ -120,120 +120,120 @@
 #include "intset.h"
 
 /* Key classes: the class of a key's VALUE allocation (headers are always in the arena). */
-#define SNAP_NOFORK 0   /* Value in the DONTFORK arena; serialized by the scan thread. */
-#define SNAP_FORK   1   /* Value in forkable memory; serialized by the fork child. */
+#define HYBSNAP_NOFORK 0   /* Value in the DONTFORK arena; serialized by the scan thread. */
+#define HYBSNAP_FORK   1   /* Value in forkable memory; serialized by the fork child. */
 
 struct listpackEx;
 struct aeEventLoop;
 
-/* ---- SNAP_NOFORK arena ---------------------------------------------------- */
+/* ---- HYBSNAP_NOFORK arena ---------------------------------------------------- */
 
 /* Create the arena: once, main thread, before the first zmalloc_nofork*(); a no-op without support. */
-void snapArenaInit(void);
+void hybsnapArenaInit(void);
 
 /* 1 if the arena exists (DONTFORK or currently forkable). */
-static inline int snapArenaAvailable(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
+static inline int hybsnapArenaAvailable(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
 
 /* Fork visibility: DONTFORK for a child forked without the keyspace, flipped forkable around any other fork. */
-int snapArenaForkable(void);
+int hybsnapArenaForkable(void);
 /* redisFork(), parent side: a child that walks the keyspace needs the arena mapped. */
-void snapArenaBeforeFork(int purpose);
+void hybsnapArenaBeforeFork(int purpose);
 /* After a child of any type was reaped: back to DONTFORK when the feature is on. */
-void snapArenaChildExited(void);
+void hybsnapArenaChildExited(void);
 /* redisFork() for a child that never touches the keyspace (the hybrid save child, a
  * REDISMODULE_FORK_NO_KEYSPACE module fork): the arena stays unmapped in it. */
-int snapForkNoKeyspace(int purpose);
+int hybsnapForkNoKeyspace(int purpose);
 /* This process is such a child: the keyspace module APIs are refused, the crash report skips the keyspace. */
-int snapChildNoKeyspace(void);
+int hybsnapChildNoKeyspace(void);
 
 /* ---- Classification and placement ---------------------------------------- */
 
 /* Apply the policy to a value: move it into or out of the arena (only the value moves, never the header). */
-void snapPlaceValueArena(robj *o);
+void hybsnapPlaceValueArena(robj *o);
 
-static inline void snapPlaceValue(robj *o) {
-    if (unlikely(zmalloc_nofork_enabled())) snapPlaceValueArena(o);
+static inline void hybsnapPlaceValue(robj *o) {
+    if (unlikely(zmalloc_nofork_enabled())) hybsnapPlaceValueArena(o);
 }
 /* Move a value out of the arena */
-void snapValueDetachFromArena(robj *o);
+void hybsnapValueDetachFromArena(robj *o);
 
 /* ---- Credit window and write sections ------------------------------------ */
 
 /* Odd while the main thread is inside a write section (see THE CREDIT WINDOW AND WRITE SECTIONS above). */
-extern redisAtomic uint64_t snap_funnel_seq;
+extern redisAtomic uint64_t hybsnap_funnel_seq;
 /* Close it: end of the outermost command, beforeSleep, GIL release. */
-void snapFunnelCloseSlow(void);
+void hybsnapFunnelCloseSlow(void);
 
-static inline void snapFunnelClose(void) {
+static inline void hybsnapFunnelClose(void) {
     uint64_t v;
-    atomicGet(snap_funnel_seq, v);
-    if (unlikely(v & 1)) snapFunnelCloseSlow();
+    atomicGet(hybsnap_funnel_seq, v);
+    if (unlikely(v & 1)) hybsnapFunnelCloseSlow();
 }
 
 /* ---- The server keyspace on the scan ------------------------------------- */
 
 /* The RDB serializer's configuration: live values on the main thread, the save-start copies on the scan thread. */
-typedef struct snapRdbCfg {
+typedef struct hybsnapRdbCfg {
     int on_scan;                 /* serializing on the scan thread */
     int compression;             /* rdbcompression */
     int maxmemory_policy;
     int apply_key_save_delay;    /* rdb-key-save-delay applies here (classic contexts only) */
-} snapRdbCfg;
-snapRdbCfg snapRdbCfgGet(void);
+} hybsnapRdbCfg;
+hybsnapRdbCfg hybsnapRdbCfgGet(void);
 
 /* ---- Hybrid snapshot: the save --------------------------------------------- */
 
-/* The one dispatch decision for rdb.c, replication.c and aof.c: C_OK started, C_ERR taken but failed, SNAP_NOT_TAKEN run the classic child. */
-#define SNAP_SAVE_RDB     0   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
-#define SNAP_SAVE_SOCKETS 1   /* diskless full sync: the replicas' sockets (rsi) */
-#define SNAP_SAVE_AOF     2   /* BGREWRITEAOF: the AOF base file */
-#define SNAP_NOT_TAKEN    1
-int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
+/* The one dispatch decision for rdb.c, replication.c and aof.c: C_OK started, C_ERR taken but failed, HYBSNAP_NOT_TAKEN run the classic child. */
+#define HYBSNAP_SAVE_RDB     0   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
+#define HYBSNAP_SAVE_SOCKETS 1   /* diskless full sync: the replicas' sockets (rsi) */
+#define HYBSNAP_SAVE_AOF     2   /* BGREWRITEAOF: the AOF base file */
+#define HYBSNAP_NOT_TAKEN    1
+int hybsnapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 
-static inline int snapHybridEnabled(void) { return server.hybrid_snapshot; }
+static inline int hybsnapHybridEnabled(void) { return server.hybrid_snapshot; }
 
-int snapHybridConfigApply(const char **err);
+int hybsnapHybridConfigApply(const char **err);
 
 /* A hybrid save is running. */
-int snapSaveInProgress(void);
+int hybsnapSaveInProgress(void);
 
 /* Events during a save: a store the save is scanning; FLUSHDB/SWAPDB hand their dbs to the save. */
-int snapSaveOwnsKvstore(kvstore *kvs);
+int hybsnapSaveOwnsKvstore(kvstore *kvs);
 
-int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed);
+int hybsnapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed);
 /* Main thread: stop the scan and complete every slot (not the child, see killRDBChild). */
-void snapSaveAbort(void);
+void hybsnapSaveAbort(void);
 /* The one child-end hook, for every child type, before the type's done handler. */
-void snapOnChildEnd(int exitcode, int bysignal);
+void hybsnapOnChildEnd(int exitcode, int bysignal);
 /* serverCron/beforeSleep: act on a pending hard-mark abort. */
-void snapSaveCron(void);
+void hybsnapSaveCron(void);
 /* CONFIG SET rdb-key-save-delay: reaches the running scan thread. */
-void snapSaveSetKeySaveDelay(int usec);
+void hybsnapSaveSetKeySaveDelay(int usec);
 
 /* Owed objects on read paths: a fork-instant original the save has not taken yet (opens the command's write section). */
-int snapKvobjIsOwed(redisDb *db, kvobj *kv);
+int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv);
 /* A read path about to write 'kv' in place: the object to write (the clone when the key was owed). */
-kvobj *snapPrepareMutation(redisDb *db, robj *key, kvobj *kv);
+kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv);
 /* Debug-build predicate and assertion at the write funnels. */
-int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
-#define snapDebugAssertNotFrozenOriginal(db, kv) \
-    debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !snapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
+int hybsnapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
+#define hybsnapDebugAssertNotFrozenOriginal(db, kv) \
+    debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !hybsnapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
 
 /* ---- Observability -------------------------------------------------------- */
 
 /* INFO memory / persistence fields, DEBUG SNAP-* (1 when handled), the INFO sections safe in the hybrid child (else NULL). */
-sds snapInfoMemory(sds info);
-sds snapInfoPersistence(sds info);
-int snapDebugCommand(struct client *c);
-const char *const *snapCrashReportInfoSections(void);
+sds hybsnapInfoMemory(sds info);
+sds hybsnapInfoPersistence(sds info);
+int hybsnapDebugCommand(struct client *c);
+const char *const *hybsnapCrashReportInfoSections(void);
 
 /* The save's memory in the parent that the classic child would hold in its own process: excluded from the eviction calculation. */
-size_t snapSaveOverheadBytes(void);
-size_t snapSaveKeysProcessed(size_t classic);
+size_t hybsnapSaveOverheadBytes(void);
+size_t hybsnapSaveKeysProcessed(size_t classic);
 
 /* ---- Tests --------------------------------------------------------------- */
 #ifdef REDIS_TEST
-int snapshotTest(int argc, char *argv[], int flags);
+int hybsnapTest(int argc, char *argv[], int flags);
 #endif
 
-#endif /* __SNAPSHOT_H */
+#endif /* __HYBRID_SNAPSHOT_H */

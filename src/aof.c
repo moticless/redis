@@ -1252,7 +1252,7 @@ void killAppendOnlyChild(void) {
         (long) server.child_pid);
     /* Hybrid rewrite: stop the scan thread and drain the overlay first, as
      * killRDBChild does. */
-    snapSaveAbort();
+    hybsnapSaveAbort();
     int killed = kill(server.child_pid,SIGUSR1) != -1;
     if (killed) {
         while(waitpid(-1, &statloc, 0) != server.child_pid);
@@ -1262,7 +1262,7 @@ void killAppendOnlyChild(void) {
      * failed rather than as a clean exit. */
     int exitcode = !killed ? 1 : WIFEXITED(statloc) ? WEXITSTATUS(statloc) : 1;
     int bysignal = killed && WIFSIGNALED(statloc) ? WTERMSIG(statloc) : 0;
-    snapOnChildEnd(exitcode, bysignal);
+    hybsnapOnChildEnd(exitcode, bysignal);
     aofRemoveTempFile(server.child_pid);
     resetChildState();
     server.aof_rewrite_time_start = -1;
@@ -3039,7 +3039,7 @@ int rewriteObject(rio *r, robj *key, robj *o, int dbid, long long expiretime) {
 
 /* What a command-form AOF base file starts with, before any key: the
  * timestamp annotation (if enabled) and the functions. Shared with the hybrid
- * AOF rewrite child (snapshot.c), whose keys arrive from the scan thread. */
+ * AOF rewrite child (hybrid_snapshot.c), whose keys arrive from the scan thread. */
 int rewriteAppendOnlyFileHeader(rio *aof) {
     /* Record timestamp at the beginning of rewriting AOF. */
     if (server.aof_timestamp_enabled) {
@@ -3244,8 +3244,8 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid snapshot: redisFork() flips the SNAP_NOFORK arena forkable for this
-     * child (stock copy-on-write while it runs), see snapArenaBeforeFork(). */
+    /* Hybrid snapshot: redisFork() flips the HYBSNAP_NOFORK arena forkable for this
+     * child (stock copy-on-write while it runs), see hybsnapArenaBeforeFork(). */
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
         server.backup_state == BACKUP_STATE_INCREMENTING)
     {
@@ -3287,8 +3287,8 @@ int rewriteAppendOnlyFileBackground(void) {
     /* Hybrid snapshot: the base file is written by the hybrid scan thread and
      * child like a BGSAVE, as an RDB with the preamble or in AOF command
      * form without it; the INCR file opened above takes the writes from the
-     * fork instant on. The stock child below runs when snapshot.c declines. */
-    int hybrid = snapSaveTryStart(SNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, 0);
+     * fork instant on. The stock child below runs when hybrid_snapshot.c declines. */
+    int hybrid = hybsnapSaveTryStart(HYBSNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, 0);
     if (hybrid == C_ERR) {
         server.aof_lastbgrewrite_status = C_ERR;
         serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");

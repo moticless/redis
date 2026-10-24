@@ -22,10 +22,10 @@
  *
  * KVSTORE OVERLAY
  * ---------------
- * The contract between a store and the hybrid snapshot (snapshot.h), which
+ * The contract between a store and the hybrid snapshot (hybrid_snapshot.h), which
  * reads the store's dicts on a background thread while the main thread keeps
- * writing. The implementation is kvsoverlay.c; kvsoverlay.h, the private
- * header kvstore.c and kvsoverlay.c share, describes its data structures and
+ * writing. The implementation is kvstore_overlay.c; kvstore_overlay.h, the private
+ * header kvstore.c and kvstore_overlay.c share, describes its data structures and
  * lifecycle. The public entry points are in this file.
  *
  * While a scan runs over a store, the snapshot's hooks are installed on it
@@ -189,12 +189,12 @@ typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
     int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
     /* The extension slot: owned by whatever extends the store's dicts (today the
-     * hybrid snapshot's save state, snapshot.c). The store never reads these two
+     * hybrid snapshot's save state, hybrid_snapshot.c). The store never reads these two
      * fields; the extension stamps the word and allocates and frees the state,
      * with __atomic builtins where two threads meet. 0 / NULL when none. */
     uint64_t ext_word;
     void *ext;
-    struct kvstoreDictOverlay *ov;  /* the dict's overlay while it is frozen (kvsoverlay.c), else NULL;
+    struct kvstoreDictOverlay *ov;  /* the dict's overlay while it is frozen (kvstore_overlay.c), else NULL;
                                    main thread stores (release), scan thread loads (acquire) */
     int refcount;               /* holders: the owning store, a running save; atomic */
     int detached;               /* out of the store's slot table, kept by a holder: the dict callbacks

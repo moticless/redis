@@ -13,7 +13,7 @@
  */
 
 /* Opt in to the private overlay header. */
-#define INCLUDE_KVSOVERLAY_H
+#define INCLUDE_KVSTORE_OVERLAY_H
 
 #include "fmacros.h"
 #include "config.h"
@@ -22,7 +22,7 @@
 #include <stddef.h>
 
 #include "zmalloc.h"
-#include "kvsoverlay.h"
+#include "kvstore_overlay.h"
 #include "fwtree.h"
 #include "redisassert.h"
 #include "monotonic.h"
@@ -53,17 +53,17 @@ struct _kvstore {
 
 /* Save state exists on a dict only while its store is under a save (the save
  * releases every state it attached before the hooks come off): no save, one
- * load. ovPeek: the attached overlay or NULL, no side effects. ovGet: what a
+ * load. kvsoPeek: the attached overlay or NULL, no side effects. kvsoGet: what a
  * dict access must go through: the attached overlay (after the 'enter' hook,
  * so the snapshot sees every access, reads included), or whatever the guard
  * decides (it may attach one now). */
-static inline kvstoreDictOverlay *ovPeek(kvstore *kvs, int didx) {
+static inline kvstoreDictOverlay *kvsoPeek(kvstore *kvs, int didx) {
     if (likely(kvs->snap_hooks == NULL)) return NULL;
     dict *d = kvs->dicts[didx];
     return d ? ((kvstoreDictMetaBase *)dictMetadata(d))->ov : NULL;
 }
 
-static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
+static inline kvstoreDictOverlay *kvsoGet(kvstore *kvs, int didx, int write) {
     if (likely(kvs->snap_hooks == NULL)) return NULL;
     dict *d = kvs->dicts[didx];
     if (!d) return NULL;
@@ -78,23 +78,23 @@ static inline kvstoreDictOverlay *ovGet(kvstore *kvs, int didx, int write) {
 /* The interception points of kvstore.c. Every public entry point that
  * touches a dict's content starts with exactly one of these three (grep
  * them to list every place the snapshot may step in):
- *   ovRead(kvs, didx)    reads and enumeration: the overlay only while its
+ *   kvsoRead(kvs, didx)    reads and enumeration: the overlay only while its
  *                        a bucket is overlayed, a plain dict read otherwise;
- *   ovWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
+ *   kvsoWrite(kvs, didx)   structural writes: the overlay of a frozen dict,
  *                        attached through the guard on first touch;
- *   ovFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
-static inline kvstoreDictOverlay *ovRead(kvstore *kvs, int didx) {
-    kvstoreDictOverlay *ov = ovGet(kvs, didx, 0);
-    return ovActive(ov) ? ov : NULL;
+ *   kvsoFrozen(kvs, didx)  layout decisions (expand): is the dict frozen. */
+static inline kvstoreDictOverlay *kvsoRead(kvstore *kvs, int didx) {
+    kvstoreDictOverlay *ov = kvsoGet(kvs, didx, 0);
+    return kvsoActive(ov) ? ov : NULL;
 }
-static inline kvstoreDictOverlay *ovWrite(kvstore *kvs, int didx) { return ovGet(kvs, didx, 1); }
-static inline int ovFrozen(kvstore *kvs, int didx) { return ovGet(kvs, didx, 0) != NULL; }
+static inline kvstoreDictOverlay *kvsoWrite(kvstore *kvs, int didx) { return kvsoGet(kvs, didx, 1); }
+static inline int kvsoFrozen(kvstore *kvs, int didx) { return kvsoGet(kvs, didx, 0) != NULL; }
 
 /* Debug-build check at the entry points that bypass the overlay on purpose:
- * none of them may meet a frozen dict. Side-effect free (ovPeek: no guard
+ * none of them may meet a frozen dict. Side-effect free (kvsoPeek: no guard
  * call), so it never attaches an overlay itself. The reason each site is
  * exempt is stated at the site; see also TASK-1.43's caller audit. */
-#define kvstoreDebugAssertNotFrozen(kvs, didx) debugAssert(ovPeek((kvs), (didx)) == NULL)
+#define kvstoreDebugAssertNotFrozen(kvs, didx) debugAssert(kvsoPeek((kvs), (didx)) == NULL)
 
 
 #define UNUSED(V) ((void) V)
@@ -421,7 +421,7 @@ static void detachDict(kvstore *kvs, int didx, int moving) {
             kvs->overhead_hashtable_rehashing -= from;
         }
         kvs->bucket_count -= dictBuckets(d);
-        ovDetachFromStore(d);
+        kvsoDetachFromStore(d);
         if (held) meta->detached = 1;
     }
     if (!moving) kvstoreDictUnref(d);
@@ -544,11 +544,11 @@ unsigned long long kvstoreScan(kvstore *kvs, unsigned long long cursor,
     }
 
     dict *d = kvstoreGetDict(kvs, didx);
-    kvstoreDictOverlay *ov = ovRead(kvs, didx);
+    kvstoreDictOverlay *ov = kvsoRead(kvs, didx);
 
     int skip = !d || (skip_cb && skip_cb(d, didx));
     if (!skip && ov) {
-        _cursor = ovScan(kvs, ov, d, cursor, scan_cb, privdata);
+        _cursor = kvsoScan(kvs, ov, d, cursor, scan_cb, privdata);
     } else if (!skip) {
         _cursor = dictScan(d, cursor, scan_cb, privdata);
         /* In dictScan, scan_cb may delete entries (e.g., in active expire case). */
@@ -583,7 +583,7 @@ int kvstoreExpand(kvstore *kvs, uint64_t newsize, int try_expand, kvstoreExpandS
         dict *d = createDictIfNeeded(kvs, i);
         if (!d) continue;
         /* Frozen by a snapshot (its pause): the layout must not change. The
-         * pause and the overlay are attached together, so this is ovFrozen()
+         * pause and the overlay are attached together, so this is kvsoFrozen()
          * without the guard call (expand runs at load and full sync, on fresh
          * stores after the save's detach, so it never meets one in practice). */
         if (d->pauseAutoResize > 0) continue;
@@ -841,8 +841,8 @@ int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it) {
 /* Returns next entry. */
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
     for (;;) {
-        kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? ovRead(kvs_it->kvs, kvs_it->didx) : NULL;
-        dictEntry *de = ov ? ovIteratorNext(ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
+        kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? kvsoRead(kvs_it->kvs, kvs_it->didx) : NULL;
+        dictEntry *de = ov ? kvsoIteratorNext(ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
                            : (kvs_it->di.d ? dictNext(&kvs_it->di) : NULL);
         if (de) return de;
         /* No current dict or reached the end of the dictionary.
@@ -915,7 +915,7 @@ unsigned long kvstoreDictRehashingCount(kvstore *kvs) {
 
 unsigned long kvstoreDictSize(kvstore *kvs, int didx)
 {
-    if (ovRead(kvs, didx)) return ovDictSize(kvs, didx);
+    if (kvsoRead(kvs, didx)) return kvsoDictSize(kvs, didx);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return 0;
@@ -958,16 +958,16 @@ dictEntry *kvstoreDictIteratorNext(kvstoreDictIterator *kvs_di)
 {
     /* The dict may be deleted during the iteration process, so here need to check for NULL. */
     if (!kvs_di->di.d) return NULL;
-    kvstoreDictOverlay *ov = ovRead(kvs_di->kvs, kvs_di->didx);
-    if (ov) return ovIteratorNext(ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
+    kvstoreDictOverlay *ov = kvsoRead(kvs_di->kvs, kvs_di->didx);
+    if (ov) return kvsoIteratorNext(ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
     if (!kvstoreGetDict(kvs_di->kvs, kvs_di->didx)) return NULL;
     return dictNext(&kvs_di->di);
 }
 
 dictEntry *kvstoreDictGetRandomKey(kvstore *kvs, int didx)
 {
-    kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (ov) return ovRandomEntry(kvs, didx, ov, 0);
+    kvstoreDictOverlay *ov = kvsoRead(kvs, didx);
+    if (ov) return kvsoRandomEntry(kvs, didx, ov, 0);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -976,8 +976,8 @@ dictEntry *kvstoreDictGetRandomKey(kvstore *kvs, int didx)
 
 dictEntry *kvstoreDictGetFairRandomKey(kvstore *kvs, int didx)
 {
-    kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (ov) return ovRandomEntry(kvs, didx, ov, 1);
+    kvstoreDictOverlay *ov = kvsoRead(kvs, didx);
+    if (ov) return kvsoRandomEntry(kvs, didx, ov, 1);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -986,8 +986,8 @@ dictEntry *kvstoreDictGetFairRandomKey(kvstore *kvs, int didx)
 
 unsigned int kvstoreDictGetSomeKeys(kvstore *kvs, int didx, dictEntry **des, unsigned int count)
 {
-    kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (ov) return ovGetSomeKeys(ov, des, count);
+    kvstoreDictOverlay *ov = kvsoRead(kvs, didx);
+    if (ov) return kvsoGetSomeKeys(ov, des, count);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return 0;
@@ -996,7 +996,7 @@ unsigned int kvstoreDictGetSomeKeys(kvstore *kvs, int didx, dictEntry **des, uns
 
 int kvstoreDictExpand(kvstore *kvs, int didx, unsigned long size)
 {
-    if (ovFrozen(kvs, didx)) return DICT_OK;   /* frozen: never resize the scanned dict */
+    if (kvsoFrozen(kvs, didx)) return DICT_OK;   /* frozen: never resize the scanned dict */
     dict *d = createDictIfNeeded(kvs, didx);
     if (!d)
         return DICT_ERR;
@@ -1059,8 +1059,8 @@ void *kvstoreDictFetchValue(kvstore *kvs, int didx, const void *key)
 }
 
 dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
-    kvstoreDictOverlay *ov = ovRead(kvs, didx);
-    if (unlikely(ov != NULL)) return ovDictFind(ov, key);
+    kvstoreDictOverlay *ov = kvsoRead(kvs, didx);
+    if (unlikely(ov != NULL)) return kvsoDictFind(ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1093,8 +1093,8 @@ dictEntry *kvstoreDictFind(kvstore *kvs, int didx, void *key) {
  */
 dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLink *bucket) {
     if (bucket) *bucket = NULL;    
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) return ovDictFindLink(kvs, didx, ov, key, bucket);
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) return kvsoDictFindLink(kvs, didx, ov, key, bucket);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d) return NULL;
     return dictFindLink(d, key, bucket);
@@ -1115,8 +1115,8 @@ dictEntryLink kvstoreDictFindLink(kvstore *kvs, int didx, void *key, dictEntryLi
  */
 void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link, int newItem) {
     dict *d;
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) { ovDictSetAtLink(kvs, didx, ov, kv, link, newItem); return; }
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) { kvsoDictSetAtLink(kvs, didx, ov, kv, link, newItem); return; }
     if (newItem) {
         d = createDictIfNeeded(kvs, didx);
         dictSetKeyAtLink(d, kv, link, newItem);
@@ -1128,8 +1128,8 @@ void kvstoreDictSetAtLink(kvstore *kvs, int didx, void *kv, dictEntryLink *link,
 }
 
 dictEntry *kvstoreDictAddRaw(kvstore *kvs, int didx, void *key, dictEntry **existing) {
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) return ovDictAddRaw(kvs, didx, ov, key, existing);
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) return kvsoDictAddRaw(kvs, didx, ov, key, existing);
     dict *d = createDictIfNeeded(kvs, didx);
     dictEntry *ret = dictAddRaw(d, key, existing);
     if (ret)
@@ -1155,8 +1155,8 @@ void kvstoreDictSetVal(kvstore *kvs, int didx, dictEntry *de, void *val) {
 }
 
 dictEntryLink kvstoreDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, const void *key, int *table_index) {
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) return ovDictTwoPhaseUnlinkFind(kvs, didx, ov, key, table_index);
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) return kvsoDictTwoPhaseUnlinkFind(kvs, didx, ov, key, table_index);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return NULL;
@@ -1168,8 +1168,8 @@ void kvstoreDictTwoPhaseUnlinkFree(kvstore *kvs, int didx, dictEntryLink link, i
 }
 
 void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link, int table_index, const void *key) {
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) { ovDictTwoPhaseUnlinkFreeKey(kvs, didx, ov, link, table_index, key); return; }
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) { kvsoDictTwoPhaseUnlinkFreeKey(kvs, didx, ov, link, table_index, key); return; }
     dict *d = kvstoreGetDict(kvs, didx);
     dictTwoPhaseUnlinkFree(d, link, table_index);
     cumulativeKeyCountAdd(kvs, didx, -1);
@@ -1177,8 +1177,8 @@ void kvstoreDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, dictEntryLink link
 }
 
 int kvstoreDictDelete(kvstore *kvs, int didx, const void *key) {
-    kvstoreDictOverlay *ov = ovWrite(kvs, didx);
-    if (unlikely(ov != NULL)) return ovDictDelete(kvs, didx, ov, key);
+    kvstoreDictOverlay *ov = kvsoWrite(kvs, didx);
+    if (unlikely(ov != NULL)) return kvsoDictDelete(kvs, didx, ov, key);
     dict *d = kvstoreGetDict(kvs, didx);
     if (!d)
         return DICT_ERR;

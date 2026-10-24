@@ -469,7 +469,7 @@ ssize_t rdbSaveRawString(rio *rdb, unsigned char *s, size_t len) {
 
     /* Try LZF compression - under 20 bytes it's unable to compress even
      * aaaaaaaaaaaaaaaaaa so skip it */
-    int compression = snapRdbCfgGet().compression;
+    int compression = hybsnapRdbCfgGet().compression;
     if (compression && len > 20) {
         n = rdbSaveLzfStringObject(rdb,s,len);
         if (n == -1) return -1;
@@ -1350,7 +1350,7 @@ ssize_t rdbSaveObject(rio *rdb, robj *o, robj *key, int dbid) {
                  * fork-instant original may be rewritten by the main thread
                  * (ebuckets bookkeeping), so compute the min TTL from the
                  * listpack itself there. */
-                uint64_t minExpire = hashTypeGetMinExpire(o, snapRdbCfgGet().on_scan);
+                uint64_t minExpire = hashTypeGetMinExpire(o, hybsnapRdbCfgGet().on_scan);
                 /* if invalid time then save 0 */
                 if (minExpire == EB_EXPIRE_TIME_INVALID)
                     minExpire = 0;
@@ -1693,8 +1693,8 @@ size_t rdbSavedObjectLen(robj *o, robj *key, int dbid) {
  * On success if the key was actually saved 1 is returned. */
 int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, int dbid) {
     /* Hybrid snapshot: the scan thread serializes with the configuration frozen
-     * at save start and its own LRU clock (snapRdbCfg). */
-    snapRdbCfg cfg = snapRdbCfgGet();
+     * at save start and its own LRU clock (hybsnapRdbCfg). */
+    hybsnapRdbCfg cfg = hybsnapRdbCfgGet();
     int on_scan = cfg.on_scan;
     int policy = cfg.maxmemory_policy;
     int savelru = policy & MAXMEMORY_FLAG_LRU;
@@ -1742,7 +1742,7 @@ int rdbSaveKeyValuePair(rio *rdb, robj *key, robj *val, long long expiretime, in
     if (rdbSaveObject(rdb,val,key,dbid) == -1) return -1;
 
     /* Delay return if required (for testing); not in the hybrid save's own
-     * serialization contexts (snapRdbCfg). */
+     * serialization contexts (hybsnapRdbCfg). */
     if (cfg.apply_key_save_delay && server.rdb_key_save_delay)
         debugDelay(server.rdb_key_save_delay);
 
@@ -2265,10 +2265,10 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
 
     if (hasActiveChildProcess()) return C_ERR;
     /* Hybrid snapshot: the scan thread and its child write the file; the
-     * stock child below runs only when snapshot.c declines (switch off,
+     * stock child below runs only when hybrid_snapshot.c declines (switch off,
      * functions-only request, or a module without the opt-in). */
-    int hybrid = snapSaveTryStart(SNAP_SAVE_RDB, req, filename, rsi, rdbflags);
-    if (hybrid != SNAP_NOT_TAKEN) return hybrid;
+    int hybrid = hybsnapSaveTryStart(HYBSNAP_SAVE_RDB, req, filename, rsi, rdbflags);
+    if (hybrid != HYBSNAP_NOT_TAKEN) return hybrid;
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
@@ -5322,7 +5322,7 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
 void killRDBChild(void) {
     /* Hybrid snapshot: the scan thread must stop reading the frozen keyspace and
      * the overlay must be merged before anyone destroys or mutates the dicts. */
-    snapSaveAbort();
+    hybsnapSaveAbort();
     kill(server.child_pid, SIGUSR1);
     /* Because we are not using here waitpid (like we have in killAppendOnlyChild
      * and TerminateModuleForkChild), all the cleanup operations is done by
@@ -5351,7 +5351,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     if (hasActiveChildProcess()) return C_ERR;
     /* Hybrid snapshot: only functions-only and slots-snapshot transfers reach
      * this stock child (see startBgsaveForReplication()); redisFork() flips
-     * the SNAP_NOFORK arena forkable for it (see snapArenaBeforeFork()). */
+     * the HYBSNAP_NOFORK arena forkable for it (see hybsnapArenaBeforeFork()). */
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */

@@ -687,8 +687,8 @@ NULL
             return;
         server.cluster_drop_packet_filter = packet_type;
         addReply(c,shared.ok);
-    } else if (snapDebugCommand(c)) {
-        /* SNAP-PLACEMENT, SNAP-DRIFT, SNAP-WINDOW-BUCKETS: replied by snapshot.c */
+    } else if (hybsnapDebugCommand(c)) {
+        /* SNAP-PLACEMENT, SNAP-DRIFT, SNAP-WINDOW-BUCKETS: replied by hybrid_snapshot.c */
     } else if (!strcasecmp(c->argv[1]->ptr,"object") && c->argc == 3) {
         kvobj *kv;
         char *strenc;
@@ -2298,7 +2298,7 @@ void logServerInfo(void) {
     int all = 0, everything = 0;
     robj *argv[16];
     int argc = 0;
-    const char *const *keep = snapCrashReportInfoSections();
+    const char *const *keep = hybsnapCrashReportInfoSections();
     if (keep) {
         /* A child forked without the keyspace (the hybrid save child, a
          * REDISMODULE_FORK_NO_KEYSPACE module fork) has none mapped: only the

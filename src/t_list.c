@@ -47,8 +47,8 @@ static void listTypeTryConvertListpack(robj *o, robj **argv, int start, int end,
 
         /* Append listpack to quicklist if it's not empty, otherwise release it. */
         /* Hybrid snapshot: the quicklist adopts this listpack as its first node; a
-         * SNAP_FORK value must not contain arena memory (unreadable by the child). */
-        snapValueDetachFromArena(o);
+         * HYBSNAP_FORK value must not contain arena memory (unreadable by the child). */
+        hybsnapValueDetachFromArena(o);
         if (lpLength(o->ptr))
             quicklistAppendListpack(ql, o->ptr);
         else
@@ -96,7 +96,7 @@ static void listTypeTryConvertQuicklist(robj *o, int shrinking, beforeConvertCB 
     ql->alloc_size -= ql->head->sz;
     quicklistRelease(ql);
     o->encoding = OBJ_ENCODING_LISTPACK;
-    snapPlaceValue(o); /* the listpack came from the quicklist: apply placement policy */
+    hybsnapPlaceValue(o); /* the listpack came from the quicklist: apply placement policy */
 }
 
 /* Check if the list needs to be converted to appropriate encoding due to

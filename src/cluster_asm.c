@@ -2249,7 +2249,7 @@ void clusterSyncSlotsCommand(client *c) {
 /* Save a key-value pair to stream I/O using either RESTORE or AOF format. */
 /* One key of the slot snapshot stream: RESTORE ... ABSTTL from a DUMP payload,
  * or the AOF command form for large non-string values. Also the hybrid
- * snapshot's record writer for a slot snapshot (snapshot.c): it runs on the
+ * snapshot's record writer for a slot snapshot (hybrid_snapshot.c): it runs on the
  * scan thread and the main thread there, besides the child. */
 int slotSnapshotSaveKeyValuePair(rio *rdb, kvobj *o, int dbid) {
     /* Get the expire time */

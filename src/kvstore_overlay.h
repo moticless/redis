@@ -7,8 +7,8 @@
  * GNU Affero General Public License v3 (AGPLv3).
  *
  *
- * WHAT IS KVSOVERLAY?
- * -------------------
+ * WHAT IS THE KVSTORE OVERLAY?
+ * ----------------------------
  * The implementation of the kvstore snapshot overlay. What it does for its
  * user (frozen dicts, 'prepare' and DEFER, overlayed buckets, windows, drain
  * and release, dict references) is the KVSTORE OVERLAY section of kvstore.h;
@@ -16,15 +16,15 @@
  *
  * WHO INCLUDES THIS
  * -----------------
- * kvstore.c and kvsoverlay.c only, each after #define INCLUDE_KVSOVERLAY_H
+ * kvstore.c and kvstore_overlay.c only, each after #define INCLUDE_KVSTORE_OVERLAY_H
  * (any other includer gets an #error); it is not an API. kvstore.c keeps the
  * public entry points and decides, per access, whether the overlay steps in
- * (its inline ovRead/ovWrite/ovFrozen helpers, one load on the common path);
- * kvsoverlay.c holds the overlay halves of those entry points and the
+ * (its inline kvsoRead/kvsoWrite/kvsoFrozen helpers, one load on the common path);
+ * kvstore_overlay.c holds the overlay halves of those entry points and the
  * overlayed buckets themselves. The store struct is private to kvstore.c and the overlay
- * struct is private to kvsoverlay.c: the two files meet only through the
+ * struct is private to kvstore_overlay.c: the two files meet only through the
  * prototypes below. The save's own per-dict state (bucket bitmaps, pause) is
- * snapshot.c's, in the dict's extension slot, and is not seen here.
+ * hybrid_snapshot.c's, in the dict's extension slot, and is not seen here.
  *
  * THE OVERLAYED BUCKETS
  * ----------------------
@@ -69,18 +69,18 @@
  *          save releases the overlay later wherever the dict is.
  */
 
-#ifndef INCLUDE_KVSOVERLAY_H
-#error "kvsoverlay.h is private to kvstore.c and kvsoverlay.c: define INCLUDE_KVSOVERLAY_H before including it"
+#ifndef INCLUDE_KVSTORE_OVERLAY_H
+#error "kvstore_overlay.h is private to kvstore.c and kvstore_overlay.c: define INCLUDE_KVSTORE_OVERLAY_H before including it"
 #endif
 
-#ifndef KVSOVERLAY_H
-#define KVSOVERLAY_H
+#ifndef KVSTORE_OVERLAY_H
+#define KVSTORE_OVERLAY_H
 
 #include "kvstore.h"
 
-/* The overlay of a frozen dict (layout in kvsoverlay.c) and a position in its overlayed buckets' chains. */
+/* The overlay of a frozen dict (layout in kvstore_overlay.c) and a position in its overlayed buckets' chains. */
 typedef struct kvstoreDictOverlay kvstoreDictOverlay;
-typedef kvstoreOvCursor ovCursor;
+typedef kvstoreOvCursor kvsoCursor;
 
 /* ---- What the overlay may reach of its store (kvstore.c) ------------------ */
 
@@ -89,29 +89,29 @@ const kvstoreSnapHooks *kvstoreSnapHooksGet(kvstore *kvs, void **privdata);
 /* The one key-count update of the store; 'after' is the dict's logical size after the change. */
 void kvstoreKeyCountAdd(kvstore *kvs, int didx, long delta, unsigned long after);
 
-/* ---- The overlay for kvstore.c (kvsoverlay.c) ------------------------------ */
+/* ---- The overlay for kvstore.c (kvstore_overlay.c) ------------------------- */
 
 /* Some bucket is overlayed: reads must consult the overlay (out of line; reached only for frozen dicts). */
-int ovActive(kvstoreDictOverlay *ov);
+int kvsoActive(kvstoreDictOverlay *ov);
 /* Logical size of dict didx, frozen or not. */
-unsigned long ovDictSize(kvstore *kvs, int didx);
+unsigned long kvsoDictSize(kvstore *kvs, int didx);
 /* The dict leaves its store (detachDict): the overlay follows the dict. */
-void ovDetachFromStore(dict *d);
+void kvsoDetachFromStore(dict *d);
 
 /* Enumeration: scan, iterator (phase 0 the dict, 1 a replaced bucket's chain, 2 buckets the dict has no entry for; next is fetched first, the caller may delete what it got), random keys. */
-unsigned long long ovScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
+unsigned long long kvsoScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
                           dictScanFunction *scan_cb, void *privdata);
-dictEntry *ovIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, ovCursor *cur);
-dictEntry *ovRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
-unsigned int ovGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
+dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, kvsoCursor *cur);
+dictEntry *kvsoRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
+unsigned int kvsoGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
 
 /* The overlay halves of the hot kvstore entry points (out of line, so the common path stays inlined). */
-dictEntry *ovDictFind(kvstoreDictOverlay *ov, void *key);
-dictEntryLink ovDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntryLink *bucket);
-void ovDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, dictEntryLink *link, int newItem);
-dictEntry *ovDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntry **existing);
-dictEntryLink ovDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int *table_index);
-void ovDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntryLink link, int table_index, const void *key);
-int ovDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key);
+dictEntry *kvsoDictFind(kvstoreDictOverlay *ov, void *key);
+dictEntryLink kvsoDictFindLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntryLink *bucket);
+void kvsoDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv, dictEntryLink *link, int newItem);
+dictEntry *kvsoDictAddRaw(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *key, dictEntry **existing);
+dictEntryLink kvsoDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int *table_index);
+void kvsoDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *ov, dictEntryLink link, int table_index, const void *key);
+int kvsoDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key);
 
-#endif /* KVSOVERLAY_H */
+#endif /* KVSTORE_OVERLAY_H */

@@ -25,16 +25,16 @@
  * Out of memory aborts the server, unless a caller uses a ztry variant.
  *
  *
- * SNAP_NOFORK ARENA
+ * HYBSNAP_NOFORK ARENA
  * -----------------
- * Used by the hybrid snapshot (snapshot.h) to keep memory out of fork
+ * Used by the hybrid snapshot (hybrid_snapshot.h) to keep memory out of fork
  * children. A dedicated jemalloc arena takes all its extents from ONE
  * reserved virtual address range (64 GB to 16 TB, the largest that mmap
  * grants, PROT_NONE and MAP_NORESERVE) marked MADV_DONTFORK, so a fork child
  * never maps it: what lives there costs nothing at fork() and nothing in
  * copy-on-write. 64-bit Linux with jemalloc only (HAVE_NOFORK_ARENA);
  * elsewhere the zmalloc_nofork*() entry points are the default allocators and
- * the hybrid save runs without an arena (see snapshot.h).
+ * the hybrid save runs without an arena (see hybrid_snapshot.h).
  *
  * - Ownership is an address test. The range is contiguous, so "is this block
  *   in the arena" is two compares (zmalloc_is_nofork). zfree() and zrealloc()
@@ -56,7 +56,7 @@
  * - Fork visibility is switchable. The range is DONTFORK normally; around
  *   any other fork (classic child, module fork, Lua debugger) it is flipped
  *   to MADV_DOFORK with zmalloc_nofork_arena_set_forkable() and back when no
- *   child is left (driven by snapshot.c).
+ *   child is left (driven by hybrid_snapshot.c).
  * - In the hybrid child the range is absent, so the kernel may hand its
  *   addresses to the child's own mmaps; the child re-reserves the range
  *   PROT_NONE first thing, so the address test keeps meaning "arena".
@@ -190,7 +190,7 @@ void zfree_with_flags(void *ptr, int flags);
 void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #endif
 
-/* ---- SNAP_NOFORK arena: see "SNAP_NOFORK ARENA" at the top of this file. ---- */
+/* ---- HYBSNAP_NOFORK arena: see "HYBSNAP_NOFORK ARENA" at the top of this file. ---- */
 #include <stdint.h>
 #include <limits.h>
 #include "config.h"   /* likely / unlikely */
@@ -201,7 +201,7 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
  * them. Cold callers use zmalloc_nofork_arena_range(). */
 extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
 extern char *zmalloc_nofork_hi;
-extern int zmalloc_nofork_active;       /* 1 while NEW SNAP_NOFORK requests go to the arena (hybrid-snapshot on) */
+extern int zmalloc_nofork_active;       /* 1 while NEW HYBSNAP_NOFORK requests go to the arena (hybrid-snapshot on) */
 /* hi is NULL while there is no arena: one load and one compare decide. */
 static inline int zmalloc_is_nofork(const void *p) {
     return (const char *)p < zmalloc_nofork_hi && (const char *)p >= zmalloc_nofork_lo;
@@ -233,7 +233,7 @@ void *zrealloc_nofork(void *ptr, size_t size);   /* zrealloc, which keeps an are
 __attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);
 void *ztrycalloc_nofork(size_t size);           /* NULL on OOM */
 void zmalloc_nofork_va_stats(size_t *reserved, size_t *used);
-/* Allocate 'size' bytes in the same arena as 'like' (default or SNAP_NOFORK),
+/* Allocate 'size' bytes in the same arena as 'like' (default or HYBSNAP_NOFORK),
  * for containers that replace a buffer instead of reallocating it in place. */
 static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *usable) {
     return zmalloc_is_nofork(like) ? zmalloc_nofork_usable(size, usable) : zmalloc_usable(size, usable);
@@ -244,7 +244,7 @@ static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *u
     (void)like;
     return zmalloc_usable(size, usable);
 }
-/* No arena on this platform: the SNAP_NOFORK entry points are the defaults. */
+/* No arena on this platform: the HYBSNAP_NOFORK entry points are the defaults. */
 #define zmalloc_nofork(size) zmalloc(size)
 #define zcalloc_nofork(size) zcalloc(size)
 #define zmalloc_nofork_usable(size, usable) zmalloc_usable(size, usable)

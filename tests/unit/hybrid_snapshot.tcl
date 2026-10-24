@@ -7,7 +7,7 @@ start_server {tags {"snapshot"} overrides {hybrid-snapshot yes}} {
         assert_equal 4096 [lindex [r config get save-small-max-bytes] 1]
     }
 
-    test {INFO memory exposes SNAP_NOFORK arena stats} {
+    test {INFO memory exposes HYBSNAP_NOFORK arena stats} {
         set info [r info memory]
         assert_match {*allocator_allocated_nofork:*} $info
         assert_match {*allocator_active_nofork:*} $info
@@ -32,7 +32,7 @@ proc snap_placement {{db ""}} {
     return [dict create {*}[r debug snap-placement $db]]
 }
 
-# The hybrid save path runs with or without the SNAP_NOFORK arena (sanitizer
+# The hybrid save path runs with or without the HYBSNAP_NOFORK arena (sanitizer
 # builds use libc and have no arena); placement checks only make sense with it.
 proc snap_arena_available {} { expr {[s snap_nofork_arena_available] == 1} }
 proc snap_arena_test {name body} {
@@ -275,11 +275,11 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             r del filler:1
             r set filler:1 back
             r del filler:2
-            # header-only clones of SNAP_FORK keys (value shared with the original)
+            # header-only clones of HYBSNAP_FORK keys (value shared with the original)
             r expire hash:ht 1000
             r expire list:ql 1000
             r persist list:ql
-            # encoding conversions on owed SNAP_NOFORK clones
+            # encoding conversions on owed HYBSNAP_NOFORK clones
             for {set i 0} {$i < 600} {incr i} { r hset hash:lp c$i v }
             assert_equal hashtable [r object encoding hash:lp]
             r sadd set:intset notanint
@@ -683,7 +683,7 @@ proc snap_populate_race {multidb module} {
 
 # One random write over the keyspace built by snap_populate_race, drawn from
 # the write-path audit: value writes of both classes, class-crossing growth and
-# encoding conversions, header-only mutations of SNAP_FORK keys (EXPIRE/PERSIST
+# encoding conversions, header-only mutations of HYBSNAP_FORK keys (EXPIRE/PERSIST
 # on b:*, hbig:*), deletes, re-adds, RENAME/COPY/MOVE/RESTORE, hash field TTLs,
 # streams, module writes, short-lived keys (lazy and active expiry) and reads.
 # Returns 1 if the command was accepted; error replies (WRONGTYPE, missing
@@ -1056,7 +1056,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             r flushall
         }
 
-        test {Hybrid snapshot harness: templated hashes (SNAP_FORK, REF form) survive a hybrid save} {
+        test {Hybrid snapshot harness: templated hashes (HYBSNAP_FORK, REF form) survive a hybrid save} {
             r flushall
             r himport prepare fieldset a b c d
             r himport set tmpl:small fieldset 1 2 3 4
@@ -1298,7 +1298,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             # the classic copy-on-write well above it
             set hy_base_small [snap_cow_run 50000 60 50 none]
             set hy_set [snap_cow_run 50000 60 50 set]
-            # SNAP_FORK dataset: 20000 values just over a lowered threshold, then
+            # HYBSNAP_FORK dataset: 20000 values just over a lowered threshold, then
             # an EXPIRE storm touches every header but no value
             r config set save-small-max-bytes 256
             set hy_base_big [snap_cow_run 20000 1000 50 none]
@@ -1845,7 +1845,7 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
 
 # ---------------------------------------------------------------------------
 # Arena fork visibility (TASK-1.22): classic fork children (AOF rewrite, diskless
-# sync, module fork) map the SNAP_NOFORK arena while they run, the hybrid child
+# sync, module fork) map the HYBSNAP_NOFORK arena while they run, the hybrid child
 # never does, and hybrid-snapshot is a runtime switch.
 # ---------------------------------------------------------------------------
 set ::snap_fork_module [file normalize tests/modules/fork.so]
@@ -2225,7 +2225,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_fallback_dataset
         set digest [debug_digest]
         set loglines [count_log_lines 0]
-        set flips [count_log_message 0 "SNAP_NOFORK arena made forkable for a MODULE child"]
+        set flips [count_log_message 0 "HYBSNAP_NOFORK arena made forkable for a MODULE child"]
         r fork.nokeyspace k:1 1500000   ;# probes the keyspace APIs on an existing key, then lives 1.5 s
         wait_for_log_messages 0 {"*nokeyspace child started*"} $loglines 50 100
         if {[snap_arena_available]} {
@@ -2240,7 +2240,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         wait_for_condition 100 100 {[r fork.exitcode] != -1} else { fail "module fork did not exit" }
         assert_equal 0 [r fork.exitcode]
         wait_for_log_messages 0 {"*called RedisModule_OpenKey inside a module fork child created with REDISMODULE_FORK_NO_KEYSPACE*"} $loglines 50 10
-        assert_equal $flips [count_log_message 0 "SNAP_NOFORK arena made forkable for a MODULE child"]
+        assert_equal $flips [count_log_message 0 "HYBSNAP_NOFORK arena made forkable for a MODULE child"]
         snap_wait_forkable 0
         r del during:nokeyspace
         assert_equal $digest [debug_digest]

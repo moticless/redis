@@ -362,7 +362,7 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
 #endif
 
 /* ============================================================================
- * SNAP_NOFORK arena: reserved DONTFORK address range + jemalloc extent hooks
+ * HYBSNAP_NOFORK arena: reserved DONTFORK address range + jemalloc extent hooks
  * ============================================================================ */
 #ifdef HAVE_NOFORK_ARENA
 #include <sys/mman.h>
@@ -729,7 +729,7 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
         return NULL;
     }
 #ifdef HAVE_NOFORK_ARENA
-    /* SNAP_NOFORK arena memory must stay in the arena. */
+    /* HYBSNAP_NOFORK arena memory must stay in the arena. */
     if (unlikely(zmalloc_is_nofork(ptr))) return noforkRealloc(ptr, size, usable, old_usable);
 #endif
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -1331,7 +1331,7 @@ void set_jemalloc_bg_thread(int enable) {
     je_mallctl("background_thread", NULL, 0, &val, 1);
 }
 
-/* Flush this thread's SNAP_NOFORK tcache back to the arena. The regions a
+/* Flush this thread's HYBSNAP_NOFORK tcache back to the arena. The regions a
  * tcache holds pin their slabs: after a FLUSHALL about 1 MB of cached regions
  * kept 30 MB of arena slabs resident, which the arena purge below cannot
  * release. Called by jemalloc_purge() (FLUSHALL/FLUSHDB, lazyfree, MEMORY

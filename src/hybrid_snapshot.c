@@ -1,9 +1,9 @@
 /*
- * snapshot.c - Hybrid snapshot: the implementation.
+ * hybrid_snapshot.c - Hybrid snapshot: the implementation.
  *
  * The design overview (value classes, one save end to end, the credit window
  * and write sections, memory, entry points) is the comment at the top of
- * snapshot.h; the full design, with figures and the race-freedom argument, is
+ * hybrid_snapshot.h; the full design, with figures and the race-freedom argument, is
  * docs/hybrid-snapshot.md. This file keeps the implementation details next to
  * the code they describe; each section below opens with its own.
  *
@@ -27,7 +27,7 @@
  */
 
 #include "server.h"
-#include "snapshot.h"
+#include "hybrid_snapshot.h"
 #include "cluster.h"
 #include "cluster_asm.h"
 #include "fmtargs.h"
@@ -43,91 +43,91 @@
 /* ---- Constants -------------------------------------------------------- */
 
 /* Slot (dict) states, monotonic; the slot is owed to the save until DONE. */
-#define SNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
-#define SNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */
-#define SNAP_SLOT_SCANNED  2   /* Fully dispatched; waiting for the main thread to complete it. */
-#define SNAP_SLOT_DONE     3   /* Completed by the main thread: overlay written back, dict unfrozen. */
+#define HYBSNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
+#define HYBSNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */
+#define HYBSNAP_SLOT_SCANNED  2   /* Fully dispatched; waiting for the main thread to complete it. */
+#define HYBSNAP_SLOT_DONE     3   /* Completed by the main thread: overlay written back, dict unfrozen. */
 
 /* The thread's credit W (buckets per grant); per-dict word: save generation and slot state. */
-#define SNAP_WINDOW_BUCKETS_DEFAULT 1024
-#define SNAP_WINDOW_BUCKETS_MAX 65536   /* overlay windows are W rounded up to a power of two: an array of that many buckets each */
-#ifndef SNAP_SCAN_PREFETCH2
-#define SNAP_SCAN_PREFETCH2 8
+#define HYBSNAP_WINDOW_BUCKETS_DEFAULT 1024
+#define HYBSNAP_WINDOW_BUCKETS_MAX 65536   /* overlay windows are W rounded up to a power of two: an array of that many buckets each */
+#ifndef HYBSNAP_SCAN_PREFETCH2
+#define HYBSNAP_SCAN_PREFETCH2 8
 #endif
-#ifndef SNAP_SCAN_PREFETCH
-#define SNAP_SCAN_PREFETCH 16   /* buckets ahead of the scan whose first entry is prefetched */
+#ifndef HYBSNAP_SCAN_PREFETCH
+#define HYBSNAP_SCAN_PREFETCH 16   /* buckets ahead of the scan whose first entry is prefetched */
 #endif
-#define SNAP_WORD(gen, st) (((uint64_t)(gen) << 8) | (uint64_t)(st))
-#define SNAP_WORD_GEN(w) ((w) >> 8)
-#define SNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
+#define HYBSNAP_WORD(gen, st) (((uint64_t)(gen) << 8) | (uint64_t)(st))
+#define HYBSNAP_WORD_GEN(w) ((w) >> 8)
+#define HYBSNAP_WORD_STATE(w) ((uint8_t)((w) & 0xff))
 /* A (store, dict) pair packed in one atomic. */
-#define SNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
-#define SNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
-#define SNAP_SCAN_DEC_DIDX(v) ((int)((v) & 0xffffffffu))
+#define HYBSNAP_SCAN_ENC(store_idx, didx) (((uint64_t)(uint32_t)(store_idx) << 32) | (uint32_t)(didx))
+#define HYBSNAP_SCAN_DEC_STORE(v) ((int)((v) >> 32))
+#define HYBSNAP_SCAN_DEC_DIDX(v) ((int)((v) & 0xffffffffu))
 
 /* Messages to the child and the staging buffers. */
-#define SNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
-#define SNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a SNAP_FORK key */
-#define SNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
-#define SNAP_MSG_ABORT  4
-#define SNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
-#define SNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
-#define SNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
+#define HYBSNAP_MSG_BUFFER 1     /* pre-encoded records of one (db, slot) */
+#define HYBSNAP_MSG_KVOBJ  2     /* whole kvobj allocation copy of a HYBSNAP_FORK key */
+#define HYBSNAP_MSG_END    3     /* big channel: robj_off = KVOBJ messages sent, src_addr = small-channel messages sent */
+#define HYBSNAP_MSG_ABORT  4
+#define HYBSNAP_SMALL_BACKLOG (1024 * 1024)   /* child: take a big value only below this much small backlog in the parent */
+#define HYBSNAP_SMALL_WAIT_MS 20              /* child: how long to wait for that backlog to reach the pipe before taking a big value */
+#define HYBSNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
 
 /* Where the scan thread is relative to a bucket. */
-#define SNAP_POS_BEHIND 0   /* the thread already read this bucket */
-#define SNAP_POS_INSIDE 1   /* the thread is reading it now */
-#define SNAP_POS_AHEAD  2   /* the thread has not reached it */
+#define HYBSNAP_POS_BEHIND 0   /* the thread already read this bucket */
+#define HYBSNAP_POS_INSIDE 1   /* the thread is reading it now */
+#define HYBSNAP_POS_AHEAD  2   /* the thread has not reached it */
 
 /* Outbound queue drain modes and buffer pool. */
-#define SNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
-#define SNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
-#define SNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
-#define SNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
-#define SNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
+#define HYBSNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
+#define HYBSNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
+#define HYBSNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
+#define HYBSNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
+#define HYBSNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
 
 /* ---- Types ------------------------------------------------------------ */
 
-typedef struct snapScanCtx snapScanCtx;
+typedef struct hybsnapScanCtx hybsnapScanCtx;
 /* Scan thread, once per fork-instant key of a slot; strictly read-only on the keyspace. */
-typedef void (snapScanDispatchFn)(void *privdata, int store_idx, int didx, kvobj *kv);
+typedef void (hybsnapScanDispatchFn)(void *privdata, int store_idx, int didx, kvobj *kv);
 /* Main thread, when a slot is complete, before its dict is unfrozen ('aborted': not fully scanned). */
-typedef void (snapScanSlotDoneFn)(void *privdata, int store_idx, int didx, int aborted);
+typedef void (hybsnapScanSlotDoneFn)(void *privdata, int store_idx, int didx, int aborted);
 /* Scan thread, after the last slot or on abort, before the scan is published as finished. */
-typedef void (snapScanThreadDoneFn)(void *privdata, int aborted);
-typedef struct snapSave snapSave;
+typedef void (hybsnapScanThreadDoneFn)(void *privdata, int aborted);
+typedef struct hybsnapSave hybsnapSave;
 
 /* Keyspace placement statistics (DEBUG SNAP-PLACEMENT, SNAP-DRIFT). */
-typedef struct snapPlacementStats {
+typedef struct hybsnapPlacementStats {
     long long keys;
     long long headers_in_arena;        /* every kvobj header should be here */
     long long headers_outside;
-    long long class_nofork;            /* snapKeyClass() == SNAP_NOFORK */
+    long long class_nofork;            /* hybsnapKeyClass() == HYBSNAP_NOFORK */
     long long class_fork;
     long long drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
     long long drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
     long long violations;              /* header outside, or multi-allocation value inside */
     long long dict_tables_in_arena;    /* dict structs + bucket arrays of db->keys / db->expires */
     long long dict_tables_outside;
-} snapPlacementStats;
+} hybsnapPlacementStats;
 
 /* The privdata of every kvstore hook on store s (guard, layout and overlay
  * callbacks alike, one convention): the scan and the store index, plus what
- * the overlay's user handed to snapScanSetOverlay for that store. The redisDb
+ * the overlay's user handed to hybsnapScanSetOverlay for that store. The redisDb
  * owning a store is resolved at call time (SWAPDB moves a store to another db
  * id; a FLUSHDB leaves it with no owner), the db id in the dump is always s. */
-struct snapGuardPriv { struct snapScanCtx *ctx; int s; void *user; };
+struct hybsnapGuardPriv { struct hybsnapScanCtx *ctx; int s; void *user; };
 
 /* What the scan keeps per store (one per db: db->keys). */
-typedef struct snapScanStore {
+typedef struct hybsnapScanStore {
     kvstore *kvs;
     dict **dicts;                 /* the fork-instant dicts by slot, one reference each; NULL once completed (allocated at freeze) */
     long nrefs;                   /* dicts not completed yet; the guard comes off at zero. Main thread. */
     int num_dicts;                /* kvstoreNumDicts() */
     int ord_base;                 /* the ordinal of its dict 0 in the scan positions */
-    int frozen;                   /* 1 while our guard is installed (snapScanFreeze() until its last dict completes) */
-    struct snapGuardPriv guard;   /* the privdata of every hook on the store */
-} snapScanStore;
+    int frozen;                   /* 1 while our guard is installed (hybsnapScanFreeze() until its last dict completes) */
+    struct hybsnapGuardPriv guard;   /* the privdata of every hook on the store */
+} hybsnapScanStore;
 
 /* What the save keeps per dict in the kvstore extension slot, allocated the
  * first time the save touches the dict (a write before the scan thread
@@ -135,32 +135,32 @@ typedef struct snapScanStore {
  * thread is on it) and freed when the dict's scan
  * completes. Meaningful only while the dict's word carries this save's
  * generation. The overlay lives next to it (kvstoreDictMetaBase.ov). */
-typedef struct snapDictState {
+typedef struct hybsnapDictState {
     uint8_t *bits[2];           /* per table: one bit per bucket, set when the main thread emitted the
                                    bucket's fork-instant chain ahead of the scan thread; main thread
                                    stores (release), scan thread loads (acquire) */
     size_t bytes[2];
     int paused;                 /* rehash and auto-resize paused: hi may pass the layout (positions are stable) */
-} snapDictState;
+} hybsnapDictState;
 
 
 /* The scan thread's chain-walk callback arguments. */
-struct snapScanEntryArgs { snapScanCtx *ctx; int s; int didx; };
+struct hybsnapScanEntryArgs { hybsnapScanCtx *ctx; int s; int didx; };
 
 
-struct snapScanCtx {
-    snapScanStore *store;           /* num_stores entries, one per db. */
+struct hybsnapScanCtx {
+    hybsnapScanStore *store;           /* num_stores entries, one per db. */
     int num_stores;
     size_t bitmap_bytes;            /* Bucket bitmaps attached to the table dicts. Main thread. */
     long retained_dicts;            /* Table dicts their store let go of before the save completed them (freed here). Main thread. */
-    redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), SNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
+    redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), HYBSNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
     int ended;                      /* Main thread: every store completed; nothing is owed any more. */
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
     uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
     const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
 
-    snapScanDispatchFn *dispatch;
-    snapScanSlotDoneFn *slot_done;
+    hybsnapScanDispatchFn *dispatch;
+    hybsnapScanSlotDoneFn *slot_done;
     void *privdata;
 
     /* SPSC completion ring, capacity == slots_total (allocated at freeze). */
@@ -184,25 +184,25 @@ struct snapScanCtx {
     kvstoreSnapHooks hooks;         /* installed on every store: the scan's guard and layout hooks plus the user's overlay callbacks */
     int has_ov;
     void **ov_priv;                 /* Per store. */
-    int frozen_all;                 /* snapScanFreeze() done. */
-    unsigned long window_buckets;   /* copied from snap_window_buckets at create: the thread's credit W */
+    int frozen_all;                 /* hybsnapScanFreeze() done. */
+    unsigned long window_buckets;   /* copied from hybsnap_window_buckets at create: the thread's credit W */
     unsigned long ov_block;         /* overlay windows: aligned runs of this many buckets (W rounded up to a power of two) */
     uint64_t pos_end;               /* the position past every dict: the thread's lo and cur at the end */
-    uint64_t hi;                    /* main thread: its own last store of snap_hi */
+    uint64_t hi;                    /* main thread: its own last store of hybsnap_hi */
     uint64_t mid;                   /* main thread: the next grant is due once lo reaches this */
     long long grants;               /* main thread: hi raised inside a section */
     redisAtomic long long stalls;   /* thread: times it waited for hi */
     redisAtomic long long stall_us; /* thread: time spent waiting */
     redisAtomic long long buckets_skipped;   /* buckets the thread skipped (already emitted) */
     /* Optional hooks, set by the owner before start. */
-    snapScanThreadDoneFn *thread_done;   /* scan thread, after the last slot or on abort, before the scan is published as finished */
+    hybsnapScanThreadDoneFn *thread_done;   /* scan thread, after the last slot or on abort, before the scan is published as finished */
     void (*thread_init)(void *privdata);   /* first thing on the scan thread */
     void (*window_done)(void *privdata);   /* after every window, and before thread_done */
     void (*store_done)(void *privdata, int s);   /* main thread, when a store's last slot completed */
 };
 
 
-typedef struct snapMsgHdr {
+typedef struct hybsnapMsgHdr {
     uint32_t type;
     int32_t dbid;
     int32_t slot;
@@ -213,36 +213,36 @@ typedef struct snapMsgHdr {
                           * replication, whose buffers carry commands on big keys) */
     uint64_t src_addr;   /* KVOBJ: parent address of the copied allocation, to relocate
                           * pointers into it (an EMBSTR value points inside its kvobj) */
-} snapMsgHdr;
+} hybsnapMsgHdr;
 
 /* records the key and expire counts at the fork instant. RDB stream must announce 
  * those counts before the keys they describe, and by then the live keyspace has changed. */
-typedef struct snapDbSizes {
+typedef struct hybsnapDbSizes {
     unsigned long long keys, expires;
     unsigned long long *slot_keys, *slot_expires;   /* cluster mode */
     int nslots;
-} snapDbSizes;
+} hybsnapDbSizes;
 
 /* A db flushed during the save: its fork-instant structures, kept alive for
  * the scan and freed (on BIO, as FLUSHDB ASYNC does) when the store completes. */
-typedef struct snapFlushedDb {
+typedef struct hybsnapFlushedDb {
     int set;
     kvstore *keys, *expires, *blessed;
     void *subexpires;
     dict *stream_idmp_keys;
-} snapFlushedDb;
+} hybsnapFlushedDb;
 
 /* One page shared with the child (MAP_SHARED, mapped before the fork). */
-typedef struct snapShared {
+typedef struct hybsnapShared {
     redisAtomic size_t small_queued;   /* small-channel bytes queued in the parent, for the child's choice of channel */
-} snapShared;
+} hybsnapShared;
 
-struct snapSave {
-    snapScanCtx *scan;
+struct hybsnapSave {
+    hybsnapScanCtx *scan;
     void *tables;              /* one block: stores, flushed and sizes below, each dbnum entries */
     void *bitmaps;             /* cluster mode, one block: slot_filter then trim_slots, CLUSTER_SLOTS bits each; NULL when neither is used */
     kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
-    snapFlushedDb *flushed;    /* per store */
+    hybsnapFlushedDb *flushed;    /* per store */
     int dbnum;
     /* Two channels to the child. The small channel carries the
      * BUFFER messages, the big channel KVOBJ, END and
@@ -251,11 +251,11 @@ struct snapSave {
      * the scan thread while the child is inside a big value. */
     int pipe_rd, pipe_wr;             /* small channel */
     int big_rd, big_wr;               /* big channel */
-    snapShared *shared;
+    hybsnapShared *shared;
     int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
-    snapDbSizes *sizes;
+    hybsnapDbSizes *sizes;
     int req, rdbflags;
-    int kind;                  /* SNAP_SAVE_RDB/SOCKETS/AOF */
+    int kind;                  /* HYBSNAP_SAVE_RDB/SOCKETS/AOF */
     int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
     int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
                                   RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
@@ -264,7 +264,7 @@ struct snapSave {
     rdbSaveInfo rsi;
     int has_rsi;
     int ae_registered;
-    int aborted;               /* snapSaveAbort() ran; waiting for the child to exit */
+    int aborted;               /* hybsnapSaveAbort() ran; waiting for the child to exit */
     int hard_mark_hit;         /* retained bytes passed the configured maximum */
     int failed;                /* a defined failure of ours (hard mark): report status err */
     size_t retained_bytes;     /* originals kept alive by the overlay (main thread) */
@@ -321,136 +321,136 @@ struct snapSave {
     int rdb_pipe_write;        /* pipe shape: child's end of server.rdb_pipe_read */
     int safe_to_exit_pipe;     /* pipe shape: the child waits on it before exiting */
 };
-static snapSave *snap_save = NULL;   /* the running hybrid save, main thread */
+static hybsnapSave *hybsnap_save = NULL;   /* the running hybrid save, main thread */
 
 
-#define snapIsAof(sv) ((sv)->kind == SNAP_SAVE_AOF)
-#define snapToSockets(sv) ((sv)->kind == SNAP_SAVE_SOCKETS)
+#define hybsnapIsAof(sv) ((sv)->kind == HYBSNAP_SAVE_AOF)
+#define hybsnapToSockets(sv) ((sv)->kind == HYBSNAP_SAVE_SOCKETS)
 
 /* ---- Function declarations (used only in this file) ------------------- */
 
-/* ---- SNAP_NOFORK arena ------------------------------------------------ */
+/* ---- HYBSNAP_NOFORK arena ------------------------------------------------ */
 
 /* Address range reserved for the arena, and the part handed to jemalloc so far (0 if unavailable). */
-static size_t snapArenaVaReserved(void);
-static size_t snapArenaVaUsed(void);
-static int snapArenaSetForkable(int forkable);
+static size_t hybsnapArenaVaReserved(void);
+static size_t hybsnapArenaVaUsed(void);
+static int hybsnapArenaSetForkable(int forkable);
 
 /* ---- Classification and placement ------------------------------------- */
 
-/* Single-allocation encoding that MAY be SNAP_NOFORK (strings, listpacks, intsets). */
-static int snapEncodingIsNoforkClass(int type, int encoding);
+/* Single-allocation encoding that MAY be HYBSNAP_NOFORK (strings, listpacks, intsets). */
+static int hybsnapEncodingIsNoforkClass(int type, int encoding);
 /* Placement policy: the class a value of this encoding and size should have. */
-static int snapClassify(int type, int encoding, size_t alloc_bytes);
+static int hybsnapClassify(int type, int encoding, size_t alloc_bytes);
 /* Actual class of a stored value, decided by where its memory is. */
-static int snapKeyClass(const robj *o);
-static void snapPlacementScan(redisDb *db, snapPlacementStats *st);
-static void snapPlacementDriftReply(struct client *c, redisDb *db, int limit);
+static int hybsnapKeyClass(const robj *o);
+static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st);
+static void hybsnapPlacementDriftReply(struct client *c, redisDb *db, int limit);
 
 /* ---- Scan engine ------------------------------------------------------ */
 
 /* Create a scan over 'num_stores' kvstores; nothing is frozen or started yet. */
-static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores, snapScanDispatchFn *dispatch,
-                            snapScanSlotDoneFn *slot_done, void *privdata);
+static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores, hybsnapScanDispatchFn *dispatch,
+                            hybsnapScanSlotDoneFn *slot_done, void *privdata);
 /* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare). */
-static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
+static void hybsnapScanSetOverlay(hybsnapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
 /* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
-static void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap);
+static void hybsnapScanSetSlotFilter(hybsnapScanCtx *ctx, const uint8_t *bitmap);
 /* Main thread: freeze every store (the fork instant) and spawn the thread; C_OK / C_ERR. */
-static int snapScanStart(snapScanCtx *ctx);
+static int hybsnapScanStart(hybsnapScanCtx *ctx);
 /* The same in two steps: freeze first, spawn the thread later (the fork goes in between). */
-static void snapScanFreeze(snapScanCtx *ctx);
-static int snapScanStartThread(snapScanCtx *ctx);
+static void hybsnapScanFreeze(hybsnapScanCtx *ctx);
+static int hybsnapScanStartThread(hybsnapScanCtx *ctx);
 /* Main thread: complete the slots the thread finished since the last call; returns how many. */
-static int snapScanHandleCompletions(snapScanCtx *ctx);
+static int hybsnapScanHandleCompletions(hybsnapScanCtx *ctx);
 /* Readable when a slot completes or the thread exits (-1 if none); register the handler on it with ctx as client data. */
-static int snapScanReadEventFd(snapScanCtx *ctx);
-static void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask);
+static int hybsnapScanReadEventFd(hybsnapScanCtx *ctx);
+static void hybsnapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask);
 /* 1 once the thread has exited (all slots scanned, or aborted). */
-static int snapScanIsFinished(snapScanCtx *ctx);
+static int hybsnapScanIsFinished(hybsnapScanCtx *ctx);
 /* Main thread: stop and join the thread, complete every slot. */
-static void snapScanAbort(snapScanCtx *ctx);
+static void hybsnapScanAbort(hybsnapScanCtx *ctx);
 /* Main thread: join if needed and free the ctx; every slot must be DONE. */
-static void snapScanRelease(snapScanCtx *ctx);
+static void hybsnapScanRelease(hybsnapScanCtx *ctx);
 /* The scan was aborted; complete every slot of every store (main thread). */
-static inline int snapScanAborted(snapScanCtx *ctx);
-static void snapScanFinishAll(snapScanCtx *ctx);
-/* SNAP_SLOT_* of (store, dict); progress counters for INFO and tests. */
-static int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx);
-static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
+static inline int hybsnapScanAborted(hybsnapScanCtx *ctx);
+static void hybsnapScanFinishAll(hybsnapScanCtx *ctx);
+/* HYBSNAP_SLOT_* of (store, dict); progress counters for INFO and tests. */
+static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx);
+static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched);
 
 /* ---- Credit window and write sections --------------------------------- */
 
 /* Every guard or funnel hook (main thread, or a module thread holding the GIL): the first opens the section and caps the thread, later ones may raise the cap. */
-static void snapFunnelOpen(void);
+static void hybsnapFunnelOpen(void);
 /* The thread's credit W, buckets per grant (DEBUG SNAP-WINDOW-BUCKETS; tests). */
-static void snapSetWindowBuckets(unsigned long n);
-static unsigned long snapGetWindowBuckets(void);
+static void hybsnapSetWindowBuckets(unsigned long n);
+static unsigned long hybsnapGetWindowBuckets(void);
 
 /* ---- Bucket bitmaps and accounting ------------------------------------ */
 
 /* Per-save bucket bitmaps: a set bit means the main thread already emitted the bucket's chain. */
-static void snapScanMarkBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
-static int snapScanBucketEmitted(snapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+static void hybsnapScanMarkBucketEmitted(hybsnapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
+static int hybsnapScanBucketEmitted(hybsnapScanCtx *ctx, int store_idx, int didx, int table, unsigned long idx);
 /* An attached dict started or finished rehashing: its bitmap follows the new table. */
-static void snapScanDictRehashStarted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
-static void snapScanDictRehashCompleted(snapScanCtx *ctx, int store_idx, int didx, dict *d);
+static void hybsnapScanDictRehashStarted(hybsnapScanCtx *ctx, int store_idx, int didx, dict *d);
+static void hybsnapScanDictRehashCompleted(hybsnapScanCtx *ctx, int store_idx, int didx, dict *d);
 /* Bitmap accounting: dicts that grew under the save, dicts retained past their store, bitmap bytes. */
-static long snapScanDictsGrown(snapScanCtx *ctx);
-static long snapScanRetainedDicts(snapScanCtx *ctx);
-static size_t snapScanBitmapBytes(snapScanCtx *ctx);
+static long hybsnapScanDictsGrown(hybsnapScanCtx *ctx);
+static long hybsnapScanRetainedDicts(hybsnapScanCtx *ctx);
+static size_t hybsnapScanBitmapBytes(hybsnapScanCtx *ctx);
 
 /* ---- Keyspace overlay ------------------------------------------------- */
 
-/* Overlay callbacks (privdata = the store's snapGuardPriv): clone a kvobj into the arena, release a fork-instant original. */
-static void *snapOverlayCloneKey(void *privdata, int didx, void *orig);
-static void snapOverlayFreeOriginal(void *privdata, int didx, void *orig);
+/* Overlay callbacks (privdata = the store's hybsnapGuardPriv): clone a kvobj into the arena, release a fork-instant original. */
+static void *hybsnapOverlayCloneKey(void *privdata, int didx, void *orig);
+static void hybsnapOverlayFreeOriginal(void *privdata, int didx, void *orig);
 /* Does the clone of an original take over its value (1) or copy it (0)? Pure: the unchanged header and the value's address. */
-static int snapOriginalSharesValue(const kvobj *orig);
+static int hybsnapOriginalSharesValue(const kvobj *orig);
 /* Retained-originals accounting, the db that owns a store, the write-back of overlayed buckets. */
-static void snapSaveRetainedAdd(kvobj *orig, int value_shared);
-static void snapSaveRetainedSub(kvobj *orig, int value_shared);
-static redisDb *snapStoreOwnerDb(snapSave *sv, int s);
-static void snapSaveDrainSideTables(void);
+static void hybsnapSaveRetainedAdd(kvobj *orig, int value_shared);
+static void hybsnapSaveRetainedSub(kvobj *orig, int value_shared);
+static redisDb *hybsnapStoreOwnerDb(hybsnapSave *sv, int s);
+static void hybsnapSaveDrainSideTables(void);
 
 /* ---- The save --------------------------------------------------------- */
 
 /* The three saves it dispatches to: same contracts as rdbSaveBackground, rdbSaveToSlavesSockets, rewriteAppendOnlyFileBackground. */
-static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
-static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
-static int snapSaveBackgroundAof(void);
+static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
+static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
+static int hybsnapSaveBackgroundAof(void);
 
 /* ---- Messages to the child -------------------------------------------- */
 
-static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+static int hybsnapSendMsg(hybsnapSave *sv, uint32_t type, int dbid, int slot,
                        const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr);
-static void snapStageFlush(snapSave *sv);
-static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type);
-static void snapOutRecycle(snapSave *sv, sds m);
+static void hybsnapStageFlush(hybsnapSave *sv);
+static int hybsnapOutEnqueue(hybsnapSave *sv, sds m, uint32_t type);
+static void hybsnapOutRecycle(hybsnapSave *sv, sds m);
 
 /* ---- Observability ---------------------------------------------------- */
 
-static size_t snapScanTableBytes(snapScanCtx *ctx);
+static size_t hybsnapScanTableBytes(hybsnapScanCtx *ctx);
 /* The running save: slots and keys. */
-static void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+static void hybsnapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent);
 /* Retained originals (replaced or deleted) and overlayed buckets; the peak over the last save. */
-static size_t snapSaveRetainedBytes(void);
-static long snapSaveSideEntries(void);
-static size_t snapSaveLastRetainedPeak(void);
+static size_t hybsnapSaveRetainedBytes(void);
+static long hybsnapSaveSideEntries(void);
+static size_t hybsnapSaveLastRetainedPeak(void);
 /* Bytes queued for the child (main-thread queue plus the thread's outbound queue); the peak over the last save. */
-static size_t snapSaveQueuedBytes(void);
-static size_t snapSaveLastQueuedPeak(void);
+static size_t hybsnapSaveQueuedBytes(void);
+static size_t hybsnapSaveLastQueuedPeak(void);
 /* Bitmaps and dicts: bitmap bytes, dicts that grew, fork-instant dicts their store let go of (cumulative). */
-static size_t snapSaveBitmapBytes(void);
-static long snapSaveGrownDicts(void);
-static long snapSaveRetainedDicts(void);
+static size_t hybsnapSaveBitmapBytes(void);
+static long hybsnapSaveGrownDicts(void);
+static long hybsnapSaveRetainedDicts(void);
 /* Main-thread work: buckets and keys emitted ahead of the window; in-place writes behind it (this save, last save). */
-static long long snapSaveMainBuckets(void);
-static long long snapSaveMainKeys(void);
-static long long snapSaveInplaceWrites(void);
-static long long snapSaveLastInplaceWrites(void);
+static long long hybsnapSaveMainBuckets(void);
+static long long hybsnapSaveMainKeys(void);
+static long long hybsnapSaveInplaceWrites(void);
+static long long hybsnapSaveLastInplaceWrites(void);
 
 /* ---- Defined elsewhere ------------------------------------------------ */
 
@@ -462,35 +462,35 @@ void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int6
  * tcache flags, range-aware zfree/zrealloc) lives in zmalloc.c so that sds,
  * listpack, intset and dict code keep arena memory in the arena without
  * knowing about classes. These are the snapshot-facing entry points. */
-void snapArenaInit(void) {
+void hybsnapArenaInit(void) {
 #ifdef HAVE_NOFORK_ARENA
     if (!zmalloc_nofork_arena_init()) {
-        serverLog(LL_WARNING, "SNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
+        serverLog(LL_WARNING, "HYBSNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
                               "range or create the jemalloc arena; hybrid snapshot runs without it.");
         return;
     }
     zmalloc_nofork_set_active(server.hybrid_snapshot);       /* new headers, tables and values go there only when on */
-    if (!server.hybrid_snapshot) snapArenaSetForkable(1);   /* nothing is placed in it; classic forks map it */
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
-                         "%s).", zmalloc_nofork_arena_index(), snapArenaVaReserved() >> 30,
+    if (!server.hybrid_snapshot) hybsnapArenaSetForkable(1);   /* nothing is placed in it; classic forks map it */
+    serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
+                         "%s).", zmalloc_nofork_arena_index(), hybsnapArenaVaReserved() >> 30,
                          server.hybrid_snapshot ? "MADV_DONTFORK: hybrid snapshot on" : "forkable: hybrid-snapshot no");
 #else
-    serverLog(LL_NOTICE, "SNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
+    serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
                          "with jemalloc); hybrid snapshot, if enabled, runs without it.");
 #endif
 }
 
-/* ---- Fork visibility of the arena (see snapshot.h) ---------------------- */
+/* ---- Fork visibility of the arena (see hybrid_snapshot.h) ---------------------- */
 
-static int snap_arena_fallback = 0;        /* flipped forkable for a non-hybrid child, flip back on reap */
-static int snap_forking_no_keyspace = 0;   /* set around snapForkNoKeyspace()'s redisFork() */
-static int snap_child_no_keyspace = 0;     /* this process is a child forked without the keyspace */
-int snapChildNoKeyspace(void) { return snap_child_no_keyspace; }
+static int hybsnap_arena_fallback = 0;        /* flipped forkable for a non-hybrid child, flip back on reap */
+static int hybsnap_forking_no_keyspace = 0;   /* set around hybsnapForkNoKeyspace()'s redisFork() */
+static int hybsnap_child_no_keyspace = 0;     /* this process is a child forked without the keyspace */
+int hybsnapChildNoKeyspace(void) { return hybsnap_child_no_keyspace; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
  * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the classic child runs
  * instead. Logged when the blocking module changes, not on every save. */
-static void snapHybridFallbackLog(void) {
+static void hybsnapHybridFallbackLog(void) {
     static sds last = NULL;
     const char *who = moduleHybridSnapshotBlockedBy();
     if (last && !strcmp(last, who)) return;
@@ -502,24 +502,24 @@ static void snapHybridFallbackLog(void) {
 
 /* Fork visibility of the arena: DONTFORK, so a child forked without the
  * keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module fork:
- * snapForkNoKeyspace) never maps it. Any other fork (classic save, diskless
+ * hybsnapForkNoKeyspace) never maps it. Any other fork (classic save, diskless
  * sync, AOF rewrite, module, Lua debugger) needs the keyspace, so redisFork()
- * flips it to DOFORK (snapArenaBeforeFork) and the child reap path flips it
- * back once no child is left (snapArenaChildExited). One madvise each way,
+ * flips it to DOFORK (hybsnapArenaBeforeFork) and the child reap path flips it
+ * back once no child is left (hybsnapArenaChildExited). One madvise each way,
  * O(1) in keys; that child pays classic copy-on-write. */
-int snapArenaForkable(void) {
+int hybsnapArenaForkable(void) {
 #ifdef HAVE_NOFORK_ARENA
-    return snapArenaAvailable() && zmalloc_nofork_arena_forkable();
+    return hybsnapArenaAvailable() && zmalloc_nofork_arena_forkable();
 #else
     return 0;
 #endif
 }
 
-static int snapArenaSetForkable(int forkable) {
+static int hybsnapArenaSetForkable(int forkable) {
 #ifdef HAVE_NOFORK_ARENA
-    if (!snapArenaAvailable()) return 0;
+    if (!hybsnapArenaAvailable()) return 0;
     if (!zmalloc_nofork_arena_set_forkable(forkable)) {
-        serverLog(LL_WARNING, "SNAP_NOFORK arena: madvise(%s) failed: %s",
+        serverLog(LL_WARNING, "HYBSNAP_NOFORK arena: madvise(%s) failed: %s",
                   forkable ? "MADV_DOFORK" : "MADV_DONTFORK", strerror(errno));
         return 0;
     }
@@ -530,24 +530,24 @@ static int snapArenaSetForkable(int forkable) {
 #endif
 }
 
-void snapArenaBeforeFork(int purpose) {
+void hybsnapArenaBeforeFork(int purpose) {
     UNUSED(purpose);
-    if (snap_forking_no_keyspace || !snapArenaAvailable() || snapArenaForkable()) return;
+    if (hybsnap_forking_no_keyspace || !hybsnapArenaAvailable() || hybsnapArenaForkable()) return;
     /* A classic child (RDB with the feature off, diskless sync, AOF rewrite,
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
-    if (snapArenaSetForkable(1)) {
-        snap_arena_fallback = 1;
-        serverLog(LL_NOTICE, "SNAP_NOFORK arena made forkable for a %s child (classic copy-on-write applies)",
+    if (hybsnapArenaSetForkable(1)) {
+        hybsnap_arena_fallback = 1;
+        serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena made forkable for a %s child (classic copy-on-write applies)",
                   strChildType(purpose));
     }
 }
 
-void snapArenaChildExited(void) {
-    if (!snap_arena_fallback) return;
+void hybsnapArenaChildExited(void) {
+    if (!hybsnap_arena_fallback) return;
     if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another classic child still runs */
-    snap_arena_fallback = 0;
-    if (server.hybrid_snapshot && snapArenaSetForkable(0))
-        serverLog(LL_NOTICE, "SNAP_NOFORK arena back to MADV_DONTFORK");
+    hybsnap_arena_fallback = 0;
+    if (server.hybrid_snapshot && hybsnapArenaSetForkable(0))
+        serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena back to MADV_DONTFORK");
 }
 
 /* Child forked without the keyspace, first thing after the fork: the arena's
@@ -557,7 +557,7 @@ void snapArenaChildExited(void) {
  * reallocated in the parent-only arena and the write would fault (seen as a
  * crash in the hybrid child's pipe reader). Reserve the whole range PROT_NONE
  * so nothing of ours can land in it. */
-static void snapChildReserveArenaRange(void) {
+static void hybsnapChildReserveArenaRange(void) {
 #ifdef HAVE_NOFORK_ARENA
     void *lo; size_t len;
     if (!zmalloc_nofork_arena_range(&lo, &len)) return;
@@ -577,63 +577,63 @@ static void snapChildReserveArenaRange(void) {
  * child and a REDISMODULE_FORK_NO_KEYSPACE module fork. The arena is left
  * DONTFORK (no page tables copied for it, no copy-on-write on it while the
  * child runs); in the child the arena's range is reserved and the keyspace
- * module APIs are refused (snapChildNoKeyspace). When the arena is forkable
+ * module APIs are refused (hybsnapChildNoKeyspace). When the arena is forkable
  * anyway (feature off, a debugger child) the child has it mapped and needs no
  * reservation, but the refusals apply all the same: one contract whatever the
  * configuration. Same return as redisFork(). */
-int snapForkNoKeyspace(int purpose) {
-    snap_forking_no_keyspace = 1;
+int hybsnapForkNoKeyspace(int purpose) {
+    hybsnap_forking_no_keyspace = 1;
     int childpid = redisFork(purpose);
-    snap_forking_no_keyspace = 0;
+    hybsnap_forking_no_keyspace = 0;
     if (childpid == 0) {
-        snap_child_no_keyspace = 1;
-        if (snapArenaAvailable() && !snapArenaForkable()) snapChildReserveArenaRange();
+        hybsnap_child_no_keyspace = 1;
+        if (hybsnapArenaAvailable() && !hybsnapArenaForkable()) hybsnapChildReserveArenaRange();
     }
     return childpid;
 }
 
 /* CONFIG SET hybrid-snapshot apply hook: flips the arena, refuses mid-save.
- * Saves take the hybrid path whether or not the SNAP_NOFORK arena exists
+ * Saves take the hybrid path whether or not the HYBSNAP_NOFORK arena exists
  * (without it the CoW benefit is gone but the mechanics are identical, which
  * is what sanitizer builds exercise). Switching is O(1): the arena is flipped
  * forkable when off, and values allocated meanwhile simply live in the
  * default allocator. */
-int snapHybridConfigApply(const char **err) {
+int hybsnapHybridConfigApply(const char **err) {
     if (server.loading) return 1;   /* applied again by the startup path */
-    if (hasActiveChildProcess() || snapSaveInProgress() || ldbPendingChildren()) {
+    if (hasActiveChildProcess() || hybsnapSaveInProgress() || ldbPendingChildren()) {
         *err = "hybrid-snapshot cannot change while a save, rewrite, module fork or debugger child is running";
         return 0;
     }
-    if (snapArenaAvailable()) {
+    if (hybsnapArenaAvailable()) {
         /* On: children stop mapping the arena; off: they must map it. Values
          * placed so far stay where they are, the switch itself is O(1). */
-        if (!snapArenaSetForkable(!server.hybrid_snapshot)) {
-            *err = "SNAP_NOFORK arena: madvise failed, see the server log";
+        if (!hybsnapArenaSetForkable(!server.hybrid_snapshot)) {
+            *err = "HYBSNAP_NOFORK arena: madvise failed, see the server log";
             return 0;
         }
         zmalloc_nofork_set_active(server.hybrid_snapshot);
-        snap_arena_fallback = 0;
+        hybsnap_arena_fallback = 0;
     }
     serverLog(LL_NOTICE, "Hybrid snapshot switched %s at runtime%s", server.hybrid_snapshot ? "on" : "off",
-              snapArenaAvailable() ? "" : " (no SNAP_NOFORK arena on this platform)");
+              hybsnapArenaAvailable() ? "" : " (no HYBSNAP_NOFORK arena on this platform)");
     return 1;
 }
 
 
-static size_t snapArenaVaReserved(void) {
+static size_t hybsnapArenaVaReserved(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t reserved = 0;
-    if (snapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
+    if (hybsnapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
     return reserved;
 #else
     return 0;
 #endif
 }
 
-static size_t snapArenaVaUsed(void) {
+static size_t hybsnapArenaVaUsed(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t used = 0;
-    if (snapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
+    if (hybsnapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
     return used;
 #else
     return 0;
@@ -646,10 +646,10 @@ static size_t snapArenaVaUsed(void) {
  * ============================================================================ */
 
 /* 1 if a value with this type/encoding is a single allocation that MAY be
- * SNAP_NOFORK (strings; listpack list/set/zset/hash; intset; listpack-ex).
+ * HYBSNAP_NOFORK (strings; listpack list/set/zset/hash; intset; listpack-ex).
  * Multi-allocation encodings (hashtable, skiplist, quicklist, stream, module,
- * arrays) are always SNAP_FORK. */
-static int snapEncodingIsNoforkClass(int type, int encoding) {
+ * arrays) are always HYBSNAP_FORK. */
+static int hybsnapEncodingIsNoforkClass(int type, int encoding) {
     switch (type) {
     case OBJ_STRING:
         return 1; /* int, embstr, raw */
@@ -667,22 +667,22 @@ static int snapEncodingIsNoforkClass(int type, int encoding) {
 }
 
 /* INT and EMBSTR strings carry their value inside the object. */
-static inline int snapValueIsInline(int type, int encoding) {
+static inline int hybsnapValueIsInline(int type, int encoding) {
     return type == OBJ_STRING && (encoding == OBJ_ENCODING_INT || encoding == OBJ_ENCODING_EMBSTR);
 }
 
-/* Placement policy: SNAP_NOFORK iff the encoding qualifies and the value's
+/* Placement policy: HYBSNAP_NOFORK iff the encoding qualifies and the value's
  * allocation is at most save-small-max-bytes (INT/EMBSTR values have no
- * separate allocation and are always SNAP_NOFORK). */
-static int snapClassify(int type, int encoding, size_t alloc_bytes) {
-    if (!snapEncodingIsNoforkClass(type, encoding)) return SNAP_FORK;
-    if (snapValueIsInline(type, encoding)) return SNAP_NOFORK;
-    return alloc_bytes <= server.save_small_max_bytes ? SNAP_NOFORK : SNAP_FORK;
+ * separate allocation and are always HYBSNAP_NOFORK). */
+static int hybsnapClassify(int type, int encoding, size_t alloc_bytes) {
+    if (!hybsnapEncodingIsNoforkClass(type, encoding)) return HYBSNAP_FORK;
+    if (hybsnapValueIsInline(type, encoding)) return HYBSNAP_NOFORK;
+    return alloc_bytes <= server.save_small_max_bytes ? HYBSNAP_NOFORK : HYBSNAP_FORK;
 }
 
 /* The single value allocation of a single-allocation value (the sds
  * allocation start for raw strings), or NULL when the value is inline. */
-static void *snapValueAllocPtr(const robj *o) {
+static void *hybsnapValueAllocPtr(const robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_RAW: return sdsAllocPtr(o->ptr);
     case OBJ_ENCODING_LISTPACK:
@@ -694,31 +694,31 @@ static void *snapValueAllocPtr(const robj *o) {
 
 
 /* Actual class of a stored key, decided by where its value memory IS: a key is
- * SNAP_NOFORK when its value has no separate allocation or when its single
+ * HYBSNAP_NOFORK when its value has no separate allocation or when its single
  * allocation (for listpack-ex: both the struct and its listpack) lies in the
- * SNAP_NOFORK arena; otherwise SNAP_FORK. The background scan serializes
- * SNAP_NOFORK keys itself and ships SNAP_FORK keys to the fork child, so this
+ * HYBSNAP_NOFORK arena; otherwise HYBSNAP_FORK. The background scan serializes
+ * HYBSNAP_NOFORK keys itself and ships HYBSNAP_FORK keys to the fork child, so this
  * is correct regardless of policy drift. */
-static int snapKeyClass(const robj *o) {
-    if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return SNAP_FORK;
-    if (snapValueIsInline(o->type, o->encoding)) return SNAP_NOFORK;
+static int hybsnapKeyClass(const robj *o) {
+    if (!hybsnapEncodingIsNoforkClass(o->type, o->encoding)) return HYBSNAP_FORK;
+    if (hybsnapValueIsInline(o->type, o->encoding)) return HYBSNAP_NOFORK;
     /* No arena: nothing is placed, the class is a pure size decision. */
-    if (!snapArenaAvailable()) {
-        void *a = snapValueAllocPtr(o);
-        return snapClassify(o->type, o->encoding, a ? zmalloc_size(a) : 0);
+    if (!hybsnapArenaAvailable()) {
+        void *a = hybsnapValueAllocPtr(o);
+        return hybsnapClassify(o->type, o->encoding, a ? zmalloc_size(a) : 0);
     }
     /* LISTPACK_EX: the class follows the struct. The struct holds the
      * ExpireMeta registered in the db's ebuckets, so it is never moved; when
      * it is in the arena the child cannot read it and the key MUST be served
      * by the background thread, wherever the listpack itself lives. */
     /* The arena is a range: the value pointer is as good as its allocation
-     * start, and is never dereferenced (snapOriginalSharesValue relies on it). */
-    if (o->ptr == NULL || !zmalloc_is_nofork(o->ptr)) return SNAP_FORK;
-    return SNAP_NOFORK;
+     * start, and is never dereferenced (hybsnapOriginalSharesValue relies on it). */
+    if (o->ptr == NULL || !zmalloc_is_nofork(o->ptr)) return HYBSNAP_FORK;
+    return HYBSNAP_NOFORK;
 }
 
 /* Copy an sds into the requested arena. */
-static sds snapSdsCopy(sds s, int to_nofork) {
+static sds hybsnapSdsCopy(sds s, int to_nofork) {
     size_t len = sdslen(s);
     char type = sdsReqType(len);
     size_t need = sdsReqSize(len, type);
@@ -728,39 +728,39 @@ static sds snapSdsCopy(sds s, int to_nofork) {
 }
 
 /* Copy an sds into the requested arena and free the original. */
-static sds snapSdsMove(sds s, int to_nofork) {
-    sds ns = snapSdsCopy(s, to_nofork);
+static sds hybsnapSdsMove(sds s, int to_nofork) {
+    sds ns = hybsnapSdsCopy(s, to_nofork);
     sdsfree(s); /* range-aware */
     return ns;
 }
 
 /* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested arena. */
-static void *snapBlobCopy(void *p, size_t bytes, int to_nofork) {
+static void *hybsnapBlobCopy(void *p, size_t bytes, int to_nofork) {
     void *n = to_nofork ? zmalloc_nofork(bytes) : zmalloc(bytes);
     memcpy(n, p, bytes);
     return n;
 }
 
 /* Same, freeing the original. */
-static void *snapBlobMove(void *p, size_t bytes, int to_nofork) {
-    void *n = snapBlobCopy(p, bytes, to_nofork);
+static void *hybsnapBlobMove(void *p, size_t bytes, int to_nofork) {
+    void *n = hybsnapBlobCopy(p, bytes, to_nofork);
     zfree(p); /* range-aware */
     return n;
 }
 
 /* Apply the placement policy to a value: move a single-allocation value into
- * the arena when snapClassify() says SNAP_NOFORK and it is outside, or out of
- * the arena when it says SNAP_FORK and it is inside. Called (through the
- * inline snapPlaceValue) at every keyspace insertion (kvobjSet, dbSetValue),
+ * the arena when hybsnapClassify() says HYBSNAP_NOFORK and it is outside, or out of
+ * the arena when it says HYBSNAP_FORK and it is inside. Called (through the
+ * inline hybsnapPlaceValue) at every keyspace insertion (kvobjSet, dbSetValue),
  * after in-place growth of a string and after an encoding conversion produced
  * a single-allocation value. Only the value moves; the header (and thus every
  * pointer to it) stays. */
-void snapPlaceValueArena(robj *o) {
-    if (!snapEncodingIsNoforkClass(o->type, o->encoding)) return;
+void hybsnapPlaceValueArena(robj *o) {
+    if (!hybsnapEncodingIsNoforkClass(o->type, o->encoding)) return;
     /* nothing to do if inline. kvobj already in no_fork arena */
-    if (snapValueIsInline(o->type, o->encoding)) return;
+    if (hybsnapValueIsInline(o->type, o->encoding)) return;
     /* Module key metadata is serialized through module callbacks, which only
-     * run in the fork child: such a key is SNAP_FORK whatever its size, so
+     * run in the fork child: such a key is HYBSNAP_FORK whatever its size, so
      * every piece of its value must be readable by the child. */
     int force_fork = o->iskvobj && getModuleMetaBits(((kvobj *)o)->metabits);
 
@@ -768,26 +768,26 @@ void snapPlaceValueArena(robj *o) {
     case OBJ_ENCODING_RAW: {
         sds s = o->ptr;
         void *a = sdsAllocPtr(s);
-        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(a));
+        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(a));
         int in = zmalloc_is_nofork(a);
-        if (want == SNAP_NOFORK && !in) o->ptr = snapSdsMove(s, 1);
-        else if (want == SNAP_FORK && in) o->ptr = snapSdsMove(s, 0);
+        if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapSdsMove(s, 1);
+        else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapSdsMove(s, 0);
         break;
     }
     case OBJ_ENCODING_LISTPACK: {
         unsigned char *lp = o->ptr;
-        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(lp));
+        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(lp));
         int in = zmalloc_is_nofork(lp);
-        if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(lp, lpBytes(lp), 1);
-        else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(lp, lpBytes(lp), 0);
+        if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 1);
+        else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 0);
         break;
     }
     case OBJ_ENCODING_INTSET: {
         intset *is = o->ptr;
-        int want = force_fork ? SNAP_FORK : snapClassify(o->type, o->encoding, zmalloc_size(is));
+        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(is));
         int in = zmalloc_is_nofork(is);
-        if (want == SNAP_NOFORK && !in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 1);
-        else if (want == SNAP_FORK && in) o->ptr = snapBlobMove(is, intsetBlobLen(is), 0);
+        if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 1);
+        else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 0);
         break;
     }
     case OBJ_ENCODING_LISTPACK_EX: {
@@ -808,14 +808,14 @@ void snapPlaceValueArena(robj *o) {
              * (kvobjSet insertion funnel, dbSetValue swap, metadata attach:
              * the db unregisters before and re-registers after). */
             if (st_in) {
-                lpt = snapBlobMove(lpt, sizeof(*lpt), 0);
+                lpt = hybsnapBlobMove(lpt, sizeof(*lpt), 0);
                 o->ptr = lpt;
             }
-            if (zmalloc_is_nofork(lpt->lp)) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
+            if (zmalloc_is_nofork(lpt->lp)) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
             break;
         }
-        if (st_in && !lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 1);
-        else if (!st_in && lp_in) lpt->lp = snapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
+        if (st_in && !lp_in) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 1);
+        else if (!st_in && lp_in) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
         break;
     }
     default:
@@ -823,7 +823,7 @@ void snapPlaceValueArena(robj *o) {
     }
 }
 
-static void snapPlacementScanTables(kvstore *kvs, snapPlacementStats *st) {
+static void hybsnapPlacementScanTables(kvstore *kvs, hybsnapPlacementStats *st) {
     for (int didx = 0; didx < kvstoreNumDicts(kvs); didx++) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (d == NULL) continue;
@@ -838,9 +838,9 @@ static void snapPlacementScanTables(kvstore *kvs, snapPlacementStats *st) {
 /* ---- Clone-on-write for the keyspace overlay ---------------------------- */
 
 /* Duplicate the whole kvobj allocation (metadata slots, robj, embedded key
- * and, for EMBSTR, the embedded value) into a fresh SNAP_NOFORK block. The
+ * and, for EMBSTR, the embedded value) into a fresh HYBSNAP_NOFORK block. The
  * value pointer is left as-is (the caller decides copy vs share). */
-static kvobj *snapKvobjCloneHeader(kvobj *orig) {
+static kvobj *hybsnapKvobjCloneHeader(kvobj *orig) {
     char *alloc = kvobjGetAllocPtr(orig);
     size_t size = zmalloc_size(alloc);
     char *nalloc = zmalloc_nofork(size);
@@ -854,20 +854,20 @@ static kvobj *snapKvobjCloneHeader(kvobj *orig) {
 
 
 /* Overlay callbacks for the server keyspace (privdata = the store's
- * snapGuardPriv). The clone copies the whole kvobj allocation into a fresh
- * arena block; SNAP_NOFORK values (single allocation in the arena) are
+ * hybsnapGuardPriv). The clone copies the whole kvobj allocation into a fresh
+ * arena block; HYBSNAP_NOFORK values (single allocation in the arena) are
  * deep-copied, everything else is shared with the original. db->expires and
- * db->subexpires are pointed at the clone. snapOverlayFreeOriginal releases a
+ * db->subexpires are pointed at the clone. hybsnapOverlayFreeOriginal releases a
  * fork-instant original after the drain. */
-static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_) {
+static void *hybsnapOverlayCloneKey(void *privdata, int didx, void *orig_) {
     /* The db owning the store right now (NULL once FLUSHDB detached it: no
      * expires/subexpires to keep in step, and no writes reach it anyway). */
-    redisDb *db = snap_save ? snapStoreOwnerDb(snap_save, ((struct snapGuardPriv *)privdata)->s) : NULL;
+    redisDb *db = hybsnap_save ? hybsnapStoreOwnerDb(hybsnap_save, ((struct hybsnapGuardPriv *)privdata)->s) : NULL;
     kvobj *orig = orig_;
-    kvobj *kv = snapKvobjCloneHeader(orig);
+    kvobj *kv = hybsnapKvobjCloneHeader(orig);
 
-    /* SNAP_NOFORK: the scan thread reads the original live -> the clone gets a
-     * private copy of the value (in the arena when there is one). SNAP_FORK:
+    /* HYBSNAP_NOFORK: the scan thread reads the original live -> the clone gets a
+     * private copy of the value (in the arena when there is one). HYBSNAP_FORK:
      * the child reads its CoW copy -> the clone shares the value.
      *
      * Without the arena the class of a single-allocation value is a size
@@ -876,21 +876,21 @@ static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_) {
      * Single-allocation values are therefore always copied in that mode;
      * only multi-allocation values (never dereferenced by the scan thread)
      * are shared. */
-    int to_arena = snapArenaAvailable();
-    int shared = snapOriginalSharesValue(orig);
+    int to_arena = hybsnapArenaAvailable();
+    int shared = hybsnapOriginalSharesValue(orig);
     int nofork = !shared;
-    if (!snapValueIsInline(orig->type, orig->encoding)) {
+    if (!hybsnapValueIsInline(orig->type, orig->encoding)) {
         switch (orig->encoding) {
         case OBJ_ENCODING_RAW:
-            if (nofork) kv->ptr = snapSdsCopy(orig->ptr, to_arena);
+            if (nofork) kv->ptr = hybsnapSdsCopy(orig->ptr, to_arena);
             else shared = 1;
             break;
         case OBJ_ENCODING_LISTPACK:
-            if (nofork) kv->ptr = snapBlobCopy(orig->ptr, lpBytes(orig->ptr), to_arena);
+            if (nofork) kv->ptr = hybsnapBlobCopy(orig->ptr, lpBytes(orig->ptr), to_arena);
             else shared = 1;
             break;
         case OBJ_ENCODING_INTSET:
-            if (nofork) kv->ptr = snapBlobCopy(orig->ptr, intsetBlobLen(orig->ptr), to_arena);
+            if (nofork) kv->ptr = hybsnapBlobCopy(orig->ptr, intsetBlobLen(orig->ptr), to_arena);
             else shared = 1;
             break;
         case OBJ_ENCODING_LISTPACK_EX: {
@@ -899,7 +899,7 @@ static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_) {
             if (nofork) {
                 listpackEx *n = zcalloc_nofork(sizeof(*n));
                 n->meta.trash = 1;
-                n->lp = snapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
+                n->lp = hybsnapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
                 kv->ptr = n;
             } else {
                 shared = 1;
@@ -908,14 +908,14 @@ static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_) {
         }
         default:
             /* Multi-allocation value (hashtable, skiplist, quicklist, stream,
-             * module, array): SNAP_FORK, the child has its own copy. */
+             * module, array): HYBSNAP_FORK, the child has its own copy. */
             shared = 1;
             break;
         }
     }
-    serverAssert(shared == snapOriginalSharesValue(orig));
+    serverAssert(shared == hybsnapOriginalSharesValue(orig));
 
-    snapSaveRetainedAdd(orig, shared);
+    hybsnapSaveRetainedAdd(orig, shared);
 
     /* The clone takes over the original's per-slot accounting: later in-place
      * updates and the delete of the clone are counted against the slot, the
@@ -950,19 +950,19 @@ static void *snapOverlayCloneKey(void *privdata, int didx, void *orig_) {
  *   - a value inside the header allocation is copied with it;
  *   - a single-allocation value (string, listpack, intset, listpack with
  *     field TTLs) is copied when the scan thread reads it, i.e. when it is in
- *     the arena (the class is the address, see snapKeyClass), and without the
+ *     the arena (the class is the address, see hybsnapKeyClass), and without the
  *     arena always: the thread would read a shared value the clone then
  *     reallocates;
  *   - a multi-allocation value is the fork child's and is taken over. */
-static int snapOriginalSharesValue(const kvobj *orig) {
-    if (snapValueIsInline(orig->type, orig->encoding)) return 0;
+static int hybsnapOriginalSharesValue(const kvobj *orig) {
+    if (hybsnapValueIsInline(orig->type, orig->encoding)) return 0;
     switch (orig->encoding) {
     case OBJ_ENCODING_RAW:
     case OBJ_ENCODING_LISTPACK:
     case OBJ_ENCODING_INTSET:
     case OBJ_ENCODING_LISTPACK_EX:
-        if (!snapEncodingIsNoforkClass(orig->type, orig->encoding)) return 1;
-        return snapArenaAvailable() ? !zmalloc_is_nofork(orig->ptr) : 0;
+        if (!hybsnapEncodingIsNoforkClass(orig->type, orig->encoding)) return 1;
+        return hybsnapArenaAvailable() ? !zmalloc_is_nofork(orig->ptr) : 0;
     default:
         return 1;
     }
@@ -971,13 +971,13 @@ static int snapOriginalSharesValue(const kvobj *orig) {
 /* A key deleted while its bucket is still owed keeps its fork-instant original
  * for the scan, in its overlayed bucket, until the bucket is written back;
  * when the clone took over its value, only the header is released.
- * Released through snapOverlayFreeOriginal. */
-static void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_) {
+ * Released through hybsnapOverlayFreeOriginal. */
+static void hybsnapOverlayFreeOriginal(void *privdata, int didx, void *orig_) {
     UNUSED(privdata);
     UNUSED(didx);
     kvobj *orig = orig_;
-    int shared = snapOriginalSharesValue(orig);
-    snapSaveRetainedSub(orig, shared);
+    int shared = hybsnapOriginalSharesValue(orig);
+    hybsnapSaveRetainedSub(orig, shared);
     /* The clone carries the key metadata (no keyMetaOnFree here) and, when
      * shared, owns the value. */
     if (!shared) kvobjFreeValueOnly(orig);
@@ -987,20 +987,20 @@ static void snapOverlayFreeOriginal(void *privdata, int didx, void *orig_) {
 /* Move a single-allocation value out of the arena if it is there. Must be
  * called before such a buffer is ADOPTED by a multi-allocation structure
  * (e.g. a listpack becoming the first quicklist node): every piece of a
- * SNAP_FORK value has to be readable by the fork child. */
-void snapValueDetachFromArena(robj *o) {
-    if (!snapArenaAvailable()) return;
+ * HYBSNAP_FORK value has to be readable by the fork child. */
+void hybsnapValueDetachFromArena(robj *o) {
+    if (!hybsnapArenaAvailable()) return;
     switch (o->encoding) {
     case OBJ_ENCODING_RAW: {
         void *a = sdsAllocPtr(o->ptr);
-        if (zmalloc_is_nofork(a)) o->ptr = snapSdsMove(o->ptr, 0);
+        if (zmalloc_is_nofork(a)) o->ptr = hybsnapSdsMove(o->ptr, 0);
         break;
     }
     case OBJ_ENCODING_LISTPACK:
-        if (zmalloc_is_nofork(o->ptr)) o->ptr = snapBlobMove(o->ptr, lpBytes(o->ptr), 0);
+        if (zmalloc_is_nofork(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, lpBytes(o->ptr), 0);
         break;
     case OBJ_ENCODING_INTSET:
-        if (zmalloc_is_nofork(o->ptr)) o->ptr = snapBlobMove(o->ptr, intsetBlobLen(o->ptr), 0);
+        if (zmalloc_is_nofork(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, intsetBlobLen(o->ptr), 0);
         break;
     default:
         break;
@@ -1009,7 +1009,7 @@ void snapValueDetachFromArena(robj *o) {
 
 /* Reply with up to 'limit' keys whose value placement disagrees with its
  * class: "key type encoding drift" per entry (test aid, DEBUG SNAP-DRIFT). */
-static void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
+static void hybsnapPlacementDriftReply(client *c, redisDb *db, int limit) {
     kvstoreIterator kvs_it;
     dictEntry *de;
     void *replylen = addReplyDeferredLen(c);
@@ -1019,19 +1019,19 @@ static void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
         kvobj *kv = dictGetKV(de);
         const char *drift = NULL;
         if (!zmalloc_is_nofork(kv)) drift = "header-outside";
-        else if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
+        else if (!hybsnapEncodingIsNoforkClass(kv->type, kv->encoding)) {
             if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) drift = "fork-value-in-arena";
-        } else if (snapValueIsInline(kv->type, kv->encoding)) {
+        } else if (hybsnapValueIsInline(kv->type, kv->encoding)) {
             drift = NULL;
         } else if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
             listpackEx *lpt = kv->ptr;
             if (zmalloc_is_nofork(lpt) != zmalloc_is_nofork(lpt->lp)) drift = "listpackex-split";
         } else {
-            void *a = snapValueAllocPtr(kv);
-            int want = snapClassify(kv->type, kv->encoding, zmalloc_size(a));
+            void *a = hybsnapValueAllocPtr(kv);
+            int want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
             int in = zmalloc_is_nofork(a);
-            if (want == SNAP_NOFORK && !in) drift = "nofork-outside";
-            if (want == SNAP_FORK && in) drift = "fork-inside";
+            if (want == HYBSNAP_NOFORK && !in) drift = "nofork-outside";
+            if (want == HYBSNAP_FORK && in) drift = "fork-inside";
         }
         if (!drift) continue;
         addReplyArrayLen(c, 4);
@@ -1045,10 +1045,10 @@ static void snapPlacementDriftReply(client *c, redisDb *db, int limit) {
     setDeferredArrayLen(c, replylen, n);
 }
 
-static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
+static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
     memset(st, 0, sizeof(*st));
-    snapPlacementScanTables(db->keys, st);
-    snapPlacementScanTables(db->expires, st);
+    hybsnapPlacementScanTables(db->keys, st);
+    hybsnapPlacementScanTables(db->expires, st);
     kvstoreIterator kvs_it;
     dictEntry *de;
     kvstoreIteratorInit(&kvs_it, db->keys);
@@ -1058,13 +1058,13 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
         int hdr_in = zmalloc_is_nofork(kv);
         if (hdr_in) st->headers_in_arena++; else { st->headers_outside++; st->violations++; }
 
-        int cls = snapKeyClass(kv);
-        if (cls == SNAP_NOFORK) st->class_nofork++; else st->class_fork++;
+        int cls = hybsnapKeyClass(kv);
+        if (cls == HYBSNAP_NOFORK) st->class_nofork++; else st->class_fork++;
 
         if (getModuleMetaBits(kv->metabits)) {
             /* Serialized by the child (module callbacks): nothing of the value
              * may be in the arena. */
-            if (cls == SNAP_NOFORK && !snapValueIsInline(kv->type, kv->encoding)) st->violations++;
+            if (cls == HYBSNAP_NOFORK && !hybsnapValueIsInline(kv->type, kv->encoding)) st->violations++;
             if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
                 listpackEx *lpt = kv->ptr;
                 if (zmalloc_is_nofork(lpt) || zmalloc_is_nofork(lpt->lp)) st->violations++;
@@ -1072,7 +1072,7 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
             continue;
         }
 
-        if (!snapEncodingIsNoforkClass(kv->type, kv->encoding)) {
+        if (!hybsnapEncodingIsNoforkClass(kv->type, kv->encoding)) {
             /* Multi-allocation value: its top-level allocation must be forkable. */
             if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) st->violations++;
             /* Quicklists adopt listpacks: every node must be forkable too. */
@@ -1083,7 +1083,7 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
             }
             continue;
         }
-        if (snapValueIsInline(kv->type, kv->encoding)) continue;
+        if (hybsnapValueIsInline(kv->type, kv->encoding)) continue;
         if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
             listpackEx *lpt = kv->ptr;
             int st_in = zmalloc_is_nofork(lpt), lp_in = zmalloc_is_nofork(lpt->lp);
@@ -1092,11 +1092,11 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
             if (!st_in && hdr_in) st->drift_nofork_outside++;   /* legacy struct outside */
             continue;
         }
-        void *a = snapValueAllocPtr(kv);
-        int want = snapClassify(kv->type, kv->encoding, zmalloc_size(a));
+        void *a = hybsnapValueAllocPtr(kv);
+        int want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
         int in = zmalloc_is_nofork(a);
-        if (want == SNAP_NOFORK && !in) st->drift_nofork_outside++;
-        if (want == SNAP_FORK && in) st->drift_fork_inside++;
+        if (want == HYBSNAP_NOFORK && !in) st->drift_nofork_outside++;
+        if (want == HYBSNAP_FORK && in) st->drift_fork_inside++;
     }
     kvstoreIteratorReset(&kvs_it);
 }
@@ -1107,11 +1107,11 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
  *
  * The scan walks every kvstore dict ("slot") of every store in sequence on a
  * dedicated thread and hands each fork-instant kvobj to a dispatch callback.
- * It is generic: nothing here knows about the save object (snapSave); the
+ * It is generic: nothing here knows about the save object (hybsnapSave); the
  * save layer plugs in through the dispatch, slot-done, window-done and
  * store-done callbacks.
  *
- * Reading contract: the credit window of snapshot.h (behind lo in place,
+ * Reading contract: the credit window of hybrid_snapshot.h (behind lo in place,
  * [lo, hi) through the overlay, hi and beyond emit-ahead). Beyond it: a
  * dict's layout is paused before hi may pass it; a dict beyond hi may grow
  * (its bitmap follows the new table) but not shrink. The thread reads the
@@ -1126,10 +1126,10 @@ static void snapPlacementScan(redisDb *db, snapPlacementStats *st) {
  */
 
 
-static __thread int snap_on_scan_thread = 0;
-static __thread int snap_scan_maxmemory_policy = 0;
-static __thread int snap_scan_rdb_compression = 0;
-static __thread int snap_main_emitting = 0;   /* main thread: inside an emit-ahead serialization */
+static __thread int hybsnap_on_scan_thread = 0;
+static __thread int hybsnap_scan_maxmemory_policy = 0;
+static __thread int hybsnap_scan_rdb_compression = 0;
+static __thread int hybsnap_main_emitting = 0;   /* main thread: inside an emit-ahead serialization */
 
 /* The RDB serializer's configuration, read through one call (rdb.c). On the
  * main thread these are the live server values; on the scan thread the copies
@@ -1139,23 +1139,23 @@ static __thread int snap_main_emitting = 0;   /* main thread: inside an emit-ahe
  * The key-save delay applies only in classic contexts: the scan thread applies
  * its own atomic copy and the main thread's emit-ahead must not slow the
  * command that triggered it. */
-snapRdbCfg snapRdbCfgGet(void) {
-    snapRdbCfg c;
-    c.on_scan = snap_on_scan_thread;
-    c.compression = c.on_scan ? snap_scan_rdb_compression : server.rdb_compression;
-    c.maxmemory_policy = c.on_scan ? snap_scan_maxmemory_policy : server.maxmemory_policy;
-    c.apply_key_save_delay = !c.on_scan && !snap_main_emitting;
+hybsnapRdbCfg hybsnapRdbCfgGet(void) {
+    hybsnapRdbCfg c;
+    c.on_scan = hybsnap_on_scan_thread;
+    c.compression = c.on_scan ? hybsnap_scan_rdb_compression : server.rdb_compression;
+    c.maxmemory_policy = c.on_scan ? hybsnap_scan_maxmemory_policy : server.maxmemory_policy;
+    c.apply_key_save_delay = !c.on_scan && !hybsnap_main_emitting;
     return c;
 }
 
-/* ---- Scan positions, the credit window and write sections (see snapshot.h) ---- */
+/* ---- Scan positions, the credit window and write sections (see hybrid_snapshot.h) ---- */
 
-static unsigned long snap_window_buckets = SNAP_WINDOW_BUCKETS_DEFAULT;
-static void snapSetWindowBuckets(unsigned long n) { snap_window_buckets = n ? n : 1; }
-static unsigned long snapGetWindowBuckets(void) { return snap_window_buckets; }
+static unsigned long hybsnap_window_buckets = HYBSNAP_WINDOW_BUCKETS_DEFAULT;
+static void hybsnapSetWindowBuckets(unsigned long n) { hybsnap_window_buckets = n ? n : 1; }
+static unsigned long hybsnapGetWindowBuckets(void) { return hybsnap_window_buckets; }
 
-static inline dict *snapTableDict(snapScanCtx *ctx, int s, int didx);
-static inline uint8_t snapDictStateOf(snapScanCtx *ctx, dict *d);
+static inline dict *hybsnapTableDict(hybsnapScanCtx *ctx, int s, int didx);
+static inline uint8_t hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 
 /* The scan order as integers. A position packs (ord, phase, idx): ord is the
  * dict's ordinal (its store's base plus didx, the real slot), phase 0 the
@@ -1164,47 +1164,47 @@ static inline uint8_t snapDictStateOf(snapScanCtx *ctx, dict *d);
  * buckets in increasing order, so it only ever moves up; dicts it never
  * visits (empty at the freeze, outside a slot filter) are gaps nobody
  * compares against. */
-#define SNAP_POS_IDX_BITS 40
-#define SNAP_POS_ORD_BITS 22
-#define SNAP_POS(ord, phase, idx) (((uint64_t)(ord) << (SNAP_POS_IDX_BITS + 2)) | ((uint64_t)(phase) << SNAP_POS_IDX_BITS) | (uint64_t)(idx))
-#define SNAP_POS_ORD(p) ((p) >> (SNAP_POS_IDX_BITS + 2))
-#define SNAP_POS_PHASE(p) ((int)(((p) >> SNAP_POS_IDX_BITS) & 3))
-#define SNAP_POS_IDX(p) ((unsigned long)((p) & ((1ULL << SNAP_POS_IDX_BITS) - 1)))
-#define SNAP_POS_INF UINT64_MAX            /* hi: no limit */
-#define SNAP_SCAN_BATCH 128                /* buckets the thread reads per announcement */
-#define SNAP_SCAN_LOOKAHEAD (SNAP_SCAN_PREFETCH > SNAP_SCAN_PREFETCH2 ? SNAP_SCAN_PREFETCH : SNAP_SCAN_PREFETCH2)   /* announced past the batch for the prefetches */
-#define SNAP_ADVANCE_DICTS 64              /* dicts one grant may open */
-#define SNAP_OV_SLOTS_SOFT 16              /* overlay windows in use past which a section stops granting */
+#define HYBSNAP_POS_IDX_BITS 40
+#define HYBSNAP_POS_ORD_BITS 22
+#define HYBSNAP_POS(ord, phase, idx) (((uint64_t)(ord) << (HYBSNAP_POS_IDX_BITS + 2)) | ((uint64_t)(phase) << HYBSNAP_POS_IDX_BITS) | (uint64_t)(idx))
+#define HYBSNAP_POS_ORD(p) ((p) >> (HYBSNAP_POS_IDX_BITS + 2))
+#define HYBSNAP_POS_PHASE(p) ((int)(((p) >> HYBSNAP_POS_IDX_BITS) & 3))
+#define HYBSNAP_POS_IDX(p) ((unsigned long)((p) & ((1ULL << HYBSNAP_POS_IDX_BITS) - 1)))
+#define HYBSNAP_POS_INF UINT64_MAX            /* hi: no limit */
+#define HYBSNAP_SCAN_BATCH 128                /* buckets the thread reads per announcement */
+#define HYBSNAP_SCAN_LOOKAHEAD (HYBSNAP_SCAN_PREFETCH > HYBSNAP_SCAN_PREFETCH2 ? HYBSNAP_SCAN_PREFETCH : HYBSNAP_SCAN_PREFETCH2)   /* announced past the batch for the prefetches */
+#define HYBSNAP_ADVANCE_DICTS 64              /* dicts one grant may open */
+#define HYBSNAP_OV_SLOTS_SOFT 16              /* overlay windows in use past which a section stops granting */
 
-/* The credit window (snapshot.h; docs/hybrid-snapshot.md section 3). Here:
+/* The credit window (hybrid_snapshot.h; docs/hybrid-snapshot.md section 3). Here:
  * cur is the last position of the batch the thread reads next (its prefetch
  * lookahead included), lo is stored after every bucket. hi is capped by
- * snapWindowCap at section open and raised by snapWindowRefill; after the cap
+ * hybsnapWindowCap at section open and raised by hybsnapWindowRefill; after the cap
  * the thread is at most on cur, and any later position it reaches sees it. */
 /* The thread's words on a cache line of their own: it stores lo after every
- * bucket, and the main thread reads snap_funnel_seq after every command. */
+ * bucket, and the main thread reads hybsnap_funnel_seq after every command. */
 static struct {
     uint64_t cur;                          /* thread: seq_cst stores */
     uint64_t lo;                           /* thread: release stores (seq_cst at the end) */
-} __attribute__((aligned(CACHE_LINE_SIZE))) snap_pos_thread;
-#define snap_cur (snap_pos_thread.cur)
-#define snap_lo (snap_pos_thread.lo)
-static uint64_t snap_hi __attribute__((aligned(CACHE_LINE_SIZE))) = SNAP_POS_INF;   /* main thread: seq_cst at the cap, release otherwise */
-static snapScanCtx *snap_live = NULL;      /* main thread: the scan whose thread runs (the cap and grants apply) */
-redisAtomic uint64_t snap_funnel_seq = 0;
+} __attribute__((aligned(CACHE_LINE_SIZE))) hybsnap_pos_thread;
+#define hybsnap_cur (hybsnap_pos_thread.cur)
+#define hybsnap_lo (hybsnap_pos_thread.lo)
+static uint64_t hybsnap_hi __attribute__((aligned(CACHE_LINE_SIZE))) = HYBSNAP_POS_INF;   /* main thread: seq_cst at the cap, release otherwise */
+static hybsnapScanCtx *hybsnap_live = NULL;      /* main thread: the scan whose thread runs (the cap and grants apply) */
+redisAtomic uint64_t hybsnap_funnel_seq = 0;
 
-static inline uint64_t snapPosLoLoad(void) { return __atomic_load_n(&snap_lo, __ATOMIC_ACQUIRE); }
+static inline uint64_t hybsnapPosLoLoad(void) { return __atomic_load_n(&hybsnap_lo, __ATOMIC_ACQUIRE); }
 
 /* A dict's ordinal and back. */
-static inline uint64_t snapOrd(snapScanCtx *ctx, int s, int didx) { return (uint64_t)ctx->store[s].ord_base + (uint64_t)didx; }
-static void snapOrdDecode(snapScanCtx *ctx, uint64_t ord, int *s, int *didx) {
+static inline uint64_t hybsnapOrd(hybsnapScanCtx *ctx, int s, int didx) { return (uint64_t)ctx->store[s].ord_base + (uint64_t)didx; }
+static void hybsnapOrdDecode(hybsnapScanCtx *ctx, uint64_t ord, int *s, int *didx) {
     int k = 0;
     while (k + 1 < ctx->num_stores && ord >= (uint64_t)ctx->store[k + 1].ord_base) k++;
     *s = k;
     *didx = (int)(ord - (uint64_t)ctx->store[k].ord_base);
 }
 
-static void snapScanPauseLayout(snapScanCtx *ctx, dict *d);
+static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d);
 
 /* Main thread: the position 'budget' readable buckets after 'from' in the
  * scan order, and in *mid the one half way. Only buckets the thread will read
@@ -1212,27 +1212,27 @@ static void snapScanPauseLayout(snapScanCtx *ctx, dict *d);
  * the thread is done with, or that the save does not hold, are skipped. Every
  * dict the walk enters is paused first: positions name buckets by (table,
  * idx), so a dict's layout must hold still before hi may pass it. Stops
- * before the layout of the SNAP_ADVANCE_DICTS-th dict. */
-static uint64_t snapWindowAdvance(snapScanCtx *ctx, uint64_t from, unsigned long budget, uint64_t *mid) {
+ * before the layout of the HYBSNAP_ADVANCE_DICTS-th dict. */
+static uint64_t hybsnapWindowAdvance(hybsnapScanCtx *ctx, uint64_t from, unsigned long budget, uint64_t *mid) {
     unsigned long half = budget / 2, used = 0;
-    *mid = SNAP_POS_INF;
+    *mid = HYBSNAP_POS_INF;
     if (from >= ctx->pos_end) return ctx->pos_end;
     int s, didx, dicts = 0;
-    snapOrdDecode(ctx, SNAP_POS_ORD(from), &s, &didx);
-    int phase = SNAP_POS_PHASE(from);
-    unsigned long idx = SNAP_POS_IDX(from);
+    hybsnapOrdDecode(ctx, HYBSNAP_POS_ORD(from), &s, &didx);
+    int phase = HYBSNAP_POS_PHASE(from);
+    unsigned long idx = HYBSNAP_POS_IDX(from);
     for (; s < ctx->num_stores; s++, didx = 0) {
         for (; didx < ctx->store[s].num_dicts; didx++, phase = 0, idx = 0) {
-            dict *d = ctx->store[s].frozen ? snapTableDict(ctx, s, didx) : NULL;
+            dict *d = ctx->store[s].frozen ? hybsnapTableDict(ctx, s, didx) : NULL;
             if (!d) continue;
-            uint8_t st = snapDictStateOf(ctx, d);
-            if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) continue;
-            uint64_t ord = snapOrd(ctx, s, didx);
-            if (++dicts > SNAP_ADVANCE_DICTS) {
-                if (*mid == SNAP_POS_INF) *mid = SNAP_POS(ord, 0, 0);
-                return SNAP_POS(ord, 0, 0);
+            uint8_t st = hybsnapDictStateOf(ctx, d);
+            if (st == HYBSNAP_SLOT_SCANNED || st == HYBSNAP_SLOT_DONE) continue;
+            uint64_t ord = hybsnapOrd(ctx, s, didx);
+            if (++dicts > HYBSNAP_ADVANCE_DICTS) {
+                if (*mid == HYBSNAP_POS_INF) *mid = HYBSNAP_POS(ord, 0, 0);
+                return HYBSNAP_POS(ord, 0, 0);
             }
-            snapScanPauseLayout(ctx, d);
+            hybsnapScanPauseLayout(ctx, d);
             if (phase == 0) phase = 1, idx = 0;
             int rehashing = dictIsRehashing(d);
             for (; phase <= (rehashing ? 2 : 1); phase++, idx = 0) {
@@ -1240,8 +1240,8 @@ static uint64_t snapWindowAdvance(snapScanCtx *ctx, uint64_t from, unsigned long
                 if (phase == 1 && rehashing && idx < (unsigned long)d->rehashidx) idx = (unsigned long)d->rehashidx;
                 if (idx >= size) continue;
                 unsigned long avail = size - idx;
-                if (*mid == SNAP_POS_INF && used + avail >= half) *mid = SNAP_POS(ord, phase, idx + (half - used));
-                if (used + avail >= budget) return SNAP_POS(ord, phase, idx + (budget - used));
+                if (*mid == HYBSNAP_POS_INF && used + avail >= half) *mid = HYBSNAP_POS(ord, phase, idx + (half - used));
+                if (used + avail >= budget) return HYBSNAP_POS(ord, phase, idx + (budget - used));
                 used += avail;
             }
         }
@@ -1254,18 +1254,18 @@ static uint64_t snapWindowAdvance(snapScanCtx *ctx, uint64_t from, unsigned long
  * it reads, and reads hi after announcing), so hi = max(H, cur + 1). A
  * thread found past H ran free outside sections; the dicts between are done
  * with, and the one it is in is paused here. */
-static void snapWindowCap(snapScanCtx *ctx) {
-    uint64_t lo = __atomic_load_n(&snap_lo, __ATOMIC_SEQ_CST);
-    uint64_t mid, h = snapWindowAdvance(ctx, lo, ctx->window_buckets, &mid);
-    __atomic_store_n(&snap_hi, h, __ATOMIC_SEQ_CST);
-    uint64_t c = __atomic_load_n(&snap_cur, __ATOMIC_SEQ_CST);
+static void hybsnapWindowCap(hybsnapScanCtx *ctx) {
+    uint64_t lo = __atomic_load_n(&hybsnap_lo, __ATOMIC_SEQ_CST);
+    uint64_t mid, h = hybsnapWindowAdvance(ctx, lo, ctx->window_buckets, &mid);
+    __atomic_store_n(&hybsnap_hi, h, __ATOMIC_SEQ_CST);
+    uint64_t c = __atomic_load_n(&hybsnap_cur, __ATOMIC_SEQ_CST);
     if (c >= h && c < ctx->pos_end) {
         int s, didx;
-        snapOrdDecode(ctx, SNAP_POS_ORD(c), &s, &didx);
-        dict *d = ctx->store[s].frozen ? snapTableDict(ctx, s, didx) : NULL;
-        if (d && snapDictStateOf(ctx, d) == SNAP_SLOT_SCANNING) snapScanPauseLayout(ctx, d);
+        hybsnapOrdDecode(ctx, HYBSNAP_POS_ORD(c), &s, &didx);
+        dict *d = ctx->store[s].frozen ? hybsnapTableDict(ctx, s, didx) : NULL;
+        if (d && hybsnapDictStateOf(ctx, d) == HYBSNAP_SLOT_SCANNING) hybsnapScanPauseLayout(ctx, d);
         h = c + 1;
-        __atomic_store_n(&snap_hi, h, __ATOMIC_RELEASE);
+        __atomic_store_n(&hybsnap_hi, h, __ATOMIC_RELEASE);
         mid = h;
     }
     ctx->hi = h;
@@ -1275,13 +1275,13 @@ static void snapWindowCap(snapScanCtx *ctx) {
 /* Main thread, inside a section: once the thread is half way through its
  * grant, grant the next W buckets (pausing the dicts they open). Not while
  * many overlay windows are in use: the section's drain has to come first. */
-static void snapWindowRefill(snapScanCtx *ctx) {
-    if (snapPosLoLoad() < ctx->mid) return;
-    if (kvstoreOverlaySlotsInUse() >= SNAP_OV_SLOTS_SOFT) return;
-    uint64_t mid, h = snapWindowAdvance(ctx, snapPosLoLoad(), ctx->window_buckets, &mid);
+static void hybsnapWindowRefill(hybsnapScanCtx *ctx) {
+    if (hybsnapPosLoLoad() < ctx->mid) return;
+    if (kvstoreOverlaySlotsInUse() >= HYBSNAP_OV_SLOTS_SOFT) return;
+    uint64_t mid, h = hybsnapWindowAdvance(ctx, hybsnapPosLoLoad(), ctx->window_buckets, &mid);
     if (h > ctx->hi) {
         ctx->hi = h;
-        __atomic_store_n(&snap_hi, h, __ATOMIC_RELEASE);
+        __atomic_store_n(&hybsnap_hi, h, __ATOMIC_RELEASE);
         ctx->grants++;
     }
     ctx->mid = mid;
@@ -1290,43 +1290,43 @@ static void snapWindowRefill(snapScanCtx *ctx) {
 /* Scan thread: may it read positions [p, last]? Announces 'last' in cur,
  * then waits while p is at or above hi. Returns the end (exclusive) it may
  * read to, at most last + 1, or 0 when the scan was aborted meanwhile. */
-static uint64_t snapScanReach(snapScanCtx *ctx, uint64_t p, uint64_t last) {
-    __atomic_store_n(&snap_cur, last, __ATOMIC_SEQ_CST);
-    uint64_t hi = __atomic_load_n(&snap_hi, __ATOMIC_SEQ_CST);
+static uint64_t hybsnapScanReach(hybsnapScanCtx *ctx, uint64_t p, uint64_t last) {
+    __atomic_store_n(&hybsnap_cur, last, __ATOMIC_SEQ_CST);
+    uint64_t hi = __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST);
     if (p >= hi) {
         monotime t;
         elapsedStart(&t);
         atomicIncr(ctx->stalls, 1);
         int spins = 0;
         while (p >= hi) {
-            if (snapScanAborted(ctx)) return 0;
+            if (hybsnapScanAborted(ctx)) return 0;
             if (++spins < 200) sched_yield();
             else usleep(20);
-            hi = __atomic_load_n(&snap_hi, __ATOMIC_SEQ_CST);
+            hi = __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST);
         }
         atomicIncr(ctx->stall_us, (long long)elapsedUs(t));
     }
     return hi > last ? last + 1 : hi;
 }
 
-static inline void snapScanSetLo(uint64_t lo) { __atomic_store_n(&snap_lo, lo, __ATOMIC_RELEASE); }
+static inline void hybsnapScanSetLo(uint64_t lo) { __atomic_store_n(&hybsnap_lo, lo, __ATOMIC_RELEASE); }
 
 /* Scan thread, at the end: wait until no write section is open. A section
  * opened after the seq_cst store of lo = END sees every bucket behind it, so
  * nothing more is emitted; one open before may still be emitting. This is
  * the only time the thread waits for a section. */
-static void snapWalkerQuiesce(snapScanCtx *ctx) {
+static void hybsnapWalkerQuiesce(hybsnapScanCtx *ctx) {
     uint64_t v;
-    atomicGetWithSync(snap_funnel_seq, v);
+    atomicGetWithSync(hybsnap_funnel_seq, v);
     if (!(v & 1)) return;
     int spins = 0;
     for (;;) {
         uint64_t n;
-        atomicGetWithSync(snap_funnel_seq, n);
+        atomicGetWithSync(hybsnap_funnel_seq, n);
         if (n != v) return;
         /* The command aborting the save may itself hold the section open and
          * be waiting to join us: an aborted scan thread reads nothing more. */
-        if (snapScanAborted(ctx)) return;
+        if (hybsnapScanAborted(ctx)) return;
         if (++spins < 200) sched_yield();
         else usleep(20);
     }
@@ -1335,45 +1335,45 @@ static void snapWalkerQuiesce(snapScanCtx *ctx) {
 /* Write sections. The main thread works on frozen dicts inside a "write
  * section": opened by the first guard or funnel hook of a command (reads
  * included), closed when the outermost command returns, at beforeSleep and
- * when a module thread releases the GIL (snapFunnelClose). Opening caps the
- * thread (snapWindowCap); every later hook of the section may raise the cap
- * (snapWindowRefill); closing writes back the overlayed buckets the thread
+ * when a module thread releases the GIL (hybsnapFunnelClose). Opening caps the
+ * thread (hybsnapWindowCap); every later hook of the section may raise the cap
+ * (hybsnapWindowRefill); closing writes back the overlayed buckets the thread
  * has passed and lifts the cap. Outside sections the thread runs free: the
  * main thread touches no frozen dict there. */
-static void snapFunnelOpen(void) {
+static void hybsnapFunnelOpen(void) {
     uint64_t v;
-    atomicGet(snap_funnel_seq, v);          /* single writer: relaxed read of our own value */
+    atomicGet(hybsnap_funnel_seq, v);          /* single writer: relaxed read of our own value */
     if (v & 1) {
-        if (snap_live) snapWindowRefill(snap_live);
+        if (hybsnap_live) hybsnapWindowRefill(hybsnap_live);
         return;
     }
-    atomicSetWithSync(snap_funnel_seq, v + 1);   /* seq_cst: pairs with snapWalkerQuiesce */
-    if (snap_live) snapWindowCap(snap_live);
+    atomicSetWithSync(hybsnap_funnel_seq, v + 1);   /* seq_cst: pairs with hybsnapWalkerQuiesce */
+    if (hybsnap_live) hybsnapWindowCap(hybsnap_live);
 }
 
-void snapFunnelCloseSlow(void) {
+void hybsnapFunnelCloseSlow(void) {
     uint64_t v;
-    atomicGet(snap_funnel_seq, v);
+    atomicGet(hybsnap_funnel_seq, v);
     if (v & 1) {
         /* At a point where no caller holds a link: write back what the
          * thread has passed, then let it run free. */
-        snapSaveDrainSideTables();
-        if (snap_live) {
-            snap_live->hi = SNAP_POS_INF;
-            __atomic_store_n(&snap_hi, SNAP_POS_INF, __ATOMIC_RELEASE);
+        hybsnapSaveDrainSideTables();
+        if (hybsnap_live) {
+            hybsnap_live->hi = HYBSNAP_POS_INF;
+            __atomic_store_n(&hybsnap_hi, HYBSNAP_POS_INF, __ATOMIC_RELEASE);
         }
-        atomicSetWithSync(snap_funnel_seq, v + 1);
+        atomicSetWithSync(hybsnap_funnel_seq, v + 1);
     }
 }
 
 /* The scan thread's waits for hi and the grants raised inside sections, of
  * the running save, else of the last one (kept at its release). */
-static struct { long long stalls, stall_us, grants; } snap_last_window;
-static void snapScanWindowStats(snapScanCtx *ctx, long long *stalls, long long *stall_us, long long *grants) {
+static struct { long long stalls, stall_us, grants; } hybsnap_last_window;
+static void hybsnapScanWindowStats(hybsnapScanCtx *ctx, long long *stalls, long long *stall_us, long long *grants) {
     if (!ctx) {
-        *stalls = snap_last_window.stalls;
-        *stall_us = snap_last_window.stall_us;
-        *grants = snap_last_window.grants;
+        *stalls = hybsnap_last_window.stalls;
+        *stall_us = hybsnap_last_window.stall_us;
+        *grants = hybsnap_last_window.grants;
         return;
     }
     atomicGet(ctx->stalls, *stalls);
@@ -1383,15 +1383,15 @@ static void snapScanWindowStats(snapScanCtx *ctx, long long *stalls, long long *
 
 /* Main thread: the scan thread is about to start (positions from the first
  * dict, no limit), or failed to (NULL). */
-static void snapWindowReset(snapScanCtx *live) {
-    __atomic_store_n(&snap_cur, 0, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&snap_lo, 0, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&snap_hi, SNAP_POS_INF, __ATOMIC_SEQ_CST);
+static void hybsnapWindowReset(hybsnapScanCtx *live) {
+    __atomic_store_n(&hybsnap_cur, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&hybsnap_lo, 0, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&hybsnap_hi, HYBSNAP_POS_INF, __ATOMIC_SEQ_CST);
     if (live) {
-        live->hi = SNAP_POS_INF;
+        live->hi = HYBSNAP_POS_INF;
         live->mid = 0;
     }
-    snap_live = live;
+    hybsnap_live = live;
 }
 
 /* ---- Per-dict save state (the kvstore extension slot: kvstoreDictMetaBase.ext_word / ext) ----
@@ -1407,67 +1407,67 @@ static void snapWindowReset(snapScanCtx *live) {
  * rest of the state (bitmaps, overlay, pause) is attached on first touch
  * and freed when the dict completes. */
 
-static inline kvstoreDictMetaBase *snapMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
-static inline uint64_t snapWordLoad(dict *d) { return __atomic_load_n(&snapMeta(d)->ext_word, __ATOMIC_ACQUIRE); }
-static inline void snapWordStore(dict *d, uint64_t w) { __atomic_store_n(&snapMeta(d)->ext_word, w, __ATOMIC_RELEASE); }
+static inline kvstoreDictMetaBase *hybsnapMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
+static inline uint64_t hybsnapWordLoad(dict *d) { return __atomic_load_n(&hybsnapMeta(d)->ext_word, __ATOMIC_ACQUIRE); }
+static inline void hybsnapWordStore(dict *d, uint64_t w) { __atomic_store_n(&hybsnapMeta(d)->ext_word, w, __ATOMIC_RELEASE); }
 /* The attached state, either thread (the main thread publishes it with release). */
-static inline snapDictState *snapStateOf(dict *d) { return __atomic_load_n(&snapMeta(d)->ext, __ATOMIC_ACQUIRE); }
+static inline hybsnapDictState *hybsnapStateOf(dict *d) { return __atomic_load_n(&hybsnapMeta(d)->ext, __ATOMIC_ACQUIRE); }
 
 /* The save's table of fork-instant dicts (filled at freeze, one reference
  * each). Entries are cleared at completion, on the main thread, after the
  * thread published SCANNED for the slot or was joined. */
-static inline dict *snapTableDict(snapScanCtx *ctx, int s, int didx) {
+static inline dict *hybsnapTableDict(hybsnapScanCtx *ctx, int s, int didx) {
     return ctx->store[s].dicts ? __atomic_load_n(&ctx->store[s].dicts[didx], __ATOMIC_RELAXED) : NULL;
 }
 
 /* Either thread: the state of a table dict (its word carries this save's generation). */
-static inline uint8_t snapDictStateOf(snapScanCtx *ctx, dict *d) {
-    uint64_t w = snapWordLoad(d);
-    serverAssert(SNAP_WORD_GEN(w) == ctx->gen);
-    return SNAP_WORD_STATE(w);
+static inline uint8_t hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d) {
+    uint64_t w = hybsnapWordLoad(d);
+    serverAssert(HYBSNAP_WORD_GEN(w) == ctx->gen);
+    return HYBSNAP_WORD_STATE(w);
 }
 
 /* Main thread: the state of the live dict d of slot (s, didx): DONE for a
  * store that is not scanned (empty at the fork instant, or completed), after
  * the end, and for a dict that is not the save's. */
-static uint8_t snapScanDictStateMain(snapScanCtx *ctx, int s, int didx, dict *d) {
-    if (ctx->ended || !ctx->store[s].frozen) return SNAP_SLOT_DONE;
-    if (d != snapTableDict(ctx, s, didx)) return SNAP_SLOT_DONE;
-    return snapDictStateOf(ctx, d);
+static uint8_t hybsnapScanDictStateMain(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
+    if (ctx->ended || !ctx->store[s].frozen) return HYBSNAP_SLOT_DONE;
+    if (d != hybsnapTableDict(ctx, s, didx)) return HYBSNAP_SLOT_DONE;
+    return hybsnapDictStateOf(ctx, d);
 }
 
 /* Scan thread: claim dict d for the walk (PENDING -> SCANNING; the main
  * thread changes no word before SCANNED). */
-static void snapScanClaim(snapScanCtx *ctx, dict *d) {
-    serverAssert(snapDictStateOf(ctx, d) == SNAP_SLOT_PENDING);
-    snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNING));
+static void hybsnapScanClaim(hybsnapScanCtx *ctx, dict *d) {
+    serverAssert(hybsnapDictStateOf(ctx, d) == HYBSNAP_SLOT_PENDING);
+    hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));
 }
 
-/* ---- Per-save bucket bitmaps (in snapDictState) ---- */
+/* ---- Per-save bucket bitmaps (in hybsnapDictState) ---- */
 
-static inline uint8_t *snapScanBitmap(snapScanCtx *ctx, int s, int didx, int table) {
+static inline uint8_t *hybsnapScanBitmap(hybsnapScanCtx *ctx, int s, int didx, int table) {
     /* Attached on demand by the main thread while the thread may be
-     * reading: acquire pairs with the release stores in snapScanBitmapAlloc. */
-    dict *d = snapTableDict(ctx, s, didx);
-    snapDictState *sn = d ? snapStateOf(d) : NULL;
+     * reading: acquire pairs with the release stores in hybsnapScanBitmapAlloc. */
+    dict *d = hybsnapTableDict(ctx, s, didx);
+    hybsnapDictState *sn = d ? hybsnapStateOf(d) : NULL;
     if (!sn) return NULL;
     return __atomic_load_n(&sn->bits[table], __ATOMIC_ACQUIRE);
 }
 
 /* Per-save bucket bitmaps: one bit per bucket of every table of a dict the
- * save touched, allocated when the dict is attached (snapDictState in the
+ * save touched, allocated when the dict is attached (hybsnapDictState in the
  * kvstore extension slot), freed when the slot completes. A set bit means the
  * bucket's chain was already emitted into the snapshot by the main thread
  * (at or beyond hi); the scan thread skips such buckets. Mark only buckets at
  * or beyond hi, inside a write section, before hi is raised over them. */
-static void snapScanMarkBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
-    uint8_t *bm = snapScanBitmap(ctx, s, didx, table);
+static void hybsnapScanMarkBucketEmitted(hybsnapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
+    uint8_t *bm = hybsnapScanBitmap(ctx, s, didx, table);
     serverAssert(bm != NULL);
     __atomic_fetch_or(&bm[idx >> 3], (uint8_t)(1u << (idx & 7)), __ATOMIC_RELAXED);
 }
 
-static int snapScanBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
-    uint8_t *bm = snapScanBitmap(ctx, s, didx, table);
+static int hybsnapScanBucketEmitted(hybsnapScanCtx *ctx, int s, int didx, int table, unsigned long idx) {
+    uint8_t *bm = hybsnapScanBitmap(ctx, s, didx, table);
     if (!bm) return 0;
     return (__atomic_load_n(&bm[idx >> 3], __ATOMIC_RELAXED) >> (idx & 7)) & 1;
 }
@@ -1475,7 +1475,7 @@ static int snapScanBucketEmitted(snapScanCtx *ctx, int s, int didx, int table, u
 /* Bucket bitmaps of this save (they live in the dicts' metadata; accounted
  * here, main thread). */
 /* The scan's own tables: the per-store dict tables and the completion ring. */
-static size_t snapScanTableBytes(snapScanCtx *ctx) {
+static size_t hybsnapScanTableBytes(hybsnapScanCtx *ctx) {
     size_t n = ctx->slots_total ? ctx->slots_total : 1;
     size_t bytes = n * sizeof(uint64_t);   /* ring */
     for (int s = 0; s < ctx->num_stores; s++)
@@ -1483,11 +1483,11 @@ static size_t snapScanTableBytes(snapScanCtx *ctx) {
     return bytes;
 }
 
-static size_t snapScanBitmapBytes(snapScanCtx *ctx) {
+static size_t hybsnapScanBitmapBytes(hybsnapScanCtx *ctx) {
     return ctx ? ctx->bitmap_bytes : 0;
 }
 
-static void snapScanBitmapAlloc(snapScanCtx *ctx, snapDictState *sn, dict *d) {
+static void hybsnapScanBitmapAlloc(hybsnapScanCtx *ctx, hybsnapDictState *sn, dict *d) {
     for (int t = 0; t < 2; t++) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[t]);
         if (size == 0) continue;
@@ -1503,19 +1503,19 @@ static void snapScanBitmapAlloc(snapScanCtx *ctx, snapDictState *sn, dict *d) {
  * the main thread once the thread has passed them and it is released when its slot
  * completes. Only the overlay callbacks of 'hooks' (clone, free_orig, enter,
  * prepare) are taken; the guard and layout hooks are the scan's
- * own. Every hook of store s receives the store's snapGuardPriv, whose 'user'
+ * own. Every hook of store s receives the store's hybsnapGuardPriv, whose 'user'
  * field is 'store_privdata[s]' (NULL array: NULL). Must be called before
- * snapScanStart(). */
+ * hybsnapScanStart(). */
 /* Before start: restrict the scan to the slots whose bit is set (cluster
  * mode; the bitmap must outlive the scan). Dicts outside the set are never
  * frozen: the guard treats them as not the save's, so their writes are plain
  * writes, and the thread's pass never visits them. */
-static void snapScanSetSlotFilter(snapScanCtx *ctx, const uint8_t *bitmap) {
+static void hybsnapScanSetSlotFilter(hybsnapScanCtx *ctx, const uint8_t *bitmap) {
     serverAssert(!ctx->started);
     ctx->slot_filter = bitmap;
 }
 
-static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
+static void hybsnapScanSetOverlay(hybsnapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
 {
     serverAssert(!ctx->started);
     ctx->hooks.clone = hooks->clone;
@@ -1526,27 +1526,27 @@ static void snapScanSetOverlay(snapScanCtx *ctx, const kvstoreSnapHooks *hooks, 
     ctx->ov_priv = store_privdata;
 }
 
-static uint64_t snap_scan_gen = 0;   /* generation of the last scan context created */
-static long snap_stat_retained_dicts = 0;   /* table dicts freed by a save, across saves (INFO snap_retained_dicts) */
+static uint64_t hybsnap_scan_gen = 0;   /* generation of the last scan context created */
+static long hybsnap_stat_retained_dicts = 0;   /* table dicts freed by a save, across saves (INFO snap_retained_dicts) */
 
 /* Create a scan over 'num_stores' kvstores (normally one per db: db->keys).
- * Nothing is frozen or started until snapScanStart(). 'dispatch' runs on the
+ * Nothing is frozen or started until hybsnapScanStart(). 'dispatch' runs on the
  * scan thread once for every fork-instant key of a slot and must be strictly
- * read-only on the keyspace (it may read the kvobj and, for SNAP_NOFORK
+ * read-only on the keyspace (it may read the kvobj and, for HYBSNAP_NOFORK
  * values, the value, never write to any dict or object). 'slot_done' runs on
  * the main thread when a slot is complete, BEFORE its dict is unfrozen and
  * its state becomes DONE ('aborted' = 1 when the slot was not fully scanned);
  * the dict's overlayed buckets are written back and its save state released right after. */
-static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
-                            snapScanDispatchFn *dispatch,
-                            snapScanSlotDoneFn *slot_done, void *privdata)
+static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores,
+                            hybsnapScanDispatchFn *dispatch,
+                            hybsnapScanSlotDoneFn *slot_done, void *privdata)
 {
-    snapScanCtx *ctx = zcalloc(sizeof(*ctx));
-    ctx->store = zcalloc(sizeof(snapScanStore) * num_stores);
+    hybsnapScanCtx *ctx = zcalloc(sizeof(*ctx));
+    ctx->store = zcalloc(sizeof(hybsnapScanStore) * num_stores);
     ctx->num_stores = num_stores;
     long long ords = 0;
     for (int s = 0; s < num_stores; s++) {
-        snapScanStore *st = &ctx->store[s];
+        hybsnapScanStore *st = &ctx->store[s];
         st->kvs = stores[s];
         st->num_dicts = kvstoreNumDicts(stores[s]);
         st->ord_base = (int)ords;
@@ -1554,13 +1554,13 @@ static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
         st->guard.ctx = ctx;
         st->guard.s = s;
     }
-    serverAssert(ords < (1LL << SNAP_POS_ORD_BITS));   /* snapScanFits() */
-    ctx->pos_end = SNAP_POS(ords, 0, 0);
+    serverAssert(ords < (1LL << HYBSNAP_POS_ORD_BITS));   /* hybsnapScanFits() */
+    ctx->pos_end = HYBSNAP_POS(ords, 0, 0);
     ctx->hi = 0;   /* no grant until the thread starts: every bucket is ahead */
-    ctx->window_buckets = snap_window_buckets;
+    ctx->window_buckets = hybsnap_window_buckets;
     ctx->ov_block = 1;
     while (ctx->ov_block < ctx->window_buckets) ctx->ov_block <<= 1;
-    ctx->gen = ++snap_scan_gen;
+    ctx->gen = ++hybsnap_scan_gen;
     atomicSet(ctx->cur_slot, -1);
     ctx->dispatch = dispatch;
     ctx->slot_done = slot_done;
@@ -1570,31 +1570,31 @@ static snapScanCtx *snapScanCreate(kvstore **stores, int num_stores,
 }
 
 /* Main thread: the dict's save state (bucket bitmaps), allocated on first use. */
-static snapDictState *snapScanState(snapScanCtx *ctx, dict *d) {
-    serverAssert(snapDictStateOf(ctx, d) != SNAP_SLOT_DONE);
-    snapDictState *sn = snapMeta(d)->ext;   /* main thread: the only writer of the pointer */
+static hybsnapDictState *hybsnapScanState(hybsnapScanCtx *ctx, dict *d) {
+    serverAssert(hybsnapDictStateOf(ctx, d) != HYBSNAP_SLOT_DONE);
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;   /* main thread: the only writer of the pointer */
     if (!sn) {
         sn = zcalloc(sizeof(*sn));
-        __atomic_store_n(&snapMeta(d)->ext, sn, __ATOMIC_RELEASE);
-        snapScanBitmapAlloc(ctx, sn, d);
+        __atomic_store_n(&hybsnapMeta(d)->ext, sn, __ATOMIC_RELEASE);
+        hybsnapScanBitmapAlloc(ctx, sn, d);
     }
     return sn;
 }
 
 /* Main thread: hold the dict's layout (table sizes, rehashidx) until its slot
- * completes. Done before the thread may read the layout (snapWindowAdvance,
- * snapWindowCap) and on any access while it is on the dict (guard). Works for
+ * completes. Done before the thread may read the layout (hybsnapWindowAdvance,
+ * hybsnapWindowCap) and on any access while it is on the dict (guard). Works for
  * a dict that left its store: no overlay is attached here. */
-static void snapScanPauseLayout(snapScanCtx *ctx, dict *d) {
-    snapDictState *sn = snapScanState(ctx, d);
+static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d) {
+    hybsnapDictState *sn = hybsnapScanState(ctx, d);
     if (sn->paused) return;
     sn->paused = 1;
     dictPauseRehashing(d);
     dictPauseAutoResize(d);
 }
 
-static inline int snapDictPaused(dict *d) {
-    snapDictState *sn = snapMeta(d)->ext;
+static inline int hybsnapDictPaused(dict *d) {
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;
     return sn && sn->paused;
 }
 
@@ -1607,53 +1607,53 @@ static inline int snapDictPaused(dict *d) {
  * replicate its bitmap into the new table (bucket i of a table of n becomes
  * buckets i + j*n of the table of k*n), and a shrink is refused for it
  * (kvstore shrinkAllowed). Returns the overlay (NULL without one). */
-static struct kvstoreDictOverlay *snapScanAttach(snapScanCtx *ctx, int s, int didx, dict *d, int pause) {
-    snapScanState(ctx, d);
-    if (ctx->has_ov && !snapMeta(d)->ov) kvstoreOverlayAttach(ctx->store[s].kvs, didx);
-    if (pause) snapScanPauseLayout(ctx, d);
-    return snapMeta(d)->ov;
+static struct kvstoreDictOverlay *hybsnapScanAttach(hybsnapScanCtx *ctx, int s, int didx, dict *d, int pause) {
+    hybsnapScanState(ctx, d);
+    if (ctx->has_ov && !hybsnapMeta(d)->ov) kvstoreOverlayAttach(ctx->store[s].kvs, didx);
+    if (pause) hybsnapScanPauseLayout(ctx, d);
+    return hybsnapMeta(d)->ov;
 }
 
 /* kvstore snapshot guard (kvstore.h): every access to a dict without an
  * overlay while the scan runs lands here. */
-static struct kvstoreDictOverlay *snapOverlayGuard(void *privdata, kvstore *kvs, int didx, int write) {
-    struct snapGuardPriv *g = privdata;
-    snapScanCtx *ctx = g->ctx;
+static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *kvs, int didx, int write) {
+    struct hybsnapGuardPriv *g = privdata;
+    hybsnapScanCtx *ctx = g->ctx;
     int s = g->s;
     dict *d = kvstoreGetDict(kvs, didx);
     /* Not the save's dict (created or swapped into the slot since the fork
      * instant, or the save is done with the slot): nothing of the fork
      * instant in it, a plain access. */
-    if (!d || d != snapTableDict(ctx, s, didx)) return NULL;
-    if (snapDictStateOf(ctx, d) >= SNAP_SLOT_SCANNED) return NULL;   /* the thread is finished with it */
+    if (!d || d != hybsnapTableDict(ctx, s, didx)) return NULL;
+    if (hybsnapDictStateOf(ctx, d) >= HYBSNAP_SLOT_SCANNED) return NULL;   /* the thread is finished with it */
     /* Every access runs inside a section, reads included (a find may step a
      * rehash): opening one caps the thread, and the cap pauses any dict the
      * thread may be reading or may enter before the section ends. */
-    snapFunnelOpen();
+    hybsnapFunnelOpen();
     /* The state after the cap: the thread may have claimed the dict while it
      * ran free. A write to a dict the thread has not reached attaches it
      * without pausing it. */
-    uint8_t st = snapDictStateOf(ctx, d);
-    if (st >= SNAP_SLOT_SCANNED) return NULL;
-    int pause = (st == SNAP_SLOT_SCANNING);
+    uint8_t st = hybsnapDictStateOf(ctx, d);
+    if (st >= HYBSNAP_SLOT_SCANNED) return NULL;
+    int pause = (st == HYBSNAP_SLOT_SCANNING);
     if (!write && !pause) return NULL;   /* a read of a dict the thread is not reading */
-    return snapScanAttach(ctx, s, didx, d, pause);
+    return hybsnapScanAttach(ctx, s, didx, d, pause);
 }
 
 /* The store-level snapshot hooks (kvstore.h): the guard above and the stage
  * B rehash and shrink hooks of attached dicts. */
-static void snapGuardRehashStarted(void *privdata, int didx, dict *d) {
-    struct snapGuardPriv *g = privdata;
-    snapScanDictRehashStarted(g->ctx, g->s, didx, d);
+static void hybsnapGuardRehashStarted(void *privdata, int didx, dict *d) {
+    struct hybsnapGuardPriv *g = privdata;
+    hybsnapScanDictRehashStarted(g->ctx, g->s, didx, d);
 }
-static void snapGuardRehashCompleted(void *privdata, int didx, dict *d) {
-    struct snapGuardPriv *g = privdata;
-    snapScanDictRehashCompleted(g->ctx, g->s, didx, d);
+static void hybsnapGuardRehashCompleted(void *privdata, int didx, dict *d) {
+    struct hybsnapGuardPriv *g = privdata;
+    hybsnapScanDictRehashCompleted(g->ctx, g->s, didx, d);
 }
-static int snapGuardShrinkAllowed(void *privdata, int didx) {
-    struct snapGuardPriv *g = privdata;
+static int hybsnapGuardShrinkAllowed(void *privdata, int didx) {
+    struct hybsnapGuardPriv *g = privdata;
     dict *d = kvstoreGetDict(g->ctx->store[g->s].kvs, didx);
-    return !d || snapMeta(d)->ext == NULL;   /* a bitmap cannot follow a merge of buckets */
+    return !d || hybsnapMeta(d)->ext == NULL;   /* a bitmap cannot follow a merge of buckets */
 }
 
 /* One pass over the store's dicts (a store empty right now holds nothing of
@@ -1664,8 +1664,8 @@ static int snapGuardShrinkAllowed(void *privdata, int didx) {
  * any of these dicts meanwhile: it detaches them and the save releases them
  * when their slot completes. A dict empty now, or allocated later, is not in
  * the table: nothing of the fork instant is in it, the guard leaves it alone. */
-static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
-    snapScanStore *st = &ctx->store[s];
+static void hybsnapScanFreezeStore(hybsnapScanCtx *ctx, int s) {
+    hybsnapScanStore *st = &ctx->store[s];
     kvstore *kvs = st->kvs;
     if (kvstoreSize(kvs) == 0) return;
     int n = st->num_dicts;
@@ -1675,15 +1675,15 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (!d || dictSize(d) == 0) continue;
         kvstoreDictRetain(kvs, didx);
-        snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_PENDING));
+        hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_PENDING));
         st->dicts[didx] = d;
         st->nrefs++;
     }
     ctx->slots_total += st->nrefs;
-    ctx->hooks.guard = snapOverlayGuard;
-    ctx->hooks.rehash_started = snapGuardRehashStarted;
-    ctx->hooks.rehash_completed = snapGuardRehashCompleted;
-    ctx->hooks.shrink_allowed = snapGuardShrinkAllowed;
+    ctx->hooks.guard = hybsnapOverlayGuard;
+    ctx->hooks.rehash_started = hybsnapGuardRehashStarted;
+    ctx->hooks.rehash_completed = hybsnapGuardRehashCompleted;
+    ctx->hooks.shrink_allowed = hybsnapGuardShrinkAllowed;
     st->guard.user = ctx->ov_priv ? ctx->ov_priv[s] : NULL;
     kvstoreSnapGuardSet(kvs, &ctx->hooks, &st->guard);
     st->frozen = 1;
@@ -1691,9 +1691,9 @@ static void snapScanFreezeStore(snapScanCtx *ctx, int s) {
 
 /* The store's last dict completed: the guard comes off now, not at release,
  * because the caller of an abort (FLUSHALL, SWAPDB, DEBUG RELOAD) frees or
- * replaces the store right after, before snapScanRelease() runs. */
-static void snapScanStoreDone(snapScanCtx *ctx, int s) {
-    snapScanStore *st = &ctx->store[s];
+ * replaces the store right after, before hybsnapScanRelease() runs. */
+static void hybsnapScanStoreDone(hybsnapScanCtx *ctx, int s) {
+    hybsnapScanStore *st = &ctx->store[s];
     if (!st->frozen) return;
     serverAssert(st->nrefs == 0);
     kvstoreSnapGuardSet(st->kvs, NULL, NULL);
@@ -1708,19 +1708,19 @@ static void snapScanStoreDone(snapScanCtx *ctx, int s) {
  * land in i + j*n, so its bitmap is k copies of the old one. */
 /* The dict's state if this save attached one (a leftover of another save is
  * not ours to touch; the main thread's access releases it). */
-static snapDictState *snapScanOwnState(snapScanCtx *ctx, dict *d) {
+static hybsnapDictState *hybsnapScanOwnState(hybsnapScanCtx *ctx, dict *d) {
     if (!ctx) return NULL;
-    snapDictState *sn = snapMeta(d)->ext;
-    if (!sn || SNAP_WORD_GEN(snapWordLoad(d)) != ctx->gen) return NULL;
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;
+    if (!sn || HYBSNAP_WORD_GEN(hybsnapWordLoad(d)) != ctx->gen) return NULL;
     return sn;
 }
 
 /* An attached, unreached dict grew or finished rehashing: its bitmap follows
  * the table. */
-static void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d) {
+static void hybsnapScanDictRehashStarted(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
-    snapDictState *sn = snapScanOwnState(ctx, d);
+    hybsnapDictState *sn = hybsnapScanOwnState(ctx, d);
     if (!sn) return;
     unsigned long size0 = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
     if (sn->bits[1]) {   /* should not happen: a rehash started over an unfinished one */
@@ -1757,10 +1757,10 @@ static void snapScanDictRehashStarted(snapScanCtx *ctx, int s, int didx, dict *d
 }
 
 /* The rehash completed: the new table is the table. */
-static void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict *d) {
+static void hybsnapScanDictRehashCompleted(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
     UNUSED(didx);
     UNUSED(s);
-    snapDictState *sn = snapScanOwnState(ctx, d);
+    hybsnapDictState *sn = hybsnapScanOwnState(ctx, d);
     if (!sn || !sn->bits[1]) return;   /* the dict was not attached when this rehash started: nothing to carry */
     if (sn->bits[0]) {
         ctx->bitmap_bytes -= sn->bytes[0];
@@ -1772,50 +1772,50 @@ static void snapScanDictRehashCompleted(snapScanCtx *ctx, int s, int didx, dict 
     sn->bytes[1] = 0;
 }
 
-static long snapScanDictsGrown(snapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
-static long snapScanRetainedDicts(snapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
+static long hybsnapScanDictsGrown(hybsnapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
+static long hybsnapScanRetainedDicts(hybsnapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
 
 /* Chain-walk callback on the scan thread: decode the entry and dispatch. */
-static void snapScanEntryCb(void *privdata, const dictEntry *de, dictEntry **plink) {
+static void hybsnapScanEntryCb(void *privdata, const dictEntry *de, dictEntry **plink) {
     UNUSED(plink);
-    struct snapScanEntryArgs *a = privdata;
+    struct hybsnapScanEntryArgs *a = privdata;
     atomicIncr(a->ctx->keys_dispatched, 1);
     a->ctx->dispatch(a->ctx->privdata, a->s, a->didx, dictGetKV(de));
 }
 
-static inline int snapScanAborted(snapScanCtx *ctx) {
+static inline int hybsnapScanAborted(hybsnapScanCtx *ctx) {
     int v;
     atomicGet(ctx->abort, v);
     return v;
 }
 
 /* Scan thread: read one frozen dict, a batch of buckets at a time, each
- * batch announced and kept below hi (snapScanReach). Returns 1 if aborted. */
-static int snapScanWalkDict(snapScanCtx *ctx, int s, int didx, dict *d, unsigned long *since_done) {
-    struct snapScanEntryArgs a = { ctx, s, didx };
-    uint64_t ord = snapOrd(ctx, s, didx);
+ * batch announced and kept below hi (hybsnapScanReach). Returns 1 if aborted. */
+static int hybsnapScanWalkDict(hybsnapScanCtx *ctx, int s, int didx, dict *d, unsigned long *since_done) {
+    struct hybsnapScanEntryArgs a = { ctx, s, didx };
+    uint64_t ord = hybsnapOrd(ctx, s, didx);
     /* The layout: hi past it means the main thread paused the dict first
-     * (snapWindowAdvance), and with no limit no section is open. */
-    uint64_t lp = SNAP_POS(ord, 0, 0);
-    if (!snapScanReach(ctx, lp, lp)) return 1;
+     * (hybsnapWindowAdvance), and with no limit no section is open. */
+    uint64_t lp = HYBSNAP_POS(ord, 0, 0);
+    if (!hybsnapScanReach(ctx, lp, lp)) return 1;
     int rehashing = dictIsRehashing(d);   /* stable: rehashing is paused */
-    snapScanSetLo(lp + 1);
+    hybsnapScanSetLo(lp + 1);
     for (int t = 0; t < (rehashing ? 2 : 1); t++) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[t]);
-        serverAssert(size < (1UL << SNAP_POS_IDX_BITS));
-        uint64_t base = SNAP_POS(ord, 1 + t, 0);
+        serverAssert(size < (1UL << HYBSNAP_POS_IDX_BITS));
+        uint64_t base = HYBSNAP_POS(ord, 1 + t, 0);
         /* Buckets of table 0 below rehashidx were moved to table 1 already. */
         unsigned long lo = (t == 0 && rehashing) ? (unsigned long)d->rehashidx : 0;
         int primed = 0;   /* the first buckets of the table are prefetched once, later ones by the lookahead */
         while (lo < size) {
-            unsigned long hi = lo + SNAP_SCAN_BATCH;
+            unsigned long hi = lo + HYBSNAP_SCAN_BATCH;
             if (hi > size || hi < lo) hi = size;
             /* The batch is announced with its prefetch lookahead: the thread
              * touches no bucket head beyond cur, nor at or beyond hi (the main
              * thread may be writing those, emitted ahead and then in place). */
-            unsigned long ahead = hi + SNAP_SCAN_LOOKAHEAD;
+            unsigned long ahead = hi + HYBSNAP_SCAN_LOOKAHEAD;
             if (ahead > size || ahead < hi) ahead = size;
-            uint64_t end = snapScanReach(ctx, base + lo, base + ahead - 1);
+            uint64_t end = hybsnapScanReach(ctx, base + lo, base + ahead - 1);
             if (!end) return 1;
             unsigned long lim = (unsigned long)(end - base);   /* bucket heads below lim may be touched */
             if (hi > lim) hi = lim;
@@ -1823,33 +1823,33 @@ static int snapScanWalkDict(snapScanCtx *ctx, int s, int didx, dict *d, unsigned
              * first entries of the next buckets on their way, then the values
              * of the ones after. */
             if (!primed) {
-                for (unsigned long k = lo; k < lo + SNAP_SCAN_PREFETCH && k < lim; k++)
-                    if (!snapScanBucketEmitted(ctx, s, didx, t, k)) dictWalkPrefetchBucket(d, t, k);
+                for (unsigned long k = lo; k < lo + HYBSNAP_SCAN_PREFETCH && k < lim; k++)
+                    if (!hybsnapScanBucketEmitted(ctx, s, didx, t, k)) dictWalkPrefetchBucket(d, t, k);
                 primed = 1;
             }
             for (unsigned long i = lo; i < hi; i++) {
-                if (i + SNAP_SCAN_PREFETCH < lim && !snapScanBucketEmitted(ctx, s, didx, t, i + SNAP_SCAN_PREFETCH))
-                    dictWalkPrefetchBucket(d, t, i + SNAP_SCAN_PREFETCH);
-#if SNAP_SCAN_PREFETCH2
+                if (i + HYBSNAP_SCAN_PREFETCH < lim && !hybsnapScanBucketEmitted(ctx, s, didx, t, i + HYBSNAP_SCAN_PREFETCH))
+                    dictWalkPrefetchBucket(d, t, i + HYBSNAP_SCAN_PREFETCH);
+#if HYBSNAP_SCAN_PREFETCH2
                 /* The header of that bucket is in cache by now: a raw string's
                  * value allocation is the next miss ('ptr' exists only for
                  * encodings that have a separate allocation). */
-                if (i + SNAP_SCAN_PREFETCH2 < lim && !snapScanBucketEmitted(ctx, s, didx, t, i + SNAP_SCAN_PREFETCH2)) {
-                    dictEntry *de2 = dictWalkBucketHead(d, t, i + SNAP_SCAN_PREFETCH2);
+                if (i + HYBSNAP_SCAN_PREFETCH2 < lim && !hybsnapScanBucketEmitted(ctx, s, didx, t, i + HYBSNAP_SCAN_PREFETCH2)) {
+                    dictEntry *de2 = dictWalkBucketHead(d, t, i + HYBSNAP_SCAN_PREFETCH2);
                     if (de2) {
                         kvobj *kv2 = dictGetKV(de2);
                         if (kv2->type == OBJ_STRING && kv2->encoding == OBJ_ENCODING_RAW) __builtin_prefetch(kv2->ptr);
                     }
                 }
 #endif
-                if (snapScanBucketEmitted(ctx, s, didx, t, i)) {
+                if (hybsnapScanBucketEmitted(ctx, s, didx, t, i)) {
                     atomicIncr(ctx->buckets_skipped, 1);
                 } else {
-                    dictWalkBucketRange(d, t, i, i + 1, snapScanEntryCb, &a);
+                    dictWalkBucketRange(d, t, i, i + 1, hybsnapScanEntryCb, &a);
                 }
-                snapScanSetLo(base + i + 1);
+                hybsnapScanSetLo(base + i + 1);
             }
-            if (snapScanAborted(ctx)) return 1;
+            if (hybsnapScanAborted(ctx)) return 1;
             *since_done += hi - lo;
             if (*since_done >= ctx->window_buckets) {
                 *since_done = 0;
@@ -1861,41 +1861,41 @@ static int snapScanWalkDict(snapScanCtx *ctx, int s, int didx, dict *d, unsigned
     return 0;
 }
 
-static void snapScanPublishScanned(snapScanCtx *ctx, int s, int didx, dict *d) {
-    snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNED));
+static void hybsnapScanPublishScanned(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
+    hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNED));
     atomicSet(ctx->cur_slot, -1);
     long wr;
     atomicGet(ctx->ring_wr, wr);
-    ctx->ring[wr] = SNAP_SCAN_ENC(s, didx);
+    ctx->ring[wr] = HYBSNAP_SCAN_ENC(s, didx);
     atomicSetWithSync(ctx->ring_wr, wr + 1);   /* release: ring[wr] visible before wr+1 */
     triggerEventNotifier(ctx->en);
 }
 
-static void *snapScanThreadMain(void *arg) {
-    snapScanCtx *ctx = arg;
+static void *hybsnapScanThreadMain(void *arg) {
+    hybsnapScanCtx *ctx = arg;
     redis_set_thread_title("snap_scan");
     makeThreadKillable();
-    snap_on_scan_thread = 1;
+    hybsnap_on_scan_thread = 1;
     if (ctx->thread_init) ctx->thread_init(ctx->privdata);
 
     unsigned long since_done = 0;   /* buckets read since the last window_done */
-    for (int s = 0; s < ctx->num_stores && !snapScanAborted(ctx); s++) {
-        if (!ctx->store[s].frozen) continue;   /* nothing of the fork instant in it (snapScanFreezeStore) */
+    for (int s = 0; s < ctx->num_stores && !hybsnapScanAborted(ctx); s++) {
+        if (!ctx->store[s].frozen) continue;   /* nothing of the fork instant in it (hybsnapScanFreezeStore) */
         for (int didx = 0; didx < ctx->store[s].num_dicts; didx++) {
-            if (snapScanAborted(ctx)) break;
+            if (hybsnapScanAborted(ctx)) break;
             /* The save's own table: the fork-instant dicts, referenced,
              * whatever the store did with them since. */
-            dict *d = snapTableDict(ctx, s, didx);
+            dict *d = hybsnapTableDict(ctx, s, didx);
             if (!d) continue;
             atomicIncr(ctx->slots_scanned, 1);
             /* Claim before announcing the layout: a cap that finds the
              * thread on the dict sees SCANNING and pauses it, as does any
              * access of the dict from then on (guard). */
-            snapScanClaim(ctx, d);
-            atomicSet(ctx->cur_slot, (int64_t)SNAP_SCAN_ENC(s, didx));
-            if (snapScanWalkDict(ctx, s, didx, d, &since_done))
-                break;   /* Aborted: leave the slot SCANNING; snapScanAbort() completes it. */
-            snapScanPublishScanned(ctx, s, didx, d);
+            hybsnapScanClaim(ctx, d);
+            atomicSet(ctx->cur_slot, (int64_t)HYBSNAP_SCAN_ENC(s, didx));
+            if (hybsnapScanWalkDict(ctx, s, didx, d, &since_done))
+                break;   /* Aborted: leave the slot SCANNING; hybsnapScanAbort() completes it. */
+            hybsnapScanPublishScanned(ctx, s, didx, d);
             if (since_done && ctx->window_done) {
                 since_done = 0;
                 ctx->window_done(ctx->privdata);
@@ -1906,11 +1906,11 @@ static void *snapScanThreadMain(void *arg) {
      * bucket. Once the section that may still be emitting has closed,
      * everything the main thread produced is in the queue: drain it before
      * the end marker. */
-    __atomic_store_n(&snap_cur, ctx->pos_end, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&snap_lo, ctx->pos_end, __ATOMIC_SEQ_CST);
-    snapWalkerQuiesce(ctx);
+    __atomic_store_n(&hybsnap_cur, ctx->pos_end, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&hybsnap_lo, ctx->pos_end, __ATOMIC_SEQ_CST);
+    hybsnapWalkerQuiesce(ctx);
     if (ctx->window_done) ctx->window_done(ctx->privdata);
-    if (ctx->thread_done) ctx->thread_done(ctx->privdata, snapScanAborted(ctx));
+    if (ctx->thread_done) ctx->thread_done(ctx->privdata, hybsnapScanAborted(ctx));
     atomicSetWithSync(ctx->finished, 1);
     triggerEventNotifier(ctx->en);
     return NULL;
@@ -1921,24 +1921,24 @@ static void *snapScanThreadMain(void *arg) {
  * may run on the main thread between this call and the fork of the writer
  * child. One pass per non-empty store: a reference and a pointer per
  * fork-instant dict, nothing allocated per dict. */
-static void snapScanFreeze(snapScanCtx *ctx) {
+static void hybsnapScanFreeze(hybsnapScanCtx *ctx) {
     serverAssert(!ctx->started && !ctx->frozen_all);
-    snapWindowReset(NULL);   /* no thread yet: drop the positions of a previous save */
-    for (int s = 0; s < ctx->num_stores; s++) snapScanFreezeStore(ctx, s);
+    hybsnapWindowReset(NULL);   /* no thread yet: drop the positions of a previous save */
+    for (int s = 0; s < ctx->num_stores; s++) hybsnapScanFreezeStore(ctx, s);
     ctx->ring = zmalloc(sizeof(uint64_t) * (ctx->slots_total ? ctx->slots_total : 1));
     ctx->frozen_all = 1;
 }
 
 /* Main thread. Spawn the scan thread over an already frozen keyspace. */
-static int snapScanStartThread(snapScanCtx *ctx) {
+static int hybsnapScanStartThread(hybsnapScanCtx *ctx) {
     serverAssert(!ctx->started && ctx->frozen_all);
-    snapWindowReset(ctx);
+    hybsnapWindowReset(ctx);
     uint64_t v;
-    atomicGet(snap_funnel_seq, v);
-    if (v & 1) snapWindowCap(ctx);   /* started from inside a section: the thread begins capped */
-    if (pthread_create(&ctx->tid, NULL, snapScanThreadMain, ctx) != 0) {
-        serverLog(LL_WARNING, "snapScanStartThread: pthread_create failed: %s", strerror(errno));
-        snapWindowReset(NULL);
+    atomicGet(hybsnap_funnel_seq, v);
+    if (v & 1) hybsnapWindowCap(ctx);   /* started from inside a section: the thread begins capped */
+    if (pthread_create(&ctx->tid, NULL, hybsnapScanThreadMain, ctx) != 0) {
+        serverLog(LL_WARNING, "hybsnapScanStartThread: pthread_create failed: %s", strerror(errno));
+        hybsnapWindowReset(NULL);
         return C_ERR;
     }
     ctx->started = 1;
@@ -1951,16 +1951,16 @@ static int snapScanStartThread(snapScanCtx *ctx) {
  * bucket bitmaps and overlay, and is paused, on demand: at the first
  * structural write to it, before hi may pass its layout, or on an access while
  * the thread is on it. Returns C_OK or C_ERR (nothing frozen on error).
- * From this point until snapScanRelease() every main-thread write to an owed
+ * From this point until hybsnapScanRelease() every main-thread write to an owed
  * dict goes through the overlay hooks: in place once the snapshot holds the
  * bucket, to a duplicate of its chain while the thread reads it.
- * snapScanStart() == snapScanFreeze() + snapScanStartThread(). */
-static int snapScanStart(snapScanCtx *ctx) {
-    snapScanFreeze(ctx);
-    if (snapScanStartThread(ctx) != C_OK) {
+ * hybsnapScanStart() == hybsnapScanFreeze() + hybsnapScanStartThread(). */
+static int hybsnapScanStart(hybsnapScanCtx *ctx) {
+    hybsnapScanFreeze(ctx);
+    if (hybsnapScanStartThread(ctx) != C_OK) {
         /* Nothing was scanned: complete whatever was attached as aborted
          * (drains an empty overlay, unfreezes) and take the guards off. */
-        snapScanFinishAll(ctx);
+        hybsnapScanFinishAll(ctx);
         ctx->frozen_all = 0;
         return C_ERR;
     }
@@ -1968,7 +1968,7 @@ static int snapScanStart(snapScanCtx *ctx) {
 }
 
 /* Thread-side request to stop (e.g. the channel to the child broke). */
-static inline void snapScanRequestAbort(snapScanCtx *ctx) {
+static inline void hybsnapScanRequestAbort(hybsnapScanCtx *ctx) {
     atomicSetWithSync(ctx->abort, 1);
 }
 
@@ -1977,8 +1977,8 @@ static inline void snapScanRequestAbort(snapScanCtx *ctx) {
  * kvstore overlay; the bitmaps are freed (their bytes returned) and the
  * layout unpaused here. The dict may have left its store meanwhile: the state
  * follows the dict, so this works wherever it is. */
-static size_t snapScanStateRelease(dict *d) {
-    snapDictState *sn = snapMeta(d)->ext;
+static size_t hybsnapScanStateRelease(dict *d) {
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;
     size_t bytes = 0;
     if (sn) {
         for (int t = 0; t < 2; t++) {
@@ -1989,7 +1989,7 @@ static size_t snapScanStateRelease(dict *d) {
             dictResumeRehashing(d);
             dictResumeAutoResize(d);
         }
-        __atomic_store_n(&snapMeta(d)->ext, NULL, __ATOMIC_RELEASE);
+        __atomic_store_n(&hybsnapMeta(d)->ext, NULL, __ATOMIC_RELEASE);
         zfree(sn);
     }
     kvstoreOverlayRelease(d);
@@ -1998,13 +1998,13 @@ static size_t snapScanStateRelease(dict *d) {
 
 /* Main thread: finish one slot (release the overlay and bitmaps, resume
  * the layout, slot-done hook, publish DONE). */
-static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted) {
+static void hybsnapScanCompleteSlot(hybsnapScanCtx *ctx, int s, int didx, int aborted) {
     /* The thread no longer reads this slot: whatever buckets are still
      * overlayed (normally none: they are written back as the window moves) go back to
      * the dict, the dict is unfrozen, and the save's reference goes: a dict
      * its store let go of meanwhile (freed, emptied, moved and released) is
      * freed here. */
-    dict *d = snapTableDict(ctx, s, didx);
+    dict *d = hybsnapTableDict(ctx, s, didx);
     serverAssert(d != NULL);
     /* DONE first: the release below writes the overlay back and then asks the
      * store whether the dict may be freed, through the public kvstore entry
@@ -2013,28 +2013,28 @@ static void snapScanCompleteSlot(snapScanCtx *ctx, int s, int didx, int aborted)
      * table dict in that state, which this completion would then leave
      * behind for the dict's eventual free to trip over (seen with the slot
      * snapshot's fail-point aborts). With DONE published the guard declines. */
-    snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_DONE));
-    ctx->bitmap_bytes -= snapScanStateRelease(d);
+    hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_DONE));
+    ctx->bitmap_bytes -= hybsnapScanStateRelease(d);
     if (ctx->slot_done) ctx->slot_done(ctx->privdata, s, didx, aborted);
-    if (kvstoreDictRefcount(d) == 1) { ctx->retained_dicts++; snap_stat_retained_dicts++; }   /* the save outlived the store's hold on it */
+    if (kvstoreDictRefcount(d) == 1) { ctx->retained_dicts++; hybsnap_stat_retained_dicts++; }   /* the save outlived the store's hold on it */
     __atomic_store_n(&ctx->store[s].dicts[didx], NULL, __ATOMIC_RELAXED);
     kvstoreDictUnref(d);
     ctx->store[s].nrefs--;
     ctx->slots_done++;
-    if (ctx->store[s].nrefs == 0) snapScanStoreDone(ctx, s);
+    if (ctx->store[s].nrefs == 0) hybsnapScanStoreDone(ctx, s);
 }
 
 /* Main thread. Handles slots the thread finished since the last call: for
  * each, calls slot_done, unfreezes the dict and publishes DONE. Returns the
  * number of slots completed. Also to be called once after
- * snapScanIsFinished() to drain the tail. */
-static int snapScanHandleCompletions(snapScanCtx *ctx) {
+ * hybsnapScanIsFinished() to drain the tail. */
+static int hybsnapScanHandleCompletions(hybsnapScanCtx *ctx) {
     int n = 0;
     long wr;
     atomicGetWithSync(ctx->ring_wr, wr);   /* acquire */
     while (ctx->ring_rd < wr) {
         uint64_t v = ctx->ring[ctx->ring_rd++];
-        snapScanCompleteSlot(ctx, SNAP_SCAN_DEC_STORE(v), SNAP_SCAN_DEC_DIDX(v), 0);
+        hybsnapScanCompleteSlot(ctx, HYBSNAP_SCAN_DEC_STORE(v), HYBSNAP_SCAN_DEC_DIDX(v), 0);
         n++;
     }
     return n;
@@ -2044,67 +2044,67 @@ static int snapScanHandleCompletions(snapScanCtx *ctx) {
  * still holds as aborted (the dict the thread was reading, then every
  * remaining entry of the save's table: a pointer per slot), then every
  * store. Nothing is owed after this. */
-static void snapScanFinishAll(snapScanCtx *ctx) {
+static void hybsnapScanFinishAll(hybsnapScanCtx *ctx) {
     int64_t cur;
     atomicGet(ctx->cur_slot, cur);
     if (cur >= 0) {
         atomicSet(ctx->cur_slot, -1);
-        snapScanCompleteSlot(ctx, SNAP_SCAN_DEC_STORE((uint64_t)cur), SNAP_SCAN_DEC_DIDX((uint64_t)cur), 1);
+        hybsnapScanCompleteSlot(ctx, HYBSNAP_SCAN_DEC_STORE((uint64_t)cur), HYBSNAP_SCAN_DEC_DIDX((uint64_t)cur), 1);
     }
     for (int s = 0; s < ctx->num_stores; s++) {
-        snapScanStore *st = &ctx->store[s];
+        hybsnapScanStore *st = &ctx->store[s];
         if (!st->frozen) continue;
         for (int didx = 0; st->nrefs > 0 && didx < st->num_dicts; didx++)
-            if (st->dicts[didx]) snapScanCompleteSlot(ctx, s, didx, 1);
-        snapScanStoreDone(ctx, s);   /* a no-op when the last completion did it */
+            if (st->dicts[didx]) hybsnapScanCompleteSlot(ctx, s, didx, 1);
+        hybsnapScanStoreDone(ctx, s);   /* a no-op when the last completion did it */
     }
     ctx->ended = 1;
 }
 
-static int snapScanIsFinished(snapScanCtx *ctx) {
+static int hybsnapScanIsFinished(hybsnapScanCtx *ctx) {
     int v;
     atomicGetWithSync(ctx->finished, v);
     return v;
 }
 
-static void snapScanJoin(snapScanCtx *ctx) {
+static void hybsnapScanJoin(hybsnapScanCtx *ctx) {
     if (ctx->started && !ctx->joined) {
         pthread_join(ctx->tid, NULL);
         ctx->joined = 1;
-        if (snap_live == ctx) snap_live = NULL;   /* lo stays where the thread left it */
+        if (hybsnap_live == ctx) hybsnap_live = NULL;   /* lo stays where the thread left it */
     }
 }
 
 /* Main thread. Asks the thread to stop (it stops within one cursor step),
  * joins it, drains fully-scanned slots normally and completes every other
  * slot with aborted=1, unfreezing all dicts. */
-static void snapScanAbort(snapScanCtx *ctx) {
+static void hybsnapScanAbort(hybsnapScanCtx *ctx) {
     if (!ctx->started) {
         /* Frozen but no thread (fork failure path): unfreeze everything. */
-        if (ctx->frozen_all) snapScanFinishAll(ctx);
+        if (ctx->frozen_all) hybsnapScanFinishAll(ctx);
         return;
     }
     atomicSetWithSync(ctx->abort, 1);
-    snapScanJoin(ctx);
+    hybsnapScanJoin(ctx);
     /* Fully scanned slots complete normally. */
-    snapScanHandleCompletions(ctx);
+    hybsnapScanHandleCompletions(ctx);
     /* Everything else was interrupted. */
-    snapScanFinishAll(ctx);
+    hybsnapScanFinishAll(ctx);
 }
 
 /* Main thread. Joins the thread if still running (does not abort it: call
- * snapScanAbort() first if the scan may be in progress) and frees the ctx.
+ * hybsnapScanAbort() first if the scan may be in progress) and frees the ctx.
  * Every slot must be DONE by then unless the ctx was never started. */
-static void snapScanRelease(snapScanCtx *ctx) {
+static void hybsnapScanRelease(hybsnapScanCtx *ctx) {
     if (ctx == NULL) return;
-    snapScanJoin(ctx);
+    hybsnapScanJoin(ctx);
     if (ctx->started)
-        snapScanWindowStats(ctx, &snap_last_window.stalls, &snap_last_window.stall_us, &snap_last_window.grants);
+        hybsnapScanWindowStats(ctx, &hybsnap_last_window.stalls, &hybsnap_last_window.stall_us, &hybsnap_last_window.grants);
     if (ctx->started) {
         /* Drain the tail, then complete whatever the thread left owed (it
          * stopped early on a broken channel) so no slot stays frozen. */
-        snapScanHandleCompletions(ctx);
-        snapScanFinishAll(ctx);
+        hybsnapScanHandleCompletions(ctx);
+        hybsnapScanFinishAll(ctx);
     }
     for (int s = 0; s < ctx->num_stores; s++)
         serverAssert(!ctx->store[s].frozen);   /* every slot completed: the guard is already off */
@@ -2117,32 +2117,32 @@ static void snapScanRelease(snapScanCtx *ctx) {
 
 /* Either thread. DONE for a slot the save holds nothing of (empty at the
  * fork instant, created since, or completed). */
-static int snapScanSlotState(snapScanCtx *ctx, int store_idx, int didx) {
-    if (ctx->ended || !ctx->store[store_idx].frozen) return SNAP_SLOT_DONE;
-    dict *d = snapTableDict(ctx, store_idx, didx);
-    if (!d) return SNAP_SLOT_DONE;
-    return snapDictStateOf(ctx, d);
+static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx) {
+    if (ctx->ended || !ctx->store[store_idx].frozen) return HYBSNAP_SLOT_DONE;
+    dict *d = hybsnapTableDict(ctx, store_idx, didx);
+    if (!d) return HYBSNAP_SLOT_DONE;
+    return hybsnapDictStateOf(ctx, d);
 }
 
 /* Readable fd that becomes ready whenever a slot completes or the thread
- * exits; register snapScanAeHandler() on it with AE_READABLE and 'ctx' as
+ * exits; register hybsnapScanAeHandler() on it with AE_READABLE and 'ctx' as
  * client data. -1 if unavailable. */
-static int snapScanReadEventFd(snapScanCtx *ctx) {
+static int hybsnapScanReadEventFd(hybsnapScanCtx *ctx) {
     return ctx->en ? getReadEventFd(ctx->en) : -1;
 }
 
-static void snapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
+static void hybsnapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata, int mask) {
     UNUSED(el);
     UNUSED(fd);
     UNUSED(mask);
-    snapScanCtx *ctx = privdata;
+    hybsnapScanCtx *ctx = privdata;
     handleEventNotifier(ctx->en);
-    snapScanHandleCompletions(ctx);
+    hybsnapScanHandleCompletions(ctx);
 }
 
 /* Progress for INFO / tests: dicts allocated at freeze in the scanned
  * stores, dicts the thread passed, dicts finished (completed or skipped). */
-static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_scanned,
+static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched)
 {
     if (slots_total) *slots_total = ctx->slots_total;
@@ -2157,20 +2157,20 @@ static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_sc
  *
  * Fork-instant sequence (main thread, nothing interleaves):
  *   1. capture per-db (and per-slot) key/expire counts for RESIZEDB/SLOT_INFO
- *   2. snapScanFreeze(): one reference and a generation stamp per non-empty
+ *   2. hybsnapScanFreeze(): one reference and a generation stamp per non-empty
  *      keyspace dict, a guard on every store; nothing is paused and nothing
  *      is allocated per dict yet (bitmaps and overlays attach on demand,
  *      at the first write that needs them)
- *   3. redisFork(): the child inherits the SNAP_FORK values (copy-on-write)
+ *   3. redisFork(): the child inherits the HYBSNAP_FORK values (copy-on-write)
  *      but none of the DONTFORK memory (headers, NOFORK values, tables)
- *   4. snapScanStartThread(): the scan thread walks the save's table of
+ *   4. hybsnapScanStartThread(): the scan thread walks the save's table of
  *      fork-instant dicts below hi and streams records to the child
  *
  * Two pipes to the child. The small channel carries BUFFER messages: 64 KB
  * staging buffers of pre-encoded records, produced by the scan thread and by
  * the main thread's emit-ahead (forwarded by the thread every W buckets
  * and at the end of each dict, in order). The big channel carries one KVOBJ message per
- * SNAP_FORK key (a copy of the kvobj header; the child follows the value
+ * HYBSNAP_FORK key (a copy of the kvobj header; the child follows the value
  * pointer into its own snapshot), then END with both channels' message
  * counts. A BUFFER may depend on big values that must precede it in the
  * output (robj_off); the child holds it until they are written.
@@ -2179,35 +2179,35 @@ static void snapScanProgress(snapScanCtx *ctx, long *slots_total, long *slots_sc
  * SELECT in AOF command form) tracked per message, records, footer, fsync,
  * rename; or the replica sockets for a diskless sync. Completion and abort
  * both flow through the classic child machinery (checkChildrenDone -> the done
- * handler -> snapOnChildEnd).
+ * handler -> hybsnapOnChildEnd).
  */
 
-static size_t snap_last_retained_peak = 0;
-static size_t snap_last_queued_peak = 0;
-static long long snap_last_inplace_writes = 0;
+static size_t hybsnap_last_retained_peak = 0;
+static size_t hybsnap_last_queued_peak = 0;
+static long long hybsnap_last_inplace_writes = 0;
 
-static long long snapSaveInplaceWrites(void) { return snap_save ? snap_save->inplace_writes : 0; }
-static long long snapSaveLastInplaceWrites(void) { return snap_last_inplace_writes; }
+static long long hybsnapSaveInplaceWrites(void) { return hybsnap_save ? hybsnap_save->inplace_writes : 0; }
+static long long hybsnapSaveLastInplaceWrites(void) { return hybsnap_last_inplace_writes; }
 
 
-int snapSaveInProgress(void) {
-    return snap_save != NULL && !snap_save->aborted;
+int hybsnapSaveInProgress(void) {
+    return hybsnap_save != NULL && !hybsnap_save->aborted;
 }
 
 /* Bytes the overlay currently keeps alive for the running save (replaced or
  * deleted originals); the peak of the last completed save and the
  * hard-mark abort counter are reported next to it. */
-static size_t snapSaveRetainedBytes(void) { return snap_save ? snap_save->retained_bytes : 0; }
-static size_t snapSaveLastRetainedPeak(void) { return snap_last_retained_peak; }
-static size_t snapSaveBitmapBytes(void) {
-    if (!snap_save || snap_child_no_keyspace) return 0;   /* the stores live in the arena, not mapped in the child (crash report INFO) */
-    return snapScanBitmapBytes(snap_save->scan);
+static size_t hybsnapSaveRetainedBytes(void) { return hybsnap_save ? hybsnap_save->retained_bytes : 0; }
+static size_t hybsnapSaveLastRetainedPeak(void) { return hybsnap_last_retained_peak; }
+static size_t hybsnapSaveBitmapBytes(void) {
+    if (!hybsnap_save || hybsnap_child_no_keyspace) return 0;   /* the stores live in the arena, not mapped in the child (crash report INFO) */
+    return hybsnapScanBitmapBytes(hybsnap_save->scan);
 }
 /* Fork-instant dicts their store let go of (freed, flushed, moved out by a
  * slot trim) before the save completed them: the save read them to the end
  * and freed them. */
-static long snapSaveRetainedDicts(void) { return snap_stat_retained_dicts; }
-static long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(snap_save->scan) : 0; }
+static long hybsnapSaveRetainedDicts(void) { return hybsnap_stat_retained_dicts; }
+static long hybsnapSaveGrownDicts(void) { return hybsnap_save ? hybsnapScanDictsGrown(hybsnap_save->scan) : 0; }
 
 /* Main-thread emission (emit-ahead): bytes queued for the scan thread to
  * forward to the child (main-thread queue plus the thread's outbound queue),
@@ -2219,11 +2219,11 @@ static long snapSaveGrownDicts(void) { return snap_save ? snapScanDictsGrown(sna
  * per-slot size tables, the dict tables, the completion ring). Memory the
  * save holds for its duration and releases, not the dataset's: counting it
  * would evict keys during every save on an instance near its limit. */
-size_t snapSaveOverheadBytes(void) {
-    snapSave *sv = snap_save;
+size_t hybsnapSaveOverheadBytes(void) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv) return 0;
-    size_t bytes = snapSaveQueuedBytes() + sv->retained_bytes + snapScanBitmapBytes(sv->scan) + snapScanTableBytes(sv->scan);
-    bytes += (size_t)sv->dbnum * sizeof(snapDbSizes);
+    size_t bytes = hybsnapSaveQueuedBytes() + sv->retained_bytes + hybsnapScanBitmapBytes(sv->scan) + hybsnapScanTableBytes(sv->scan);
+    bytes += (size_t)sv->dbnum * sizeof(hybsnapDbSizes);
     for (int j = 0; j < sv->dbnum; j++)
         bytes += (size_t)sv->sizes[j].nslots * 2 * sizeof(unsigned long long);
     if (sv->trim_slots) bytes += CLUSTER_SLOTS / 8;
@@ -2231,63 +2231,63 @@ size_t snapSaveOverheadBytes(void) {
     return bytes;
 }
 
-static size_t snapSaveQueuedBytes(void) {
-    if (!snap_save) return 0;
+static size_t hybsnapSaveQueuedBytes(void) {
+    if (!hybsnap_save) return 0;
     size_t n, o;
-    atomicGet(snap_save->mq_bytes, n);
-    atomicGet(snap_save->oq_bytes, o);
+    atomicGet(hybsnap_save->mq_bytes, n);
+    atomicGet(hybsnap_save->oq_bytes, o);
     return n + o;
 }
-static size_t snapSaveLastQueuedPeak(void) { return snap_last_queued_peak; }
-static long long snapSaveMainBuckets(void) { return snap_save ? snap_save->main_buckets : 0; }
-static long long snapSaveMainKeys(void) { long long n = 0; if (snap_save) atomicGet(snap_save->main_keys, n); return n; }
+static size_t hybsnapSaveLastQueuedPeak(void) { return hybsnap_last_queued_peak; }
+static long long hybsnapSaveMainBuckets(void) { return hybsnap_save ? hybsnap_save->main_buckets : 0; }
+static long long hybsnapSaveMainKeys(void) { long long n = 0; if (hybsnap_save) atomicGet(hybsnap_save->main_keys, n); return n; }
 
 
 /* ---- INFO, DEBUG and the crash report (server.c, debug.c call these) ---- */
 
 /* INFO memory: the arena's allocator statistics (sampled by cron next to the
  * default arena's) and its fork visibility. */
-sds snapInfoMemory(sds info) {
+sds hybsnapInfoMemory(sds info) {
     return sdscatprintf(info, FMTARGS(
         "allocator_allocated_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_allocated,
         "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
         "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
         "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
-        "snap_nofork_arena_available:%d\r\n", snapArenaAvailable(),
-        "snap_nofork_arena_forkable:%d\r\n", snapArenaForkable(),
-        "snap_nofork_va_reserved:%zu\r\n", snapArenaVaReserved(),
-        "snap_nofork_va_used:%zu\r\n", snapArenaVaUsed()));
+        "snap_nofork_arena_available:%d\r\n", hybsnapArenaAvailable(),
+        "snap_nofork_arena_forkable:%d\r\n", hybsnapArenaForkable(),
+        "snap_nofork_va_reserved:%zu\r\n", hybsnapArenaVaReserved(),
+        "snap_nofork_va_used:%zu\r\n", hybsnapArenaVaUsed()));
 }
 
 /* current_save_keys_processed during a hybrid save: the child sees only the
- * SNAP_FORK keys, so the figure is what the scan thread and the main thread
+ * HYBSNAP_FORK keys, so the figure is what the scan thread and the main thread
  * dispatched so far; 'classic' otherwise. */
-size_t snapSaveKeysProcessed(size_t classic) {
-    if (!snapSaveInProgress()) return classic;
+size_t hybsnapSaveKeysProcessed(size_t classic) {
+    if (!hybsnapSaveInProgress()) return classic;
     long slots_total, slots_done;
     long long keys_nofork, keys_fork, bytes_sent;
-    snapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
-    return (size_t)(keys_nofork + keys_fork + snapSaveMainKeys());
+    hybsnapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
+    return (size_t)(keys_nofork + keys_fork + hybsnapSaveMainKeys());
 }
 
 /* INFO persistence: the running save's progress and queues, the last save's
  * peaks and the counters across saves. */
-sds snapInfoPersistence(sds info) {
+sds hybsnapInfoPersistence(sds info) {
     long slots_total = 0, slots_done = 0;
     long long keys_nofork = 0, keys_fork = 0, bytes_sent = 0;
-    snapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
+    hybsnapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
     kvstoreOverlayStats os = kvstoreOverlayStatsGet();
     long long stalls, stall_us, grants;
-    snapScanWindowStats(snap_save ? snap_save->scan : NULL, &stalls, &stall_us, &grants);
+    hybsnapScanWindowStats(hybsnap_save ? hybsnap_save->scan : NULL, &stalls, &stall_us, &grants);
     return sdscatprintf(info, FMTARGS(
-        "snap_save_in_progress:%d\r\n", snapSaveInProgress(),
+        "snap_save_in_progress:%d\r\n", hybsnapSaveInProgress(),
         "snap_save_slots_total:%ld\r\n", slots_total,
         "snap_save_slots_done:%ld\r\n", slots_done,
         "snap_save_keys_nofork:%lld\r\n", keys_nofork,
         "snap_save_keys_fork:%lld\r\n", keys_fork,
         "snap_save_bytes_sent:%lld\r\n", bytes_sent,
-        "snap_save_retained_bytes:%zu\r\n", snapSaveRetainedBytes(),
-        "snap_save_side_entries:%ld\r\n", snapSaveSideEntries(),
+        "snap_save_retained_bytes:%zu\r\n", hybsnapSaveRetainedBytes(),
+        "snap_save_side_entries:%ld\r\n", hybsnapSaveSideEntries(),
         "snap_save_overlay_buckets:%lld\r\n", os.buckets,
         "snap_save_overlay_clones:%lld\r\n", os.clones,
         "snap_save_overlay_peak_buckets:%ld\r\n", os.peak,
@@ -2295,33 +2295,33 @@ sds snapInfoPersistence(sds info) {
         "snap_save_scan_stalls:%lld\r\n", stalls,
         "snap_save_scan_stall_ms:%lld\r\n", stall_us / 1000,
         "snap_save_window_grants:%lld\r\n", grants,
-        "snap_last_save_retained_peak:%zu\r\n", snapSaveLastRetainedPeak(),
-        "snap_save_queued_bytes:%zu\r\n", snapSaveQueuedBytes(),
-        "snap_last_save_queued_peak:%zu\r\n", snapSaveLastQueuedPeak(),
-        "snap_save_bitmap_bytes:%zu\r\n", snapSaveBitmapBytes(),
-        "snap_save_grown_dicts:%ld\r\n", snapSaveGrownDicts(),
-        "snap_retained_dicts:%ld\r\n", snapSaveRetainedDicts(),
-        "snap_save_main_buckets:%lld\r\n", snapSaveMainBuckets(),
-        "snap_save_main_keys:%lld\r\n", snapSaveMainKeys(),
-        "snap_hard_mark_aborts:%lld\r\n", server.stat_snap_hard_mark_aborts,
-        "snap_saves:%lld\r\n", server.stat_snap_saves,
+        "snap_last_save_retained_peak:%zu\r\n", hybsnapSaveLastRetainedPeak(),
+        "snap_save_queued_bytes:%zu\r\n", hybsnapSaveQueuedBytes(),
+        "snap_last_save_queued_peak:%zu\r\n", hybsnapSaveLastQueuedPeak(),
+        "snap_save_bitmap_bytes:%zu\r\n", hybsnapSaveBitmapBytes(),
+        "snap_save_grown_dicts:%ld\r\n", hybsnapSaveGrownDicts(),
+        "snap_retained_dicts:%ld\r\n", hybsnapSaveRetainedDicts(),
+        "snap_save_main_buckets:%lld\r\n", hybsnapSaveMainBuckets(),
+        "snap_save_main_keys:%lld\r\n", hybsnapSaveMainKeys(),
+        "snap_hard_mark_aborts:%lld\r\n", server.stat_hybsnap_hard_mark_aborts,
+        "snap_saves:%lld\r\n", server.stat_hybsnap_saves,
         "snap_hybrid_blocked_by:%s\r\n", moduleHybridSnapshotBlockedBy(),
-        "snap_save_inplace_writes:%lld\r\n", snapSaveInplaceWrites(),
-        "snap_last_save_inplace_writes:%lld\r\n", snapSaveLastInplaceWrites(),
-        "snap_inplace_writes_total:%lld\r\n", server.stat_snap_inplace_writes));
+        "snap_save_inplace_writes:%lld\r\n", hybsnapSaveInplaceWrites(),
+        "snap_last_save_inplace_writes:%lld\r\n", hybsnapSaveLastInplaceWrites(),
+        "snap_inplace_writes_total:%lld\r\n", server.stat_hybsnap_inplace_writes));
 }
 
 /* The INFO sections a crash report may generate inside a child forked without
  * the keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module
  * fork: memory, keyspace, keysizes and hotkeys would fault); NULL in every
  * other process, meaning "all". */
-const char *const *snapCrashReportInfoSections(void) {
+const char *const *hybsnapCrashReportInfoSections(void) {
     static const char *const keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
                                        "cpu", "module_list", "errorstats", "cluster", NULL};
-    return snapChildNoKeyspace() ? keep : NULL;
+    return hybsnapChildNoKeyspace() ? keep : NULL;
 }
 
-static redisDb *snapDebugDbArg(client *c) {
+static redisDb *hybsnapDebugDbArg(client *c) {
     if (c->argc == 2) return c->db;
     long long dbid;
     if (getLongLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return NULL;
@@ -2334,18 +2334,18 @@ static redisDb *snapDebugDbArg(client *c) {
 
 /* DEBUG SNAP-PLACEMENT [dbid] | SNAP-DRIFT [dbid] | SNAP-WINDOW-BUCKETS [n].
  * Returns 1 when the subcommand was one of these (and replied), 0 otherwise. */
-int snapDebugCommand(client *c) {
+int hybsnapDebugCommand(client *c) {
     const char *sub = c->argv[1]->ptr;
     if (!strcasecmp(sub, "snap-placement") && (c->argc == 2 || c->argc == 3)) {
-        redisDb *db = snapDebugDbArg(c);
+        redisDb *db = hybsnapDebugDbArg(c);
         if (!db) return 1;
-        snapPlacementStats st;
-        snapPlacementScan(db, &st);
+        hybsnapPlacementStats st;
+        hybsnapPlacementScan(db, &st);
         addReplyMapLen(c, 11);
         addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
         addReplyBulkCString(c, "dict_tables_in_arena"); addReplyLongLong(c, st.dict_tables_in_arena);
         addReplyBulkCString(c, "dict_tables_outside"); addReplyLongLong(c, st.dict_tables_outside);
-        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, snapArenaAvailable());
+        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, hybsnapArenaAvailable());
         addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
         addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);
         addReplyBulkCString(c, "class_nofork"); addReplyLongLong(c, st.class_nofork);
@@ -2356,21 +2356,21 @@ int snapDebugCommand(client *c) {
         return 1;
     }
     if (!strcasecmp(sub, "snap-drift") && (c->argc == 2 || c->argc == 3)) {
-        redisDb *db = snapDebugDbArg(c);
-        if (db) snapPlacementDriftReply(c, db, 50);
+        redisDb *db = hybsnapDebugDbArg(c);
+        if (db) hybsnapPlacementDriftReply(c, db, 50);
         return 1;
     }
     if (!strcasecmp(sub, "snap-window-buckets") && (c->argc == 2 || c->argc == 3)) {
         if (c->argc == 3) {
             long long n;
             if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return 1;
-            if (n < 1 || n > SNAP_WINDOW_BUCKETS_MAX) {
+            if (n < 1 || n > HYBSNAP_WINDOW_BUCKETS_MAX) {
                 addReplyError(c, "Out of range");
                 return 1;
             }
-            snapSetWindowBuckets((unsigned long)n);
+            hybsnapSetWindowBuckets((unsigned long)n);
         }
-        addReplyLongLong(c, (long long)snapGetWindowBuckets());
+        addReplyLongLong(c, (long long)hybsnapGetWindowBuckets());
         return 1;
     }
     return 0;
@@ -2386,14 +2386,14 @@ int snapDebugCommand(client *c) {
  * whole. When the bucket is inside and 'win' is given, *win receives its
  * overlay window: the aligned run of ov_block buckets around it (at most the
  * table), tagged with the position of its last bucket. */
-static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
-    uint8_t st = snapScanDictStateMain(ctx, s, didx, d);
-    if (st >= SNAP_SLOT_SCANNED) return SNAP_POS_BEHIND;
-    if (st == SNAP_SLOT_PENDING && !snapDictPaused(d)) return SNAP_POS_AHEAD;
-    uint64_t base = SNAP_POS(snapOrd(ctx, s, didx), 1 + table, 0);
+static int hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
+    uint8_t st = hybsnapScanDictStateMain(ctx, s, didx, d);
+    if (st >= HYBSNAP_SLOT_SCANNED) return HYBSNAP_POS_BEHIND;
+    if (st == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) return HYBSNAP_POS_AHEAD;
+    uint64_t base = HYBSNAP_POS(hybsnapOrd(ctx, s, didx), 1 + table, 0);
     uint64_t p = base + idx;
-    if (p < snapPosLoLoad()) return SNAP_POS_BEHIND;
-    if (p >= ctx->hi) return SNAP_POS_AHEAD;
+    if (p < hybsnapPosLoLoad()) return HYBSNAP_POS_BEHIND;
+    if (p >= ctx->hi) return HYBSNAP_POS_AHEAD;
     if (win) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[table]);
         unsigned long n = ctx->ov_block < size ? ctx->ov_block : size;
@@ -2402,36 +2402,36 @@ static int snapBucketPosition(snapScanCtx *ctx, int s, int didx, dict *d, int ta
         win->n = n;
         win->last = base + win->lo + n - 1;
     }
-    return SNAP_POS_INSIDE;
+    return HYBSNAP_POS_INSIDE;
 }
 
 /* A message buffer holding only the header space; the payload is appended
  * and the header filled in when the message is handed over. */
-static sds snapMsgNew(size_t payload) {
-    sds m = sdsMakeRoomForNonGreedy(sdsempty(), sizeof(snapMsgHdr) + payload);
-    sdsIncrLen(m, sizeof(snapMsgHdr));
+static sds hybsnapMsgNew(size_t payload) {
+    sds m = sdsMakeRoomForNonGreedy(sdsempty(), sizeof(hybsnapMsgHdr) + payload);
+    sdsIncrLen(m, sizeof(hybsnapMsgHdr));
     return m;
 }
 
 /* mq_lock held: complete message 'm' (header space + payload) and queue it as
  * it will go on the pipe, without another copy. */
-static void snapSaveQueuePushLocked(snapSave *sv, uint32_t type, int dbid, int slot, sds m, uint32_t robj_off, uint64_t src_addr) {
-    snapMsgHdr h = { type, dbid, slot, (uint32_t)(sdslen(m) - sizeof(snapMsgHdr)), robj_off, src_addr };
+static void hybsnapSaveQueuePushLocked(hybsnapSave *sv, uint32_t type, int dbid, int slot, sds m, uint32_t robj_off, uint64_t src_addr) {
+    hybsnapMsgHdr h = { type, dbid, slot, (uint32_t)(sdslen(m) - sizeof(hybsnapMsgHdr)), robj_off, src_addr };
     memcpy(m, &h, sizeof(h));
     listAddNodeTail(sv->mq, m);
     atomicIncr(sv->mq_bytes, sdsAllocSize(m));
 }
 
 /* Main thread, mq_lock held: hand the partial BUFFER over as a message. */
-static void snapSaveMainStageFlushLocked(snapSave *sv) {
-    if (sdslen(sv->mstage) <= sizeof(snapMsgHdr)) return;
-    snapSaveQueuePushLocked(sv, SNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0, 0);
-    sv->mstage = snapMsgNew(0);
+static void hybsnapSaveMainStageFlushLocked(hybsnapSave *sv) {
+    if (sdslen(sv->mstage) <= sizeof(hybsnapMsgHdr)) return;
+    hybsnapSaveQueuePushLocked(sv, HYBSNAP_MSG_BUFFER, sv->mstage_dbid, sv->mstage_slot, sv->mstage, 0, 0);
+    sv->mstage = hybsnapMsgNew(0);
 }
 
 /* Cluster mode: is slot didx one an atomic slot migration was trimming at the
  * fork instant? Its keys are skipped by every producer (classic parity). */
-static inline int snapSaveSlotTrimmed(snapSave *sv, int didx) {
+static inline int hybsnapSaveSlotTrimmed(hybsnapSave *sv, int didx) {
     return sv->trim_slots && (sv->trim_slots[didx >> 3] & (1u << (didx & 7)));
 }
 
@@ -2439,7 +2439,7 @@ static inline int snapSaveSlotTrimmed(snapSave *sv, int didx) {
  * scan thread, child): the RDB key-value pair, or for an AOF rewrite without
  * the preamble the command form rewriteAppendOnlyFileRio writes per key
  * (per-type rewriter, PEXPIREAT, BLESS, module key metadata). 0 on success. */
-static int snapSaveWriteRecord(snapSave *sv, rio *r, kvobj *kv, int dbid) {
+static int hybsnapSaveWriteRecord(hybsnapSave *sv, rio *r, kvobj *kv, int dbid) {
     robj key;
     if (sv->slots_form) return slotSnapshotSaveKeyValuePair(r, kv, dbid) == C_OK ? 0 : -1;
     initStaticStringObject(key, kvobjGetKey(kv));
@@ -2450,35 +2450,35 @@ static int snapSaveWriteRecord(snapSave *sv, rio *r, kvobj *kv, int dbid) {
 /* Main thread: serialize the whole chain of bucket (table, idx) of dict d of
  * slot (s, didx) as it is now, i.e. still at its fork-instant state (no key of
  * a not yet emitted bucket ahead of the thread was ever written in place). */
-static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table, unsigned long idx) {
-    snap_main_emitting = 1;
+static void hybsnapSaveEmitBucket(hybsnapSave *sv, int s, int didx, dict *d, int table, unsigned long idx) {
+    hybsnap_main_emitting = 1;
     long long keys = 0;
     sdsclear(sv->mscratch);
     for (dictEntry *de = d->ht_table[table][idx]; de; de = dictGetNext(de)) {
         kvobj *kv = dictGetKV(de);
-        if (snapSaveSlotTrimmed(sv, didx)) {
+        if (hybsnapSaveSlotTrimmed(sv, didx)) {
             atomicIncr(sv->keys_skipped, 1);
             continue;
         }
-        int cls = snapKeyClass(kv);
-        if (cls == SNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = SNAP_FORK;
-        if (cls == SNAP_FORK) {
+        int cls = hybsnapKeyClass(kv);
+        if (cls == HYBSNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = HYBSNAP_FORK;
+        if (cls == HYBSNAP_FORK) {
             /* The child resolves kv->ptr in its own memory: it must be forkable. */
             char *alloc = kvobjGetAllocPtr(kv);
             debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
                               !zmalloc_is_nofork(kv->ptr));
             size_t len = zmalloc_size(alloc);
-            sds copy = snapMsgNew(len);
+            sds copy = hybsnapMsgNew(len);
             copy = sdscatlen(copy, alloc, len);
             pthread_mutex_lock(&sv->mq_lock);
-            snapSaveQueuePushLocked(sv, SNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
+            hybsnapSaveQueuePushLocked(sv, HYBSNAP_MSG_KVOBJ, s, didx, copy, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
             pthread_mutex_unlock(&sv->mq_lock);
         } else {
             /* The chain's records pile up in mscratch (appended: a rio over
              * the sds adds to it) and join the stage under one lock below. */
             rio r;
             rioInitWithBuffer(&r, sv->mscratch);
-            if (snapSaveWriteRecord(sv, &r, kv, s) != 0)
+            if (hybsnapSaveWriteRecord(sv, &r, kv, s) != 0)
                 serverPanic("Hybrid snapshot: failed to serialize a key on the main thread");
             sv->mscratch = r.io.buffer.ptr;
         }
@@ -2487,21 +2487,21 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
     if (sdslen(sv->mscratch)) {
         pthread_mutex_lock(&sv->mq_lock);
         if (sv->mstage_dbid != s || sv->mstage_slot != didx) {
-            snapSaveMainStageFlushLocked(sv);
+            hybsnapSaveMainStageFlushLocked(sv);
             sv->mstage_dbid = s;
             sv->mstage_slot = didx;
         }
         sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
         /* mq_bytes counts the stage when it is handed over as a message
-         * (snapSaveQueuePushLocked); counting the records here as well
+         * (hybsnapSaveQueuePushLocked); counting the records here as well
          * made the figure drift by the whole emitted volume and produced
          * a false hard-mark abort. */
-        if (sdslen(sv->mstage) - sizeof(snapMsgHdr) >= SNAP_STAGE_BYTES) snapSaveMainStageFlushLocked(sv);
+        if (sdslen(sv->mstage) - sizeof(hybsnapMsgHdr) >= HYBSNAP_STAGE_BYTES) hybsnapSaveMainStageFlushLocked(sv);
         pthread_mutex_unlock(&sv->mq_lock);
     }
     if (keys) atomicIncr(sv->main_keys, keys);
     sv->main_buckets++;
-    snap_main_emitting = 0;
+    hybsnap_main_emitting = 0;
 }
 
 /* Scan thread, every W buckets, at the end of each dict and before END:
@@ -2513,14 +2513,14 @@ static void snapSaveEmitBucket(snapSave *sv, int s, int didx, dict *d, int table
  * emit-ahead, which must not slow the command that triggered it, so its
  * share is slept before END), in slices so an abort or CONFIG SET
  * rdb-key-save-delay 0 is seen within 10 ms. */
-static int snapSaveKeyDelay(snapSave *sv, long long keys) {
+static int hybsnapSaveKeyDelay(hybsnapSave *sv, long long keys) {
     int slept = 0;
-    while (keys-- > 0 && !snapScanAborted(sv->scan)) {
+    while (keys-- > 0 && !hybsnapScanAborted(sv->scan)) {
         int delay;
         atomicGet(sv->key_save_delay, delay);
         if (delay <= 0) return slept;
         slept = 1;
-        while (delay > 0 && !snapScanAborted(sv->scan)) {
+        while (delay > 0 && !hybsnapScanAborted(sv->scan)) {
             int slice = delay > 10000 ? 10000 : delay;
             debugDelay(slice);
             delay -= slice;
@@ -2529,28 +2529,28 @@ static int snapSaveKeyDelay(snapSave *sv, long long keys) {
     return slept;
 }
 
-static void snapSaveWindowDone(void *priv) {
-    snapSave *sv = priv;
+static void hybsnapSaveWindowDone(void *priv) {
+    hybsnapSave *sv = priv;
     list *ready = sv->mq_ready;   /* empty: drained by the previous call */
     pthread_mutex_lock(&sv->mq_lock);
-    snapSaveMainStageFlushLocked(sv);
+    hybsnapSaveMainStageFlushLocked(sv);
     sv->mq_ready = sv->mq;
     sv->mq = ready;
     ready = sv->mq_ready;
     pthread_mutex_unlock(&sv->mq_lock);
-    if (listLength(ready)) snapStageFlush(sv);   /* this thread's partial buffer first (order is free anyway) */
+    if (listLength(ready)) hybsnapStageFlush(sv);   /* this thread's partial buffer first (order is free anyway) */
     listNode *ln;
     while ((ln = listFirst(ready)) != NULL) {
         sds m = listNodeValue(ln);
         size_t a = sdsAllocSize(m);
         listDelNode(ready, ln);
-        if (snapScanAborted(sv->scan)) {
+        if (hybsnapScanAborted(sv->scan)) {
             sdsfree(m);
             atomicDecr(sv->mq_bytes, a);
         } else {
             uint32_t type;
             memcpy(&type, m, sizeof(type));
-            snapOutEnqueue(sv, m, type);   /* the queue owns m now: it may be sent and freed already */
+            hybsnapOutEnqueue(sv, m, type);   /* the queue owns m now: it may be sent and freed already */
             atomicDecr(sv->mq_bytes, a);
         }
     }
@@ -2565,23 +2565,23 @@ static void snapSaveWindowDone(void *priv) {
  * bucket ahead, emit it and set the bit, and later raise hi over it. A later
  * look in the same section sees the bucket inside the window, but the thread
  * will skip it (it reads the bit after reading hi), so it is not owed. */
-static int snapBucketOwed(snapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos, kvstoreOvWindow *win) {
-    *pos = snapBucketPosition(ctx, s, didx, d, table, idx, win);
-    if (*pos == SNAP_POS_BEHIND) return 0;
-    return !snapScanBucketEmitted(ctx, s, didx, table, idx);
+static int hybsnapBucketOwed(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos, kvstoreOvWindow *win) {
+    *pos = hybsnapBucketPosition(ctx, s, didx, d, table, idx, win);
+    if (*pos == HYBSNAP_POS_BEHIND) return 0;
+    return !hybsnapScanBucketEmitted(ctx, s, didx, table, idx);
 }
 
-/* Overlay 'prepare' hook (privdata = the store's snapGuardPriv): may the frozen chain of
+/* Overlay 'prepare' hook (privdata = the store's hybsnapGuardPriv): may the frozen chain of
  * 'key' be written in place? Emits the bucket first when the thread has not
  * reached it; defers it, in the window *win, when the thread is reading it. */
-static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
-    int s = ((struct snapGuardPriv *)privdata)->s;
-    snapSave *sv = snap_save;
+static int hybsnapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
+    int s = ((struct hybsnapGuardPriv *)privdata)->s;
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (dictIsRehashing(d) && snapScanDictStateMain(sv->scan, s, didx, d) == SNAP_SLOT_PENDING && !snapDictPaused(d)) {
+    if (dictIsRehashing(d) && hybsnapScanDictStateMain(sv->scan, s, didx, d) == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) {
         /* An unreached dict mid-rehash, beyond hi (not paused), keeps rehashing: entries of
          * old bucket i0 move to new buckets i0 + j*n at any step, so the unit
          * the main thread emits and marks is the whole class, both tables.
@@ -2589,32 +2589,32 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
          * keeps the scan thread from reading those moved entries later. */
         unsigned long n = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
         unsigned long i0 = (table == 0) ? idx : (idx & (n - 1));
-        int owed = !snapScanBucketEmitted(sv->scan, s, didx, 0, i0);
-        for (unsigned long j = i0; !owed && j < size1; j += n) owed = !snapScanBucketEmitted(sv->scan, s, didx, 1, j);
+        int owed = !hybsnapScanBucketEmitted(sv->scan, s, didx, 0, i0);
+        for (unsigned long j = i0; !owed && j < size1; j += n) owed = !hybsnapScanBucketEmitted(sv->scan, s, didx, 1, j);
         if (!owed) {
             sv->inplace_writes++;
-            server.stat_snap_inplace_writes++;
+            server.stat_hybsnap_inplace_writes++;
             return KVSTORE_OV_INPLACE;
         }
-        if (!snapScanBucketEmitted(sv->scan, s, didx, 0, i0)) {
-            if ((long)i0 >= d->rehashidx) snapSaveEmitBucket(sv, s, didx, d, 0, i0);   /* below rehashidx the chain moved already */
-            snapScanMarkBucketEmitted(sv->scan, s, didx, 0, i0);
+        if (!hybsnapScanBucketEmitted(sv->scan, s, didx, 0, i0)) {
+            if ((long)i0 >= d->rehashidx) hybsnapSaveEmitBucket(sv, s, didx, d, 0, i0);   /* below rehashidx the chain moved already */
+            hybsnapScanMarkBucketEmitted(sv->scan, s, didx, 0, i0);
         }
         for (unsigned long j = i0; j < size1; j += n) {
-            if (snapScanBucketEmitted(sv->scan, s, didx, 1, j)) continue;
-            snapSaveEmitBucket(sv, s, didx, d, 1, j);
-            snapScanMarkBucketEmitted(sv->scan, s, didx, 1, j);
+            if (hybsnapScanBucketEmitted(sv->scan, s, didx, 1, j)) continue;
+            hybsnapSaveEmitBucket(sv, s, didx, d, 1, j);
+            hybsnapScanMarkBucketEmitted(sv->scan, s, didx, 1, j);
         }
         return KVSTORE_OV_INPLACE;
     }
-    if (!snapBucketOwed(sv->scan, s, didx, d, table, idx, &pos, win)) {
+    if (!hybsnapBucketOwed(sv->scan, s, didx, d, table, idx, &pos, win)) {
         sv->inplace_writes++;
-        server.stat_snap_inplace_writes++;
+        server.stat_hybsnap_inplace_writes++;
         return KVSTORE_OV_INPLACE;
     }
-    if (pos == SNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
-    snapSaveEmitBucket(sv, s, didx, d, table, idx);
-    snapScanMarkBucketEmitted(sv->scan, s, didx, table, idx);
+    if (pos == HYBSNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
+    hybsnapSaveEmitBucket(sv, s, didx, d, table, idx);
+    hybsnapScanMarkBucketEmitted(sv->scan, s, didx, table, idx);
     return KVSTORE_OV_INPLACE;
 }
 
@@ -2622,19 +2622,19 @@ static int snapOverlayPrepare(void *privdata, int didx, dict *d, const void *key
  * link: write back the overlayed buckets the scan thread has passed, i.e.
  * those of the overlay windows wholly below lo. Called at the end of every
  * section and from cron; a no-op until lo has moved since the last drain. */
-static uint64_t snap_drain_lo = 0;
-static void snapSaveDrainSideTables(void) {
-    snapSave *sv = snap_save;
+static uint64_t hybsnap_drain_lo = 0;
+static void hybsnapSaveDrainSideTables(void) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return;
-    uint64_t lo = snapPosLoLoad();
-    if (lo == snap_drain_lo) return;
-    snap_drain_lo = lo;
+    uint64_t lo = hybsnapPosLoLoad();
+    if (lo == hybsnap_drain_lo) return;
+    hybsnap_drain_lo = lo;
     kvstoreOverlayDrain(lo);
 }
 
 /* Overlayed buckets of the running save. */
-static long snapSaveSideEntries(void) {
-    snapSave *sv = snap_save;
+static long hybsnapSaveSideEntries(void) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
     return kvstoreOverlayPending();
 }
@@ -2643,14 +2643,14 @@ static long snapSaveSideEntries(void) {
 
 /* Store index of a kvstore being scanned, -1 if the save does not own it
  * (a keyspace created after the fork, e.g. by a FLUSHDB during the save). */
-static int snapStoreIndexOf(snapSave *sv, kvstore *kvs) {
+static int hybsnapStoreIndexOf(hybsnapSave *sv, kvstore *kvs) {
     for (int s = 0; s < sv->dbnum; s++)
         if (sv->stores[s] && sv->stores[s] == kvs) return s;
     return -1;
 }
 
 /* The db that holds store s right now, NULL when none (FLUSHDB detached it). */
-static redisDb *snapStoreOwnerDb(snapSave *sv, int s) {
+static redisDb *hybsnapStoreOwnerDb(hybsnapSave *sv, int s) {
     if (!sv->stores[s]) return NULL;   /* flushed and already freed */
     for (int j = 0; j < server.dbnum; j++)
         if (server.db[j].keys == sv->stores[s]) return &server.db[j];
@@ -2659,10 +2659,10 @@ static redisDb *snapStoreOwnerDb(snapSave *sv, int s) {
 
 /* FLUSHDB and SWAPDB during a save. A store is a kvstore the save is
  * scanning, identified by the db id it had at the fork instant. */
-int snapSaveOwnsKvstore(kvstore *kvs) {
-    snapSave *sv = snap_save;
+int hybsnapSaveOwnsKvstore(kvstore *kvs) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
-    return snapStoreIndexOf(sv, kvs) >= 0;
+    return hybsnapStoreIndexOf(sv, kvs) >= 0;
 }
 
 /* FLUSHDB during a save (db.c emptyDbStructure): the db swapped in fresh,
@@ -2670,18 +2670,18 @@ int snapSaveOwnsKvstore(kvstore *kvs) {
  * thread keeps walking 'keys' (the live db is already empty for everyone
  * else); everything is freed on BIO when the store completes. Returns 1
  * when adopted, 0 when the caller must free them itself. */
-int snapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed) {
-    snapSave *sv = snap_save;
+int hybsnapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
-    int s = snapStoreIndexOf(sv, keys);
+    int s = hybsnapStoreIndexOf(sv, keys);
     if (s < 0 || sv->flushed[s].set) return 0;
-    sv->flushed[s] = (snapFlushedDb){ 1, keys, expires, blessed, subexpires, stream_idmp_keys };
+    sv->flushed[s] = (hybsnapFlushedDb){ 1, keys, expires, blessed, subexpires, stream_idmp_keys };
     serverLog(LL_NOTICE, "Hybrid snapshot: db %d flushed during the save, its keyspace stays with the save until its slots complete", s);
     return 1;
 }
 
-static void snapSaveFreeFlushed(snapSave *sv, int s) {
-    snapFlushedDb *f = &sv->flushed[s];
+static void hybsnapSaveFreeFlushed(hybsnapSave *sv, int s) {
+    hybsnapFlushedDb *f = &sv->flushed[s];
     if (!f->set) return;
     f->set = 0;
     /* The store is gone for us from here on (INFO counters, store lookups). */
@@ -2690,9 +2690,9 @@ static void snapSaveFreeFlushed(snapSave *sv, int s) {
 }
 
 /* Scan callback: store s has no slot left owed (completed or aborted). */
-static void snapSaveStoreDone(void *privdata, int s) {
-    snapSave *sv = privdata;
-    snapSaveFreeFlushed(sv, s);
+static void hybsnapSaveStoreDone(void *privdata, int s) {
+    hybsnapSave *sv = privdata;
+    hybsnapSaveFreeFlushed(sv, s);
 }
 
 /* 1 if 'kv' is a fork-instant original the running save has not taken yet:
@@ -2701,23 +2701,23 @@ static void snapSaveStoreDone(void *privdata, int s) {
  * in place. Opens the command's write section. The answer stays valid until
  * the command ends: a bucket behind the thread or emitted stays so, and one
  * still owed is only treated as owed for longer than needed; a read path that would mutate (lazy field expiry) skips the mutation when
- * this returns 1, a read path that must mutate calls snapPrepareMutation. */
-int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
-    snapSave *sv = snap_save;
+ * this returns 1, a read path that must mutate calls hybsnapPrepareMutation. */
+int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv) {
+    hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
-    int s = snapStoreIndexOf(sv, db->keys);
+    int s = hybsnapStoreIndexOf(sv, db->keys);
     if (s < 0) return 0;   /* a keyspace created after the fork: nothing in it is owed */
     sds key = kvobjGetKey(kv);
     int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
     dict *d = kvstoreGetDict(db->keys, slot);
     if (!d) return 0;
-    uint8_t st = snapScanDictStateMain(sv->scan, s, slot, d);
-    if (st == SNAP_SLOT_SCANNED || st == SNAP_SLOT_DONE) return 0;
-    snapFunnelOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
+    uint8_t st = hybsnapScanDictStateMain(sv->scan, s, slot, d);
+    if (st == HYBSNAP_SLOT_SCANNED || st == HYBSNAP_SLOT_DONE) return 0;
+    hybsnapFunnelOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (!snapBucketOwed(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
+    if (!hybsnapBucketOwed(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
     /* Ahead and not emitted, or being read: the frozen entry itself is owed,
      * its clone in an overlayed bucket is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
@@ -2729,12 +2729,12 @@ int snapKvobjIsOwed(redisDb *db, kvobj *kv) {
  * through the write funnel (a write lookup that emits or clones its bucket)
  * and return the object to write, which may be the clone; else 'kv'. NULL
  * only if the key is gone. */
-kvobj *snapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
-    if (!snapKvobjIsOwed(db, kv)) return kv;
+kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
+    if (!hybsnapKvobjIsOwed(db, kv)) return kv;
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
 }
 
-/* Debug-build check at the write funnels. A SNAP_FORK value whose top-level
+/* Debug-build check at the write funnels. A HYBSNAP_FORK value whose top-level
  * pointer never moves (stream, hashtable, skiplist, quicklist, module type)
  * may be mutated in place even while owed: the child serializes its own
  * copy-on-write image from the fork instant, and the header copy taken later
@@ -2742,24 +2742,24 @@ kvobj *snapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
  * XACK/XACKDEL reach such values through a read lookup (write-path audit,
  * streams row), which is why this exemption exists. Single-allocation values
  * (raw strings, listpacks, intsets) may move on write and stay checked. */
-int snapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
+int hybsnapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
     if (kv->type == OBJ_STREAM || kv->type == OBJ_MODULE ||
         kv->encoding == OBJ_ENCODING_HT || kv->encoding == OBJ_ENCODING_SKIPLIST ||
         kv->encoding == OBJ_ENCODING_QUICKLIST)
         return 0;
-    return snapKvobjIsOwed(db, kv);
+    return hybsnapKvobjIsOwed(db, kv);
 }
 
 /* CONFIG SET rdb-key-save-delay apply hook: reaches the running scan thread. */
-void snapSaveSetKeySaveDelay(int usec) {
-    if (snap_save) atomicSet(snap_save->key_save_delay, usec);
+void hybsnapSaveSetKeySaveDelay(int usec) {
+    if (hybsnap_save) atomicSet(hybsnap_save->key_save_delay, usec);
 }
 
 /* Bytes of an original the overlay keeps alive: its kvobj allocation plus,
  * when the clone took a private copy, its value allocation(s). */
-static size_t snapOriginalRetainedBytes(kvobj *orig, int value_shared) {
+static size_t hybsnapOriginalRetainedBytes(kvobj *orig, int value_shared) {
     size_t n = zmalloc_size(kvobjGetAllocPtr(orig));
-    if (value_shared || snapValueIsInline(orig->type, orig->encoding)) return n;
+    if (value_shared || hybsnapValueIsInline(orig->type, orig->encoding)) return n;
     switch (orig->encoding) {
     case OBJ_ENCODING_RAW: n += zmalloc_size(sdsAllocPtr(orig->ptr)); break;
     case OBJ_ENCODING_LISTPACK:
@@ -2775,12 +2775,12 @@ static size_t snapOriginalRetainedBytes(kvobj *orig, int value_shared) {
 }
 
 /* Main thread, from the overlay clone callback: account a retained original
- * and arm the hard-mark abort. The abort itself runs from snapSaveCron():
+ * and arm the hard-mark abort. The abort itself runs from hybsnapSaveCron():
  * we are inside a keyspace write here and the overlay must stay intact. */
-static void snapSaveRetainedAdd(kvobj *orig, int value_shared) {
-    if (!snap_save || snap_save->aborted) return;
-    snapSave *sv = snap_save;
-    sv->retained_bytes += snapOriginalRetainedBytes(orig, value_shared);
+static void hybsnapSaveRetainedAdd(kvobj *orig, int value_shared) {
+    if (!hybsnap_save || hybsnap_save->aborted) return;
+    hybsnapSave *sv = hybsnap_save;
+    sv->retained_bytes += hybsnapOriginalRetainedBytes(orig, value_shared);
     if (sv->retained_bytes > sv->retained_peak) sv->retained_peak = sv->retained_bytes;
     if (server.hybrid_snapshot_max_retained_bytes && !sv->hard_mark_hit &&
         sv->retained_bytes > server.hybrid_snapshot_max_retained_bytes) {
@@ -2790,22 +2790,22 @@ static void snapSaveRetainedAdd(kvobj *orig, int value_shared) {
     }
 }
 
-static void snapSaveRetainedSub(kvobj *orig, int value_shared) {
-    if (!snap_save) return;
-    size_t n = snapOriginalRetainedBytes(orig, value_shared);
-    snap_save->retained_bytes = n > snap_save->retained_bytes ? 0 : snap_save->retained_bytes - n;
+static void hybsnapSaveRetainedSub(kvobj *orig, int value_shared) {
+    if (!hybsnap_save) return;
+    size_t n = hybsnapOriginalRetainedBytes(orig, value_shared);
+    hybsnap_save->retained_bytes = n > hybsnap_save->retained_bytes ? 0 : hybsnap_save->retained_bytes - n;
 }
 
 /* Main thread, serverCron/beforeSleep: act on a pending hard-mark abort. */
-void snapSaveCron(void) {
-    if (!snap_save || snap_save->aborted) return;
-    snapSave *sv = snap_save;
+void hybsnapSaveCron(void) {
+    if (!hybsnap_save || hybsnap_save->aborted) return;
+    hybsnapSave *sv = hybsnap_save;
     /* Writes may have stopped since the thread passed a bucket: drain from
      * here too, so an overlayed bucket never outlives that by more than a tick. */
-    if (snapSaveSideEntries()) {
-        snapFunnelOpen();
-        snapSaveDrainSideTables();
-        snapFunnelClose();
+    if (hybsnapSaveSideEntries()) {
+        hybsnapFunnelOpen();
+        hybsnapSaveDrainSideTables();
+        hybsnapFunnelClose();
     }
     size_t queued;
     atomicGet(sv->mq_bytes, queued);
@@ -2813,7 +2813,7 @@ void snapSaveCron(void) {
      * overlay's retained originals and the records queued for the child on
      * both threads. The abort below counts only what the main thread holds:
      * the scan thread's queue waits for the child instead of growing. */
-    size_t all_queued = snapSaveQueuedBytes();
+    size_t all_queued = hybsnapSaveQueuedBytes();
     if (sv->retained_bytes + all_queued > sv->retained_peak) sv->retained_peak = sv->retained_bytes + all_queued;
     if (server.hybrid_snapshot_max_retained_bytes && !sv->hard_mark_hit) {
         if (sv->retained_bytes + queued > server.hybrid_snapshot_max_retained_bytes) {
@@ -2823,24 +2823,24 @@ void snapSaveCron(void) {
         }
     }
     if (!sv->hard_mark_hit) return;
-    snap_save->failed = 1;
-    server.stat_snap_hard_mark_aborts++;
-    killRDBChild();   /* -> snapSaveAbort(): drains the overlays; the done handler releases */
+    hybsnap_save->failed = 1;
+    server.stat_hybsnap_hard_mark_aborts++;
+    killRDBChild();   /* -> hybsnapSaveAbort(): drains the overlays; the done handler releases */
 }
 
-static void snapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
+static void hybsnapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
                       long long *keys_fork, long long *bytes_sent)
 {
     *slots_total = *slots_done = 0;
     *keys_nofork = *keys_fork = *bytes_sent = 0;
-    if (!snap_save || snap_save->aborted) return;
-    snapScanProgress(snap_save->scan, slots_total, NULL, slots_done, NULL);
-    atomicGet(snap_save->keys_nofork, *keys_nofork);
-    atomicGet(snap_save->keys_fork, *keys_fork);
-    atomicGet(snap_save->bytes_sent, *bytes_sent);
+    if (!hybsnap_save || hybsnap_save->aborted) return;
+    hybsnapScanProgress(hybsnap_save->scan, slots_total, NULL, slots_done, NULL);
+    atomicGet(hybsnap_save->keys_nofork, *keys_nofork);
+    atomicGet(hybsnap_save->keys_fork, *keys_fork);
+    atomicGet(hybsnap_save->bytes_sent, *bytes_sent);
 }
 
-static int snapReadAll(int fd, void *p, size_t n) {
+static int hybsnapReadAll(int fd, void *p, size_t n) {
     char *c = p;
     while (n) {
         ssize_t r = read(fd, c, n);
@@ -2862,9 +2862,9 @@ static int snapReadAll(int fd, void *p, size_t n) {
  * bound and what used_memory reports) and the pool serves staging-sized
  * requests only, so a small KVOBJ or END message never pins a 64 KB buffer
  * in the queue with a few bytes in it. */
-static sds snapOutTake(snapSave *sv, size_t need) {
+static sds hybsnapOutTake(hybsnapSave *sv, size_t need) {
     listNode *ln;
-    if (need >= SNAP_STAGE_BYTES && (ln = listFirst(sv->oq_pool)) != NULL) {
+    if (need >= HYBSNAP_STAGE_BYTES && (ln = listFirst(sv->oq_pool)) != NULL) {
         sds m = listNodeValue(ln);
         listDelNode(sv->oq_pool, ln);
         return sdsMakeRoomForNonGreedy(m, need);
@@ -2874,9 +2874,9 @@ static sds snapOutTake(snapSave *sv, size_t need) {
 
 /* Scan thread: a drained message goes back to the pool when it is a staging
  * buffer, is freed otherwise. */
-static void snapOutRecycle(snapSave *sv, sds m) {
+static void hybsnapOutRecycle(hybsnapSave *sv, sds m) {
     size_t a = sdsalloc(m);
-    if (a >= SNAP_STAGE_BYTES && a <= 4 * SNAP_STAGE_BYTES && listLength(sv->oq_pool) < SNAP_OUT_POOL_MAX) {
+    if (a >= HYBSNAP_STAGE_BYTES && a <= 4 * HYBSNAP_STAGE_BYTES && listLength(sv->oq_pool) < HYBSNAP_OUT_POOL_MAX) {
         sdsclear(m);
         listAddNodeTail(sv->oq_pool, m);
     } else {
@@ -2884,13 +2884,13 @@ static void snapOutRecycle(snapSave *sv, sds m) {
     }
 }
 
-static void snapOutPublish(snapSave *sv) {
+static void hybsnapOutPublish(hybsnapSave *sv) {
     atomicSet(sv->shared->small_queued, sv->sq_bytes);
 }
 
 /* Scan thread: write one channel's queued messages to its (non-blocking)
  * pipe. 0 = the list is empty, 1 = the pipe is full, -1 = broken (child gone). */
-static int snapOutDrainList(snapSave *sv, list *l, int fd, size_t *head_off, int small) {
+static int hybsnapOutDrainList(hybsnapSave *sv, list *l, int fd, size_t *head_off, int small) {
     listNode *ln;
     while ((ln = listFirst(l)) != NULL) {
         sds m = listNodeValue(ln);
@@ -2907,10 +2907,10 @@ static int snapOutDrainList(snapSave *sv, list *l, int fd, size_t *head_off, int
             atomicDecr(sv->oq_bytes, a);
             if (small) {
                 sv->sq_bytes -= a;
-                snapOutPublish(sv);
+                hybsnapOutPublish(sv);
             }
             listDelNode(l, ln);
-            snapOutRecycle(sv, m);
+            hybsnapOutRecycle(sv, m);
             *head_off = 0;
         }
     }
@@ -2919,14 +2919,14 @@ static int snapOutDrainList(snapSave *sv, list *l, int fd, size_t *head_off, int
 
 /* Scan thread: push both pipes. Returns -1 when a pipe is broken (child
  * gone) or a BOUND wait saw an abort. */
-static int snapOutDrain(snapSave *sv, int mode, size_t target) {
+static int hybsnapOutDrain(hybsnapSave *sv, int mode, size_t target) {
     for (;;) {
-        int rs = snapOutDrainList(sv, sv->oq, sv->pipe_wr, &sv->oq_head_off, 1);
-        int rb = snapOutDrainList(sv, sv->bq, sv->big_wr, &sv->bq_head_off, 0);
+        int rs = hybsnapOutDrainList(sv, sv->oq, sv->pipe_wr, &sv->oq_head_off, 1);
+        int rb = hybsnapOutDrainList(sv, sv->bq, sv->big_wr, &sv->bq_head_off, 0);
         if (rs < 0 || rb < 0) return -1;
         if (rs == 0 && rb == 0) return 0;
-        if (mode == SNAP_DRAIN_TRY) return 0;
-        if (mode == SNAP_DRAIN_BOUND) {
+        if (mode == HYBSNAP_DRAIN_TRY) return 0;
+        if (mode == HYBSNAP_DRAIN_BOUND) {
             size_t q;
             atomicGet(sv->oq_bytes, q);
             if (q <= target) return 0;
@@ -2937,7 +2937,7 @@ static int snapOutDrain(snapSave *sv, int mode, size_t target) {
          * 'all replicas drop during rdb pipe' test hung here once the big
          * channel's 64 KB pipe was full of KVOBJ headers). What did not fit
          * is moot; the child dies on SIGUSR1 or sees the pipes close. */
-        if (snapScanAborted(sv->scan)) return -1;
+        if (hybsnapScanAborted(sv->scan)) return -1;
         struct pollfd pfd[2];
         int n = 0;
         if (rs == 1) pfd[n++] = (struct pollfd){ .fd = sv->pipe_wr, .events = POLLOUT, .revents = 0 };
@@ -2949,7 +2949,7 @@ static int snapOutDrain(snapSave *sv, int mode, size_t target) {
     }
 }
 
-static void snapOutClearList(list *l) {
+static void hybsnapOutClearList(list *l) {
     listNode *ln;
     while ((ln = listFirst(l)) != NULL) {
         sdsfree(listNodeValue(ln));
@@ -2957,13 +2957,13 @@ static void snapOutClearList(list *l) {
     }
 }
 
-static void snapOutClear(snapSave *sv) {
-    snapOutClearList(sv->oq);
-    snapOutClearList(sv->bq);
+static void hybsnapOutClear(hybsnapSave *sv) {
+    hybsnapOutClearList(sv->oq);
+    hybsnapOutClearList(sv->bq);
     sv->oq_head_off = sv->bq_head_off = 0;
     sv->sq_bytes = 0;
     atomicSet(sv->oq_bytes, 0);
-    snapOutPublish(sv);
+    hybsnapOutPublish(sv);
 }
 
 /* Scan thread: queue a complete message (header + payload in 'm', owned by
@@ -2971,14 +2971,14 @@ static void snapOutClear(snapSave *sv) {
  * the thread waits for the child rather than growing further; it never aborts
  * for that (the main-thread hard mark covers what the main thread retains and
  * queues). A broken pipe (child gone) aborts the scan. */
-static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
+static int hybsnapOutEnqueue(hybsnapSave *sv, sds m, uint32_t type) {
     size_t n = sdslen(m);
-    int big = (type == SNAP_MSG_KVOBJ || type == SNAP_MSG_END || type == SNAP_MSG_ABORT);
-    if (type == SNAP_MSG_BUFFER) {
+    int big = (type == HYBSNAP_MSG_KVOBJ || type == HYBSNAP_MSG_END || type == HYBSNAP_MSG_ABORT);
+    if (type == HYBSNAP_MSG_BUFFER) {
         if (sv->tag_all) {
             /* Debug: depend on every big value sent so far (inline replication
              * would set the exact dependency per command). */
-            snapMsgHdr h;
+            hybsnapMsgHdr h;
             memcpy(&h, m, sizeof(h));
             h.robj_off = sv->kv_seq;
             memcpy(m, &h, sizeof(h));
@@ -2986,12 +2986,12 @@ static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
     }
     if (big) {
         listAddNodeTail(sv->bq, m);
-        if (type == SNAP_MSG_KVOBJ) sv->kv_seq++;
+        if (type == HYBSNAP_MSG_KVOBJ) sv->kv_seq++;
     } else {
         listAddNodeTail(sv->oq, m);
         sv->sq_bytes += sdsAllocSize(m);
         sv->small_seq++;
-        snapOutPublish(sv);
+        hybsnapOutPublish(sv);
     }
     size_t q, mqb, peak;
     atomicIncrGet(sv->oq_bytes, q, sdsAllocSize(m));   /* what the queues really hold */
@@ -3000,78 +3000,78 @@ static int snapOutEnqueue(snapSave *sv, sds m, uint32_t type) {
     if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
     atomicIncr(sv->msgs_sent, 1);
     atomicIncr(sv->bytes_sent, (long long)n);
-    int rc = snapOutDrain(sv, SNAP_DRAIN_TRY, 0);
+    int rc = hybsnapOutDrain(sv, HYBSNAP_DRAIN_TRY, 0);
     if (rc == 0 && sv->oq_limit) {
         atomicGet(sv->oq_bytes, q);
-        if (q > sv->oq_limit) rc = snapOutDrain(sv, SNAP_DRAIN_BOUND, sv->oq_limit);
+        if (q > sv->oq_limit) rc = hybsnapOutDrain(sv, HYBSNAP_DRAIN_BOUND, sv->oq_limit);
     }
     if (rc != 0) {
-        snapScanRequestAbort(sv->scan);
+        hybsnapScanRequestAbort(sv->scan);
         return -1;
     }
     return 0;
 }
 
 /* Scan thread: one message from a header and a payload it does not own. */
-static int snapSendMsg(snapSave *sv, uint32_t type, int dbid, int slot,
+static int hybsnapSendMsg(hybsnapSave *sv, uint32_t type, int dbid, int slot,
                        const void *payload, uint32_t len, uint32_t robj_off, uint64_t src_addr)
 {
-    snapMsgHdr h = { type, dbid, slot, len, robj_off, src_addr };
-    sds m = snapOutTake(sv, sizeof(h) + len);
+    hybsnapMsgHdr h = { type, dbid, slot, len, robj_off, src_addr };
+    sds m = hybsnapOutTake(sv, sizeof(h) + len);
     m = sdscatlen(m, &h, sizeof(h));
     if (len) m = sdscatlen(m, payload, len);
-    return snapOutEnqueue(sv, m, type);
+    return hybsnapOutEnqueue(sv, m, type);
 }
 
 /* The staging buffer is a BUFFER message in the making: its first
- * sizeof(snapMsgHdr) bytes are reserved for the header, the records follow, and
+ * sizeof(hybsnapMsgHdr) bytes are reserved for the header, the records follow, and
  * the flush hands the whole buffer to the queue without a copy. */
-static void snapStageReset(snapSave *sv) {
-    sv->stage = snapOutTake(sv, sizeof(snapMsgHdr) + SNAP_STAGE_BYTES + SNAP_STAGE_SLACK);
-    sdsIncrLen(sv->stage, sizeof(snapMsgHdr));
+static void hybsnapStageReset(hybsnapSave *sv) {
+    sv->stage = hybsnapOutTake(sv, sizeof(hybsnapMsgHdr) + HYBSNAP_STAGE_BYTES + HYBSNAP_STAGE_SLACK);
+    sdsIncrLen(sv->stage, sizeof(hybsnapMsgHdr));
 }
 
-static void snapStageFlush(snapSave *sv) {
-    if (sdslen(sv->stage) <= sizeof(snapMsgHdr)) return;
-    snapMsgHdr h = { SNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot,
-                     (uint32_t)(sdslen(sv->stage) - sizeof(snapMsgHdr)), 0, 0 };
+static void hybsnapStageFlush(hybsnapSave *sv) {
+    if (sdslen(sv->stage) <= sizeof(hybsnapMsgHdr)) return;
+    hybsnapMsgHdr h = { HYBSNAP_MSG_BUFFER, sv->stage_dbid, sv->stage_slot,
+                     (uint32_t)(sdslen(sv->stage) - sizeof(hybsnapMsgHdr)), 0, 0 };
     memcpy(sv->stage, &h, sizeof(h));
-    snapOutEnqueue(sv, sv->stage, SNAP_MSG_BUFFER);
-    snapStageReset(sv);
+    hybsnapOutEnqueue(sv, sv->stage, HYBSNAP_MSG_BUFFER);
+    hybsnapStageReset(sv);
 }
 
 /* Scan thread: one fork-instant key. Read-only on the keyspace. */
-static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
-    snapSave *sv = priv;
-    if (snapSaveSlotTrimmed(sv, didx)) {
+static void hybsnapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
+    hybsnapSave *sv = priv;
+    if (hybsnapSaveSlotTrimmed(sv, didx)) {
         atomicIncr(sv->keys_skipped, 1);
         return;
     }
     if (sv->stage_dbid != s || sv->stage_slot != didx) {
-        snapStageFlush(sv);
+        hybsnapStageFlush(sv);
         sv->stage_dbid = s;
         sv->stage_slot = didx;
     }
-    int cls = snapKeyClass(kv);
+    int cls = hybsnapKeyClass(kv);
     /* Module key metadata is serialized through module callbacks: child only. */
-    if (cls == SNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = SNAP_FORK;
+    if (cls == HYBSNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = HYBSNAP_FORK;
 
-    if (cls == SNAP_FORK) {
-        snapStageFlush(sv);   /* keep the child's stream in scan order */
+    if (cls == HYBSNAP_FORK) {
+        hybsnapStageFlush(sv);   /* keep the child's stream in scan order */
         char *alloc = kvobjGetAllocPtr(kv);
         size_t len = zmalloc_size(alloc);
         /* The child resolves kv->ptr in its own memory: it must be forkable. */
         debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
                           !zmalloc_is_nofork(kv->ptr));
-        snapSendMsg(sv, SNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
+        hybsnapSendMsg(sv, HYBSNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
         atomicIncr(sv->keys_fork, 1);
-        snapSaveKeyDelay(sv, 1);
+        hybsnapSaveKeyDelay(sv, 1);
     } else {
         rio r;
         rioInitWithBuffer(&r, sv->stage);
-        if (snapSaveWriteRecord(sv, &r, kv, s) != 0) {
+        if (hybsnapSaveWriteRecord(sv, &r, kv, s) != 0) {
             serverLog(LL_WARNING, "Hybrid snapshot: failed to serialize a key on the scan thread");
-            snapScanRequestAbort(sv->scan);
+            hybsnapScanRequestAbort(sv->scan);
         }
         sv->stage = r.io.buffer.ptr;
         atomicIncr(sv->keys_nofork, 1);
@@ -3082,31 +3082,31 @@ static void snapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         int delay;
         atomicGet(sv->key_save_delay, delay);
         if (delay > 0) {
-            snapStageFlush(sv);
-            snapSaveKeyDelay(sv, 1);
-        } else if (sdslen(sv->stage) + SNAP_STAGE_SLACK > sdsalloc(sv->stage)) {
-            snapStageFlush(sv);
+            hybsnapStageFlush(sv);
+            hybsnapSaveKeyDelay(sv, 1);
+        } else if (sdslen(sv->stage) + HYBSNAP_STAGE_SLACK > sdsalloc(sv->stage)) {
+            hybsnapStageFlush(sv);
         }
     }
 }
 
 /* Scan thread, before the first slot: publish the frozen config to this thread. */
-static void snapSaveThreadInit(void *priv) {
-    snapSave *sv = priv;
-    snap_scan_maxmemory_policy = sv->maxmemory_policy;
-    snap_scan_rdb_compression = sv->rdb_compression;
+static void hybsnapSaveThreadInit(void *priv) {
+    hybsnapSave *sv = priv;
+    hybsnap_scan_maxmemory_policy = sv->maxmemory_policy;
+    hybsnap_scan_rdb_compression = sv->rdb_compression;
 }
 
 
 /* Scan thread: after the last slot (or on abort). */
-static void snapSaveThreadDone(void *priv, int aborted) {
-    snapSave *sv = priv;
+static void hybsnapSaveThreadDone(void *priv, int aborted) {
+    hybsnapSave *sv = priv;
     if (aborted) {
         /* Whatever is still queued is moot; the child must see ABORT (or die
          * first, which breaks the pipe and ends the wait). */
-        snapOutClear(sv);
-        snapSendMsg(sv, SNAP_MSG_ABORT, -1, -1, NULL, 0, 0, 0);
-        snapOutDrain(sv, SNAP_DRAIN_ALL, 0);
+        hybsnapOutClear(sv);
+        hybsnapSendMsg(sv, HYBSNAP_MSG_ABORT, -1, -1, NULL, 0, 0, 0);
+        hybsnapOutDrain(sv, HYBSNAP_DRAIN_ALL, 0);
     } else {
         /* The delay owed for the keys the main thread emitted ahead (their
          * records were forwarded as the thread went, so the drain was never
@@ -3115,22 +3115,22 @@ static void snapSaveThreadDone(void *priv, int aborted) {
         long long mk;
         atomicGet(sv->main_keys, mk);
         if (mk > sv->delayed_main_keys) {
-            snapSaveKeyDelay(sv, mk - sv->delayed_main_keys);
+            hybsnapSaveKeyDelay(sv, mk - sv->delayed_main_keys);
             sv->delayed_main_keys = mk;
         }
-        if (snapScanAborted(sv->scan)) return;
-        snapStageFlush(sv);
+        if (hybsnapScanAborted(sv->scan)) return;
+        hybsnapStageFlush(sv);
         /* END carries both channels' message counts: the child finishes when
          * it has consumed them. */
-        if (snapSendMsg(sv, SNAP_MSG_END, -1, -1, NULL, 0, sv->kv_seq, sv->small_seq) == 0 &&
-            snapOutDrain(sv, SNAP_DRAIN_ALL, 0) != 0)
-            snapScanRequestAbort(sv->scan);
+        if (hybsnapSendMsg(sv, HYBSNAP_MSG_END, -1, -1, NULL, 0, sv->kv_seq, sv->small_seq) == 0 &&
+            hybsnapOutDrain(sv, HYBSNAP_DRAIN_ALL, 0) != 0)
+            hybsnapScanRequestAbort(sv->scan);
     }
 }
 
 /* ---- child ---- */
 
-static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_db, int *cur_slot) {
+static int hybsnapChildSelect(rio *rdb, hybsnapSave *sv, int dbid, int slot, int *cur_db, int *cur_slot) {
     if (sv->slots_form) {
         /* Slot snapshot stream: SELECT on a db change; the slot info once per
          * slot, before its first record, whichever producer delivers it (the
@@ -3184,7 +3184,7 @@ static int snapChildSelect(rio *rdb, snapSave *sv, int dbid, int slot, int *cur_
 /* Child: write the whole RDB stream. 'out' is the socket rio for a diskless
  * sync (framed with the diskless EOF mark, nothing on disk); NULL means a
  * temp file renamed to sv->filename at the end. */
-static int snapSaveChildWrite(snapSave *sv, rio *out) {
+static int hybsnapSaveChildWrite(hybsnapSave *sv, rio *out) {
     char tmpfile[256] = "";
     char eofmark[RDB_EOF_MARK_SIZE];
     char *err_op = "";
@@ -3203,7 +3203,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
 
     startSaving(sv->rdbflags);
     if (!out) {
-        if (snapIsAof(sv))
+        if (hybsnapIsAof(sv))
             snprintf(tmpfile, sizeof(tmpfile), "temp-rewriteaof-%d.aof", (int)getpid());   /* as rewriteAppendOnlyFile() */
         else
             snprintf(tmpfile, sizeof(tmpfile), "temp-%d.rdb", (int)getpid());
@@ -3215,7 +3215,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         }
         rioInitWithFile(&filerio, fp);
         rdb = &filerio;
-        if (snapIsAof(sv) ? server.aof_rewrite_incremental_fsync : server.rdb_save_incremental_fsync) {
+        if (hybsnapIsAof(sv) ? server.aof_rewrite_incremental_fsync : server.rdb_save_incremental_fsync) {
             rioSetAutoSync(rdb, REDIS_AUTOSYNC_BYTES);
             if (!(sv->rdbflags & RDBFLAGS_KEEP_CACHE)) rioSetReclaimCache(rdb, 1);
         }
@@ -3240,7 +3240,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     /* Two channels. Small: BUFFER messages in production order.
      * Big: KVOBJ (one big value each), then END (or ABORT).
      * Policy: the small channel while the parent reports a backlog of at
-     * least SNAP_SMALL_BACKLOG on it (or nothing waits on the big channel), a
+     * least HYBSNAP_SMALL_BACKLOG on it (or nothing waits on the big channel), a
      * big value otherwise. The bounded queue then never parks the scan thread
      * while we are inside a big value, and the big values come up as soon as
      * the small side is caught up (a single FIFO took the big values handed
@@ -3250,7 +3250,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
      * message counts: we are done when both are consumed. */
     uint64_t small_total = 0, small_seen = 0, kv_total = 0, kv_written = 0;
     int ended = 0;
-    snapMsgHdr held;
+    hybsnapMsgHdr held;
     int have_held = 0;                 /* a BUFFER (in 'payload') waiting for big values */
     /* rdb channel: replicas seen hanging up. Like the classic connset writer the
      * transfer goes on for the others and fails only when none is left; the
@@ -3258,7 +3258,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     char *conn_dead = zcalloc(sv->rdb_channel && sv->numconns ? sv->numconns : 1);
     int ndead = 0;
     for (;;) {
-        snapMsgHdr h;
+        hybsnapMsgHdr h;
         int src;   /* 0 = small channel, 1 = big channel */
         if (have_held) {
             if (held.robj_off <= kv_written) {
@@ -3319,7 +3319,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             }
             size_t backlog;
             atomicGet(sv->shared->small_queued, backlog);
-            if (!small_ready && big_ready && small_open && backlog >= SNAP_SMALL_BACKLOG) {
+            if (!small_ready && big_ready && small_open && backlog >= HYBSNAP_SMALL_BACKLOG) {
                 /* The parent holds a small backlog that the scan thread has
                  * not pushed into the pipe yet (it pushes at its own
                  * enqueues, about once a millisecond, a pipe's worth each
@@ -3329,35 +3329,35 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
                  * whole value and the scan thread parked (29-36 s under
                  * writes against 21-24 with an unbounded overflow). */
                 struct pollfd one = { .fd = sv->pipe_rd, .events = POLLIN, .revents = 0 };
-                int r = poll(&one, 1, SNAP_SMALL_WAIT_MS);
+                int r = poll(&one, 1, HYBSNAP_SMALL_WAIT_MS);
                 if (r > 0 && (one.revents & POLLIN)) small_ready = 1;
             }
-            src = (small_ready && (backlog >= SNAP_SMALL_BACKLOG || !big_ready)) ? 0 : 1;
+            src = (small_ready && (backlog >= HYBSNAP_SMALL_BACKLOG || !big_ready)) ? 0 : 1;
         }
         if (src == 1) {
-            if (snapReadAll(sv->big_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
-            if (h.type == SNAP_MSG_END) {
+            if (hybsnapReadAll(sv->big_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
+            if (h.type == HYBSNAP_MSG_END) {
                 ended = 1;
                 kv_total = h.robj_off;
                 small_total = h.src_addr;
                 if (kv_written != kv_total) { errno = EPROTO; err_op = "big value count"; goto werr; }
                 continue;
             }
-            if (h.type == SNAP_MSG_ABORT) { aborted = 1; goto werr; }
-            if (h.type != SNAP_MSG_KVOBJ) { errno = EPROTO; err_op = "unknown message"; goto werr; }
+            if (h.type == HYBSNAP_MSG_ABORT) { aborted = 1; goto werr; }
+            if (h.type != HYBSNAP_MSG_KVOBJ) { errno = EPROTO; err_op = "unknown message"; goto werr; }
             if (h.len > bigbuf_cap) {
                 bigbuf = zrealloc(bigbuf, h.len);
                 bigbuf_cap = h.len;
             }
-            if (h.len && snapReadAll(sv->big_rd, bigbuf, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
-            if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+            if (h.len && hybsnapReadAll(sv->big_rd, bigbuf, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+            if (hybsnapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
             kvobj *kv = (kvobj *)(bigbuf + h.robj_off);
             /* An embedded string value lives inside the kvobj allocation: its
              * pointer is the parent's address, relocate it into our copy. */
             if (kv->encoding == OBJ_ENCODING_EMBSTR)
                 kv->ptr = bigbuf + ((char *)kv->ptr - (char *)(uintptr_t)h.src_addr);
             size_t before = rdb->processed_bytes;
-            if (snapSaveWriteRecord(sv, rdb, kv, h.dbid) != 0) { err_op = "record"; goto werr; }
+            if (hybsnapSaveWriteRecord(sv, rdb, kv, h.dbid) != 0) { err_op = "record"; goto werr; }
             key_counter++;
             kv_written++;
             /* As the classic child does after each key: drop the value's pages from
@@ -3369,27 +3369,27 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
             goto progress;
         }
         /* Small channel, from the pipe. */
-        if (snapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
+        if (hybsnapReadAll(sv->pipe_rd, &h, sizeof(h)) != 0) { err_op = "channel read (header)"; goto werr; }
         small_seen++;
-        if (h.type != SNAP_MSG_BUFFER) { errno = EPROTO; err_op = "unknown message"; goto werr; }
+        if (h.type != HYBSNAP_MSG_BUFFER) { errno = EPROTO; err_op = "unknown message"; goto werr; }
         if (h.len > payload_cap) {
             payload = zrealloc(payload, h.len);
             payload_cap = h.len;
         }
-        if (h.len && snapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
+        if (h.len && hybsnapReadAll(sv->pipe_rd, payload, h.len) != 0) { err_op = "channel read (payload)"; goto werr; }
         if (h.robj_off > kv_written) {
             held = h;
             have_held = 1;
             continue;
         }
     write_small:
-        if (snapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
+        if (hybsnapChildSelect(rdb, sv, h.dbid, h.slot, &cur_db, &cur_slot) != 0) { err_op = "selectdb"; goto werr; }
         if (rioWrite(rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
     progress:
         if ((msgs++ & 1023) == 0) {
             long long now = mstime();
             if (now - info_updated_time >= 1000) {
-                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, snapIsAof(sv) ? "AOF rewrite" : "RDB");
+                sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, hybsnapIsAof(sv) ? "AOF rewrite" : "RDB");
                 info_updated_time = now;
             }
         }
@@ -3405,7 +3405,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
     if (out) {
         if (!sv->slots_form && rioWrite(rdb, eofmark, RDB_EOF_MARK_SIZE) == 0) { err_op = "eof mark"; goto werr; }
         if (rioFlush(rdb) == 0) { err_op = "flush"; goto werr; }
-        serverLog(LL_NOTICE, "Hybrid %s transfer done, %ld SNAP_FORK keys serialized by the child, %zu bytes sent.",
+        serverLog(LL_NOTICE, "Hybrid %s transfer done, %ld HYBSNAP_FORK keys serialized by the child, %zu bytes sent.",
                   sv->slots_form ? "slot snapshot" : "RDB", key_counter, rdb->processed_bytes);
         stopSaving(1);
         return C_OK;
@@ -3422,9 +3422,9 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         stopSaving(0);
         return C_ERR;
     }
-    if (snapIsAof(sv)) {
+    if (hybsnapIsAof(sv)) {
         /* The parent's done handler renames it into the manifest and fsyncs the directory. */
-        serverLog(LL_NOTICE, "Hybrid AOF rewrite done, %ld SNAP_FORK keys serialized by the child, %zu bytes written to %s.",
+        serverLog(LL_NOTICE, "Hybrid AOF rewrite done, %ld HYBSNAP_FORK keys serialized by the child, %zu bytes written to %s.",
                   key_counter, rdb->processed_bytes, sv->filename);
         stopSaving(1);
         return C_OK;
@@ -3434,7 +3434,7 @@ static int snapSaveChildWrite(snapSave *sv, rio *out) {
         stopSaving(0);
         return C_ERR;
     }
-    serverLog(LL_NOTICE, "Hybrid snapshot done, %ld SNAP_FORK keys serialized by the child, %zu bytes written.",
+    serverLog(LL_NOTICE, "Hybrid snapshot done, %ld HYBSNAP_FORK keys serialized by the child, %zu bytes written.",
               key_counter, rdb->processed_bytes);
     stopSaving(1);
     return C_OK;
@@ -3454,12 +3454,12 @@ werr:
     return aborted ? SERVER_CHILD_NOERROR_RETVAL : C_ERR;
 }
 
-static void snapSaveChild(snapSave *sv) {
+static void hybsnapSaveChild(hybsnapSave *sv) {
     rio sock;
     char aofname[256];
     close(sv->pipe_wr);
     close(sv->big_wr);
-    if (snapToSockets(sv)) {
+    if (hybsnapToSockets(sv)) {
         if (sv->rdb_channel) {
             rioInitWithConnset(&sock, sv->conns, sv->numconns);
         } else {
@@ -3474,7 +3474,7 @@ static void snapSaveChild(snapSave *sv) {
          * of the compression flag was set from the same request at start.) */
         if (sv->req & SLAVE_REQ_RDB_NO_COMPRESS) server.rdb_compression = 0;
         if (sv->req & SLAVE_REQ_RDB_NO_CHECKSUM) server.rdb_checksum = 0;
-    } else if (snapIsAof(sv)) {
+    } else if (hybsnapIsAof(sv)) {
         /* The name backgroundRewriteDoneHandler and aofRemoveTempFile expect. */
         snprintf(aofname, sizeof(aofname), "temp-rewriteaof-bg-%d.aof", (int)getpid());
         sv->filename = aofname;
@@ -3483,13 +3483,13 @@ static void snapSaveChild(snapSave *sv) {
     } else {
         redisSetProcTitle("redis-rdb-bgsave");
     }
-    if (!snapIsAof(sv)) redisSetCpuAffinity(server.bgsave_cpulist);
-    int retval = snapSaveChildWrite(sv, snapToSockets(sv) ? &sock : NULL);
+    if (!hybsnapIsAof(sv)) redisSetCpuAffinity(server.bgsave_cpulist);
+    int retval = hybsnapSaveChildWrite(sv, hybsnapToSockets(sv) ? &sock : NULL);
     if (retval == C_OK) {
-        if (snapIsAof(sv)) sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
+        if (hybsnapIsAof(sv)) sendChildCowInfo(CHILD_INFO_TYPE_AOF_COW_SIZE, "AOF rewrite");
         else sendChildCowInfo(CHILD_INFO_TYPE_RDB_COW_SIZE, "RDB");
     }
-    if (snapToSockets(sv)) {
+    if (hybsnapToSockets(sv)) {
         if (sv->rdb_channel) {
             rioFreeConnset(&sock);
         } else {
@@ -3511,16 +3511,16 @@ static void snapSaveChild(snapSave *sv) {
 
 /* ---- parent ---- */
 
-static void snapSaveFree(snapSave *sv) {
+static void hybsnapSaveFree(hybsnapSave *sv) {
     if (sv->ae_registered)
-        aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
-    if (sv->scan) snapScanRelease(sv->scan);
+        aeDeleteFileEvent(server.el, hybsnapScanReadEventFd(sv->scan), AE_READABLE);
+    if (sv->scan) hybsnapScanRelease(sv->scan);
     if (sv->oq) {
-        snapOutClearList(sv->oq);
+        hybsnapOutClearList(sv->oq);
         listRelease(sv->oq);
     }
     if (sv->bq) {
-        snapOutClearList(sv->bq);
+        hybsnapOutClearList(sv->bq);
         listRelease(sv->bq);
     }
     if (sv->oq_pool) {
@@ -3535,15 +3535,15 @@ static void snapSaveFree(snapSave *sv) {
     if (sv->pipe_rd != -1) close(sv->pipe_rd);
     if (sv->big_wr != -1) close(sv->big_wr);
     if (sv->big_rd != -1) close(sv->big_rd);
-    if (sv->shared) munmap(sv->shared, sizeof(snapShared));
+    if (sv->shared) munmap(sv->shared, sizeof(hybsnapShared));
     if (sv->sizes) {
         for (int j = 0; j < sv->dbnum; j++) zfree(sv->sizes[j].slot_keys);   /* slot_expires lives in the same block */
     }
     sdsfree(sv->stage);
     if (sv->mq) {
-        snapOutClearList(sv->mq);
+        hybsnapOutClearList(sv->mq);
         listRelease(sv->mq);
-        snapOutClearList(sv->mq_ready);
+        hybsnapOutClearList(sv->mq_ready);
         listRelease(sv->mq_ready);
         pthread_mutex_destroy(&sv->mq_lock);
     }
@@ -3551,27 +3551,27 @@ static void snapSaveFree(snapSave *sv) {
     sdsfree(sv->mscratch);
     /* Flushed dbs still held (every db of an AOF rewrite that saw FLUSHALL,
      * when the child ended before their slots completed): free them while
-     * sv->stores is still there, snapSaveFreeFlushed clears the entry. */
-    for (int j = 0; j < sv->dbnum; j++) snapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
+     * sv->stores is still there, hybsnapSaveFreeFlushed clears the entry. */
+    for (int j = 0; j < sv->dbnum; j++) hybsnapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
     zfree(sv->bitmaps);
     zfree(sv->tables);
     zfree(sv);
 }
 
-/* Overlay callbacks for the server keyspace (privdata = the store's snapGuardPriv). */
-static void snapOverlayEnter(void *privdata) { UNUSED(privdata); snapFunnelOpen(); }
-static const kvstoreSnapHooks snap_server_hooks = {
-    .clone = snapOverlayCloneKey, .free_orig = snapOverlayFreeOriginal, .enter = snapOverlayEnter,
-    .prepare = snapOverlayPrepare,
+/* Overlay callbacks for the server keyspace (privdata = the store's hybsnapGuardPriv). */
+static void hybsnapOverlayEnter(void *privdata) { UNUSED(privdata); hybsnapFunnelOpen(); }
+static const kvstoreSnapHooks hybsnap_server_hooks = {
+    .clone = hybsnapOverlayCloneKey, .free_orig = hybsnapOverlayFreeOriginal, .enter = hybsnapOverlayEnter,
+    .prepare = hybsnapOverlayPrepare,
 };
 
 /* Main thread: the save object, its channel, queues and scan context for a
  * frozen-to-be keyspace. NULL on failure (logged). */
-static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    serverAssert(snap_save == NULL);
+static hybsnapSave *hybsnapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    serverAssert(hybsnap_save == NULL);
 
     kvstoreOverlayStatsReset();   /* the overlay counters of INFO describe this save */
-    snapSave *sv = zcalloc(sizeof(*sv));
+    hybsnapSave *sv = zcalloc(sizeof(*sv));
     sv->pipe_rd = sv->pipe_wr = sv->big_rd = sv->big_wr = -1;
     sv->dbnum = server.dbnum;
     sv->kind = kind;
@@ -3579,10 +3579,10 @@ static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *
     sv->rdbflags = rdbflags;
     sv->filename = filename;
     if (rsi) { sv->rsi = *rsi; sv->has_rsi = 1; }
-    sv->tables = zcalloc((sizeof(kvstore *) + sizeof(snapFlushedDb) + sizeof(snapDbSizes)) * sv->dbnum);
+    sv->tables = zcalloc((sizeof(kvstore *) + sizeof(hybsnapFlushedDb) + sizeof(hybsnapDbSizes)) * sv->dbnum);
     sv->stores = sv->tables;
-    sv->flushed = (snapFlushedDb *)(sv->stores + sv->dbnum);
-    sv->sizes = (snapDbSizes *)(sv->flushed + sv->dbnum);
+    sv->flushed = (hybsnapFlushedDb *)(sv->stores + sv->dbnum);
+    sv->sizes = (hybsnapDbSizes *)(sv->flushed + sv->dbnum);
     if (req & SLAVE_REQ_SLOTS_SNAPSHOT) {
         /* Atomic slot migration's slot snapshot: only the migrating slots, as
          * the classic child reads them from its copy of the migrate task. */
@@ -3629,7 +3629,7 @@ static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *
         int fds[2];
         if (pipe(fds) != 0) {
             serverLog(LL_WARNING, "Hybrid snapshot: pipe() failed: %s", strerror(errno));
-            snapSaveFree(sv);
+            hybsnapSaveFree(sv);
             return NULL;
         }
         *ends[c] = fds[0];
@@ -3640,15 +3640,15 @@ static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *
 #endif
         if (fcntl(fds[1], F_SETFL, fcntl(fds[1], F_GETFL) | O_NONBLOCK) == -1) {
             serverLog(LL_WARNING, "Hybrid snapshot: fcntl(O_NONBLOCK) failed: %s", strerror(errno));
-            snapSaveFree(sv);
+            hybsnapSaveFree(sv);
             return NULL;
         }
     }
-    sv->shared = mmap(NULL, sizeof(snapShared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
+    sv->shared = mmap(NULL, sizeof(hybsnapShared), PROT_READ | PROT_WRITE, MAP_SHARED | MAP_ANONYMOUS, -1, 0);
     if (sv->shared == MAP_FAILED) {
         sv->shared = NULL;
         serverLog(LL_WARNING, "Hybrid snapshot: mmap(MAP_SHARED) failed: %s", strerror(errno));
-        snapSaveFree(sv);
+        hybsnapSaveFree(sv);
         return NULL;
     }
     atomicSet(sv->shared->small_queued, 0);
@@ -3657,33 +3657,33 @@ static snapSave *snapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *
     sv->oq_pool = listCreate();
     sv->oq_limit = server.hybrid_snapshot_max_queued_bytes;
     sv->tag_all = server.hybrid_snapshot_tag_all;
-    snapStageReset(sv);
+    hybsnapStageReset(sv);
     sv->stage_dbid = sv->stage_slot = -1;
     pthread_mutex_init(&sv->mq_lock, NULL);
     sv->mq = listCreate();
     sv->mq_ready = listCreate();
-    sv->mstage = snapMsgNew(0);
+    sv->mstage = hybsnapMsgNew(0);
     sv->mscratch = sdsempty();
     sv->mstage_dbid = sv->mstage_slot = -1;
     atomicSet(sv->key_save_delay, server.rdb_key_save_delay);
     sv->maxmemory_policy = server.maxmemory_policy;
     sv->rdb_compression = (req & (SLAVE_REQ_RDB_NO_COMPRESS | SLAVE_REQ_SLOTS_SNAPSHOT)) ? 0 : server.rdb_compression;   /* a slot snapshot never compresses (slotSnapshotSaveRio) */
-    server.stat_snap_saves++;
-    sv->scan = snapScanCreate(sv->stores, sv->dbnum, snapSaveDispatch, NULL, sv);
-    if (sv->slot_filter) snapScanSetSlotFilter(sv->scan, sv->slot_filter);
-    snapScanSetOverlay(sv->scan, &snap_server_hooks, NULL);
-    sv->scan->store_done = snapSaveStoreDone;
-    sv->scan->thread_done = snapSaveThreadDone;
-    sv->scan->thread_init = snapSaveThreadInit;
-    sv->scan->window_done = snapSaveWindowDone;
+    server.stat_hybsnap_saves++;
+    sv->scan = hybsnapScanCreate(sv->stores, sv->dbnum, hybsnapSaveDispatch, NULL, sv);
+    if (sv->slot_filter) hybsnapScanSetSlotFilter(sv->scan, sv->slot_filter);
+    hybsnapScanSetOverlay(sv->scan, &hybsnap_server_hooks, NULL);
+    sv->scan->store_done = hybsnapSaveStoreDone;
+    sv->scan->thread_done = hybsnapSaveThreadDone;
+    sv->scan->thread_init = hybsnapSaveThreadInit;
+    sv->scan->window_done = hybsnapSaveWindowDone;
     return sv;
 }
 
 /* Main thread: FORK INSTANT. Freeze, fork the writer child, start the scan
  * thread. On a fork failure the keyspace is unfrozen and sv is freed; the
  * caller undoes its own state (replica states, pipes). */
-static int snapSaveLaunch(snapSave *sv) {
-    if (!snapIsAof(sv)) {
+static int hybsnapSaveLaunch(hybsnapSave *sv) {
+    if (!hybsnapIsAof(sv)) {
         server.stat_rdb_saves++;
         server.dirty_before_bgsave = server.dirty;
         server.lastbgsave_try = time(NULL);
@@ -3692,37 +3692,37 @@ static int snapSaveLaunch(snapSave *sv) {
     /* FORK INSTANT: freeze, then fork. */
     mstime_t freeze_lat;
     latencyStartMonitor(freeze_lat);
-    snapScanFreeze(sv->scan);
+    hybsnapScanFreeze(sv->scan);
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
-    pid_t childpid = snapForkNoKeyspace(snapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
+    pid_t childpid = hybsnapForkNoKeyspace(hybsnapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
     if (childpid == 0) {
-        snapSaveChild(sv);   /* never returns */
+        hybsnapSaveChild(sv);   /* never returns */
     }
     if (childpid == -1) {
-        if (snapIsAof(sv)) server.aof_lastbgrewrite_status = C_ERR;
-        else if (!snapToSockets(sv)) server.lastbgsave_status = C_ERR;
+        if (hybsnapIsAof(sv)) server.aof_lastbgrewrite_status = C_ERR;
+        else if (!hybsnapToSockets(sv)) server.lastbgsave_status = C_ERR;
         serverLog(LL_WARNING, "Can't save in background (hybrid): fork: %s", strerror(errno));
-        snapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
-        snapSaveFree(sv);
+        hybsnapScanAbort(sv->scan);   /* unfreeze; nothing was scanned */
+        hybsnapSaveFree(sv);
         return C_ERR;
     }
     close(sv->pipe_rd);
     sv->pipe_rd = -1;
     close(sv->big_rd);
     sv->big_rd = -1;
-    snap_save = sv;
+    hybsnap_save = sv;
     /* The classic done handlers branch on it; an AOF rewrite leaves it NONE. */
-    if (!snapIsAof(sv)) server.rdb_child_type = snapToSockets(sv) ? RDB_CHILD_TYPE_SOCKET : RDB_CHILD_TYPE_DISK;
-    if (snapScanStartThread(sv->scan) != C_OK) {
+    if (!hybsnapIsAof(sv)) server.rdb_child_type = hybsnapToSockets(sv) ? RDB_CHILD_TYPE_SOCKET : RDB_CHILD_TYPE_DISK;
+    if (hybsnapScanStartThread(sv->scan) != C_OK) {
         /* The child is waiting on the channel: kill it, unfreeze. */
         serverLog(LL_WARNING, "Hybrid snapshot: cannot start the scan thread; aborting the save");
-        killRDBChild();   /* -> snapSaveAbort() unfreezes; the done handler releases */
+        killRDBChild();   /* -> hybsnapSaveAbort() unfreezes; the done handler releases */
     } else {
-        aeCreateFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE, snapScanAeHandler, sv->scan);
+        aeCreateFileEvent(server.el, hybsnapScanReadEventFd(sv->scan), AE_READABLE, hybsnapScanAeHandler, sv->scan);
         sv->ae_registered = 1;
     }
-    if (snapIsAof(sv)) {
+    if (hybsnapIsAof(sv)) {
         serverLog(LL_NOTICE, "Hybrid AOF rewrite started by pid %ld (scan thread streams the %s base file to the child)",
                   (long)childpid, sv->aof_cmd_form ? "AOF" : "RDB");
     } else {
@@ -3740,12 +3740,12 @@ static int snapSaveLaunch(snapSave *sv) {
  * is where the INCR file's history starts; backgroundRewriteDoneHandler does
  * the manifest work on the temp file the child leaves behind, as for the classic
  * child. */
-static int snapSaveBackgroundAof(void) {
+static int hybsnapSaveBackgroundAof(void) {
     if (hasActiveChildProcess()) return C_ERR;
-    snapSave *sv = snapSaveCreate(SNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
+    hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
     if (!sv) return C_ERR;
     sv->aof_cmd_form = !server.aof_use_rdb_preamble;
-    return snapSaveLaunch(sv);   /* the child names its own temp file */
+    return hybsnapSaveLaunch(sv);   /* the child names its own temp file */
 }
 
 /* The one decision whether a save takes the hybrid path, for every consumer
@@ -3754,47 +3754,47 @@ static int snapSaveBackgroundAof(void) {
  * keyspace content (functions-only transfers keep the classic child; a slot
  * snapshot is a hybrid save over the migrating slots) and every relevant module has opted in (otherwise the fallback
  * is logged once per blocking module). Returns C_OK when the hybrid save
- * started, C_ERR when it was taken and failed to start, SNAP_NOT_TAKEN when
+ * started, C_ERR when it was taken and failed to start, HYBSNAP_NOT_TAKEN when
  * the caller must run the classic fork child. */
-int snapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    if (!snapHybridEnabled()) return SNAP_NOT_TAKEN;
+int hybsnapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+    if (!hybsnapHybridEnabled()) return HYBSNAP_NOT_TAKEN;
     /* A functions-only transfer has no keyspace content for the scan thread;
      * the classic child serves it (redisFork maps the arena). A slot snapshot
      * (atomic slot migration) is a hybrid save over the migrating slots. */
-    if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return SNAP_NOT_TAKEN;
-    if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return SNAP_NOT_TAKEN;
-    /* Scan positions number every dict of every db in SNAP_POS_ORD_BITS bits. */
-    if ((long long)server.dbnum * (server.cluster_enabled ? CLUSTER_SLOTS : 1) >= (1LL << SNAP_POS_ORD_BITS)) {
+    if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return HYBSNAP_NOT_TAKEN;
+    if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return HYBSNAP_NOT_TAKEN;
+    /* Scan positions number every dict of every db in HYBSNAP_POS_ORD_BITS bits. */
+    if ((long long)server.dbnum * (server.cluster_enabled ? CLUSTER_SLOTS : 1) >= (1LL << HYBSNAP_POS_ORD_BITS)) {
         static int logged = 0;
         if (!logged) serverLog(LL_NOTICE, "Hybrid snapshot: too many databases for the scan positions, the classic child serves the save");
         logged = 1;
-        return SNAP_NOT_TAKEN;
+        return HYBSNAP_NOT_TAKEN;
     }
     if (!moduleAllModulesHandleHybridSnapshot()) {
-        snapHybridFallbackLog();   /* a module's save callbacks need the keyspace */
-        return SNAP_NOT_TAKEN;
+        hybsnapHybridFallbackLog();   /* a module's save callbacks need the keyspace */
+        return HYBSNAP_NOT_TAKEN;
     }
     switch (kind) {
-    case SNAP_SAVE_RDB:     return snapSaveBackground(req, filename, rsi, rdbflags);
-    case SNAP_SAVE_SOCKETS: return snapSaveToSlavesSockets(req, rsi);
-    case SNAP_SAVE_AOF:     return snapSaveBackgroundAof();
+    case HYBSNAP_SAVE_RDB:     return hybsnapSaveBackground(req, filename, rsi, rdbflags);
+    case HYBSNAP_SAVE_SOCKETS: return hybsnapSaveToSlavesSockets(req, rsi);
+    case HYBSNAP_SAVE_AOF:     return hybsnapSaveBackgroundAof();
     }
     serverPanic("unknown hybrid save kind %d", kind);
 }
 
 /* Start a hybrid background save: freeze the keyspace (overlay), fork the
  * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
-static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (hasActiveChildProcess()) return C_ERR;
-    if (snapArenaForkable()) {
+    if (hybsnapArenaForkable()) {
         /* Only a Lua debugger session can leave the arena forkable with no
          * exclusive child around. The hybrid child never touches the arena, so
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
-        serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+        serverLog(LL_NOTICE, "Hybrid snapshot: the HYBSNAP_NOFORK arena is forkable (debugger child); the save child will map it");
     }
-    snapSave *sv = snapSaveCreate(SNAP_SAVE_RDB, req, filename, rsi, rdbflags);
+    hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_RDB, req, filename, rsi, rdbflags);
     if (!sv) return C_ERR;
-    return snapSaveLaunch(sv);
+    return hybsnapSaveLaunch(sv);
 }
 
 /* Diskless full sync through the hybrid save: the same scan and
@@ -3806,7 +3806,7 @@ static int snapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdb
  * writes the classic rdb pipe that the parent fans out to the sockets, and
  * waits on the safe-to-exit pipe before exiting. The classic socket done
  * handler (RDB_CHILD_TYPE_SOCKET) does the replica bookkeeping afterwards. */
-static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
+static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listIter li;
     listNode *ln;
     int pipefds[2];
@@ -3816,10 +3816,10 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */
     if (server.rdb_pipe_conns) return C_ERR;
-    if (snapArenaForkable())
-        serverLog(LL_NOTICE, "Hybrid snapshot: the SNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+    if (hybsnapArenaForkable())
+        serverLog(LL_NOTICE, "Hybrid snapshot: the HYBSNAP_NOFORK arena is forkable (debugger child); the save child will map it");
 
-    snapSave *sv = snapSaveCreate(SNAP_SAVE_SOCKETS, req, NULL, rsi, RDBFLAGS_REPLICATION);
+    hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_SOCKETS, req, NULL, rsi, RDBFLAGS_REPLICATION);
     if (!sv) return C_ERR;
     sv->rdb_channel = rdb_channel;
     sv->rdb_pipe_write = sv->safe_to_exit_pipe = -1;
@@ -3828,8 +3828,8 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         /* The child cannot write the sockets itself: with TLS the parent must
          * keep a continuous TLS state when it takes over after the child. */
         if (anetPipe(pipefds, O_NONBLOCK, 0) == -1) {
-            snapScanAbort(sv->scan);
-            snapSaveFree(sv);
+            hybsnapScanAbort(sv->scan);
+            hybsnapSaveFree(sv);
             return C_ERR;
         }
         server.rdb_pipe_read = pipefds[0];
@@ -3839,8 +3839,8 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
             close(sv->rdb_pipe_write);
             close(server.rdb_pipe_read);
             server.rdb_pipe_read = -1;
-            snapScanAbort(sv->scan);
-            snapSaveFree(sv);
+            hybsnapScanAbort(sv->scan);
+            hybsnapSaveFree(sv);
             return C_ERR;
         }
         sv->safe_to_exit_pipe = pipefds[0];
@@ -3871,7 +3871,7 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         server.rdb_pipe_numconns_writing = 0;
     }
 
-    if (snapSaveLaunch(sv) != C_OK) {
+    if (hybsnapSaveLaunch(sv) != C_OK) {
         /* Undo the state change. The caller will perform cleanup on all the
          * replicas in BGSAVE_START state, but the setup above turned them
          * into BGSAVE_END. */
@@ -3892,7 +3892,7 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
         zfree(conns);
         return C_ERR;
     }
-    /* sv is live from here (snap_save); it does not own 'conns'. */
+    /* sv is live from here (hybsnap_save); it does not own 'conns'. */
     sv->conns = NULL;
     serverLog(LL_NOTICE, "Background RDB transfer started by pid %ld to %s (hybrid: the scan thread streams to the child)",
               (long)server.child_pid, rdb_channel ? "replica socket" : "parent process pipe");
@@ -3911,19 +3911,19 @@ static int snapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
 
 /* Stop the scan thread and complete every slot (main thread). Safe to call
  * when no hybrid save is running. Does not touch the child (see killRDBChild). */
-void snapSaveAbort(void) {
-    if (!snap_save || snap_save->aborted) return;
-    snapSave *sv = snap_save;
+void hybsnapSaveAbort(void) {
+    if (!hybsnap_save || hybsnap_save->aborted) return;
+    hybsnapSave *sv = hybsnap_save;
     sv->aborted = 1;
     /* Stops the thread within one cursor step, joins it, completes every slot.
      * A thread blocked on write() returns once the child reads or dies. */
-    snapScanAbort(sv->scan);
+    hybsnapScanAbort(sv->scan);
     /* Every slot is complete and every overlay released: the stores are not
      * ours to look at any more (the aborting FLUSHALL ASYNC or full-sync load
      * frees them on BIO while this save object waits for the child). */
     for (int s = 0; s < sv->dbnum; s++) sv->stores[s] = NULL;
     if (sv->ae_registered) {
-        aeDeleteFileEvent(server.el, snapScanReadEventFd(sv->scan), AE_READABLE);
+        aeDeleteFileEvent(server.el, hybsnapScanReadEventFd(sv->scan), AE_READABLE);
         sv->ae_registered = 0;
     }
     serverLog(LL_NOTICE, "Hybrid snapshot: scan aborted, keyspace overlay drained.");
@@ -3935,24 +3935,24 @@ void snapSaveAbort(void) {
  * no hybrid save owns the child; otherwise stops the scan if the child failed
  * or the scan is unfinished, joins the thread, releases every state and
  * publishes the last save's peaks. */
-void snapOnChildEnd(int exitcode, int bysignal) {
-    if (!snap_save) return;
-    snapSave *sv = snap_save;
+void hybsnapOnChildEnd(int exitcode, int bysignal) {
+    if (!hybsnap_save) return;
+    hybsnapSave *sv = hybsnap_save;
     /* The child is gone. If the scan did not complete (or the thread stopped
      * on its own when the channel broke, leaving slots owed), stop it and
      * complete every remaining slot. Harmless after a clean finish. */
-    if (!(!bysignal && exitcode == 0) || !snapScanIsFinished(sv->scan))
-        snapScanAbort(sv->scan);
-    if (sv->failed && !snapToSockets(sv) && !snapIsAof(sv)) {
+    if (!(!bysignal && exitcode == 0) || !hybsnapScanIsFinished(sv->scan))
+        hybsnapScanAbort(sv->scan);
+    if (sv->failed && !hybsnapToSockets(sv) && !hybsnapIsAof(sv)) {
         /* Our own defined failure (hard mark): the child was ended with the
          * whitelisted SIGUSR1, which the plain done handler does not count.
          * A socket transfer reports through the replicas, as the classic save. */
         server.lastbgsave_status = C_ERR;
         server.stat_rdb_consecutive_failures++;
     }
-    snap_last_retained_peak = sv->retained_peak;
-    atomicGet(sv->queued_peak, snap_last_queued_peak);
-    snap_last_inplace_writes = sv->inplace_writes;
+    hybsnap_last_retained_peak = sv->retained_peak;
+    atomicGet(sv->queued_peak, hybsnap_last_queued_peak);
+    hybsnap_last_inplace_writes = sv->inplace_writes;
     if (!bysignal && exitcode == 0 && !sv->failed) {
         /* The classic end-of-save line, from the side that knows the counts: the
          * keys the scan thread and the main thread produced, and the keys of
@@ -3963,19 +3963,19 @@ void snapOnChildEnd(int exitcode, int bysignal) {
         atomicGet(sv->keys_skipped, skipped);
         atomicGet(sv->main_keys, main);
         serverLog(LL_NOTICE, "%s done, %lld keys saved, %lld keys skipped.",
-                  snapIsAof(sv) ? "AOF rewrite" : sv->slots_form ? "Slot snapshot" : "BGSAVE",
+                  hybsnapIsAof(sv) ? "AOF rewrite" : sv->slots_form ? "Slot snapshot" : "BGSAVE",
                   nofork + fork + main, skipped);
     }
-    snap_save = NULL;
-    snapSaveFree(sv);   /* drains completions, joins, unregisters */
+    hybsnap_save = NULL;
+    hybsnapSaveFree(sv);   /* drains completions, joins, unregisters */
     serverLog(LL_NOTICE, "Hybrid snapshot: scan thread joined and overlay released.");
 }
 
 /* ---- Unit tests ---------------------------------------------------------- */
 #ifdef REDIS_TEST
 /* Test helper: 1 while slot (store, dict) is not DONE. */
-static int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
-    return snapScanSlotState(ctx, store_idx, didx) != SNAP_SLOT_DONE;
+static int hybsnapScanKeyIsOwed(hybsnapScanCtx *ctx, int store_idx, int didx) {
+    return hybsnapScanSlotState(ctx, store_idx, didx) != HYBSNAP_SLOT_DONE;
 }
 #include "testhelp.h"
 #include <sys/wait.h>
@@ -3985,21 +3985,21 @@ static int snapScanKeyIsOwed(snapScanCtx *ctx, int store_idx, int didx) {
 extern dictType KvstoreDictTestType;   /* kvstore.c (REDIS_TEST) */
 extern kvstoreType KvstoreTestType;
 
-#define SNAP_TEST_STORES 2
-#define SNAP_TEST_DICT_BITS 2
-#define SNAP_TEST_DICTS (1 << SNAP_TEST_DICT_BITS)
-#define SNAP_TEST_MAXKEYS 6000
+#define HYBSNAP_TEST_STORES 2
+#define HYBSNAP_TEST_DICT_BITS 2
+#define HYBSNAP_TEST_DICTS (1 << HYBSNAP_TEST_DICT_BITS)
+#define HYBSNAP_TEST_MAXKEYS 6000
 
-struct snapScanTestState {
-    unsigned char seen[SNAP_TEST_STORES][SNAP_TEST_DICTS][SNAP_TEST_MAXKEYS];
-    int inserted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+struct hybsnapScanTestState {
+    unsigned char seen[HYBSNAP_TEST_STORES][HYBSNAP_TEST_DICTS][HYBSNAP_TEST_MAXKEYS];
+    int inserted[HYBSNAP_TEST_STORES][HYBSNAP_TEST_DICTS];
     redisAtomic long dispatched;
     redisAtomic long bad;             /* unparsable / out-of-range / duplicate */
-    int done_calls[SNAP_TEST_STORES][SNAP_TEST_DICTS];
-    int done_aborted[SNAP_TEST_STORES][SNAP_TEST_DICTS];
+    int done_calls[HYBSNAP_TEST_STORES][HYBSNAP_TEST_DICTS];
+    int done_aborted[HYBSNAP_TEST_STORES][HYBSNAP_TEST_DICTS];
     int dispatch_sleep_us;
     redisAtomic int wrong_state;      /* dispatch saw its slot not SCANNING */
-    snapScanCtx *ctx;
+    hybsnapScanCtx *ctx;
     kvstore **stores;
     int rehashing_at_done;
 };
@@ -4013,7 +4013,7 @@ static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink);
  * fault on 'p'. Returns 1 if the child faulted exactly on the write (SIGSEGV
  * or SIGBUS after 'r' and no 'd'), 0 if it wrote fine and exited 0, and -1 on
  * any other outcome (printed). */
-static int snapTestChildWriteFaults(void *p) {
+static int hybsnapTestChildWriteFaults(void *p) {
     int fds[2];
     if (pipe(fds) != 0) return -1;
     pid_t pid = fork();
@@ -4048,9 +4048,9 @@ static int snapTestChildWriteFaults(void *p) {
 
 /* Fork a child that exercises the allocator (zmalloc + zmalloc_nofork are both
  * forbidden/unmapped for the arena, so only the default arena is used) to
- * prove jemalloc's post-fork state is intact with the SNAP_NOFORK arena
+ * prove jemalloc's post-fork state is intact with the HYBSNAP_NOFORK arena
  * present. Returns 1 on success. */
-static int snapTestChildAllocatorAlive(void) {
+static int hybsnapTestChildAllocatorAlive(void) {
     pid_t pid = fork();
     if (pid == 0) {
         for (int i = 0; i < 1000; i++) { void *x = zmalloc(64 + i); zfree(x); }
@@ -4070,7 +4070,7 @@ static int snapTestChildAllocatorAlive(void) {
 /* Look up the mapping containing 'p' in /proc/self/smaps and return 1 if its
  * VmFlags include "dc" (VM_DONTCOPY, i.e. MADV_DONTFORK), 0 if not, -1 if not
  * found. */
-static int snapTestMappingIsDontcopy(const void *p) {
+static int hybsnapTestMappingIsDontcopy(const void *p) {
     FILE *f = fopen("/proc/self/smaps", "r");
     if (!f) return -1;
     char line[1024];
@@ -4093,13 +4093,13 @@ static int snapTestMappingIsDontcopy(const void *p) {
     return result;
 }
 
-static long long snapTestNowNs(void) {
+static long long hybsnapTestNowNs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
     return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
-static int snapTestCountMaps(void) {
+static int hybsnapTestCountMaps(void) {
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) return -1;
     int n = 0;
@@ -4109,7 +4109,7 @@ static int snapTestCountMaps(void) {
     return n;
 }
 
-static void snapTestPurgeArena(void) {
+static void hybsnapTestPurgeArena(void) {
 #ifdef HAVE_NOFORK_ARENA
     char buf[64];
     snprintf(buf, sizeof(buf), "arena.%u.purge", zmalloc_nofork_arena_index());
@@ -4125,7 +4125,7 @@ static void snapTestPurgeArena(void) {
 
 /* Test keys are aligned C strings owned by the dict (no_value dicts need
  * aligned stored keys; the real keyspace stores kvobj pointers). */
-static char *snapTestKey(int s, int didx, int i) {
+static char *hybsnapTestKey(int s, int didx, int i) {
     char buf[64];
     int len = snprintf(buf, sizeof(buf), "k:%d:%d:%d", s, didx, i);
     char *k = zmalloc(len + 1);
@@ -4133,8 +4133,8 @@ static char *snapTestKey(int s, int didx, int i) {
     return k;
 }
 
-static void snapTestDispatch(void *priv, int s, int didx, kvobj *kv) {
-    struct snapScanTestState *st = priv;
+static void hybsnapTestDispatch(void *priv, int s, int didx, kvobj *kv) {
+    struct hybsnapScanTestState *st = priv;
     const char *key = (const char*)kv;   /* test dict stores plain C strings */
     int ps, pd, pi;
     if (sscanf(key, "k:%d:%d:%d", &ps, &pd, &pi) != 3 || ps != s || pd != didx ||
@@ -4144,18 +4144,18 @@ static void snapTestDispatch(void *priv, int s, int didx, kvobj *kv) {
     } else {
         st->seen[s][didx][pi] = 1;
     }
-    if (st->ctx && snapScanSlotState(st->ctx, s, didx) != SNAP_SLOT_SCANNING) atomicSetWithSync(st->wrong_state, 1);
+    if (st->ctx && hybsnapScanSlotState(st->ctx, s, didx) != HYBSNAP_SLOT_SCANNING) atomicSetWithSync(st->wrong_state, 1);
     atomicIncr(st->dispatched, 1);
     if (st->dispatch_sleep_us) usleep(st->dispatch_sleep_us);
 }
 
-static int snapTestKeyCompare(dictCmpCache *cache, const void *k1, const void *k2) {
+static int hybsnapTestKeyCompare(dictCmpCache *cache, const void *k1, const void *k2) {
     UNUSED(cache);
     return strcmp(k1, k2) == 0;
 }
 
-static void snapTestSlotDone(void *priv, int s, int didx, int aborted) {
-    struct snapScanTestState *st = priv;
+static void hybsnapTestSlotDone(void *priv, int s, int didx, int aborted) {
+    struct hybsnapScanTestState *st = priv;
     st->done_calls[s][didx]++;
     st->done_aborted[s][didx] = aborted;
     /* The dict is still frozen here: record whether the mid-rehash dict is
@@ -4166,78 +4166,78 @@ static void snapTestSlotDone(void *priv, int s, int didx, int aborted) {
     }
 }
 
-static int snapTestAllUnfrozen(kvstore **stores) {
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+static int hybsnapTestAllUnfrozen(kvstore **stores) {
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
             dict *d = kvstoreGetDict(stores[s], didx);
             if (d && (d->pauserehash != 0 || d->pauseAutoResize != 0)) return 0;
         }
     return 1;
 }
 
-static int snapTestAllState(snapScanCtx *ctx, int state) {
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
-            if (snapScanSlotState(ctx, s, didx) != state) return 0;
+static int hybsnapTestAllState(hybsnapScanCtx *ctx, int state) {
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++)
+            if (hybsnapScanSlotState(ctx, s, didx) != state) return 0;
     return 1;
 }
 
 
 /* Tests without a scan thread: put the window where a thread and its
  * grants would have it. */
-static void snapTestWindow(snapScanCtx *ctx, uint64_t lo, uint64_t hi) {
-    __atomic_store_n(&snap_lo, lo, __ATOMIC_SEQ_CST);
-    __atomic_store_n(&snap_hi, hi, __ATOMIC_SEQ_CST);
+static void hybsnapTestWindow(hybsnapScanCtx *ctx, uint64_t lo, uint64_t hi) {
+    __atomic_store_n(&hybsnap_lo, lo, __ATOMIC_SEQ_CST);
+    __atomic_store_n(&hybsnap_hi, hi, __ATOMIC_SEQ_CST);
     ctx->hi = hi;
 }
 
-static void snapScanTests(int accurate) {
+static void hybsnapScanTests(int accurate) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;   /* the kvstore test type compares pointers */
-    kvstore *stores[SNAP_TEST_STORES];
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        stores[s] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    noval.keyCompare = hybsnapTestKeyCompare;   /* the kvstore test type compares pointers */
+    kvstore *stores[HYBSNAP_TEST_STORES];
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        stores[s] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
 
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
     st->stores = stores;
 
     /* Population: store 0: d0 = 1 key, d1 = empty (never allocated), d2 = 5000
      * keys, d3 = left mid-rehash. Store 1: d0..d2 = 100 keys each, d3 empty. */
     dictSetResizeEnabled(DICT_RESIZE_ENABLE);
-    int plan[SNAP_TEST_STORES][SNAP_TEST_DICTS] = { {1, 0, 5000, -1}, {100, 100, 100, 0} };
-    for (int s = 0; s < SNAP_TEST_STORES; s++) {
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+    int plan[HYBSNAP_TEST_STORES][HYBSNAP_TEST_DICTS] = { {1, 0, 5000, -1}, {100, 100, 100, 0} };
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++) {
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
             int n = plan[s][didx];
             if (n == -1) {
                 /* Insert until the dict is rehashing (expand just triggered). */
                 int i = 0;
-                while (i < SNAP_TEST_MAXKEYS) {
-                    serverAssert(kvstoreDictAddRaw(stores[s], didx, snapTestKey(s, didx, i), NULL) != NULL);
+                while (i < HYBSNAP_TEST_MAXKEYS) {
+                    serverAssert(kvstoreDictAddRaw(stores[s], didx, hybsnapTestKey(s, didx, i), NULL) != NULL);
                     i++;
                     if (i > 64 && dictIsRehashing(kvstoreGetDict(stores[s], didx))) break;
                 }
                 n = i;
             } else {
                 for (int i = 0; i < n; i++)
-                    serverAssert(kvstoreDictAddRaw(stores[s], didx, snapTestKey(s, didx, i), NULL) != NULL);
+                    serverAssert(kvstoreDictAddRaw(stores[s], didx, hybsnapTestKey(s, didx, i), NULL) != NULL);
             }
             st->inserted[s][didx] = n;
         }
     }
     long total_keys = 0;
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) total_keys += st->inserted[s][didx];
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) total_keys += st->inserted[s][didx];
     test_cond("scan test: a dict was left mid-rehash at scan start",
               dictIsRehashing(kvstoreGetDict(stores[0], 3)));
     test_cond("scan test: an empty slot has no dict allocated", kvstoreGetDict(stores[0], 1) == NULL);
 
     /* ---- Full scan with concurrent main-thread reads ---- */
-    snapScanCtx *ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     st->dispatch_sleep_us = 0;
-    test_cond("scan: nothing is owed before start", snapTestAllState(ctx, SNAP_SLOT_DONE));
-    snapScanFreeze(ctx);   /* guard installed, no thread yet: the checks below are deterministic */
+    test_cond("scan: nothing is owed before start", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
+    hybsnapScanFreeze(ctx);   /* guard installed, no thread yet: the checks below are deterministic */
     {
         /* On-demand freeze: the freeze pauses nothing; the
          * first write-intent access to a slot the thread has not finished
@@ -4245,77 +4245,77 @@ static void snapScanTests(int accurate) {
          * reading does not. */
         dict *d = kvstoreGetDict(stores[0], 0);
         test_cond("scan: no dict is paused right after start", d->pauserehash == 0 && d->pauseAutoResize == 0);
-        char *k0 = snapTestKey(0, 0, 0);   /* store 0 dict 0 holds one key */
+        char *k0 = hybsnapTestKey(0, 0, 0);   /* store 0 dict 0 holds one key */
         dictEntryLink b = NULL;
         dictEntryLink l = kvstoreDictFindLink(stores[0], 0, k0, &b);
         test_cond("scan: a write-intent lookup on an unreached dict attaches it (bitmap) without pausing it and finds the key",
-                  l != NULL && d->pauserehash == 0 && d->pauseAutoResize == 0 && snapScanBitmapBytes(ctx) > 0);
+                  l != NULL && d->pauserehash == 0 && d->pauseAutoResize == 0 && hybsnapScanBitmapBytes(ctx) > 0);
         zfree(k0);
         /* An attached, unreached dict may grow, and its bitmap
          * follows (bucket i of n -> i + j*n of k*n); it may not shrink. */
         dict *big = kvstoreGetDict(stores[0], 2);   /* 5000 keys */
         while (dictIsRehashing(big)) dictRehash(big, 1000);   /* start from one table (it is not attached yet) */
-        char *kb = snapTestKey(0, 2, 1);
+        char *kb = hybsnapTestKey(0, 2, 1);
         kvstoreDictFindLink(stores[0], 2, kb, &b);
         zfree(kb);
         unsigned long n0 = DICTHT_SIZE(big->ht_size_exp[0]);
-        snapScanMarkBucketEmitted(ctx, 0, 2, 0, 3);
-        snapScanMarkBucketEmitted(ctx, 0, 2, 0, n0 - 1);
-        size_t bm_before = snapScanBitmapBytes(ctx);
+        hybsnapScanMarkBucketEmitted(ctx, 0, 2, 0, 3);
+        hybsnapScanMarkBucketEmitted(ctx, 0, 2, 0, n0 - 1);
+        size_t bm_before = hybsnapScanBitmapBytes(ctx);
         int r1 = dictExpand(big, n0 * 16);   /* allowed: not paused */
         unsigned long n1 = DICTHT_SIZE(big->ht_size_exp[1]);
-        int ok = r1 == DICT_OK && dictIsRehashing(big) && n1 == n0 * 16 && snapScanBitmapBytes(ctx) > bm_before;
+        int ok = r1 == DICT_OK && dictIsRehashing(big) && n1 == n0 * 16 && hybsnapScanBitmapBytes(ctx) > bm_before;
         for (unsigned long j = 0; ok && j < 16; j++)
-            ok = snapScanBucketEmitted(ctx, 0, 2, 1, 3 + j * n0) && snapScanBucketEmitted(ctx, 0, 2, 1, n0 - 1 + j * n0) &&
-                 !snapScanBucketEmitted(ctx, 0, 2, 1, 4 + j * n0);
+            ok = hybsnapScanBucketEmitted(ctx, 0, 2, 1, 3 + j * n0) && hybsnapScanBucketEmitted(ctx, 0, 2, 1, n0 - 1 + j * n0) &&
+                 !hybsnapScanBucketEmitted(ctx, 0, 2, 1, 4 + j * n0);
         test_cond("scan: an unreached dict expands and its bitmap is replicated into the new table", ok);
         while (dictIsRehashing(big)) dictRehash(big, 1000);   /* finish the rehash: the new bitmap becomes the table's */
         test_cond("scan: after the rehash the carried bitmap is the dict's only one",
-                  snapScanBucketEmitted(ctx, 0, 2, 0, 3 + n0) && snapScanBucketEmitted(ctx, 0, 2, 0, n0 - 1 + 2 * n0) &&
-                  !snapScanBucketEmitted(ctx, 0, 2, 0, 4) && snapScanBitmapBytes(ctx) == bm_before - (n0 + 7) / 8 + (n1 + 7) / 8);
+                  hybsnapScanBucketEmitted(ctx, 0, 2, 0, 3 + n0) && hybsnapScanBucketEmitted(ctx, 0, 2, 0, n0 - 1 + 2 * n0) &&
+                  !hybsnapScanBucketEmitted(ctx, 0, 2, 0, 4) && hybsnapScanBitmapBytes(ctx) == bm_before - (n0 + 7) / 8 + (n1 + 7) / 8);
         /* 5000 keys in 16 x their table: the fill ratio asks for a shrink, the snapshot refuses it. */
         signed char exp_before = big->ht_size_exp[0];
         int r2 = dictShrinkIfNeeded(big);
         test_cond("scan: an attached dict refuses to shrink", r2 == DICT_ERR && !dictIsRehashing(big) && big->ht_size_exp[0] == exp_before);
         /* The marks above named buckets that hold keys: clear them so the walk
          * below dispatches every key (the thread skips marked buckets). */
-        snapDictState *bsn = ((kvstoreDictMetaBase *)dictMetadata(big))->ext;
+        hybsnapDictState *bsn = ((kvstoreDictMetaBase *)dictMetadata(big))->ext;
         memset(bsn->bits[0], 0, bsn->bytes[0]);
-        snapFunnelClose();   /* the accesses above opened a section: "command end" */
+        hybsnapFunnelClose();   /* the accesses above opened a section: "command end" */
     }
-    test_cond("scan: snapScanStartThread() succeeds", snapScanStartThread(ctx) == C_OK);
+    test_cond("scan: hybsnapScanStartThread() succeeds", hybsnapScanStartThread(ctx) == C_OK);
     /* Concurrent reads from the owner thread while the scan runs. */
     long reads = 0, misses = 0;
     unsigned seed = 7;
     int completions = 0;
-    while (!snapScanIsFinished(ctx)) {
+    while (!hybsnapScanIsFinished(ctx)) {
         seed = seed * 1103515245u + 12345u;
-        int s = (seed >> 8) % SNAP_TEST_STORES, didx = (seed >> 12) % SNAP_TEST_DICTS;
+        int s = (seed >> 8) % HYBSNAP_TEST_STORES, didx = (seed >> 12) % HYBSNAP_TEST_DICTS;
         if (st->inserted[s][didx] > 0) {
             int i = (seed >> 16) % st->inserted[s][didx];
-            char *k = snapTestKey(s, didx, i);
+            char *k = hybsnapTestKey(s, didx, i);
             if (kvstoreDictFind(stores[s], didx, k) == NULL) misses++;
             zfree(k);
             reads++;
-            snapFunnelClose();   /* a read of a slot under scan opens a section: end the "command" */
+            hybsnapFunnelClose();   /* a read of a slot under scan opens a section: end the "command" */
         }
-        completions += snapScanHandleCompletions(ctx);
+        completions += hybsnapScanHandleCompletions(ctx);
     }
-    completions += snapScanHandleCompletions(ctx);
+    completions += hybsnapScanHandleCompletions(ctx);
     long dispatched, bad;
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
     int wrong_state;
     atomicGet(st->wrong_state, wrong_state);
     long all_seen = 1;
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++)
             for (int i = 0; i < st->inserted[s][didx]; i++) if (!st->seen[s][didx][i]) all_seen = 0;
     /* Slots empty at the fork instant have no dict (allocate on demand) and
      * are never completed; every populated one completes once through the ring. */
     int done_once = 1, empty_slots = 0;
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
             int expect = st->inserted[s][didx] > 0 ? 1 : 0;
             if (st->inserted[s][didx] == 0) empty_slots++;
             if (st->done_calls[s][didx] != expect || st->done_aborted[s][didx] != 0) done_once = 0;
@@ -4327,22 +4327,22 @@ static void snapScanTests(int accurate) {
     test_cond("scan: dispatch always ran with its slot in SCANNING state", wrong_state == 0);
     test_cond("scan: concurrent owner-thread lookups all hit", reads > 0 && misses == 0);
     test_cond("scan: every populated slot completed exactly once, none aborted",
-              done_once && completions == SNAP_TEST_STORES * SNAP_TEST_DICTS - empty_slots);
-    test_cond("scan: all slots DONE at the end", snapTestAllState(ctx, SNAP_SLOT_DONE));
-    test_cond("scan: no slot is owed after completion", !snapScanKeyIsOwed(ctx, 0, 0) && !snapScanKeyIsOwed(ctx, 1, 3));
-    test_cond("scan: all dicts unfrozen at the end", snapTestAllUnfrozen(stores));
+              done_once && completions == HYBSNAP_TEST_STORES * HYBSNAP_TEST_DICTS - empty_slots);
+    test_cond("scan: all slots DONE at the end", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
+    test_cond("scan: no slot is owed after completion", !hybsnapScanKeyIsOwed(ctx, 0, 0) && !hybsnapScanKeyIsOwed(ctx, 1, 3));
+    test_cond("scan: all dicts unfrozen at the end", hybsnapTestAllUnfrozen(stores));
     /* With the on-demand freeze a dict left mid-rehash at start may finish
      * rehashing through main-thread reads before the thread reaches it (the
      * thread never rehashes: it only reads a layout that holds still). */
     printf("scan: mid-rehash dict %s mid-rehash when its slot completed\n", st->rehashing_at_done ? "still" : "no longer");
     {
         long t, sc, dn; long long kd;
-        snapScanProgress(ctx, &t, &sc, &dn, &kd);
+        hybsnapScanProgress(ctx, &t, &sc, &dn, &kd);
         printf("scan: progress total %ld scanned %ld done %ld keys %lld (empty slots %d)\n", t, sc, dn, kd, empty_slots);
         test_cond("scan: progress counters consistent (the allocated dicts)",
-                  t == SNAP_TEST_STORES * SNAP_TEST_DICTS - empty_slots && sc == t && dn == t && kd == total_keys);
+                  t == HYBSNAP_TEST_STORES * HYBSNAP_TEST_DICTS - empty_slots && sc == t && dn == t && kd == total_keys);
     }
-    snapScanRelease(ctx);
+    hybsnapScanRelease(ctx);
 
     /* ---- Abort mid-scan ---- */
     memset(st->seen, 0, sizeof(st->seen));
@@ -4351,19 +4351,19 @@ static void snapScanTests(int accurate) {
     atomicSet(st->dispatched, 0);
     atomicSet(st->bad, 0);
     st->dispatch_sleep_us = accurate ? 200 : 100;   /* 5000-key slot takes >= 0.5 s */
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    test_cond("abort: start", snapScanStart(ctx) == C_OK);
+    test_cond("abort: start", hybsnapScanStart(ctx) == C_OK);
     /* Wait until the thread is inside the first big slot. */
     long d0;
-    do { usleep(1000); atomicGet(st->dispatched, d0); } while (d0 < 50 && !snapScanIsFinished(ctx));
-    long long t0 = snapTestNowNs();
-    snapScanAbort(ctx);
-    long long abort_ms = (snapTestNowNs() - t0) / 1000000;
+    do { usleep(1000); atomicGet(st->dispatched, d0); } while (d0 < 50 && !hybsnapScanIsFinished(ctx));
+    long long t0 = hybsnapTestNowNs();
+    hybsnapScanAbort(ctx);
+    long long abort_ms = (hybsnapTestNowNs() - t0) / 1000000;
     atomicGet(st->dispatched, dispatched);
     int aborted_slots = 0, normal_slots = 0, calls = 0, twice = 0;
-    for (int s = 0; s < SNAP_TEST_STORES; s++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
             calls += st->done_calls[s][didx];
             if (st->done_calls[s][didx] > 1) twice++;
             if (!st->done_calls[s][didx]) continue;   /* not reached: the save never touched it */
@@ -4373,13 +4373,13 @@ static void snapScanTests(int accurate) {
            dispatched, abort_ms, aborted_slots, normal_slots);
     test_cond("abort: stopped well before the scan would have finished", dispatched < total_keys);
     test_cond("abort: returned promptly (< 500 ms)", abort_ms < 500);
-    test_cond("abort: thread finished", snapScanIsFinished(ctx));
-    test_cond("abort: no slot completed twice, the reached ones once", twice == 0 && calls == aborted_slots + normal_slots && calls <= SNAP_TEST_STORES * SNAP_TEST_DICTS);
+    test_cond("abort: thread finished", hybsnapScanIsFinished(ctx));
+    test_cond("abort: no slot completed twice, the reached ones once", twice == 0 && calls == aborted_slots + normal_slots && calls <= HYBSNAP_TEST_STORES * HYBSNAP_TEST_DICTS);
     test_cond("abort: interrupted slots reported as aborted", aborted_slots >= 1);
     test_cond("abort: slots scanned before the abort completed normally", normal_slots >= 1);
-    test_cond("abort: all slots DONE", snapTestAllState(ctx, SNAP_SLOT_DONE));
-    test_cond("abort: all dicts unfrozen", snapTestAllUnfrozen(stores));
-    snapScanRelease(ctx);
+    test_cond("abort: all slots DONE", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
+    test_cond("abort: all dicts unfrozen", hybsnapTestAllUnfrozen(stores));
+    hybsnapScanRelease(ctx);
 
     /* ---- Credit: inside a section the thread reads only its grant ---- */
     memset(st->seen, 0, sizeof(st->seen));
@@ -4388,12 +4388,12 @@ static void snapScanTests(int accurate) {
     atomicSet(st->dispatched, 0);
     atomicSet(st->bad, 0);
     st->dispatch_sleep_us = 0;
-    unsigned long saved_w = snapGetWindowBuckets();
-    snapSetWindowBuckets(64);
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    unsigned long saved_w = hybsnapGetWindowBuckets();
+    hybsnapSetWindowBuckets(64);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapFunnelOpen();
-    test_cond("credit: start with a write section open", snapScanStart(ctx) == C_OK);
+    hybsnapFunnelOpen();
+    test_cond("credit: start with a write section open", hybsnapScanStart(ctx) == C_OK);
     long long stalls = 0;
     for (int i = 0; i < 2000 && stalls == 0; i++) { usleep(1000); atomicGet(ctx->stalls, stalls); }
     long first;
@@ -4401,44 +4401,44 @@ static void snapScanTests(int accurate) {
     usleep(20000);
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: the thread read its grant and waits at hi (64 buckets: d0, then part of d2)",
-              stalls == 1 && first > 0 && dispatched == first && first < total_keys && !snapScanIsFinished(ctx));
-    snapFunnelOpen();   /* a later hook of the same section: the thread is past mid, the next 64 buckets are granted */
+              stalls == 1 && first > 0 && dispatched == first && first < total_keys && !hybsnapScanIsFinished(ctx));
+    hybsnapFunnelOpen();   /* a later hook of the same section: the thread is past mid, the next 64 buckets are granted */
     long long stalls2 = stalls;
     for (int i = 0; i < 2000 && stalls2 == stalls; i++) { usleep(1000); atomicGet(ctx->stalls, stalls2); }
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: a hook inside the section raised hi, the thread read on and waits again",
               ctx->grants == 1 && stalls2 == 2 && dispatched > first && dispatched < total_keys);
-    snapFunnelClose();   /* no limit outside sections */
-    while (!snapScanIsFinished(ctx)) usleep(100);
-    snapScanHandleCompletions(ctx);
+    hybsnapFunnelClose();   /* no limit outside sections */
+    while (!hybsnapScanIsFinished(ctx)) usleep(100);
+    hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
     atomicGet(ctx->stalls, stalls);
     test_cond("credit: after the section closed the thread ran to the end, every key once, no further wait",
               dispatched == total_keys && bad == 0 && stalls == 2);
-    snapScanRelease(ctx);
-    snapSetWindowBuckets(saved_w);
+    hybsnapScanRelease(ctx);
+    hybsnapSetWindowBuckets(saved_w);
 
     /* ---- Abort while the aborting command holds the section open ---- */
     atomicSet(st->dispatched, 0);
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapFunnelOpen();
-    test_cond("abort-in-section: start", snapScanStart(ctx) == C_OK);
+    hybsnapFunnelOpen();
+    test_cond("abort-in-section: start", hybsnapScanStart(ctx) == C_OK);
     usleep(5000);
-    t0 = snapTestNowNs();
-    snapScanAbort(ctx);
-    abort_ms = (snapTestNowNs() - t0) / 1000000;
-    test_cond("abort-in-section: abort returned promptly although the section is still open", abort_ms < 500 && snapScanIsFinished(ctx));
-    test_cond("abort-in-section: all slots DONE, dicts unfrozen", snapTestAllState(ctx, SNAP_SLOT_DONE) && snapTestAllUnfrozen(stores));
-    snapScanRelease(ctx);
-    snapFunnelClose();
+    t0 = hybsnapTestNowNs();
+    hybsnapScanAbort(ctx);
+    abort_ms = (hybsnapTestNowNs() - t0) / 1000000;
+    test_cond("abort-in-section: abort returned promptly although the section is still open", abort_ms < 500 && hybsnapScanIsFinished(ctx));
+    test_cond("abort-in-section: all slots DONE, dicts unfrozen", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE) && hybsnapTestAllUnfrozen(stores));
+    hybsnapScanRelease(ctx);
+    hybsnapFunnelClose();
 
     /* ---- Positions and grants (no thread) ---- */
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    for (int s2 = 0; s2 < SNAP_TEST_STORES; s2++)
-        for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+    for (int s2 = 0; s2 < HYBSNAP_TEST_STORES; s2++)
+        for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
             dict *d = kvstoreGetDict(stores[s2], didx);
             while (d && dictIsRehashing(d)) dictRehash(d, 1000);   /* one table each, then one rehash set up below */
         }
@@ -4446,51 +4446,51 @@ static void snapScanTests(int accurate) {
     unsigned long r12n = DICTHT_SIZE(r12->ht_size_exp[0]);
     dictExpand(r12, r12n * 2);
     dictRehash(r12, 5);
-    snapScanFreeze(ctx);
+    hybsnapScanFreeze(ctx);
     {
-        uint64_t o00 = snapOrd(ctx, 0, 0), o02 = snapOrd(ctx, 0, 2), o03 = snapOrd(ctx, 0, 3);
-        uint64_t o10 = snapOrd(ctx, 1, 0), o11 = snapOrd(ctx, 1, 1), o12 = snapOrd(ctx, 1, 2);
+        uint64_t o00 = hybsnapOrd(ctx, 0, 0), o02 = hybsnapOrd(ctx, 0, 2), o03 = hybsnapOrd(ctx, 0, 3);
+        uint64_t o10 = hybsnapOrd(ctx, 1, 0), o11 = hybsnapOrd(ctx, 1, 1), o12 = hybsnapOrd(ctx, 1, 2);
         test_cond("positions: the scan order is integer order (layout, table 0, table 1; dicts; stores)",
-                  SNAP_POS(o02, 0, 0) < SNAP_POS(o02, 1, 0) && SNAP_POS(o02, 1, (1UL << SNAP_POS_IDX_BITS) - 1) < SNAP_POS(o02, 2, 0) &&
-                  SNAP_POS(o02, 2, (1UL << SNAP_POS_IDX_BITS) - 1) < SNAP_POS(o03, 0, 0) && SNAP_POS(o03, 2, 0) < SNAP_POS(o10, 0, 0) &&
-                  ctx->pos_end > SNAP_POS(snapOrd(ctx, 1, 3), 2, 0));
+                  HYBSNAP_POS(o02, 0, 0) < HYBSNAP_POS(o02, 1, 0) && HYBSNAP_POS(o02, 1, (1UL << HYBSNAP_POS_IDX_BITS) - 1) < HYBSNAP_POS(o02, 2, 0) &&
+                  HYBSNAP_POS(o02, 2, (1UL << HYBSNAP_POS_IDX_BITS) - 1) < HYBSNAP_POS(o03, 0, 0) && HYBSNAP_POS(o03, 2, 0) < HYBSNAP_POS(o10, 0, 0) &&
+                  ctx->pos_end > HYBSNAP_POS(hybsnapOrd(ctx, 1, 3), 2, 0));
         dict *d00 = kvstoreGetDict(stores[0], 0), *d02 = kvstoreGetDict(stores[0], 2), *d03 = kvstoreGetDict(stores[0], 3);
         unsigned long n00 = DICTHT_SIZE(d00->ht_size_exp[0]), n02 = DICTHT_SIZE(d02->ht_size_exp[0]);
-        uint64_t mid, h = snapWindowAdvance(ctx, SNAP_POS(o00, 1, 0), n00 + 2, &mid);
+        uint64_t mid, h = hybsnapWindowAdvance(ctx, HYBSNAP_POS(o00, 1, 0), n00 + 2, &mid);
         test_cond("grants: the empty slot (no dict) is a gap: a grant past dict 0 goes on in dict 2",
-                  h == SNAP_POS(o02, 1, 2) && mid == SNAP_POS(o00, 1, (n00 + 2) / 2) &&
+                  h == HYBSNAP_POS(o02, 1, 2) && mid == HYBSNAP_POS(o00, 1, (n00 + 2) / 2) &&
                   d00->pauserehash == 1 && d02->pauserehash == 1 && d03->pauserehash == 0);
-        h = snapWindowAdvance(ctx, SNAP_POS(o02, 1, n02 - 3), 5, &mid);
+        h = hybsnapWindowAdvance(ctx, HYBSNAP_POS(o02, 1, n02 - 3), 5, &mid);
         test_cond("grants: a grant crossing into the next dict pauses it first and counts from its table 0",
-                  h == SNAP_POS(o03, 1, 2) && d03->pauserehash == 1 && d02->pauserehash == 1);
+                  h == HYBSNAP_POS(o03, 1, 2) && d03->pauserehash == 1 && d02->pauserehash == 1);
         unsigned long rehashidx = (unsigned long)r12->rehashidx;
-        h = snapWindowAdvance(ctx, SNAP_POS(o12, 0, 0), (r12n - rehashidx) + 3, &mid);
+        h = hybsnapWindowAdvance(ctx, HYBSNAP_POS(o12, 0, 0), (r12n - rehashidx) + 3, &mid);
         test_cond("grants: a rehashing dict counts table 0 from rehashidx, then table 1",
-                  rehashidx > 0 && dictIsRehashing(r12) && h == SNAP_POS(o12, 2, 3) && r12->pauserehash == 1);
+                  rehashidx > 0 && dictIsRehashing(r12) && h == HYBSNAP_POS(o12, 2, 3) && r12->pauserehash == 1);
         /* The cap, with the thread found past the grant (it ran free outside
          * sections and claimed store 1's dict 1). */
         dict *d11 = kvstoreGetDict(stores[1], 1);
-        snapWordStore(d11, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNING));
-        __atomic_store_n(&snap_lo, SNAP_POS(o00, 1, 0), __ATOMIC_SEQ_CST);
-        __atomic_store_n(&snap_cur, SNAP_POS(o11, 1, 5), __ATOMIC_SEQ_CST);
-        snapWindowCap(ctx);
-        uint64_t c1 = SNAP_POS(o11, 1, 5) + 1;
+        hybsnapWordStore(d11, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));
+        __atomic_store_n(&hybsnap_lo, HYBSNAP_POS(o00, 1, 0), __ATOMIC_SEQ_CST);
+        __atomic_store_n(&hybsnap_cur, HYBSNAP_POS(o11, 1, 5), __ATOMIC_SEQ_CST);
+        hybsnapWindowCap(ctx);
+        uint64_t c1 = HYBSNAP_POS(o11, 1, 5) + 1;
         test_cond("cap: a thread found past H gets hi = cur + 1, and the dict it is in is paused",
-                  ctx->hi == c1 && __atomic_load_n(&snap_hi, __ATOMIC_SEQ_CST) == c1 && d11->pauserehash == 1);
+                  ctx->hi == c1 && __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST) == c1 && d11->pauserehash == 1);
         int pos;
-        snapFunnelOpen();
-        int in = snapBucketOwed(ctx, 1, 1, d11, 0, 3, &pos, NULL);
+        hybsnapFunnelOpen();
+        int in = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 3, &pos, NULL);
         int p_in = pos;
-        int ahead = snapBucketOwed(ctx, 1, 1, d11, 0, 6, &pos, NULL);
+        int ahead = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 6, &pos, NULL);
         int p_ahead = pos;
-        snapFunnelClose();
+        hybsnapFunnelClose();
         test_cond("cap: below cur + 1 the bucket may be being read, at it the thread cannot be",
-                  in && p_in == SNAP_POS_INSIDE && ahead && p_ahead == SNAP_POS_AHEAD);
+                  in && p_in == HYBSNAP_POS_INSIDE && ahead && p_ahead == HYBSNAP_POS_AHEAD);
         (void)o10;
     }
-    snapScanAbort(ctx);   /* frozen, never started: unfreezes and unpauses */
-    snapScanRelease(ctx);
-    snapWindowReset(NULL);
+    hybsnapScanAbort(ctx);   /* frozen, never started: unfreezes and unpauses */
+    hybsnapScanRelease(ctx);
+    hybsnapWindowReset(NULL);
 
     /* ---- Bucket bitmap: buckets marked emitted are skipped by the thread ---- */
     memset(st->seen, 0, sizeof(st->seen));
@@ -4498,92 +4498,92 @@ static void snapScanTests(int accurate) {
     memset(st->done_aborted, 0, sizeof(st->done_aborted));
     atomicSet(st->dispatched, 0);
     atomicSet(st->bad, 0);
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanFreeze(ctx);
+    hybsnapScanFreeze(ctx);
     {
         dict *d = kvstoreGetDict(stores[1], 0);
-        size_t none = snapScanBitmapBytes(ctx);
-        snapScanAttach(ctx, 1, 0, d, 0);   /* what the guard does on the first write to an unreached slot */
-        size_t before = snapScanBitmapBytes(ctx);
+        size_t none = hybsnapScanBitmapBytes(ctx);
+        hybsnapScanAttach(ctx, 1, 0, d, 0);   /* what the guard does on the first write to an unreached slot */
+        size_t before = hybsnapScanBitmapBytes(ctx);
         for (int t = 0; t < 2; t++)
             for (unsigned long i = 0; i < DICTHT_SIZE(d->ht_size_exp[t]); i++)
-                snapScanMarkBucketEmitted(ctx, 1, 0, t, i);
+                hybsnapScanMarkBucketEmitted(ctx, 1, 0, t, i);
         test_cond("bitmap: none at freeze, allocated for every table of the dict on attach", none == 0 && before > 0 &&
-                  snapScanBucketEmitted(ctx, 1, 0, 0, 0) && !snapScanBucketEmitted(ctx, 1, 1, 0, 0));
+                  hybsnapScanBucketEmitted(ctx, 1, 0, 0, 0) && !hybsnapScanBucketEmitted(ctx, 1, 1, 0, 0));
     }
-    test_cond("bitmap: start thread", snapScanStartThread(ctx) == C_OK);
-    while (!snapScanIsFinished(ctx)) usleep(100);
-    snapScanHandleCompletions(ctx);
+    test_cond("bitmap: start thread", hybsnapScanStartThread(ctx) == C_OK);
+    while (!hybsnapScanIsFinished(ctx)) usleep(100);
+    hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
     {
         int skipped_ok = 1;
         for (int i = 0; i < st->inserted[1][0]; i++) if (st->seen[1][0][i]) skipped_ok = 0;
         int others_ok = 1;
-        for (int s = 0; s < SNAP_TEST_STORES; s++)
-            for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
+        for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
+            for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
                 if (s == 1 && didx == 0) continue;
                 for (int i = 0; i < st->inserted[s][didx]; i++) if (!st->seen[s][didx][i]) others_ok = 0;
             }
         test_cond("bitmap: keys of emitted buckets were not dispatched, everything else once",
                   skipped_ok && others_ok && bad == 0 && dispatched == total_keys - st->inserted[1][0]);
-        test_cond("bitmap: freed when the slots completed", snapScanBitmapBytes(ctx) == 0);
+        test_cond("bitmap: freed when the slots completed", hybsnapScanBitmapBytes(ctx) == 0);
     }
-    snapScanRelease(ctx);
+    hybsnapScanRelease(ctx);
 
     /* ---- Owed: a bucket emitted ahead of the window stays not-owed once the
      * window moves over it (the thread skips it by its bit). Simulates one
      * write section spanning a window publish, with no thread running. ---- */
-    ctx = snapScanCreate(stores, SNAP_TEST_STORES, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanFreeze(ctx);
+    hybsnapScanFreeze(ctx);
     {
         dict *d = kvstoreGetDict(stores[0], 3);   /* populated */
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
-        uint64_t o = snapOrd(ctx, 0, 3), b0 = SNAP_POS(o, 1, 0);
+        uint64_t o = hybsnapOrd(ctx, 0, 3), b0 = HYBSNAP_POS(o, 1, 0);
         int pos, p_ahead, p_after, p_other, p_behind;
         test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
-        snapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
-        snapWordStore(d, SNAP_WORD(ctx->gen, SNAP_SLOT_SCANNING));   /* as the thread's claim would */
-        snapTestWindow(ctx, b0, b0 + mid);          /* the thread may read [0, mid) */
-        snapFunnelOpen();                           /* a command opens its write section */
-        int owed_ahead = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
-        snapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
-        snapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant later in the same section moves the window over it */
-        int owed_after = snapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
-        int owed_other = snapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
-        int owed_behind = snapBucketOwed(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
-        snapFunnelClose();
-        test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == SNAP_POS_AHEAD);
-        test_cond("owed: the same bucket, emitted, is not owed after the window moved over it", !owed_after && p_after == SNAP_POS_INSIDE);
-        test_cond("owed: an unemitted bucket inside the window is owed", owed_other && p_other == SNAP_POS_INSIDE);
-        test_cond("owed: a bucket behind the window is not owed", !owed_behind && p_behind == SNAP_POS_BEHIND);
+        hybsnapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
+        hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));   /* as the thread's claim would */
+        hybsnapTestWindow(ctx, b0, b0 + mid);          /* the thread may read [0, mid) */
+        hybsnapFunnelOpen();                           /* a command opens its write section */
+        int owed_ahead = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
+        hybsnapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
+        hybsnapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant later in the same section moves the window over it */
+        int owed_after = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
+        int owed_other = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
+        int owed_behind = hybsnapBucketOwed(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
+        hybsnapFunnelClose();
+        test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == HYBSNAP_POS_AHEAD);
+        test_cond("owed: the same bucket, emitted, is not owed after the window moved over it", !owed_after && p_after == HYBSNAP_POS_INSIDE);
+        test_cond("owed: an unemitted bucket inside the window is owed", owed_other && p_other == HYBSNAP_POS_INSIDE);
+        test_cond("owed: a bucket behind the window is not owed", !owed_behind && p_behind == HYBSNAP_POS_BEHIND);
 
         /* The layout phase: the thread has claimed the dict and reads its table
          * sizes, no chain yet (hi just past the layout position). Every bucket
          * of every table is ahead of it, so a write emits the bucket first and
          * then goes in place. */
-        snapTestWindow(ctx, SNAP_POS(o, 0, 0), SNAP_POS(o, 0, 0) + 1);
-        snapFunnelOpen();
+        hybsnapTestWindow(ctx, HYBSNAP_POS(o, 0, 0), HYBSNAP_POS(o, 0, 0) + 1);
+        hybsnapFunnelOpen();
         int layout_ahead = 1, layout_owed = 1;
         for (int t = 0; t < 2; t++) {
             if (!d->ht_table[t]) continue;
             unsigned long tsize = DICTHT_SIZE(d->ht_size_exp[t]);
             unsigned long probe[3] = { 0, tsize / 2, tsize - 1 };
             for (int j = 0; j < 3; j++) {
-                int owed = snapBucketOwed(ctx, 0, 3, d, t, probe[j], &pos, NULL);
-                if (pos != SNAP_POS_AHEAD) layout_ahead = 0;
+                int owed = hybsnapBucketOwed(ctx, 0, 3, d, t, probe[j], &pos, NULL);
+                if (pos != HYBSNAP_POS_AHEAD) layout_ahead = 0;
                 if (!owed) layout_owed = 0;
             }
         }
-        snapFunnelClose();
-        snapWindowReset(NULL);
+        hybsnapFunnelClose();
+        hybsnapWindowReset(NULL);
         test_cond("owed: in the layout phase every bucket of every table is ahead of the window and owed",
                   layout_ahead && layout_owed);
     }
-    snapScanAbort(ctx);   /* frozen, never started: unfreezes */
-    snapScanRelease(ctx);
+    hybsnapScanAbort(ctx);   /* frozen, never started: unfreezes */
+    hybsnapScanRelease(ctx);
 
     /* ---- Empty stores ---- */
     {
@@ -4592,27 +4592,27 @@ static void snapScanTests(int accurate) {
         empty[1] = kvstoreCreate(&KvstoreTestType, &noval, 3, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
         atomicSet(st->dispatched, 0);
         st->dispatch_sleep_us = 0;
-        snapScanCtx *ectx = snapScanCreate(empty, 2, snapTestDispatch, NULL, st);
+        hybsnapScanCtx *ectx = hybsnapScanCreate(empty, 2, hybsnapTestDispatch, NULL, st);
         st->ctx = NULL;
-        test_cond("empty: start", snapScanStart(ectx) == C_OK);
-        while (!snapScanIsFinished(ectx)) usleep(100);
-        snapScanHandleCompletions(ectx);
+        test_cond("empty: start", hybsnapScanStart(ectx) == C_OK);
+        while (!hybsnapScanIsFinished(ectx)) usleep(100);
+        hybsnapScanHandleCompletions(ectx);
         atomicGet(st->dispatched, dispatched);
         long et, esc, edn; long long ekd;
-        snapScanProgress(ectx, &et, &esc, &edn, &ekd);
+        hybsnapScanProgress(ectx, &et, &esc, &edn, &ekd);
         test_cond("empty: nothing to scan, nothing visited, zero dispatches", et == 0 && edn == 0 && esc == 0 && dispatched == 0);
-        snapScanRelease(ectx);
+        hybsnapScanRelease(ectx);
         kvstoreRelease(empty[0]);
         kvstoreRelease(empty[1]);
     }
 
-    for (int s = 0; s < SNAP_TEST_STORES; s++) kvstoreRelease(stores[s]);
+    for (int s = 0; s < HYBSNAP_TEST_STORES; s++) kvstoreRelease(stores[s]);
     zfree(st);
 }
 
 /* ---- Placement / range-aware allocator tests ---- */
-static void snapPlacementTests(void) {
-    if (!snapArenaAvailable()) return;
+static void hybsnapPlacementTests(void) {
+    if (!hybsnapArenaAvailable()) return;
     server.save_small_max_bytes = 4096;
 
     /* Generic allocator paths keep arena memory in the arena. */
@@ -4653,7 +4653,7 @@ static void snapPlacementTests(void) {
     /* sds growth through the sds API keeps the arena. */
     {
         sds s = sdsnewlen("x", 1);
-        sds t = snapSdsMove(s, 1);
+        sds t = hybsnapSdsMove(s, 1);
         test_cond("sds moved into the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
         t = sdsMakeRoomFor(t, 20000);
         test_cond("sdsMakeRoomFor() on an arena sds stays in the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
@@ -4661,27 +4661,27 @@ static void snapPlacementTests(void) {
     }
 
     /* Classification table. */
-    test_cond("classify: small raw string is NOFORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 100) == SNAP_NOFORK);
-    test_cond("classify: 4096-byte raw string is NOFORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4096) == SNAP_NOFORK);
-    test_cond("classify: 4097-byte raw string is FORK", snapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4097) == SNAP_FORK);
+    test_cond("classify: small raw string is NOFORK", hybsnapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 100) == HYBSNAP_NOFORK);
+    test_cond("classify: 4096-byte raw string is NOFORK", hybsnapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4096) == HYBSNAP_NOFORK);
+    test_cond("classify: 4097-byte raw string is FORK", hybsnapClassify(OBJ_STRING, OBJ_ENCODING_RAW, 4097) == HYBSNAP_FORK);
     test_cond("classify: INT / EMBSTR are NOFORK regardless of size",
-              snapClassify(OBJ_STRING, OBJ_ENCODING_INT, 0) == SNAP_NOFORK &&
-              snapClassify(OBJ_STRING, OBJ_ENCODING_EMBSTR, 100000) == SNAP_NOFORK);
+              hybsnapClassify(OBJ_STRING, OBJ_ENCODING_INT, 0) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_STRING, OBJ_ENCODING_EMBSTR, 100000) == HYBSNAP_NOFORK);
     test_cond("classify: small listpack hash/set/zset/list are NOFORK",
-              snapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
-              snapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK_EX, 100) == SNAP_NOFORK &&
-              snapClassify(OBJ_SET, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
-              snapClassify(OBJ_SET, OBJ_ENCODING_INTSET, 100) == SNAP_NOFORK &&
-              snapClassify(OBJ_ZSET, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK &&
-              snapClassify(OBJ_LIST, OBJ_ENCODING_LISTPACK, 100) == SNAP_NOFORK);
+              hybsnapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK, 100) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_HASH, OBJ_ENCODING_LISTPACK_EX, 100) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_SET, OBJ_ENCODING_LISTPACK, 100) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_SET, OBJ_ENCODING_INTSET, 100) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_ZSET, OBJ_ENCODING_LISTPACK, 100) == HYBSNAP_NOFORK &&
+              hybsnapClassify(OBJ_LIST, OBJ_ENCODING_LISTPACK, 100) == HYBSNAP_NOFORK);
     test_cond("classify: multi-allocation encodings and other types are FORK",
-              snapClassify(OBJ_HASH, OBJ_ENCODING_HT, 10) == SNAP_FORK &&
-              snapClassify(OBJ_SET, OBJ_ENCODING_HT, 10) == SNAP_FORK &&
-              snapClassify(OBJ_ZSET, OBJ_ENCODING_SKIPLIST, 10) == SNAP_FORK &&
-              snapClassify(OBJ_LIST, OBJ_ENCODING_QUICKLIST, 10) == SNAP_FORK &&
-              snapClassify(OBJ_STREAM, OBJ_ENCODING_STREAM, 10) == SNAP_FORK &&
-              snapClassify(OBJ_MODULE, OBJ_ENCODING_RAW, 10) == SNAP_FORK &&
-              snapClassify(OBJ_ARRAY, OBJ_ENCODING_SLICED_ARRAY, 10) == SNAP_FORK);
+              hybsnapClassify(OBJ_HASH, OBJ_ENCODING_HT, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_SET, OBJ_ENCODING_HT, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_ZSET, OBJ_ENCODING_SKIPLIST, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_LIST, OBJ_ENCODING_QUICKLIST, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_STREAM, OBJ_ENCODING_STREAM, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_MODULE, OBJ_ENCODING_RAW, 10) == HYBSNAP_FORK &&
+              hybsnapClassify(OBJ_ARRAY, OBJ_ENCODING_SLICED_ARRAY, 10) == HYBSNAP_FORK);
 
     /* Placement through kvobjSet(). */
     sds key = sdsnew("placement-key");
@@ -4690,31 +4690,31 @@ static void snapPlacementTests(void) {
     {
         kvobj *kv = kvobjSet(key, createRawStringObject(buf, 100), 0);
         test_cond("kvobj header (raw string) is in the arena", zmalloc_is_nofork(kv));
-        test_cond("small raw string value moved into the arena", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && snapKeyClass(kv) == SNAP_NOFORK);
+        test_cond("small raw string value moved into the arena", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         test_cond("value content preserved after the move", sdslen(kv->ptr) == 100 && memcmp(kv->ptr, buf, 100) == 0);
         /* Unbounded in-place growth keeps the arena; the policy hook moves it out. */
         kv->ptr = sdscatlen(kv->ptr, buf, 10000);
         test_cond("grown string still in the arena before the policy hook", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)));
-        snapPlaceValue(kv);
-        test_cond("snapPlaceValue() moves a string over the threshold out of the arena",
-                  !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_FORK);
+        hybsnapPlaceValue(kv);
+        test_cond("hybsnapPlaceValue() moves a string over the threshold out of the arena",
+                  !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         test_cond("content preserved after moving out", sdslen(kv->ptr) == 10100 && memcmp(kv->ptr, buf, 100) == 0);
         decrRefCount(kv);
     }
     {
         kvobj *kv = kvobjSet(key, createRawStringObject(buf, 10000), 0);
         test_cond("large raw string: header in arena, value outside, class FORK",
-                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && snapKeyClass(kv) == SNAP_FORK);
+                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     {
         kvobj *kv = kvobjSet(key, createStringObject("tiny", 4), 0);
         test_cond("embstr value: header in arena, class NOFORK",
-                  kv->encoding == OBJ_ENCODING_EMBSTR && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_NOFORK);
+                  kv->encoding == OBJ_ENCODING_EMBSTR && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         decrRefCount(kv);
         kv = kvobjSet(key, createStringObjectFromLongLongForValue(1234567), 0);
         test_cond("int value: header in arena, class NOFORK",
-                  kv->encoding == OBJ_ENCODING_INT && zmalloc_is_nofork(kv) && snapKeyClass(kv) == SNAP_NOFORK);
+                  kv->encoding == OBJ_ENCODING_INT && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         decrRefCount(kv);
     }
     {
@@ -4723,15 +4723,15 @@ static void snapPlacementTests(void) {
         o->ptr = lpAppend(o->ptr, (unsigned char*)"field", 5);
         o->ptr = lpAppend(o->ptr, (unsigned char*)"value", 5);
         kvobj *kv = kvobjSet(key, o, 0);
-        test_cond("small listpack hash moved into the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK);
+        test_cond("small listpack hash moved into the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         unsigned char *p = lpFirst(kv->ptr);
         int64_t l; unsigned char *sv = lpGet(p, &l, NULL);
         test_cond("listpack content preserved", sv && l == 5 && memcmp(sv, "field", 5) == 0);
         /* Grow in place past the threshold: stays in the arena, class stays NOFORK by placement. */
         kv->ptr = lpAppend(kv->ptr, (unsigned char*)buf, 6000);
-        test_cond("listpack grown in place stays in the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK);
-        snapPlaceValue(kv);
-        test_cond("policy hook moves an oversized listpack out", !zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_FORK);
+        test_cond("listpack grown in place stays in the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+        hybsnapPlaceValue(kv);
+        test_cond("policy hook moves an oversized listpack out", !zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     {
@@ -4739,14 +4739,14 @@ static void snapPlacementTests(void) {
         uint8_t ok;
         for (long long i = 0; i < 50; i++) o->ptr = intsetAdd(o->ptr, i * 7, &ok);
         kvobj *kv = kvobjSet(key, o, 0);
-        test_cond("intset moved into the arena", zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_NOFORK && intsetLen(kv->ptr) == 50);
+        test_cond("intset moved into the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK && intsetLen(kv->ptr) == 50);
         decrRefCount(kv);
     }
     {
         robj *o = createSetObject();   /* hashtable encoding */
         kvobj *kv = kvobjSet(key, o, 0);
         test_cond("hashtable set: header in arena, dict outside, class FORK",
-                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(kv->ptr) && snapKeyClass(kv) == SNAP_FORK);
+                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     sdsfree(key);
@@ -4762,8 +4762,8 @@ static void snapPlacementTests(void) {
         kvstore *kp = kvstoreCreate(&KvstoreTestType, &plain, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
         dictSetResizeEnabled(DICT_RESIZE_ENABLE);
         for (int i = 0; i < 3000; i++) {
-            serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
-            serverAssert(kvstoreDictAddRaw(kp, 0, snapTestKey(0, 0, i), NULL) != NULL);
+            serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
+            serverAssert(kvstoreDictAddRaw(kp, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
         }
         dict *ds = kvstoreGetDict(ks, 0), *dp = kvstoreGetDict(kp, 0);
         while (dictIsRehashing(ds)) dictRehash(ds, 100);
@@ -4773,7 +4773,7 @@ static void snapPlacementTests(void) {
                   !zmalloc_is_nofork(kp) && !zmalloc_is_nofork(dp) && !zmalloc_is_nofork(dp->ht_table[0]));
         /* Force another expand (rehash allocates a new table) and check it too. */
         for (int i = 3000; i < 9000; i++)
-            serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
+            serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
         test_cond("nofork_alloc dict: table allocated by rehash is in the arena",
                   zmalloc_is_nofork(ds->ht_table[0]) && (ds->ht_table[1] == NULL || zmalloc_is_nofork(ds->ht_table[1])));
         kvstoreRelease(ks);
@@ -4785,14 +4785,14 @@ static void snapPlacementTests(void) {
 
 static void *ovTestClone(void *priv, int didx, void *orig) {
     UNUSED(didx);
-    struct ovTestCounters *c = ((struct snapGuardPriv *)priv)->user;
+    struct ovTestCounters *c = ((struct hybsnapGuardPriv *)priv)->user;
     c->clones++;
     return zstrdup(orig);
 }
 
 static void ovTestFree(void *priv, int didx, void *orig) {
     UNUSED(didx);
-    struct ovTestCounters *c = ((struct snapGuardPriv *)priv)->user;
+    struct ovTestCounters *c = ((struct hybsnapGuardPriv *)priv)->user;
     c->frees++;
     zfree(orig);
 }
@@ -4820,78 +4820,78 @@ static void ovTestScanCb(void *priv, const dictEntry *de, dictEntry **plink) {
 /* The save holds a reference on every fork-instant dict and walks
  * its own table of them. A store that frees, empties or moves one of them
  * during the save detaches it; the save reads it to the end and frees it. */
-static void snapRefcountTests(void) {
+static void hybsnapRefcountTests(void) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;
+    noval.keyCompare = hybsnapTestKeyCompare;
     kvstore *stores[1];
-    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstore *ks = stores[0];
     /* dict 0 and 3: fork-instant content; dict 1: allocated but empty; dict 2: not allocated. */
     for (int i = 0; i < 50; i++) {
-        serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
-        serverAssert(kvstoreDictAddRaw(ks, 3, snapTestKey(0, 3, i), NULL) != NULL);
+        serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
+        serverAssert(kvstoreDictAddRaw(ks, 3, hybsnapTestKey(0, 3, i), NULL) != NULL);
     }
-    serverAssert(kvstoreDictAddRaw(ks, 1, snapTestKey(0, 1, 0), NULL) != NULL);
+    serverAssert(kvstoreDictAddRaw(ks, 1, hybsnapTestKey(0, 1, 0), NULL) != NULL);
     serverAssert(kvstoreDictDelete(ks, 1, "k:0:1:0") == DICT_OK);
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
     st->inserted[0][0] = st->inserted[0][3] = 50;
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter };
     long dispatched, bad, t, sc, dn;
     long long kd;
 
     /* A credit of one bucket: each save below starts inside a section, so the
      * thread reads a bucket of dict 0 per guard hook and never reaches dict 3
      * before the section closes. */
-    unsigned long saved_w = snapGetWindowBuckets();
-    snapSetWindowBuckets(1);
+    unsigned long saved_w = hybsnapGetWindowBuckets();
+    hybsnapSetWindowBuckets(1);
 
     /* ---- A: the table and the references; a dict moved out during the save ---- */
-    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapFunnelOpen();   /* the thread starts capped */
-    test_cond("refs: start with a section open", snapScanStart(ctx) == C_OK);
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapFunnelOpen();   /* the thread starts capped */
+    test_cond("refs: start with a section open", hybsnapScanStart(ctx) == C_OK);
     dict *d0 = kvstoreGetDict(ks, 0), *d3 = kvstoreGetDict(ks, 3);
     test_cond("refs: the save holds one reference on every non-empty dict, none on an empty one",
               kvstoreDictRefcount(d0) == 2 && kvstoreDictRefcount(d3) == 2 && kvstoreDictRefcount(kvstoreGetDict(ks, 1)) == 1);
     test_cond("refs: an empty or missing dict holds nothing of the save: DONE from the start",
-              snapScanSlotState(ctx, 0, 3) == SNAP_SLOT_PENDING && snapScanSlotState(ctx, 0, 1) == SNAP_SLOT_DONE &&
-              !snapScanKeyIsOwed(ctx, 0, 2) && kvstoreRefcount(ks) == 1 + 3);
-    serverAssert(kvstoreDictAddRaw(ks, 1, snapTestKey(0, 1, 5), NULL) != NULL);   /* post-fork keys the dispatch would flag as bad */
-    serverAssert(kvstoreDictAddRaw(ks, 2, snapTestKey(0, 2, 5), NULL) != NULL);
+              hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING && hybsnapScanSlotState(ctx, 0, 1) == HYBSNAP_SLOT_DONE &&
+              !hybsnapScanKeyIsOwed(ctx, 0, 2) && kvstoreRefcount(ks) == 1 + 3);
+    serverAssert(kvstoreDictAddRaw(ks, 1, hybsnapTestKey(0, 1, 5), NULL) != NULL);   /* post-fork keys the dispatch would flag as bad */
+    serverAssert(kvstoreDictAddRaw(ks, 2, hybsnapTestKey(0, 2, 5), NULL) != NULL);
     test_cond("refs: writes to dicts outside the table attach nothing",
-              snapScanSlotState(ctx, 0, 1) == SNAP_SLOT_DONE && snapScanSlotState(ctx, 0, 2) == SNAP_SLOT_DONE &&
+              hybsnapScanSlotState(ctx, 0, 1) == HYBSNAP_SLOT_DONE && hybsnapScanSlotState(ctx, 0, 2) == HYBSNAP_SLOT_DONE &&
               !kvstoreOverlayIsFrozen(ks, 1) && !kvstoreOverlayIsFrozen(ks, 2) &&
-              snapMeta(kvstoreGetDict(ks, 1))->ext == NULL && snapMeta(kvstoreGetDict(ks, 2))->ext == NULL);
+              hybsnapMeta(kvstoreGetDict(ks, 1))->ext == NULL && hybsnapMeta(kvstoreGetDict(ks, 2))->ext == NULL);
     /* A write to a table dict the thread has not reached attaches it (an overlayed bucket whose duplicate chain lacks the key). */
     serverAssert(kvstoreDictDelete(ks, 3, "k:0:3:7") == DICT_OK);
     test_cond("refs: the write attached dict 3", kvstoreOverlayIsFrozen(ks, 3) && kvstoreDictSize(ks, 3) == 49);
     /* Move dict 3 to another store while the save holds it (the slot-trim path
      * of atomic slot migration), then release that store the way BIO does. */
-    kvstore *tmp = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstore *tmp = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstoreMoveDict(ks, tmp, 3);
     test_cond("refs: the moved dict left the slot with its logical size; the save still holds it",
               kvstoreGetDict(ks, 3) == NULL && kvstoreGetDict(tmp, 3) == d3 && kvstoreDictRefcount(d3) == 2 &&
               kvstoreSize(ks) == 52 && kvstoreSize(tmp) == 49 && kvstoreDictDetached(d3) &&
-              snapScanSlotState(ctx, 0, 3) == SNAP_SLOT_PENDING);
+              hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING);
     kvstoreRelease(tmp);
     test_cond("refs: the released store left the dict to the save", kvstoreDictRefcount(d3) == 1 && d3->type->userdata == tmp);
-    snapFunnelClose();
-    while (!snapScanIsFinished(ctx)) { snapScanHandleCompletions(ctx); usleep(100); }
-    snapScanHandleCompletions(ctx);
+    hybsnapFunnelClose();
+    while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
+    hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
-    snapScanProgress(ctx, &t, &sc, &dn, &kd);
+    hybsnapScanProgress(ctx, &t, &sc, &dn, &kd);
     test_cond("refs: the fork-instant keys of both dicts were dispatched, the moved one included; the post-fork ones never",
               dispatched == 100 && bad == 0 && kd == 100 && st->seen[0][3][7]);
     test_cond("refs: two table entries, both completed, the moved dict freed by the save",
               t == 2 && sc == 2 && dn == 2 && st->done_calls[0][0] == 1 && st->done_calls[0][3] == 1 &&
-              snapScanRetainedDicts(ctx) == 1 && !snapScanKeyIsOwed(ctx, 0, 3));
-    snapScanRelease(ctx);
+              hybsnapScanRetainedDicts(ctx) == 1 && !hybsnapScanKeyIsOwed(ctx, 0, 3));
+    hybsnapScanRelease(ctx);
 
     /* ---- B: the store emptied (FLUSH) while the save reads it ---- */
     memset(st->seen, 0, sizeof(st->seen));
@@ -4899,33 +4899,33 @@ static void snapRefcountTests(void) {
     atomicSet(st->dispatched, 0);
     atomicSet(st->bad, 0);
     st->inserted[0][1] = st->inserted[0][2] = 6;   /* k:0:1:5 and k:0:2:5 are fork-instant now */
-    ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapFunnelOpen();
-    test_cond("refs: second save starts", snapScanStart(ctx) == C_OK);
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapFunnelOpen();
+    test_cond("refs: second save starts", hybsnapScanStart(ctx) == C_OK);
     d0 = kvstoreGetDict(ks, 0);
     kvstoreEmpty(ks, NULL);
     test_cond("refs: emptying the store hands its fork-instant dicts to the save",
               kvstoreSize(ks) == 0 && kvstoreGetDict(ks, 0) == NULL && kvstoreDictRefcount(d0) == 1 && kvstoreDictDetached(d0) &&
-              snapScanSlotState(ctx, 0, 0) != SNAP_SLOT_DONE);
-    serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, 60), NULL) != NULL);   /* a fresh dict in the slot */
+              hybsnapScanSlotState(ctx, 0, 0) != HYBSNAP_SLOT_DONE);
+    serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, 60), NULL) != NULL);   /* a fresh dict in the slot */
     test_cond("refs: the slot's new dict is not the save's", kvstoreGetDict(ks, 0) != d0 && !kvstoreOverlayIsFrozen(ks, 0));
-    snapFunnelClose();
-    while (!snapScanIsFinished(ctx)) { snapScanHandleCompletions(ctx); usleep(100); }
-    snapScanHandleCompletions(ctx);
+    hybsnapFunnelClose();
+    while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
+    hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
-    snapScanProgress(ctx, &t, &sc, &dn, &kd);
+    hybsnapScanProgress(ctx, &t, &sc, &dn, &kd);
     test_cond("refs: the detached dicts were walked to the end and freed by the save; the new key never dispatched",
-              dispatched == 52 && bad == 0 && t == 3 && dn == 3 && snapScanRetainedDicts(ctx) == 3 && kvstoreSize(ks) == 1);
-    snapScanRelease(ctx);
+              dispatched == 52 && bad == 0 && t == 3 && dn == 3 && hybsnapScanRetainedDicts(ctx) == 3 && kvstoreSize(ks) == 1);
+    hybsnapScanRelease(ctx);
 
     /* ---- C: a table dict that empties under the save, in a store that frees empty dicts ---- */
-    kvstore *fs = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS);
+    kvstore *fs = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND | KVSTORE_FREE_EMPTY_DICTS);
     kvstore *fstores[1] = { fs };
-    serverAssert(kvstoreDictAddRaw(fs, 3, snapTestKey(0, 3, 0), NULL) != NULL);
-    for (int i = 0; i < 20; i++) serverAssert(kvstoreDictAddRaw(fs, 0, snapTestKey(0, 0, i), NULL) != NULL);
+    serverAssert(kvstoreDictAddRaw(fs, 3, hybsnapTestKey(0, 3, 0), NULL) != NULL);
+    for (int i = 0; i < 20; i++) serverAssert(kvstoreDictAddRaw(fs, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
     memset(st->seen, 0, sizeof(st->seen));
     memset(st->done_calls, 0, sizeof(st->done_calls));
     atomicSet(st->dispatched, 0);
@@ -4934,60 +4934,60 @@ static void snapRefcountTests(void) {
     st->inserted[0][1] = st->inserted[0][2] = 0;
     st->inserted[0][3] = 1;
     st->stores = fstores;
-    ctx = snapScanCreate(fstores, 1, snapTestDispatch, snapTestSlotDone, st);
+    ctx = hybsnapScanCreate(fstores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapFunnelOpen();
-    test_cond("refs: third save starts", snapScanStart(ctx) == C_OK);
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapFunnelOpen();
+    test_cond("refs: third save starts", hybsnapScanStart(ctx) == C_OK);
     dict *f3 = kvstoreGetDict(fs, 3);
     serverAssert(kvstoreDictDelete(fs, 3, "k:0:3:0") == DICT_OK);   /* deferred: an overlayed bucket without the key, the dict logically empty */
     kvstoreFreeDictIfNeeded(fs, 3);
     /* The overlayed bucket holds the dict's layout, so the emptied dict is not freed yet: it goes at the release. */
     test_cond("refs: the emptied dict is logically empty and stays with the save until the overlay is released",
               kvstoreGetDict(fs, 3) == f3 && kvstoreDictSize(fs, 3) == 0 && kvstoreDictRefcount(f3) == 2 &&
-              !kvstoreDictDetached(f3) && snapScanSlotState(ctx, 0, 3) == SNAP_SLOT_PENDING && kvstoreSize(fs) == 20);
-    snapFunnelClose();
-    while (!snapScanIsFinished(ctx)) { snapScanHandleCompletions(ctx); usleep(100); }
-    snapScanHandleCompletions(ctx);
+              !kvstoreDictDetached(f3) && hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING && kvstoreSize(fs) == 20);
+    hybsnapFunnelClose();
+    while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
+    hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
     atomicGet(st->bad, bad);
     test_cond("refs: its fork-instant key was still dispatched; the delete written back at release, the dict freed",
-              dispatched == 21 && bad == 0 && snapScanRetainedDicts(ctx) == 1 && kvstoreGetDict(fs, 3) == NULL);
-    snapScanRelease(ctx);
-    snapSetWindowBuckets(saved_w);
+              dispatched == 21 && bad == 0 && hybsnapScanRetainedDicts(ctx) == 1 && kvstoreGetDict(fs, 3) == NULL);
+    hybsnapScanRelease(ctx);
+    hybsnapSetWindowBuckets(saved_w);
     kvstoreRelease(fs);
     kvstoreRelease(ks);
     zfree(st);
 }
 
-static void snapOverlayTests(int abort_variant) {
+static void hybsnapOverlayTests(int abort_variant) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;
+    noval.keyCompare = hybsnapTestKeyCompare;
     kvstore *stores[1];
-    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstore *ks = stores[0];
     const int N = 1000;
     char *orig5 = NULL, *orig7 = NULL;
     for (int i = 0; i < N; i++) {
-        char *k = snapTestKey(0, 0, i);
+        char *k = hybsnapTestKey(0, 0, i);
         if (i == 5) orig5 = k;
         if (i == 7) orig7 = k;
         serverAssert(kvstoreDictAddRaw(ks, 0, k, NULL) != NULL);
     }
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
     st->inserted[0][0] = N;
     st->dispatch_sleep_us = abort_variant ? 50 : 0;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
 
-    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
-    snapScanSetOverlay(ctx, &hooks, privs);
-    test_cond("overlay: start", snapScanStart(ctx) == C_OK);
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter };
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    test_cond("overlay: start", hybsnapScanStart(ctx) == C_OK);
     test_cond("overlay: nothing is attached at start, the empty slot is DONE",
-              !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !snapScanKeyIsOwed(ctx, 0, 3));
+              !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !hybsnapScanKeyIsOwed(ctx, 0, 3));
     dict *frozen = kvstoreGetDict(ks, 0);
 
     /* Read: original, no clone. */
@@ -5056,15 +5056,15 @@ static void snapOverlayTests(int abort_variant) {
     /* The scan thread must have dispatched exactly the fork-instant set. The
      * writes above opened a write section (overlay 'enter' hook), which in the
      * server ends with the command: end it here or the thread waits forever. */
-    test_cond("overlay: the writes above opened a write section", (snap_funnel_seq & 1) == 1);
-    snapFunnelClose();
+    test_cond("overlay: the writes above opened a write section", (hybsnap_funnel_seq & 1) == 1);
+    hybsnapFunnelClose();
     if (abort_variant) {
         long d0;
-        do { usleep(500); atomicGet(st->dispatched, d0); } while (d0 < 10 && !snapScanIsFinished(ctx));
-        snapScanAbort(ctx);
+        do { usleep(500); atomicGet(st->dispatched, d0); } while (d0 < 10 && !hybsnapScanIsFinished(ctx));
+        hybsnapScanAbort(ctx);
     } else {
-        while (!snapScanIsFinished(ctx)) usleep(200);
-        snapScanHandleCompletions(ctx);
+        while (!hybsnapScanIsFinished(ctx)) usleep(200);
+        hybsnapScanHandleCompletions(ctx);
     }
     long dispatched, bad;
     atomicGet(st->dispatched, dispatched);
@@ -5092,7 +5092,7 @@ static void snapOverlayTests(int abort_variant) {
     n = ovTestCountIter(ks, &has_new, &e5);
     test_cond("overlay: iteration after the drain matches", n == N + 2 && has_new && e5 == clone5);
 
-    snapScanRelease(ctx);
+    hybsnapScanRelease(ctx);
     kvstoreRelease(ks);
     zfree(st);
 }
@@ -5113,27 +5113,27 @@ static void ovTestScanSeen(void *priv, const dictEntry *de, dictEntry **plink) {
  * write-back, and the write-back itself. No scan thread: the guard is
  * installed (frozen) and every write defers (no 'prepare' hook), so each
  * write overlays its bucket. */
-static void snapOverlayBucketTests(void) {
+static void hybsnapOverlayBucketTests(void) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;
+    noval.keyCompare = hybsnapTestKeyCompare;
     kvstore *stores[1];
-    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstore *ks = stores[0];
     const int N = 300;
-    for (int i = 0; i < N; i++) serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, i), NULL) != NULL);
+    for (int i = 0; i < N; i++) serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
     dict *d = kvstoreGetDict(ks, 0);
     while (dictIsRehashing(d)) dictRehash(d, 1000);
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
     st->inserted[0][0] = N;
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
-    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter };
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapScanFreeze(ctx);
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapScanFreeze(ctx);
 
     /* A bucket of at least three entries (300 keys in a table of 512). */
     unsigned long size0 = DICTHT_SIZE(d->ht_size_exp[0]), b = size0;
@@ -5199,7 +5199,7 @@ static void snapOverlayBucketTests(void) {
 
     /* ---- 3. a scan that spans a write-back loses no key that was there throughout ---- */
     for (int i = 0; i < N; i += 11) {   /* overlay more buckets */
-        char *k = snapTestKey(0, 0, i);
+        char *k = hybsnapTestKey(0, 0, i);
         dictEntryLink bucket = NULL;
         kvstoreDictFindLink(ks, 0, k, &bucket);
         zfree(k);
@@ -5218,9 +5218,9 @@ static void snapOverlayBucketTests(void) {
               kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)N && kvstoreDictSize(ks, 0) == (unsigned long)N &&
               dictFind(d, newkey) != NULL && dictFind(d, k1name) == NULL && cnt.frees == cnt.clones);
 
-    snapFunnelClose();
-    snapScanAbort(ctx);
-    snapScanRelease(ctx);
+    hybsnapFunnelClose();
+    hybsnapScanAbort(ctx);
+    hybsnapScanRelease(ctx);
     test_cond("overlay buckets: after the release the dict holds the logical keys and every original was freed",
               !kvstoreOverlayIsFrozen(ks, 0) && kvstoreDictSize(ks, 0) == (unsigned long)N && cnt.frees == cnt.clones);
     kvstoreRelease(ks);
@@ -5264,33 +5264,33 @@ static int ovTestKeyInHalf(dict *d, int didx, int n, int upper, char *used, char
  * past its first four slots.
  * No scan thread: a test 'prepare' hook defers every write in a window it
  * chooses. */
-static void snapOverlayWindowTests(void) {
+static void hybsnapOverlayWindowTests(void) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;
+    noval.keyCompare = hybsnapTestKeyCompare;
     kvstore *stores[1];
-    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstore *ks = stores[0];
     const int N = 200;
-    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) {
-        for (int i = 0; i < N; i++) serverAssert(kvstoreDictAddRaw(ks, didx, snapTestKey(0, didx, i), NULL) != NULL);
+    for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) {
+        for (int i = 0; i < N; i++) serverAssert(kvstoreDictAddRaw(ks, didx, hybsnapTestKey(0, didx, i), NULL) != NULL);
         dict *d = kvstoreGetDict(ks, didx);
         while (dictIsRehashing(d)) dictRehash(d, 1000);
     }
     dict *d0 = kvstoreGetDict(ks, 0), *d1 = kvstoreGetDict(ks, 1), *d2 = kvstoreGetDict(ks, 2);
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
-    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) st->inserted[0][didx] = N;
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
+    for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) st->inserted[0][didx] = N;
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter,
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter,
                                .prepare = ovTestPrepareHalves };
-    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapScanFreeze(ctx);
-    char *used[SNAP_TEST_DICTS];
-    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++)
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapScanFreeze(ctx);
+    char *used[HYBSNAP_TEST_DICTS];
+    for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++)
         used[didx] = zcalloc(DICTHT_SIZE(kvstoreGetDict(ks, didx)->ht_size_exp[0]));
     char lo0[32], hi0[32], k1[32], lo2[32], hi2[32];
     serverAssert(ovTestKeyInHalf(d0, 0, N, 0, used[0], lo0, sizeof(lo0)) && ovTestKeyInHalf(d0, 0, N, 1, used[0], hi0, sizeof(hi0)) &&
@@ -5311,7 +5311,7 @@ static void snapOverlayWindowTests(void) {
               dictFind(d1, k1) != NULL && kvstoreDictFind(ks, 1, k1) == NULL);
 
     /* Dict 1 leaves its store (the slot-trim move) with its bucket still overlayed: drained all the same. */
-    kvstore *tmp = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    kvstore *tmp = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstoreMoveDict(ks, tmp, 1);
     test_cond("overlay window: the moved dict keeps its overlayed bucket", kvstoreDictDetached(d1) && kvstoreOverlayPending() == 1);
     test_cond("overlay window: a drain past window 11 writes back the moved dict's bucket",
@@ -5364,13 +5364,13 @@ static void snapOverlayWindowTests(void) {
               kvstoreOverlayDrain(40) == 0 && kvstoreOverlaySlotsInUse() == 0 && dictSize(d3) == (unsigned long)N - 10 &&
               cnt.frees == cnt.clones);
 
-    snapFunnelClose();
-    snapScanAbort(ctx);
-    snapScanRelease(ctx);
+    hybsnapFunnelClose();
+    hybsnapScanAbort(ctx);
+    hybsnapScanRelease(ctx);
     test_cond("overlay window: after the release nothing is overlayed and nothing is frozen",
               kvstoreOverlayPending() == 0 && !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 2) &&
               kvstoreSize(ks) == 3ULL * N - 15);
-    for (int didx = 0; didx < SNAP_TEST_DICTS; didx++) zfree(used[didx]);
+    for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) zfree(used[didx]);
     kvstoreRelease(ks);
     zfree(st);
 }
@@ -5379,19 +5379,19 @@ static void snapOverlayWindowTests(void) {
  * overlay buckets of either table and pause the rehash, enumeration and scan
  * return every key that was there throughout, and the rehash resumes once the
  * overlay is gone. */
-static void snapOverlayRehashTests(void) {
+static void hybsnapOverlayRehashTests(void) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
-    noval.keyCompare = snapTestKeyCompare;
+    noval.keyCompare = hybsnapTestKeyCompare;
     kvstore *stores[1];
-    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, SNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
+    stores[0] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
     kvstore *ks = stores[0];
     dict *d = NULL;
     int N = 0;
     /* Stop right after an expansion of a table of at least 64 buckets starts: the
      * rehash then needs about that many more steps, none of which run below. */
     while (N < 250) {
-        serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, N), NULL) != NULL);
+        serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, N), NULL) != NULL);
         N++;
         d = kvstoreGetDict(ks, 0);
         if (dictIsRehashing(d) && DICTHT_SIZE(d->ht_size_exp[0]) >= 64) break;
@@ -5399,27 +5399,27 @@ static void snapOverlayRehashTests(void) {
     int two_tables = dictIsRehashing(d) && d->ht_used[0] > 0 && d->ht_used[1] > 0;
     test_cond("overlay rehash: the dict is mid-rehash with entries in both tables", two_tables);
     serverAssert(two_tables);
-    struct snapScanTestState *st = zcalloc(sizeof(*st));
+    struct hybsnapScanTestState *st = zcalloc(sizeof(*st));
     st->inserted[0][0] = N;
     st->stores = stores;
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
-    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = snapOverlayEnter };
-    snapScanCtx *ctx = snapScanCreate(stores, 1, snapTestDispatch, snapTestSlotDone, st);
+    kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter };
+    hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    snapScanSetOverlay(ctx, &hooks, privs);
-    snapScanFreeze(ctx);
+    hybsnapScanSetOverlay(ctx, &hooks, privs);
+    hybsnapScanFreeze(ctx);
 
     /* Delete every 7th key, add 20 new ones: buckets of both tables overlay. */
     int gone[300] = {0}, added = 0;
     for (int i = 0; i < N; i += 7) {
-        char *k = snapTestKey(0, 0, i);
+        char *k = hybsnapTestKey(0, 0, i);
         serverAssert(kvstoreDictDelete(ks, 0, k) == DICT_OK);
         gone[i] = 1;
         zfree(k);
     }
     for (int j = 0; j < 20; j++) {
-        serverAssert(kvstoreDictAddRaw(ks, 0, snapTestKey(0, 0, N + j), NULL) != NULL);
+        serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, N + j), NULL) != NULL);
         added++;
     }
     int ndel = 0;
@@ -5463,14 +5463,14 @@ static void snapOverlayRehashTests(void) {
     test_cond("overlay rehash: the write-back left the dict with exactly the logical keys",
               kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)(N - ndel + added) && cnt.frees == cnt.clones);
 
-    snapFunnelClose();
-    snapScanAbort(ctx);
-    snapScanRelease(ctx);
+    hybsnapFunnelClose();
+    hybsnapScanAbort(ctx);
+    hybsnapScanRelease(ctx);
     d = kvstoreGetDict(ks, 0);
     int finished = 1;
     while (dictIsRehashing(d)) { dictRehash(d, 1000); }
     for (int i = 0; i < N + added; i++) {
-        char *k = snapTestKey(0, 0, i);
+        char *k = hybsnapTestKey(0, 0, i);
         int present = dictFind(d, k) != NULL;
         int want = (i < N) ? !gone[i] : 1;
         if (present != want) finished = 0;
@@ -5481,7 +5481,7 @@ static void snapOverlayRehashTests(void) {
     zfree(st);
 }
 
-int snapshotTest(int argc, char **argv, int flags) {
+int hybsnapTest(int argc, char **argv, int flags) {
     UNUSED(argc);
     {
         union { uint8_t byte; kvBits bits; } w;
@@ -5497,23 +5497,23 @@ int snapshotTest(int argc, char **argv, int flags) {
     server.logfile = "";
     server.verbosity = LL_DEBUG;
     server.hybrid_snapshot = 1;
-    snapArenaInit();
+    hybsnapArenaInit();
 
 #ifdef HAVE_NOFORK_ARENA
-    test_cond("SNAP_NOFORK arena is available on Linux+jemalloc", snapArenaAvailable());
+    test_cond("HYBSNAP_NOFORK arena is available on Linux+jemalloc", hybsnapArenaAvailable());
 #else
-    test_cond("SNAP_NOFORK arena reported unavailable on this platform", !snapArenaAvailable());
+    test_cond("HYBSNAP_NOFORK arena reported unavailable on this platform", !hybsnapArenaAvailable());
     void *fb = zmalloc_nofork(100);
     test_cond("fallback alloc goes to the default allocator", fb != NULL && !zmalloc_is_nofork(fb));
     zfree(fb);
     /* The background scan and the keyspace overlay do not depend on the arena. */
-    snapScanTests(accurate);
-    snapRefcountTests();
-    snapOverlayTests(0);
-    snapOverlayTests(1);
-    snapOverlayBucketTests();
-    snapOverlayWindowTests();
-    snapOverlayRehashTests();
+    hybsnapScanTests(accurate);
+    hybsnapRefcountTests();
+    hybsnapOverlayTests(0);
+    hybsnapOverlayTests(1);
+    hybsnapOverlayBucketTests();
+    hybsnapOverlayWindowTests();
+    hybsnapOverlayRehashTests();
     test_report();
     return 0;
 #endif
@@ -5527,30 +5527,30 @@ int snapshotTest(int argc, char **argv, int flags) {
     test_cond("zmalloc_size() >= requested size", zmalloc_size(p) >= 100);
 
     /* 2. fork visibility */
-    test_cond("SNAP_NOFORK mapping carries the VM_DONTCOPY (dc) flag", snapTestMappingIsDontcopy(p) == 1);
-    test_cond("zmalloc mapping does not carry the dc flag", snapTestMappingIsDontcopy(q) == 0);
-    test_cond("fork child survives and can use the default allocator", snapTestChildAllocatorAlive() == 1);
-    test_cond("fork child faults when writing a SNAP_NOFORK allocation", snapTestChildWriteFaults(p) == 1);
-    test_cond("fork child can write a zmalloc allocation", snapTestChildWriteFaults(q) == 0);
+    test_cond("HYBSNAP_NOFORK mapping carries the VM_DONTCOPY (dc) flag", hybsnapTestMappingIsDontcopy(p) == 1);
+    test_cond("zmalloc mapping does not carry the dc flag", hybsnapTestMappingIsDontcopy(q) == 0);
+    test_cond("fork child survives and can use the default allocator", hybsnapTestChildAllocatorAlive() == 1);
+    test_cond("fork child faults when writing a HYBSNAP_NOFORK allocation", hybsnapTestChildWriteFaults(p) == 1);
+    test_cond("fork child can write a zmalloc allocation", hybsnapTestChildWriteFaults(q) == 0);
     /* Fork visibility flip: one madvise over the reservation. */
-    test_cond("arena is DONTFORK by default", !snapArenaForkable());
-    test_cond("flip: arena made forkable", snapArenaSetForkable(1) && snapArenaForkable());
-    test_cond("flip: fork child can write a SNAP_NOFORK allocation while forkable", snapTestChildWriteFaults(p) == 0);
-    test_cond("flip: arena back to DONTFORK", snapArenaSetForkable(0) && !snapArenaForkable());
-    test_cond("flip: fork child faults again on the same allocation", snapTestChildWriteFaults(p) == 1);
+    test_cond("arena is DONTFORK by default", !hybsnapArenaForkable());
+    test_cond("flip: arena made forkable", hybsnapArenaSetForkable(1) && hybsnapArenaForkable());
+    test_cond("flip: fork child can write a HYBSNAP_NOFORK allocation while forkable", hybsnapTestChildWriteFaults(p) == 0);
+    test_cond("flip: arena back to DONTFORK", hybsnapArenaSetForkable(0) && !hybsnapArenaForkable());
+    test_cond("flip: fork child faults again on the same allocation", hybsnapTestChildWriteFaults(p) == 1);
 
     /* Large (>= 2MB, multi-page-run) allocation is also DONTFORK. */
     char *big = zmalloc_nofork(5 * 1024 * 1024);
     memset(big, 1, 5 * 1024 * 1024);
-    test_cond("large SNAP_NOFORK allocation is in the arena", zmalloc_is_nofork(big));
-    test_cond("fork child faults on a large SNAP_NOFORK allocation (first page)", snapTestChildWriteFaults(big) == 1);
-    test_cond("fork child faults on a large SNAP_NOFORK allocation (last page)",
-              snapTestChildWriteFaults(big + 5 * 1024 * 1024 - 1) == 1);
+    test_cond("large HYBSNAP_NOFORK allocation is in the arena", zmalloc_is_nofork(big));
+    test_cond("fork child faults on a large HYBSNAP_NOFORK allocation (first page)", hybsnapTestChildWriteFaults(big) == 1);
+    test_cond("fork child faults on a large HYBSNAP_NOFORK allocation (last page)",
+              hybsnapTestChildWriteFaults(big + 5 * 1024 * 1024 - 1) == 1);
 
     /* realloc keeps the class */
     p = zrealloc_nofork(p, 5000);
     test_cond("zrealloc_nofork() result stays in the arena", zmalloc_is_nofork(p));
-    test_cond("fork child faults after realloc", snapTestChildWriteFaults(p) == 1);
+    test_cond("fork child faults after realloc", hybsnapTestChildWriteFaults(p) == 1);
     zfree(p);
     zfree(q);
     zfree(big);
@@ -5571,31 +5571,31 @@ int snapshotTest(int argc, char **argv, int flags) {
                 ((char*)ptrs[i])[sz-1] = 1;
             }
             for (int i = 0; i < N; i += 2) { zfree(ptrs[i]); ptrs[i] = NULL; }
-            snapTestPurgeArena();
+            hybsnapTestPurgeArena();
             for (int i = 1; i < N; i += 2) {
                 seed = seed * 1103515245u + 12345u;
                 ptrs[i] = zrealloc_nofork(ptrs[i], 8 + (seed >> 8) % 16384);
             }
-            snapTestPurgeArena();
+            hybsnapTestPurgeArena();
             for (int i = 1; i < N; i += (N / 32)) {
                 if (!zmalloc_is_nofork(ptrs[i])) bad_class++;
-                if (snapTestChildWriteFaults(ptrs[i]) != 1) bad_fork++;
+                if (hybsnapTestChildWriteFaults(ptrs[i]) != 1) bad_fork++;
             }
             for (int i = 1; i < N; i += 2) zfree(ptrs[i]);
-            snapTestPurgeArena();
+            hybsnapTestPurgeArena();
         }
         /* Fresh allocation after purge cycles must still be DONTFORK (commit path). */
         void *fresh = zmalloc_nofork(4096 * 3);
         memset(fresh, 2, 4096 * 3);
-        test_cond("mapping after purge cycles carries the dc flag", snapTestMappingIsDontcopy(fresh) == 1);
+        test_cond("mapping after purge cycles carries the dc flag", hybsnapTestMappingIsDontcopy(fresh) == 1);
         test_cond("stress: sampled live pointers are all in the arena", bad_class == 0);
         test_cond("stress: sampled live pointers all fault in the child after purge/decay/realloc cycles", bad_fork == 0);
-        test_cond("allocation after purge cycles is still DONTFORK", snapTestChildWriteFaults(fresh) == 1);
+        test_cond("allocation after purge cycles is still DONTFORK", hybsnapTestChildWriteFaults(fresh) == 1);
         zfree(fresh);
         zfree(ptrs);
     }
 
-    /* 4. tcache isolation: freed SNAP_NOFORK blocks must never be recycled into
+    /* 4. tcache isolation: freed HYBSNAP_NOFORK blocks must never be recycled into
      * default-arena allocations, and vice versa. */
     {
         const int N = 2000;
@@ -5605,7 +5605,7 @@ int snapshotTest(int argc, char **argv, int flags) {
         int leaked = 0;
         for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
-        test_cond("freed SNAP_NOFORK blocks are never handed to zmalloc()", leaked == 0);
+        test_cond("freed HYBSNAP_NOFORK blocks are never handed to zmalloc()", leaked == 0);
 
         for (int i = 0; i < N; i++) a[i] = zmalloc(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
@@ -5632,32 +5632,32 @@ int snapshotTest(int argc, char **argv, int flags) {
         void **a = zmalloc(sizeof(void*) * N);
         long long t0, t1;
 
-        t0 = snapTestNowNs();
+        t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) { void *x = zmalloc(64); zfree(x); }
-        t1 = snapTestNowNs();
+        t1 = hybsnapTestNowNs();
         double z_pair = (double)(t1 - t0) / N;
 
-        t0 = snapTestNowNs();
+        t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) { void *x = zmalloc_nofork(64); zfree(x); }
-        t1 = snapTestNowNs();
+        t1 = hybsnapTestNowNs();
         double s_pair = (double)(t1 - t0) / N;
 
-        t0 = snapTestNowNs();
+        t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) a[i] = zmalloc(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
-        t1 = snapTestNowNs();
+        t1 = hybsnapTestNowNs();
         double z_bulk = (double)(t1 - t0) / N;
 
-        t0 = snapTestNowNs();
+        t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
-        t1 = snapTestNowNs();
+        t1 = hybsnapTestNowNs();
         double s_bulk = (double)(t1 - t0) / N;
 
-        t0 = snapTestNowNs();
+        t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
         for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);
-        t1 = snapTestNowNs();
+        t1 = hybsnapTestNowNs();
         double s_bulk_sized = (double)(t1 - t0) / N;
 
         printf("BENCH alloc+free 64B, N=%d: zmalloc/zfree pair %.1f ns, zmalloc_nofork pair %.1f ns; "
@@ -5672,25 +5672,25 @@ int snapshotTest(int argc, char **argv, int flags) {
      * with identical flags merge back). */
     {
         const int N = large ? 10000000 : 1000000;
-        int maps_before = snapTestCountMaps();
+        int maps_before = hybsnapTestCountMaps();
         void **a = zmalloc(sizeof(void*) * N);
         for (int i = 0; i < N; i++) { a[i] = zmalloc_nofork(96); ((char*)a[i])[0] = 1; }
-        int maps_after = snapTestCountMaps();
+        int maps_after = hybsnapTestCountMaps();
         for (int i = 0; i < N; i++) zfree(a[i]);
         zfree(a);
-        printf("VMA maps: before=%d after %d x 96B SNAP_NOFORK allocations=%d (delta %d)\n",
+        printf("VMA maps: before=%d after %d x 96B HYBSNAP_NOFORK allocations=%d (delta %d)\n",
                maps_before, N, maps_after, maps_after - maps_before);
         test_cond("VMA count stays far below vm.max_map_count default (65530)", maps_after < 10000);
     }
 
-    snapPlacementTests();
-    snapScanTests(accurate);
-    snapRefcountTests();
-    snapOverlayTests(0);
-    snapOverlayTests(1);
-    snapOverlayBucketTests();
-    snapOverlayWindowTests();
-    snapOverlayRehashTests();
+    hybsnapPlacementTests();
+    hybsnapScanTests(accurate);
+    hybsnapRefcountTests();
+    hybsnapOverlayTests(0);
+    hybsnapOverlayTests(1);
+    hybsnapOverlayBucketTests();
+    hybsnapOverlayWindowTests();
+    hybsnapOverlayRehashTests();
 
     test_report();
     return 0;

@@ -43,7 +43,7 @@ int clusterAsmCancelBySlotRangeArray(struct slotRangeArray *slots, const char *r
 int clusterAsmCancelInvalidTasks(void);
 int isSlotInAsmTask(int slot);
 int isSlotInTrimJob(int slot);
-/* The slot snapshot stream, shared with the hybrid snapshot's producers (snapshot.c). */
+/* The slot snapshot stream, shared with the hybrid snapshot's producers (hybrid_snapshot.c). */
 int asmMigratingSlotsBitmap(uint8_t *bitmap);          /* CLUSTER_SLOTS/8 zeroed bytes in; the migrate task's slots; returns their count, 0 if none */
 int slotSnapshotWritePrelude(rio *rdb);                /* in the writing process: fail point, compression off, module commands, FUNCTION RESTORE */
 int slotSnapshotWriteSlotInfo(rio *rdb, int slot, unsigned long keys, unsigned long expires);

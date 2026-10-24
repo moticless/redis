@@ -83,7 +83,7 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     min_size += sizeMetas;
     min_size += key_sds_size;
 
-    /* Allocate object memory. Every kvobj header lives in the SNAP_NOFORK
+    /* Allocate object memory. Every kvobj header lives in the HYBSNAP_NOFORK
      * arena (hybrid snapshot): the fork child never reads headers directly. */
     char *alloc = zmalloc_nofork(min_size);
     kvobj *kv = (kvobj *) (alloc + sizeMetas);
@@ -185,7 +185,7 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     min_size += sizeMetas;
     min_size += key_sds_size;
 
-    /* Allocate object memory (SNAP_NOFORK arena, see kvobjCreate). */
+    /* Allocate object memory (HYBSNAP_NOFORK arena, see kvobjCreate). */
     size_t bufsize = 0;
     char *alloc = zmalloc_nofork_usable(min_size, &bufsize);
     o = (kvobj *) (alloc + sizeMetas);
@@ -336,9 +336,9 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
     
     decrRefCount(val);
     /* Hybrid snapshot placement policy: small single-allocation values live in
-     * the SNAP_NOFORK arena. kvobjSet() is the funnel for every keyspace
+     * the HYBSNAP_NOFORK arena. kvobjSet() is the funnel for every keyspace
      * insertion (dbAdd, RDB/AOF load, RESTORE, overwrite). */
-    snapPlaceValue(kv);
+    hybsnapPlaceValue(kv);
     return kv;
 }
 

@@ -3,7 +3,7 @@
 Hybrid snapshot is a `fork()`-based snapshot that keeps the fork for the values it is good at and
 keeps everything else out of the child. This document describes the design as implemented, for
 a reader who knows Redis internals (kvstore, dict, rdb.c, the fork child) but has not seen this
-code. It is the reference; `src/snapshot.c` carries a shorter overview in its file header and
+code. It is the reference; `src/hybrid_snapshot.c` carries a shorter overview in its file header and
 `poc-hybrid-bgsave-spec.md` is the design history.
 
 Contents: 1 problem and classes, 2 one save end to end, 3 the write funnel and the bucket overlay,
@@ -22,21 +22,21 @@ The hybrid splits every key's **value** into one of two classes:
 
 | class | what | where it lives | who serializes it |
 |---|---|---|---|
-| SNAP_NOFORK | every kvobj header; the keyspace and expires hash tables; single-allocation values up to `save-small-max-bytes` (default 4096): strings, listpack, intset, listpackEx | the SNAP_NOFORK arena, a jemalloc arena whose extents carry `MADV_DONTFORK`; the child never maps it | a scan thread in the parent, reading the live memory |
-| SNAP_FORK | multi-allocation encodings (hash table, skiplist, quicklist, stream), module types, template hashes, any eligible encoding above the cap, any key with module key metadata | the default arena, forkable | the fork child, from its copy-on-write snapshot, exactly as the classic save |
+| HYBSNAP_NOFORK | every kvobj header; the keyspace and expires hash tables; single-allocation values up to `save-small-max-bytes` (default 4096): strings, listpack, intset, listpackEx | the HYBSNAP_NOFORK arena, a jemalloc arena whose extents carry `MADV_DONTFORK`; the child never maps it | a scan thread in the parent, reading the live memory |
+| HYBSNAP_FORK | multi-allocation encodings (hash table, skiplist, quicklist, stream), module types, template hashes, any eligible encoding above the cap, any key with module key metadata | the default arena, forkable | the fork child, from its copy-on-write snapshot, exactly as the classic save |
 
 Because headers and tables are in the arena, the child cannot walk the keyspace at all. It is a
-serializer of SNAP_FORK values and the single writer of the output. The scan thread serializes
-SNAP_NOFORK values itself and ships SNAP_FORK keys to the child as copies of their headers; the
+serializer of HYBSNAP_FORK values and the single writer of the output. The scan thread serializes
+HYBSNAP_NOFORK values itself and ships HYBSNAP_FORK keys to the child as copies of their headers; the
 child follows the value pointer into its own snapshot.
 
 The class boundary follows an existing one: Redis already switches a hash from a listpack to a
 hash table at a size threshold, and the listpack side is one allocation built to be copied. The
-cap is a knob (`save-small-max-bytes`); the encoding list is `snapEncodingIsNoforkClass()`.
+cap is a knob (`save-small-max-bytes`); the encoding list is `hybsnapEncodingIsNoforkClass()`.
 
 **Placement.** The class is applied to the value allocation when a key is inserted (`kvobjSet`,
 `dbSetValue`), after an in-place growth of a string, and after an encoding conversion produced a
-single-allocation value (`snapPlaceValue`). A value that crosses the cap or converts to a
+single-allocation value (`hybsnapPlaceValue`). A value that crosses the cap or converts to a
 multi-allocation encoding is moved out of the arena; a listpack adopted as the first node of a
 quicklist is detached from the arena first. Only the value moves; the header, and every pointer
 to it, stays. `DEBUG SNAP-PLACEMENT` and `DEBUG SNAP-DRIFT` report where values are versus where
@@ -62,10 +62,10 @@ memory.
 |---|---|---|---|
 | 1 | Capture per-db (and per-slot) key and expire counts for `RESIZEDB` / `SLOT_INFO`. | | |
 | 2 | **Freeze**: for every non-empty keyspace dict take one reference, stamp it `(generation, PENDING)` and record it in the save's table; install the store's snapshot guard. Nothing is paused, nothing allocated per dict. | | |
-| 3 | `redisFork()`. The arena stays `MADV_DONTFORK`. | | Inherits the SNAP_FORK values (copy-on-write), the forkable half of the server, no headers, no tables, no small values. Reserves the arena's address range `PROT_NONE` so its own mappings cannot land there. |
-| 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts in scan order (section 3, the credit window). For each dict: claim it, announce its layout position and read its table sizes, then announce batches of 128 buckets (plus the prefetch lookahead) and read their chains with atomic loads, staying below `hi` and skipping buckets whose bitmap bit is set; publish `lo` behind each bucket. SNAP_NOFORK keys are serialized into a 64 KB staging buffer; SNAP_FORK keys become KVOBJ messages. Every `W` buckets (default 1024) and at the end of each dict forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
+| 3 | `redisFork()`. The arena stays `MADV_DONTFORK`. | | Inherits the HYBSNAP_FORK values (copy-on-write), the forkable half of the server, no headers, no tables, no small values. Reserves the arena's address range `PROT_NONE` so its own mappings cannot land there. |
+| 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts in scan order (section 3, the credit window). For each dict: claim it, announce its layout position and read its table sizes, then announce batches of 128 buckets (plus the prefetch lookahead) and read their chains with atomic loads, staying below `hi` and skipping buckets whose bitmap bit is set; publish `lo` behind each bucket. HYBSNAP_NOFORK keys are serialized into a 64 KB staging buffer; HYBSNAP_FORK keys become KVOBJ messages. Every `W` buckets (default 1024) and at the end of each dict forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
 | 5 | Write back overlayed buckets at the end of every write section and once per cron tick: a bucket the thread has passed (its overlay window wholly below `lo`) gets its duplicate chain installed in the dict and its originals released. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, free the bitmaps, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, set `lo` and `cur` past every position, wait once for an open write section to close (it may still be emitting), drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
-| 6 | `checkChildrenDone` -> the classic done handler -> `snapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
+| 6 | `checkChildrenDone` -> the classic done handler -> `hybsnapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
 
 ![One hybrid save in flight](images/hybrid-snapshot-flow.png)
 
@@ -89,7 +89,7 @@ The figure draws the overlay per key ("dup", "tomb"). In the implemented bucket 
    (mutex, taken by the thread          buckets and per dict      ▼
     every W buckets)                                      oq: small-channel queue ──► pipe A (BUFFER) ──► small-first loop
                                                                                         shared page: bytes queued on oq
- SNAP_FORK key written ahead:                                                             (child reads it to choose)
+ HYBSNAP_FORK key written ahead:                                                             (child reads it to choose)
    header copy ──► mq ─────────────────► bq: big-channel queue ──► pipe B (KVOBJ, END, ABORT) ──► one big value at a time
                                         one bound over oq + bq:
                                         hybrid-snapshot-max-queued-bytes
@@ -120,7 +120,7 @@ compares it with the dict's state and the credit window (below):
 | behind | dict SCANNED or DONE, or `p < lo` | write in place; nothing is owed |
 | emitted | the bucket's bitmap bit is set, whatever the position | write in place; the thread skips the bucket |
 | inside | `lo <= p < hi`, bit clear | never touch the dict's slot or chain: on the first write duplicate the whole chain of the bucket (every key cloned) into an overlayed bucket and apply this and later writes to the duplicate; a delete unlinks from the duplicate, an add links into it; the originals stay in the dict for the thread |
-| ahead | dict PENDING and not paused (wholly beyond `hi`), or `p >= hi`, bit clear | **emit first**: serialize the bucket's whole fork-instant chain on the main thread (SNAP_NOFORK records into the staging area, SNAP_FORK keys as header copies) into `mq`, set the bit, then write in place |
+| ahead | dict PENDING and not paused (wholly beyond `hi`), or `p >= hi`, bit clear | **emit first**: serialize the bucket's whole fork-instant chain on the main thread (HYBSNAP_NOFORK records into the staging area, HYBSNAP_FORK keys as header copies) into `mq`, set the bit, then write in place |
 
 **The credit window.** The scan visits a fixed order, and each bucket has a position in it: a
 64-bit integer packing the dict's ordinal (its store's base plus the slot, so a slot filter's
@@ -175,7 +175,7 @@ the layout of its 64th dict.
 - In-place header writes outside the funnel do not happen during a hybrid save: the LRU/LFU touch
   in `lookupKey` is skipped while a child exists (the save's writer child counts), and the
   in-place writes of read commands (`PFCOUNT`'s cache, `RM_SetLRU` on a READ handle) go through the
-  funnel (`snapPrepareMutation`).
+  funnel (`hybsnapPrepareMutation`).
 - **Abort**: the thread's wait for `hi` checks for an abort, as does its final wait.
 - **Module threads** holding the GIL open, grant and close sections exactly as the main thread
   does; the GIL serializes them with it.
@@ -206,12 +206,12 @@ a power of two, at most the table) around the bucket, with the scan position of 
 bucket. One index serves the whole save: slots, each the buckets of one window of one dict, a
 bucket at offset `index - lo` of its slot's array, with a bitmap of the offsets in use. The index
 grows on demand; the write-back at every section's end and the grant limit of 16 windows in use
-keep it small. `W` is at most `SNAP_WINDOW_BUCKETS_MAX` (65536), so a slot's array is bounded
+keep it small. `W` is at most `HYBSNAP_WINDOW_BUCKETS_MAX` (65536), so a slot's array is bounded
 too. An overlayed bucket is named by `(table, bucket index)` and
 owns the duplicate chain (ordinary dict entries, so a position in it is an ordinary
 `dictEntryLink`) and records nothing per original: the originals are found by walking the dict's
 own chain at that bucket, and whether a clone took over its original's value is recomputed from
-the original's header and the address of its value (`snapOriginalSharesValue`). There are no
+the original's header and the address of its value (`hybsnapOriginalSharesValue`). There are no
 tombstones: a deleted key is simply absent from the duplicate while its original stays in the
 dict. Enumeration (`SCAN`, `KEYS`, iterators) hands out the duplicate chain at the first original
 it meets of an overlayed bucket and skips the other originals of that bucket, and the buckets
@@ -220,8 +220,8 @@ rehash and auto-resize are paused, so a `(table, index)` name stays valid; both 
 the last bucket is written back.
 
 **Clone.** Duplicating a bucket clones each key of its chain: the whole kvobj allocation into a
-fresh arena block. A SNAP_NOFORK value
-is deep-copied; a SNAP_FORK value is shared with the original, since the child already has its
+fresh arena block. A HYBSNAP_NOFORK value
+is deep-copied; a HYBSNAP_FORK value is shared with the original, since the child already has its
 own copy. The clone takes over the key's entry in `db->expires` and, for a hash with field TTLs,
 the registration in the db's sub-expiry buckets: the original's `ExpireMeta` is trashed, which is
 why anything that serializes a fork-instant original must read field TTLs from the value, not
@@ -252,16 +252,16 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 
 | memory | where | bound |
 |---|---|---|
-| copy-on-write on SNAP_FORK values written during the save | child, kernel | the forkable memory: `allocator_active` minus `allocator_active_nofork`, reached only if every forkable page is written |
+| copy-on-write on HYBSNAP_FORK values written during the save | child, kernel | the forkable memory: `allocator_active` minus `allocator_active_nofork`, reached only if every forkable page is written |
 | child page tables | child | proportional to the forkable range; sets the fork stall |
-| retained originals: fork-instant SNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket's overlay window |
+| retained originals: fork-instant HYBSNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket's overlay window |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded within the thread's next `W` buckets or at the end of its dict |
 | the scan thread's queues to the child (`oq` + `bq`) | parent | `hybrid-snapshot-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
 | per-dict bitmaps and the overlay index | parent | one bit per bucket per table of attached and paused dicts; per overlay window holding buckets an array of one pointer per bucket of the window (8 KB at the default 1024) and its bitmap, plus the duplicated chains; grants stop at 16 windows in use |
 
 The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
 retained originals plus the bytes the main thread has queued and the thread has not yet handed to
-its own queues. `snapSaveCron` aborts the save when it is exceeded, and reports the save as failed
+its own queues. `hybsnapSaveCron` aborts the save when it is exceeded, and reports the save as failed
 (`rdb_last_bgsave_status:err`, `snap_hard_mark_aborts`). The worst-case memory a save holds in the
 parent is the sum of the two bounds. The queues, the retained originals, the bitmaps and the save's
 fixed bookkeeping (per-slot size tables, dict tables, completion ring) are excluded from the eviction
@@ -288,7 +288,7 @@ copy-on-write on the arena.
 | diskless full sync, rdb channel | hybrid; the child writes the replicas' sockets | several replicas share one child; the replication stream buffers on the replica |
 | diskless full sync, one connection | hybrid; the child writes a pipe, the parent relays it | about 2 CPU-seconds of relay per 4 GB on the main thread |
 | functions-only transfer | classic child | no keyspace content |
-| atomic slot migration's slot snapshot | hybrid over the migrating slots only; the child writes the rdb-channel connection | a third record form: the stream is RESP (`FUNCTION RESTORE`, `SELECT`, `CLUSTER SYNCSLOTS CONF SLOT-INFO` once per slot, `RESTORE ... ABSTTL` from a `DUMP` payload per key, `CLUSTER SYNCSLOTS SNAPSHOT-EOF`), written by the same producers through `slotSnapshotSaveKeyValuePair`; only the migrating slots' dicts are frozen and scanned (`snapScanSetSlotFilter`), writes to every other slot are plain writes; the child never maps the arena, so the migration pays the fork-class page tables and fork-class copy-on-write, as a hybrid BGSAVE does |
+| atomic slot migration's slot snapshot | hybrid over the migrating slots only; the child writes the rdb-channel connection | a third record form: the stream is RESP (`FUNCTION RESTORE`, `SELECT`, `CLUSTER SYNCSLOTS CONF SLOT-INFO` once per slot, `RESTORE ... ABSTTL` from a `DUMP` payload per key, `CLUSTER SYNCSLOTS SNAPSHOT-EOF`), written by the same producers through `slotSnapshotSaveKeyValuePair`; only the migrating slots' dicts are frozen and scanned (`hybsnapScanSetSlotFilter`), writes to every other slot are plain writes; the child never maps the arena, so the migration pays the fork-class page tables and fork-class copy-on-write, as a hybrid BGSAVE does |
 | BGREWRITEAOF, `aof-use-rdb-preamble yes` | hybrid, AOF child, RDB base file | the INCR file opens before the freeze, so the fork instant is where its history starts |
 | BGREWRITEAOF, `aof-use-rdb-preamble no` | hybrid, AOF child, command-form base file | the same producers call `rewriteObject` per record; the child writes the AOF prologue and emits `SELECT` only on a db change |
 | BACKUP | through BGREWRITEAOF | |
@@ -327,7 +327,7 @@ What happens when something else touches the keyspace or the child during a hybr
 ## 7. Module contract
 
 Module code never runs on the scan thread: module values and every key with module key metadata
-are SNAP_FORK, serialized by the child from the header copy through the type's `rdb_save` and the
+are HYBSNAP_FORK, serialized by the child from the header copy through the type's `rdb_save` and the
 metadata save callbacks, as the classic save does. `aux_save` runs in the child from the RDB header.
 Persistence events fire where the classic save fires them. Module allocations are forkable and mapped in the
 child.
@@ -361,7 +361,7 @@ A module's own forks are a separate declaration, made per fork call. `RedisModul
 classic child: it may walk the keyspace, so the arena is flipped forkable for it. A child that
 works on module memory only (an index, a cache) is forked with
 `RedisModule_ForkWithFlags(ctx, REDISMODULE_FORK_NO_KEYSPACE, cb, user_data)`. It is forked the way
-the hybrid child is (`snapForkNoKeyspace`): the arena stays `MADV_DONTFORK`, the child reserves its
+the hybrid child is (`hybsnapForkNoKeyspace`): the arena stays `MADV_DONTFORK`, the child reserves its
 range, the same keyspace APIs are refused there with the same once-per-API log, and the crash
 report skips the INFO sections that read the keyspace. The refusals apply with the feature on or
 off, so the contract does not depend on the configuration. Rule 2 above applies to the whole
@@ -378,7 +378,7 @@ the single-child rule applies as for any fork.
 | config | default | meaning |
 |---|---|---|
 | `hybrid-snapshot` | no | the switch; runtime, refused while a child or save runs |
-| `save-small-max-bytes` | 4096 | the SNAP_NOFORK size cap for single-allocation values; affects values placed from then on |
+| `save-small-max-bytes` | 4096 | the HYBSNAP_NOFORK size cap for single-allocation values; affects values placed from then on |
 | `hybrid-snapshot-max-retained-bytes` | 256mb | the hard mark over retained originals plus main-thread queued bytes; 0 unlimited |
 | `hybrid-snapshot-max-queued-bytes` | 100mb | the bound over the scan thread's two queues; 0 unbounded |
 | `hybrid-snapshot-tag-all` | no | debug: every BUFFER depends on all big values sent before it |
@@ -425,20 +425,20 @@ status fields are the classic ones.
 `SNAP-WINDOW-BUCKETS [n]` (get or set the credit `W`, buckets per grant; tests).
 
 **Log lines** worth knowing: `Hybrid background saving started by pid ... (scan thread streams to
-the child)`, `Hybrid AOF rewrite started ...`, `Hybrid snapshot done, N SNAP_FORK keys serialized by
+the child)`, `Hybrid AOF rewrite started ...`, `Hybrid snapshot done, N HYBSNAP_FORK keys serialized by
 the child`, `Hybrid snapshot: ... past hybrid-snapshot-max-retained-bytes ...: aborting the save`,
 `Hybrid snapshot: scan aborted, keyspace overlay drained`, `Hybrid snapshot: db N flushed during the
 save, its keyspace stays with the save`, `Hybrid snapshot: falling back to the fork child, module
-'...' has not declared ...`, `SNAP_NOFORK arena made forkable for a ... child` and `... back to
+'...' has not declared ...`, `HYBSNAP_NOFORK arena made forkable for a ... child` and `... back to
 MADV_DONTFORK`.
 
-**Unit tests**: `redis-server test snapshot` (scan engine, placement, overlay, references),
-`tests/unit/snapshot.tcl` (the harness race workload, every entry point, every interaction above).
+**Unit tests**: `redis-server test hybrid_snapshot` (scan engine, placement, overlay, references),
+`tests/unit/hybrid_snapshot.tcl` (the harness race workload, every entry point, every interaction above).
 
 ## 9. Glossary
 
-- **class**: SNAP_NOFORK or SNAP_FORK, a property of a key's value allocation (section 1).
-- **arena**: the SNAP_NOFORK jemalloc arena, `MADV_DONTFORK`, never mapped in the hybrid child.
+- **class**: HYBSNAP_NOFORK or HYBSNAP_FORK, a property of a key's value allocation (section 1).
+- **arena**: the HYBSNAP_NOFORK jemalloc arena, `MADV_DONTFORK`, never mapped in the hybrid child.
 - **fork instant**: the moment of `redisFork()`; the snapshot's point in time. Everything the
   save writes is the state at that instant.
 - **store**: a kvstore the save is scanning, identified by the db id it had at the fork instant;
@@ -469,12 +469,12 @@ MADV_DONTFORK`.
   for the child; **hard mark**: the bound over both on the parent side.
 - **small channel** / **big channel**: the two pipes to the child; BUFFER messages on the first,
   KVOBJ, END and ABORT on the second. "Small" names the channel, not the class: a BUFFER may carry
-  SNAP_FORK headers the main thread emitted inline.
+  HYBSNAP_FORK headers the main thread emitted inline.
 - **dependency**: the count of big values that must precede a BUFFER in the output (`robj_off`).
 
 ## 10. Invariants
 
-1. The scan thread reads a fork-instant header or SNAP_NOFORK value only while it is unchanged:
+1. The scan thread reads a fork-instant header or HYBSNAP_NOFORK value only while it is unchanged:
    every keyspace write to an owed bucket goes through the funnel, which emits or clones before the
    dict changes.
 2. The thread reads chain pointers only below `hi` and after announcing them in `cur`; the main

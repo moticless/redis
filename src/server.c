@@ -354,7 +354,7 @@ static void dictDestructorKV(dict *d, void *key) {
         size_t alloc_size = kvobjAllocSize(kv);
         if (alloc_size > meta->alloc_size)
             serverLog(LL_WARNING, "slot alloc_size drift: key '%s' type %d enc %d size %zu > meta %zu (hybrid save in progress: %d)",
-                      kvobjGetKey(kv), kv->type, kv->encoding, alloc_size, meta->alloc_size, snapSaveInProgress());
+                      kvobjGetKey(kv), kv->type, kv->encoding, alloc_size, meta->alloc_size, hybsnapSaveInProgress());
         debugServerAssert(alloc_size <= meta->alloc_size);
         meta->alloc_size -= alloc_size;
         /* kvstoreMeta may be NULL when freeing kvstore created with kvstoreBaseType
@@ -661,7 +661,7 @@ dictType dbDictType = {
     .keyFromStoredKey = kvGetKey,    /* get key from stored-key */
     .prefetchEntryKey = dbDictPrefetchEntryKey,
     .prefetchEntryValue = dbDictPrefetchEntryValue,
-    .nofork_alloc = 1,      /* hybrid snapshot: tables live in the SNAP_NOFORK arena */
+    .nofork_alloc = 1,      /* hybrid snapshot: tables live in the HYBSNAP_NOFORK arena */
 };
 
 /* Db->expires */
@@ -676,7 +676,7 @@ dictType dbExpiresDictType = {
     .no_value = 1,              /* keys and values are unified (kvobj) */
     .keys_are_odd = 0,          /* simple kvobj (robj) struct */
     .keyFromStoredKey = kvGetKey,   /* get key from stored-key */
-    .nofork_alloc = 1,          /* hybrid snapshot: tables live in the SNAP_NOFORK arena */
+    .nofork_alloc = 1,          /* hybrid snapshot: tables live in the HYBSNAP_NOFORK arena */
 };
 
 /* Command table. sds string -> command struct pointer. */
@@ -866,9 +866,9 @@ void resetChildState(void) {
     updateDictResizePolicy();
     closeChildInfoPipe();
     /* Reaped or killed (killRDBChild/killAppendOnlyChild/TerminateModuleForkChild
-     * come here without checkChildrenDone): the SNAP_NOFORK arena may go back
+     * come here without checkChildrenDone): the HYBSNAP_NOFORK arena may go back
      * to DONTFORK now that no exclusive child is left. */
-    snapArenaChildExited();
+    hybsnapArenaChildExited();
     moduleFireServerEvent(REDISMODULE_EVENT_FORK_CHILD,
                           REDISMODULE_SUBEVENT_FORK_CHILD_DIED,
                           NULL);
@@ -1468,7 +1468,7 @@ void checkChildrenDone(void) {
         } else if (pid == server.child_pid) {
             /* Hybrid snapshot: release the save (scan thread, overlays) before
              * the type's done handler does the stock bookkeeping. */
-            snapOnChildEnd(exitcode, bysignal);
+            hybsnapOnChildEnd(exitcode, bysignal);
             if (server.child_type == CHILD_TYPE_RDB) {
                 backgroundSaveDoneHandler(exitcode, bysignal);
             } else if (server.child_type == CHILD_TYPE_AOF) {
@@ -1480,14 +1480,14 @@ void checkChildrenDone(void) {
                 exit(1);
             }
             if (!bysignal && exitcode == 0) receiveChildInfo();
-            resetChildState();   /* flips the SNAP_NOFORK arena back if needed */
+            resetChildState();   /* flips the HYBSNAP_NOFORK arena back if needed */
         } else {
             if (!ldbRemoveChild(pid)) {
                 serverLog(LL_WARNING,
                           "Warning, detected child with unmatched pid: %ld",
                           (long) pid);
             } else {
-                snapArenaChildExited();
+                hybsnapArenaChildExited();
             }
         }
 
@@ -1540,7 +1540,7 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_resident,
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
-        if (snapArenaAvailable()) {
+        if (hybsnapArenaAvailable()) {
             zmalloc_get_allocator_info_by_arena(zmalloc_nofork_arena_index(),
                                                 0,
                                                 &server.cron_malloc_stats.nofork_allocator_allocated,
@@ -1732,7 +1732,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
     }
 
     /* Check if a background saving or AOF rewrite in progress terminated. */
-    snapSaveCron();
+    hybsnapSaveCron();
     if (hasActiveChildProcess() || ldbPendingChildren())
     {
         run_with_period(1000) receiveChildInfo();
@@ -1794,7 +1794,7 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * clear the AOF error in case of success to make the DB writable again,
      * however to try every second is enough in case of 'hz' is set to
      * a higher frequency. */
-    /* SNAP_NOFORK arena: return this thread's cached regions to the bins, so
+    /* HYBSNAP_NOFORK arena: return this thread's cached regions to the bins, so
      * an idle keyspace or an active-defrag pass (tcache bypassed) does not
      * leave slabs pinned by the explicit tcache (see zmalloc.c). */
     run_with_period(1000) zmalloc_nofork_tcache_flush();
@@ -1992,7 +1992,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Hybrid snapshot: keyspace writes outside call() (expire cycle, eviction,
      * module timers) end with the event loop iteration at the latest. */
-    snapFunnelClose();
+    hybsnapFunnelClose();
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -3147,9 +3147,9 @@ void initServer(void) {
     }
     server.db = zmalloc(sizeof(redisDb)*server.dbnum);
 
-    /* Create the SNAP_NOFORK (MADV_DONTFORK) arena before any keyspace
-     * structure is allocated (see snapshot.c). */
-    snapArenaInit();
+    /* Create the HYBSNAP_NOFORK (MADV_DONTFORK) arena before any keyspace
+     * structure is allocated (see hybrid_snapshot.c). */
+    hybsnapArenaInit();
 
     /* Create the Redis databases, and initialize other internal state. */
     int slot_count_bits = 0;
@@ -4556,7 +4556,7 @@ static void afterCommandEx(client *c, long duration, int ops_before) {
         listJoin(c->reply, server.pending_push_messages);
         /* Hybrid snapshot: links into frozen dicts are never held across
          * commands, so the write section (if any) ends here. */
-        snapFunnelClose();
+        hybsnapFunnelClose();
     }
 
     /* Run debug assertions if any are enabled */
@@ -6832,16 +6832,16 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "active_defrag_running:%d\r\n", server.active_defrag_running,
             "lazyfree_pending_objects:%zu\r\n", lazyfreeGetPendingObjectsCount(),
             "lazyfreed_objects:%zu\r\n", lazyfreeGetFreedObjectsCount()));
-        info = snapInfoMemory(info);
+        info = hybsnapInfoMemory(info);
         freeMemoryOverheadData(mh);
     }
 
     /* Persistence */
     if (all_sections || (dictFind(section_dict,"persistence") != NULL)) {
         if (sections++) info = sdscat(info,"\r\n");
-        /* Hybrid snapshot: the child only sees SNAP_FORK keys; progress is what
+        /* Hybrid snapshot: the child only sees HYBSNAP_FORK keys; progress is what
          * the scan thread and the main thread have dispatched so far. */
-        size_t save_keys_processed = snapSaveKeysProcessed(server.stat_current_save_keys_processed);
+        size_t save_keys_processed = hybsnapSaveKeysProcessed(server.stat_current_save_keys_processed);
         double fork_perc = 0;
         if (server.stat_module_progress) {
             fork_perc = server.stat_module_progress * 100;
@@ -6890,7 +6890,7 @@ sds genRedisInfoString(dict *section_dict, int all_sections, int everything) {
             "backup_in_progress:%d\r\n", backupIsInProgress(),
             "module_fork_in_progress:%d\r\n", server.child_type == CHILD_TYPE_MODULE,
             "module_fork_last_cow_size:%zu\r\n", server.stat_module_cow_bytes));
-        info = snapInfoPersistence(info);
+        info = hybsnapInfoPersistence(info);
 
         if (server.aof_enabled) {
             info = sdscatprintf(info, FMTARGS(
@@ -7750,7 +7750,7 @@ int redisFork(int purpose) {
         openChildInfoPipe();
     }
 
-    snapArenaBeforeFork(purpose);   /* stock children must map the SNAP_NOFORK arena */
+    hybsnapArenaBeforeFork(purpose);   /* stock children must map the HYBSNAP_NOFORK arena */
 
     int childpid;
     long long start = ustime();
@@ -7930,7 +7930,7 @@ void dismissMemoryInChild(void) {
     /* Hybrid snapshot: the keyspace kvstores live in the DONTFORK arena and are
      * not mapped in the child at all unless the arena was flipped forkable for
      * this (stock) child; touching them here would fault otherwise. */
-    if ((!snapArenaAvailable() || snapArenaForkable()) &&
+    if ((!hybsnapArenaAvailable() || hybsnapArenaForkable()) &&
         (server.in_fork_child == CHILD_TYPE_RDB || server.in_fork_child == CHILD_TYPE_AOF)) {
         for (int dbid = 0; dbid < server.dbnum; dbid++) {
             dismissKvstoreBucketsMemory(server.db[dbid].expires);
@@ -8288,7 +8288,7 @@ struct redisTest {
     {"zset", zsetTest},
     {"topk", chkTopKTest},
     {"fastfloat", fastFloatTest},
-    {"snapshot", snapshotTest},
+    {"hybrid_snapshot", hybsnapTest},
 };
 redisTestProc *getTestProcByName(const char *name) {
     int numtests = sizeof(redisTests)/sizeof(struct redisTest);

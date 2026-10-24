@@ -2586,14 +2586,14 @@ struct redisServer {
     int sort_bypattern;
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
-    int hybrid_snapshot;              /* Hybrid snapshot: SNAP_NOFORK arena + background scan (snapshot.c). Runtime switch. */
-    long long stat_snap_saves;      /* Hybrid saves started (INFO snap_saves). */
-    long long stat_snap_inplace_writes;  /* Writes to already-scanned keys served in place (no clone). */
-    size_t save_small_max_bytes;    /* Max value size for SNAP_NOFORK class (snapshot.c). */
+    int hybrid_snapshot;              /* Hybrid snapshot: HYBSNAP_NOFORK arena + background scan (hybrid_snapshot.c). Runtime switch. */
+    long long stat_hybsnap_saves;      /* Hybrid saves started (INFO snap_saves). */
+    long long stat_hybsnap_inplace_writes;  /* Writes to already-scanned keys served in place (no clone). */
+    size_t save_small_max_bytes;    /* Max value size for HYBSNAP_NOFORK class (hybrid_snapshot.c). */
     size_t hybrid_snapshot_max_retained_bytes; /* Hybrid save aborts when the overlay retains more than this (0 = no limit). */
     size_t hybrid_snapshot_max_queued_bytes;   /* Scan thread waits for the child past this much queued output (0 = no bound). */
     int hybrid_snapshot_tag_all;         /* debug: every BUFFER depends on all big values sent before it */
-    long long stat_snap_hard_mark_aborts;    /* Hybrid saves aborted at the retained-bytes hard mark. */
+    long long stat_hybsnap_hard_mark_aborts;    /* Hybrid saves aborted at the retained-bytes hard mark. */
     size_t hash_max_listpack_entries;
     size_t hash_max_listpack_value;
     /* Hash template config */
@@ -4991,6 +4991,6 @@ int iAmMaster(void);
 #define STRINGIFY_(x) #x
 #define STRINGIFY(x) STRINGIFY_(x)
 
-#include "snapshot.h"
+#include "hybrid_snapshot.h"
 
 #endif

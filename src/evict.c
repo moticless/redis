@@ -383,7 +383,7 @@ size_t freeMemoryGetNotCountedMemory(void) {
      * the save holds for its duration and releases, not the dataset's:
      * counting it would evict keys during every save on an instance near its
      * limit (a cluster node's per-slot size tables alone are 256 KB). */
-    overhead += snapSaveOverheadBytes();
+    overhead += hybsnapSaveOverheadBytes();
     return overhead;
 }
 

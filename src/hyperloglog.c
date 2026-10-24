@@ -1751,7 +1751,7 @@ void pfcountCommand(client *c) {
          * BGSAVE take an owed key through the write funnel first, as every
          * write command does. The read lookup above settled expiry, so the
          * key is there either way. */
-        o = snapPrepareMutation(c->db, c->argv[1], o);
+        o = hybsnapPrepareMutation(c->db, c->argv[1], o);
         o = dbUnshareStringValue(c->db,c->argv[1],o);
 
         /* Check if the cached cardinality is valid. */
