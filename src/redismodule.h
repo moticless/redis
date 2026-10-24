@@ -357,8 +357,7 @@ typedef uint64_t RedisModuleTimerID;
  * also covers: module-owned state keeps no pointer into Redis-owned key memory
  * (a RedisModule_StringDMA result, a RedisModuleKey) that a save callback
  * dereferences, and keys are mutated only through a handle opened with
- * REDISMODULE_WRITE, from a module thread only under the GIL. Full contract:
- * docs/hybrid-snapshot.md, section 7. */
+ * REDISMODULE_WRITE, from a module thread only under the GIL. */
 #define REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT    (1<<4)
 
 /* Next option flag, must be updated when adding new module flags above!

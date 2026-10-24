@@ -1992,7 +1992,7 @@ void beforeSleep(struct aeEventLoop *eventLoop) {
 
     /* Hybrid snapshot: keyspace writes outside call() (expire cycle, eviction,
      * module timers) end with the event loop iteration at the latest. */
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
 
     /* Just call a subset of vital functions in case we are re-entering
      * the event loop from processEventsWhileBlocked(). Note that in this
@@ -4556,7 +4556,7 @@ static void afterCommandEx(client *c, long duration, int ops_before) {
         listJoin(c->reply, server.pending_push_messages);
         /* Hybrid snapshot: links into frozen dicts are never held across
          * commands, so the write section (if any) ends here. */
-        hybsnapFunnelClose();
+        hybsnapSectionClose();
     }
 
     /* Run debug assertions if any are enabled */

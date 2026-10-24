@@ -3,8 +3,7 @@
  *
  * The design overview (value classes, one save end to end, the credit window
  * and write sections, memory, entry points) is the comment at the top of
- * hybrid_snapshot.h; the full design, with figures and the race-freedom argument, is
- * docs/hybrid-snapshot.md. This file keeps the implementation details next to
+ * hybrid_snapshot.h. This file keeps the implementation details next to
  * the code they describe; each section below opens with its own.
  *
  * Sections, in order:
@@ -356,9 +355,7 @@ static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores, hybsn
 static void hybsnapScanSetOverlay(hybsnapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
 /* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
 static void hybsnapScanSetSlotFilter(hybsnapScanCtx *ctx, const uint8_t *bitmap);
-/* Main thread: freeze every store (the fork instant) and spawn the thread; C_OK / C_ERR. */
-static int hybsnapScanStart(hybsnapScanCtx *ctx);
-/* The same in two steps: freeze first, spawn the thread later (the fork goes in between). */
+/* Main thread: freeze every store (the fork instant), then, after the fork, spawn the thread; C_OK / C_ERR. */
 static void hybsnapScanFreeze(hybsnapScanCtx *ctx);
 static int hybsnapScanStartThread(hybsnapScanCtx *ctx);
 /* Main thread: complete the slots the thread finished since the last call; returns how many. */
@@ -375,15 +372,14 @@ static void hybsnapScanRelease(hybsnapScanCtx *ctx);
 /* The scan was aborted; complete every slot of every store (main thread). */
 static inline int hybsnapScanAborted(hybsnapScanCtx *ctx);
 static void hybsnapScanFinishAll(hybsnapScanCtx *ctx);
-/* HYBSNAP_SLOT_* of (store, dict); progress counters for INFO and tests. */
-static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx);
+/* Progress counters for INFO and tests. */
 static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *slots_scanned,
                       long *slots_done, long long *keys_dispatched);
 
 /* ---- Credit window and write sections --------------------------------- */
 
 /* Every guard or funnel hook (main thread, or a module thread holding the GIL): the first opens the section and caps the thread, later ones may raise the cap. */
-static void hybsnapFunnelOpen(void);
+static void hybsnapSectionOpen(void);
 /* The thread's credit W, buckets per grant (DEBUG SNAP-WINDOW-BUCKETS; tests). */
 static void hybsnapSetWindowBuckets(unsigned long n);
 static unsigned long hybsnapGetWindowBuckets(void);
@@ -396,9 +392,8 @@ static int hybsnapScanBucketEmitted(hybsnapScanCtx *ctx, int store_idx, int didx
 /* An attached dict started or finished rehashing: its bitmap follows the new table. */
 static void hybsnapScanDictRehashStarted(hybsnapScanCtx *ctx, int store_idx, int didx, dict *d);
 static void hybsnapScanDictRehashCompleted(hybsnapScanCtx *ctx, int store_idx, int didx, dict *d);
-/* Bitmap accounting: dicts that grew under the save, dicts retained past their store, bitmap bytes. */
+/* Bitmap accounting: dicts that grew under the save, bitmap bytes. */
 static long hybsnapScanDictsGrown(hybsnapScanCtx *ctx);
-static long hybsnapScanRetainedDicts(hybsnapScanCtx *ctx);
 static size_t hybsnapScanBitmapBytes(hybsnapScanCtx *ctx);
 
 /* ---- Keyspace overlay ------------------------------------------------- */
@@ -1176,13 +1171,13 @@ static inline uint8_t hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 #define HYBSNAP_ADVANCE_DICTS 64              /* dicts one grant may open */
 #define HYBSNAP_OV_SLOTS_SOFT 16              /* overlay windows in use past which a section stops granting */
 
-/* The credit window (hybrid_snapshot.h; docs/hybrid-snapshot.md section 3). Here:
+/* The credit window (hybrid_snapshot.h). Here:
  * cur is the last position of the batch the thread reads next (its prefetch
  * lookahead included), lo is stored after every bucket. hi is capped by
  * hybsnapWindowCap at section open and raised by hybsnapWindowRefill; after the cap
  * the thread is at most on cur, and any later position it reaches sees it. */
 /* The thread's words on a cache line of their own: it stores lo after every
- * bucket, and the main thread reads hybsnap_funnel_seq after every command. */
+ * bucket, and the main thread reads hybsnap_section_seq after every command. */
 static struct {
     uint64_t cur;                          /* thread: seq_cst stores */
     uint64_t lo;                           /* thread: release stores (seq_cst at the end) */
@@ -1191,7 +1186,7 @@ static struct {
 #define hybsnap_lo (hybsnap_pos_thread.lo)
 static uint64_t hybsnap_hi __attribute__((aligned(CACHE_LINE_SIZE))) = HYBSNAP_POS_INF;   /* main thread: seq_cst at the cap, release otherwise */
 static hybsnapScanCtx *hybsnap_live = NULL;      /* main thread: the scan whose thread runs (the cap and grants apply) */
-redisAtomic uint64_t hybsnap_funnel_seq = 0;
+redisAtomic uint64_t hybsnap_section_seq = 0;
 
 static inline uint64_t hybsnapPosLoLoad(void) { return __atomic_load_n(&hybsnap_lo, __ATOMIC_ACQUIRE); }
 
@@ -1317,12 +1312,12 @@ static inline void hybsnapScanSetLo(uint64_t lo) { __atomic_store_n(&hybsnap_lo,
  * the only time the thread waits for a section. */
 static void hybsnapWalkerQuiesce(hybsnapScanCtx *ctx) {
     uint64_t v;
-    atomicGetWithSync(hybsnap_funnel_seq, v);
+    atomicGetWithSync(hybsnap_section_seq, v);
     if (!(v & 1)) return;
     int spins = 0;
     for (;;) {
         uint64_t n;
-        atomicGetWithSync(hybsnap_funnel_seq, n);
+        atomicGetWithSync(hybsnap_section_seq, n);
         if (n != v) return;
         /* The command aborting the save may itself hold the section open and
          * be waiting to join us: an aborted scan thread reads nothing more. */
@@ -1335,25 +1330,25 @@ static void hybsnapWalkerQuiesce(hybsnapScanCtx *ctx) {
 /* Write sections. The main thread works on frozen dicts inside a "write
  * section": opened by the first guard or funnel hook of a command (reads
  * included), closed when the outermost command returns, at beforeSleep and
- * when a module thread releases the GIL (hybsnapFunnelClose). Opening caps the
+ * when a module thread releases the GIL (hybsnapSectionClose). Opening caps the
  * thread (hybsnapWindowCap); every later hook of the section may raise the cap
  * (hybsnapWindowRefill); closing writes back the overlayed buckets the thread
  * has passed and lifts the cap. Outside sections the thread runs free: the
  * main thread touches no frozen dict there. */
-static void hybsnapFunnelOpen(void) {
+static void hybsnapSectionOpen(void) {
     uint64_t v;
-    atomicGet(hybsnap_funnel_seq, v);          /* single writer: relaxed read of our own value */
+    atomicGet(hybsnap_section_seq, v);          /* single writer: relaxed read of our own value */
     if (v & 1) {
         if (hybsnap_live) hybsnapWindowRefill(hybsnap_live);
         return;
     }
-    atomicSetWithSync(hybsnap_funnel_seq, v + 1);   /* seq_cst: pairs with hybsnapWalkerQuiesce */
+    atomicSetWithSync(hybsnap_section_seq, v + 1);   /* seq_cst: pairs with hybsnapWalkerQuiesce */
     if (hybsnap_live) hybsnapWindowCap(hybsnap_live);
 }
 
-void hybsnapFunnelCloseSlow(void) {
+void hybsnapSectionCloseSlow(void) {
     uint64_t v;
-    atomicGet(hybsnap_funnel_seq, v);
+    atomicGet(hybsnap_section_seq, v);
     if (v & 1) {
         /* At a point where no caller holds a link: write back what the
          * thread has passed, then let it run free. */
@@ -1362,7 +1357,7 @@ void hybsnapFunnelCloseSlow(void) {
             hybsnap_live->hi = HYBSNAP_POS_INF;
             __atomic_store_n(&hybsnap_hi, HYBSNAP_POS_INF, __ATOMIC_RELEASE);
         }
-        atomicSetWithSync(hybsnap_funnel_seq, v + 1);
+        atomicSetWithSync(hybsnap_section_seq, v + 1);
     }
 }
 
@@ -1505,7 +1500,7 @@ static void hybsnapScanBitmapAlloc(hybsnapScanCtx *ctx, hybsnapDictState *sn, di
  * prepare) are taken; the guard and layout hooks are the scan's
  * own. Every hook of store s receives the store's hybsnapGuardPriv, whose 'user'
  * field is 'store_privdata[s]' (NULL array: NULL). Must be called before
- * hybsnapScanStart(). */
+ * hybsnapScanFreeze(). */
 /* Before start: restrict the scan to the slots whose bit is set (cluster
  * mode; the bitmap must outlive the scan). Dicts outside the set are never
  * frozen: the guard treats them as not the save's, so their writes are plain
@@ -1530,7 +1525,8 @@ static uint64_t hybsnap_scan_gen = 0;   /* generation of the last scan context c
 static long hybsnap_stat_retained_dicts = 0;   /* table dicts freed by a save, across saves (INFO snap_retained_dicts) */
 
 /* Create a scan over 'num_stores' kvstores (normally one per db: db->keys).
- * Nothing is frozen or started until hybsnapScanStart(). 'dispatch' runs on the
+ * Nothing is frozen or started until hybsnapScanFreeze() and
+ * hybsnapScanStartThread(). 'dispatch' runs on the
  * scan thread once for every fork-instant key of a slot and must be strictly
  * read-only on the keyspace (it may read the kvobj and, for HYBSNAP_NOFORK
  * values, the value, never write to any dict or object). 'slot_done' runs on
@@ -1629,7 +1625,7 @@ static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *k
     /* Every access runs inside a section, reads included (a find may step a
      * rehash): opening one caps the thread, and the cap pauses any dict the
      * thread may be reading or may enter before the section ends. */
-    hybsnapFunnelOpen();
+    hybsnapSectionOpen();
     /* The state after the cap: the thread may have claimed the dict while it
      * ran free. A write to a dict the thread has not reached attaches it
      * without pausing it. */
@@ -1773,7 +1769,6 @@ static void hybsnapScanDictRehashCompleted(hybsnapScanCtx *ctx, int s, int didx,
 }
 
 static long hybsnapScanDictsGrown(hybsnapScanCtx *ctx) { return ctx ? ctx->dicts_grown : 0; }
-static long hybsnapScanRetainedDicts(hybsnapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
 
 /* Chain-walk callback on the scan thread: decode the entry and dispatch. */
 static void hybsnapScanEntryCb(void *privdata, const dictEntry *de, dictEntry **plink) {
@@ -1934,7 +1929,7 @@ static int hybsnapScanStartThread(hybsnapScanCtx *ctx) {
     serverAssert(!ctx->started && ctx->frozen_all);
     hybsnapWindowReset(ctx);
     uint64_t v;
-    atomicGet(hybsnap_funnel_seq, v);
+    atomicGet(hybsnap_section_seq, v);
     if (v & 1) hybsnapWindowCap(ctx);   /* started from inside a section: the thread begins capped */
     if (pthread_create(&ctx->tid, NULL, hybsnapScanThreadMain, ctx) != 0) {
         serverLog(LL_WARNING, "hybsnapScanStartThread: pthread_create failed: %s", strerror(errno));
@@ -1942,28 +1937,6 @@ static int hybsnapScanStartThread(hybsnapScanCtx *ctx) {
         return C_ERR;
     }
     ctx->started = 1;
-    return C_OK;
-}
-
-/* Main thread. Installs the snapshot guard on every non-empty store
- * (kvstore.h) and spawns the scan thread. Nothing is visited, paused or
- * allocated per dict: a dict is stamped with the save's generation, gets its
- * bucket bitmaps and overlay, and is paused, on demand: at the first
- * structural write to it, before hi may pass its layout, or on an access while
- * the thread is on it. Returns C_OK or C_ERR (nothing frozen on error).
- * From this point until hybsnapScanRelease() every main-thread write to an owed
- * dict goes through the overlay hooks: in place once the snapshot holds the
- * bucket, to a duplicate of its chain while the thread reads it.
- * hybsnapScanStart() == hybsnapScanFreeze() + hybsnapScanStartThread(). */
-static int hybsnapScanStart(hybsnapScanCtx *ctx) {
-    hybsnapScanFreeze(ctx);
-    if (hybsnapScanStartThread(ctx) != C_OK) {
-        /* Nothing was scanned: complete whatever was attached as aborted
-         * (drains an empty overlay, unfreezes) and take the guards off. */
-        hybsnapScanFinishAll(ctx);
-        ctx->frozen_all = 0;
-        return C_ERR;
-    }
     return C_OK;
 }
 
@@ -2113,15 +2086,6 @@ static void hybsnapScanRelease(hybsnapScanCtx *ctx) {
     zfree(ctx->ring);
     freeEventNotifier(ctx->en);
     zfree(ctx);
-}
-
-/* Either thread. DONE for a slot the save holds nothing of (empty at the
- * fork instant, created since, or completed). */
-static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx) {
-    if (ctx->ended || !ctx->store[store_idx].frozen) return HYBSNAP_SLOT_DONE;
-    dict *d = hybsnapTableDict(ctx, store_idx, didx);
-    if (!d) return HYBSNAP_SLOT_DONE;
-    return hybsnapDictStateOf(ctx, d);
 }
 
 /* Readable fd that becomes ready whenever a slot completes or the thread
@@ -2713,7 +2677,7 @@ int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv) {
     if (!d) return 0;
     uint8_t st = hybsnapScanDictStateMain(sv->scan, s, slot, d);
     if (st == HYBSNAP_SLOT_SCANNED || st == HYBSNAP_SLOT_DONE) return 0;
-    hybsnapFunnelOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
+    hybsnapSectionOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
     int table, pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
@@ -2803,9 +2767,9 @@ void hybsnapSaveCron(void) {
     /* Writes may have stopped since the thread passed a bucket: drain from
      * here too, so an overlayed bucket never outlives that by more than a tick. */
     if (hybsnapSaveSideEntries()) {
-        hybsnapFunnelOpen();
+        hybsnapSectionOpen();
         hybsnapSaveDrainSideTables();
-        hybsnapFunnelClose();
+        hybsnapSectionClose();
     }
     size_t queued;
     atomicGet(sv->mq_bytes, queued);
@@ -3559,7 +3523,7 @@ static void hybsnapSaveFree(hybsnapSave *sv) {
 }
 
 /* Overlay callbacks for the server keyspace (privdata = the store's hybsnapGuardPriv). */
-static void hybsnapOverlayEnter(void *privdata) { UNUSED(privdata); hybsnapFunnelOpen(); }
+static void hybsnapOverlayEnter(void *privdata) { UNUSED(privdata); hybsnapSectionOpen(); }
 static const kvstoreSnapHooks hybsnap_server_hooks = {
     .clone = hybsnapOverlayCloneKey, .free_orig = hybsnapOverlayFreeOriginal, .enter = hybsnapOverlayEnter,
     .prepare = hybsnapOverlayPrepare,
@@ -3973,6 +3937,33 @@ void hybsnapOnChildEnd(int exitcode, int bysignal) {
 
 /* ---- Unit tests ---------------------------------------------------------- */
 #ifdef REDIS_TEST
+/* Test helper: HYBSNAP_SLOT_* of (store, dict), from either thread. DONE for a
+ * slot the save holds nothing of (empty at the fork instant, created since, or
+ * completed). */
+static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx) {
+    if (ctx->ended || !ctx->store[store_idx].frozen) return HYBSNAP_SLOT_DONE;
+    dict *d = hybsnapTableDict(ctx, store_idx, didx);
+    if (!d) return HYBSNAP_SLOT_DONE;
+    return hybsnapDictStateOf(ctx, d);
+}
+
+/* Test helper: table dicts this save retained past their store. */
+static long hybsnapScanRetainedDicts(hybsnapScanCtx *ctx) { return ctx ? ctx->retained_dicts : 0; }
+
+/* Test helper: freeze and spawn the thread in one call, with no fork in
+ * between. On a failed spawn nothing was scanned: complete whatever was
+ * attached as aborted and take the guards off (the save instead kills its
+ * waiting child). */
+static int hybsnapScanStart(hybsnapScanCtx *ctx) {
+    hybsnapScanFreeze(ctx);
+    if (hybsnapScanStartThread(ctx) != C_OK) {
+        hybsnapScanFinishAll(ctx);
+        ctx->frozen_all = 0;
+        return C_ERR;
+    }
+    return C_OK;
+}
+
 /* Test helper: 1 while slot (store, dict) is not DONE. */
 static int hybsnapScanKeyIsOwed(hybsnapScanCtx *ctx, int store_idx, int didx) {
     return hybsnapScanSlotState(ctx, store_idx, didx) != HYBSNAP_SLOT_DONE;
@@ -4281,7 +4272,7 @@ static void hybsnapScanTests(int accurate) {
          * below dispatches every key (the thread skips marked buckets). */
         hybsnapDictState *bsn = ((kvstoreDictMetaBase *)dictMetadata(big))->ext;
         memset(bsn->bits[0], 0, bsn->bytes[0]);
-        hybsnapFunnelClose();   /* the accesses above opened a section: "command end" */
+        hybsnapSectionClose();   /* the accesses above opened a section: "command end" */
     }
     test_cond("scan: hybsnapScanStartThread() succeeds", hybsnapScanStartThread(ctx) == C_OK);
     /* Concurrent reads from the owner thread while the scan runs. */
@@ -4297,7 +4288,7 @@ static void hybsnapScanTests(int accurate) {
             if (kvstoreDictFind(stores[s], didx, k) == NULL) misses++;
             zfree(k);
             reads++;
-            hybsnapFunnelClose();   /* a read of a slot under scan opens a section: end the "command" */
+            hybsnapSectionClose();   /* a read of a slot under scan opens a section: end the "command" */
         }
         completions += hybsnapScanHandleCompletions(ctx);
     }
@@ -4392,7 +4383,7 @@ static void hybsnapScanTests(int accurate) {
     hybsnapSetWindowBuckets(64);
     ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    hybsnapFunnelOpen();
+    hybsnapSectionOpen();
     test_cond("credit: start with a write section open", hybsnapScanStart(ctx) == C_OK);
     long long stalls = 0;
     for (int i = 0; i < 2000 && stalls == 0; i++) { usleep(1000); atomicGet(ctx->stalls, stalls); }
@@ -4402,13 +4393,13 @@ static void hybsnapScanTests(int accurate) {
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: the thread read its grant and waits at hi (64 buckets: d0, then part of d2)",
               stalls == 1 && first > 0 && dispatched == first && first < total_keys && !hybsnapScanIsFinished(ctx));
-    hybsnapFunnelOpen();   /* a later hook of the same section: the thread is past mid, the next 64 buckets are granted */
+    hybsnapSectionOpen();   /* a later hook of the same section: the thread is past mid, the next 64 buckets are granted */
     long long stalls2 = stalls;
     for (int i = 0; i < 2000 && stalls2 == stalls; i++) { usleep(1000); atomicGet(ctx->stalls, stalls2); }
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: a hook inside the section raised hi, the thread read on and waits again",
               ctx->grants == 1 && stalls2 == 2 && dispatched > first && dispatched < total_keys);
-    hybsnapFunnelClose();   /* no limit outside sections */
+    hybsnapSectionClose();   /* no limit outside sections */
     while (!hybsnapScanIsFinished(ctx)) usleep(100);
     hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
@@ -4423,7 +4414,7 @@ static void hybsnapScanTests(int accurate) {
     atomicSet(st->dispatched, 0);
     ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
-    hybsnapFunnelOpen();
+    hybsnapSectionOpen();
     test_cond("abort-in-section: start", hybsnapScanStart(ctx) == C_OK);
     usleep(5000);
     t0 = hybsnapTestNowNs();
@@ -4432,7 +4423,7 @@ static void hybsnapScanTests(int accurate) {
     test_cond("abort-in-section: abort returned promptly although the section is still open", abort_ms < 500 && hybsnapScanIsFinished(ctx));
     test_cond("abort-in-section: all slots DONE, dicts unfrozen", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE) && hybsnapTestAllUnfrozen(stores));
     hybsnapScanRelease(ctx);
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
 
     /* ---- Positions and grants (no thread) ---- */
     ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
@@ -4478,12 +4469,12 @@ static void hybsnapScanTests(int accurate) {
         test_cond("cap: a thread found past H gets hi = cur + 1, and the dict it is in is paused",
                   ctx->hi == c1 && __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST) == c1 && d11->pauserehash == 1);
         int pos;
-        hybsnapFunnelOpen();
+        hybsnapSectionOpen();
         int in = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 3, &pos, NULL);
         int p_in = pos;
         int ahead = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 6, &pos, NULL);
         int p_ahead = pos;
-        hybsnapFunnelClose();
+        hybsnapSectionClose();
         test_cond("cap: below cur + 1 the bucket may be being read, at it the thread cannot be",
                   in && p_in == HYBSNAP_POS_INSIDE && ahead && p_ahead == HYBSNAP_POS_AHEAD);
         (void)o10;
@@ -4547,14 +4538,14 @@ static void hybsnapScanTests(int accurate) {
         hybsnapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
         hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));   /* as the thread's claim would */
         hybsnapTestWindow(ctx, b0, b0 + mid);          /* the thread may read [0, mid) */
-        hybsnapFunnelOpen();                           /* a command opens its write section */
+        hybsnapSectionOpen();                           /* a command opens its write section */
         int owed_ahead = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
         hybsnapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
         hybsnapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant later in the same section moves the window over it */
         int owed_after = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
         int owed_other = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
         int owed_behind = hybsnapBucketOwed(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
-        hybsnapFunnelClose();
+        hybsnapSectionClose();
         test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == HYBSNAP_POS_AHEAD);
         test_cond("owed: the same bucket, emitted, is not owed after the window moved over it", !owed_after && p_after == HYBSNAP_POS_INSIDE);
         test_cond("owed: an unemitted bucket inside the window is owed", owed_other && p_other == HYBSNAP_POS_INSIDE);
@@ -4565,7 +4556,7 @@ static void hybsnapScanTests(int accurate) {
          * of every table is ahead of it, so a write emits the bucket first and
          * then goes in place. */
         hybsnapTestWindow(ctx, HYBSNAP_POS(o, 0, 0), HYBSNAP_POS(o, 0, 0) + 1);
-        hybsnapFunnelOpen();
+        hybsnapSectionOpen();
         int layout_ahead = 1, layout_owed = 1;
         for (int t = 0; t < 2; t++) {
             if (!d->ht_table[t]) continue;
@@ -4577,7 +4568,7 @@ static void hybsnapScanTests(int accurate) {
                 if (!owed) layout_owed = 0;
             }
         }
-        hybsnapFunnelClose();
+        hybsnapSectionClose();
         hybsnapWindowReset(NULL);
         test_cond("owed: in the layout phase every bucket of every table is ahead of the window and owed",
                   layout_ahead && layout_owed);
@@ -4853,7 +4844,7 @@ static void hybsnapRefcountTests(void) {
     hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     hybsnapScanSetOverlay(ctx, &hooks, privs);
-    hybsnapFunnelOpen();   /* the thread starts capped */
+    hybsnapSectionOpen();   /* the thread starts capped */
     test_cond("refs: start with a section open", hybsnapScanStart(ctx) == C_OK);
     dict *d0 = kvstoreGetDict(ks, 0), *d3 = kvstoreGetDict(ks, 3);
     test_cond("refs: the save holds one reference on every non-empty dict, none on an empty one",
@@ -4880,7 +4871,7 @@ static void hybsnapRefcountTests(void) {
               hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING);
     kvstoreRelease(tmp);
     test_cond("refs: the released store left the dict to the save", kvstoreDictRefcount(d3) == 1 && d3->type->userdata == tmp);
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
     hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
@@ -4902,7 +4893,7 @@ static void hybsnapRefcountTests(void) {
     ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     hybsnapScanSetOverlay(ctx, &hooks, privs);
-    hybsnapFunnelOpen();
+    hybsnapSectionOpen();
     test_cond("refs: second save starts", hybsnapScanStart(ctx) == C_OK);
     d0 = kvstoreGetDict(ks, 0);
     kvstoreEmpty(ks, NULL);
@@ -4911,7 +4902,7 @@ static void hybsnapRefcountTests(void) {
               hybsnapScanSlotState(ctx, 0, 0) != HYBSNAP_SLOT_DONE);
     serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, 60), NULL) != NULL);   /* a fresh dict in the slot */
     test_cond("refs: the slot's new dict is not the save's", kvstoreGetDict(ks, 0) != d0 && !kvstoreOverlayIsFrozen(ks, 0));
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
     hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
@@ -4937,7 +4928,7 @@ static void hybsnapRefcountTests(void) {
     ctx = hybsnapScanCreate(fstores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     hybsnapScanSetOverlay(ctx, &hooks, privs);
-    hybsnapFunnelOpen();
+    hybsnapSectionOpen();
     test_cond("refs: third save starts", hybsnapScanStart(ctx) == C_OK);
     dict *f3 = kvstoreGetDict(fs, 3);
     serverAssert(kvstoreDictDelete(fs, 3, "k:0:3:0") == DICT_OK);   /* deferred: an overlayed bucket without the key, the dict logically empty */
@@ -4946,7 +4937,7 @@ static void hybsnapRefcountTests(void) {
     test_cond("refs: the emptied dict is logically empty and stays with the save until the overlay is released",
               kvstoreGetDict(fs, 3) == f3 && kvstoreDictSize(fs, 3) == 0 && kvstoreDictRefcount(f3) == 2 &&
               !kvstoreDictDetached(f3) && hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING && kvstoreSize(fs) == 20);
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     while (!hybsnapScanIsFinished(ctx)) { hybsnapScanHandleCompletions(ctx); usleep(100); }
     hybsnapScanHandleCompletions(ctx);
     atomicGet(st->dispatched, dispatched);
@@ -5056,8 +5047,8 @@ static void hybsnapOverlayTests(int abort_variant) {
     /* The scan thread must have dispatched exactly the fork-instant set. The
      * writes above opened a write section (overlay 'enter' hook), which in the
      * server ends with the command: end it here or the thread waits forever. */
-    test_cond("overlay: the writes above opened a write section", (hybsnap_funnel_seq & 1) == 1);
-    hybsnapFunnelClose();
+    test_cond("overlay: the writes above opened a write section", (hybsnap_section_seq & 1) == 1);
+    hybsnapSectionClose();
     if (abort_variant) {
         long d0;
         do { usleep(500); atomicGet(st->dispatched, d0); } while (d0 < 10 && !hybsnapScanIsFinished(ctx));
@@ -5218,7 +5209,7 @@ static void hybsnapOverlayBucketTests(void) {
               kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)N && kvstoreDictSize(ks, 0) == (unsigned long)N &&
               dictFind(d, newkey) != NULL && dictFind(d, k1name) == NULL && cnt.frees == cnt.clones);
 
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     hybsnapScanAbort(ctx);
     hybsnapScanRelease(ctx);
     test_cond("overlay buckets: after the release the dict holds the logical keys and every original was freed",
@@ -5364,7 +5355,7 @@ static void hybsnapOverlayWindowTests(void) {
               kvstoreOverlayDrain(40) == 0 && kvstoreOverlaySlotsInUse() == 0 && dictSize(d3) == (unsigned long)N - 10 &&
               cnt.frees == cnt.clones);
 
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     hybsnapScanAbort(ctx);
     hybsnapScanRelease(ctx);
     test_cond("overlay window: after the release nothing is overlayed and nothing is frozen",
@@ -5463,7 +5454,7 @@ static void hybsnapOverlayRehashTests(void) {
     test_cond("overlay rehash: the write-back left the dict with exactly the logical keys",
               kvstoreOverlayPending() == 0 && dictSize(d) == (unsigned long)(N - ndel + added) && cnt.frees == cnt.clones);
 
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     hybsnapScanAbort(ctx);
     hybsnapScanRelease(ctx);
     d = kvstoreGetDict(ks, 0);

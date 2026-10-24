@@ -78,8 +78,8 @@
  * is a seq_cst store-load pair on each side (thread: store cur, load hi;
  * main: store hi, load cur): either the main thread sees where the thread is,
  * or the thread sees the cap. A slot (dict) is "owed" to the save until its
- * state is HYBSNAP_SLOT_DONE. The full argument: docs/hybrid-snapshot.md
- * section 3; the encoding and the code: hybrid_snapshot.c, "Scan positions".
+ * state is HYBSNAP_SLOT_DONE. The encoding and the code: hybrid_snapshot.c,
+ * "Scan positions".
  *
  * MEMORY
  * ------
@@ -104,11 +104,11 @@
  * WHERE TO LOOK
  * -------------
  * hybrid_snapshot.c: the implementation (its head lists its sections) and the unit
- * tests (redis-server test snapshot). kvstore.h, KVSTORE OVERLAY: the overlay
- * contract (frozen dicts, overlayed buckets); kvsoverlay.h / kvsoverlay.c: its
+ * tests (redis-server test hybrid_snapshot). kvstore.h, KVSTORE OVERLAY: the overlay
+ * contract (frozen dicts, overlayed buckets); kvstore_overlay.h / kvstore_overlay.c: its
  * implementation.
- * zmalloc.c: the arena. docs/hybrid-snapshot.md: the design, with figures.
- * All functions here are prefixed "snap".
+ * zmalloc.c: the arena.
+ * All functions here are prefixed "hybsnap".
  */
 
 #ifndef __HYBRID_SNAPSHOT_H
@@ -159,15 +159,20 @@ void hybsnapValueDetachFromArena(robj *o);
 
 /* ---- Credit window and write sections ------------------------------------ */
 
-/* Odd while the main thread is inside a write section (see THE CREDIT WINDOW AND WRITE SECTIONS above). */
-extern redisAtomic uint64_t hybsnap_funnel_seq;
-/* Close it: end of the outermost command, beforeSleep, GIL release. */
-void hybsnapFunnelCloseSlow(void);
+/* Write-section counter: odd while the main thread is inside a write section
+ * (THE CREDIT WINDOW AND WRITE SECTIONS above), +1 at each open and close. The
+ * scan thread reads it once, at the end, to wait for an open section to close. */
+extern redisAtomic uint64_t hybsnap_section_seq;
+/* End the open write section: write back the overlayed buckets the thread has
+ * passed and lift the cap. Called at the end of the outermost command, in
+ * beforeSleep, and when a module thread releases the GIL. */
+void hybsnapSectionCloseSlow(void);
 
-static inline void hybsnapFunnelClose(void) {
+/* A no-op outside a section: one relaxed load. */
+static inline void hybsnapSectionClose(void) {
     uint64_t v;
-    atomicGet(hybsnap_funnel_seq, v);
-    if (unlikely(v & 1)) hybsnapFunnelCloseSlow();
+    atomicGet(hybsnap_section_seq, v);
+    if (unlikely(v & 1)) hybsnapSectionCloseSlow();
 }
 
 /* ---- The server keyspace on the scan ------------------------------------- */

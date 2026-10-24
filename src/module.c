@@ -9400,7 +9400,7 @@ int moduleTryAcquireGIL(void) {
 
 void moduleReleaseGIL(void) {
     /* Hybrid snapshot: a module thread's keyspace writes end with the GIL. */
-    hybsnapFunnelClose();
+    hybsnapSectionClose();
     threadHoldsGIL = 0;
     pthread_mutex_unlock(&moduleGIL);
 }
