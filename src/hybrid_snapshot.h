@@ -120,8 +120,10 @@
 #include "intset.h"
 
 /* Key classes: the class of a key's VALUE allocation (headers are always in the arena). */
-#define HYBSNAP_NOFORK 0   /* Value in the DONTFORK arena; serialized by the scan thread. */
-#define HYBSNAP_FORK   1   /* Value in forkable memory; serialized by the fork child. */
+typedef enum hybsnapValueClass {
+    HYBSNAP_NOFORK = 0,   /* Value in the DONTFORK arena; serialized by the scan thread. */
+    HYBSNAP_FORK   = 1,   /* Value in forkable memory; serialized by the fork child. */
+} hybsnapValueClass;
 
 struct listpackEx;
 struct aeEventLoop;
@@ -188,12 +190,16 @@ hybsnapRdbCfg hybsnapRdbCfgGet(void);
 
 /* ---- Hybrid snapshot: the save --------------------------------------------- */
 
-/* The one dispatch decision for rdb.c, replication.c and aof.c: C_OK started, C_ERR taken but failed, HYBSNAP_NOT_TAKEN run the classic child. */
-#define HYBSNAP_SAVE_RDB     0   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
-#define HYBSNAP_SAVE_SOCKETS 1   /* diskless full sync: the replicas' sockets (rsi) */
-#define HYBSNAP_SAVE_AOF     2   /* BGREWRITEAOF: the AOF base file */
-#define HYBSNAP_NOT_TAKEN    1
-int hybsnapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
+/* What a hybrid save writes. */
+typedef enum hybsnapSaveKind {
+    HYBSNAP_SAVE_RDB     = 0,   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
+    HYBSNAP_SAVE_SOCKETS = 1,   /* diskless full sync: the replicas' sockets (rsi) */
+    HYBSNAP_SAVE_AOF     = 2,   /* BGREWRITEAOF: the AOF base file */
+} hybsnapSaveKind;
+/* The one dispatch decision for rdb.c, replication.c and aof.c: C_OK started,
+ * C_ERR taken but failed, HYBSNAP_NOT_TAKEN run the classic child. */
+#define HYBSNAP_NOT_TAKEN 1
+int hybsnapSaveTryStart(hybsnapSaveKind kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
 
 static inline int hybsnapHybridEnabled(void) { return server.hybrid_snapshot; }
 

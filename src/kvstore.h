@@ -108,9 +108,11 @@ typedef void (kvstoreOverlayEnterFn)(void *privdata);
 typedef struct kvstoreOvWindow { uint64_t last; int table; unsigned long lo, n; } kvstoreOvWindow;
 /* Before a structural write of 'key': may the frozen chain be written in place; on DEFER, the window the bucket is in
  * (optional: absent = DEFER, the window the whole table with last 0). */
-#define KVSTORE_OV_DEFER   0   /* the scan thread is reading the bucket: the write goes to the bucket's duplicate */
-#define KVSTORE_OV_INPLACE 1   /* the snapshot holds the bucket (or just emitted it): write in place */
-typedef int (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win);
+typedef enum kvstoreOverlayPrepareResult {
+    KVSTORE_OV_DEFER   = 0,   /* the scan thread is reading the bucket: the write goes to the bucket's duplicate */
+    KVSTORE_OV_INPLACE = 1,   /* the snapshot holds the bucket (or just emitted it): write in place */
+} kvstoreOverlayPrepareResult;
+typedef kvstoreOverlayPrepareResult (kvstoreOverlayPrepareFn)(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win);
 /* The snapshot's hooks on a store, one struct and one privdata; it must outlive every overlay attached while installed. */
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;

@@ -41,11 +41,15 @@
 
 /* ---- Constants -------------------------------------------------------- */
 
-/* Slot (dict) states, monotonic; the slot is owed to the save until DONE. */
-#define HYBSNAP_SLOT_PENDING  0   /* Not reached by the scan thread yet. */
-#define HYBSNAP_SLOT_SCANNING 1   /* Being read by the scan thread. */
-#define HYBSNAP_SLOT_SCANNED  2   /* Fully dispatched; waiting for the main thread to complete it. */
-#define HYBSNAP_SLOT_DONE     3   /* Completed by the main thread: overlay written back, dict unfrozen. */
+/* Slot (dict) states, monotonic; the slot is owed to the save until DONE. The
+ * order is relied on (st >= HYBSNAP_SLOT_SCANNED: the thread is finished with
+ * it); stored in the low byte of the dict's word (HYBSNAP_WORD). */
+typedef enum hybsnapSlotState {
+    HYBSNAP_SLOT_PENDING  = 0,   /* Not reached by the scan thread yet. */
+    HYBSNAP_SLOT_SCANNING = 1,   /* Being read by the scan thread. */
+    HYBSNAP_SLOT_SCANNED  = 2,   /* Fully dispatched; waiting for the main thread to complete it. */
+    HYBSNAP_SLOT_DONE     = 3,   /* Completed by the main thread: overlay written back, dict unfrozen. */
+} hybsnapSlotState;
 
 /* The thread's credit W (buckets per grant); per-dict word: save generation and slot state. */
 #define HYBSNAP_WINDOW_BUCKETS_DEFAULT 1024
@@ -74,14 +78,18 @@
 #define HYBSNAP_STAGE_BYTES (64 * 1024)   /* staging buffer flush threshold */
 
 /* Where the scan thread is relative to a bucket. */
-#define HYBSNAP_POS_BEHIND 0   /* the thread already read this bucket */
-#define HYBSNAP_POS_INSIDE 1   /* the thread is reading it now */
-#define HYBSNAP_POS_AHEAD  2   /* the thread has not reached it */
+typedef enum hybsnapBucketPos {
+    HYBSNAP_POS_BEHIND = 0,   /* the thread already read this bucket */
+    HYBSNAP_POS_INSIDE = 1,   /* the thread is reading it now */
+    HYBSNAP_POS_AHEAD  = 2,   /* the thread has not reached it */
+} hybsnapBucketPos;
 
 /* Outbound queue drain modes and buffer pool. */
-#define HYBSNAP_DRAIN_TRY   0   /* write what the pipe takes, never wait */
-#define HYBSNAP_DRAIN_BOUND 1   /* wait until oq_bytes <= target; give up on abort */
-#define HYBSNAP_DRAIN_ALL   2   /* wait until the queue is empty, abort or not */
+typedef enum hybsnapDrainMode {
+    HYBSNAP_DRAIN_TRY   = 0,   /* write what the pipe takes, never wait */
+    HYBSNAP_DRAIN_BOUND = 1,   /* wait until oq_bytes <= target; give up on abort */
+    HYBSNAP_DRAIN_ALL   = 2,   /* wait until the queue is empty, abort or not */
+} hybsnapDrainMode;
 #define HYBSNAP_OUT_POOL_MAX 16   /* staging buffers kept for reuse */
 #define HYBSNAP_STAGE_SLACK (8 * 1024)   /* headroom a record may take before the flush */
 
@@ -254,7 +262,7 @@ struct hybsnapSave {
     int tag_all;                      /* debug (hybrid-snapshot-tag-all): every BUFFER depends on all big values sent before it */
     hybsnapDbSizes *sizes;
     int req, rdbflags;
-    int kind;                  /* HYBSNAP_SAVE_RDB/SOCKETS/AOF */
+    hybsnapSaveKind kind;
     int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
     int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
                                   RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
@@ -340,9 +348,9 @@ static int hybsnapArenaSetForkable(int forkable);
 /* Single-allocation encoding that MAY be HYBSNAP_NOFORK (strings, listpacks, intsets). */
 static int hybsnapEncodingIsNoforkClass(int type, int encoding);
 /* Placement policy: the class a value of this encoding and size should have. */
-static int hybsnapClassify(int type, int encoding, size_t alloc_bytes);
+static hybsnapValueClass hybsnapClassify(int type, int encoding, size_t alloc_bytes);
 /* Actual class of a stored value, decided by where its memory is. */
-static int hybsnapKeyClass(const robj *o);
+static hybsnapValueClass hybsnapKeyClass(const robj *o);
 static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st);
 static void hybsnapPlacementDriftReply(struct client *c, redisDb *db, int limit);
 
@@ -669,7 +677,7 @@ static inline int hybsnapValueIsInline(int type, int encoding) {
 /* Placement policy: HYBSNAP_NOFORK iff the encoding qualifies and the value's
  * allocation is at most save-small-max-bytes (INT/EMBSTR values have no
  * separate allocation and are always HYBSNAP_NOFORK). */
-static int hybsnapClassify(int type, int encoding, size_t alloc_bytes) {
+static hybsnapValueClass hybsnapClassify(int type, int encoding, size_t alloc_bytes) {
     if (!hybsnapEncodingIsNoforkClass(type, encoding)) return HYBSNAP_FORK;
     if (hybsnapValueIsInline(type, encoding)) return HYBSNAP_NOFORK;
     return alloc_bytes <= server.save_small_max_bytes ? HYBSNAP_NOFORK : HYBSNAP_FORK;
@@ -694,7 +702,7 @@ static void *hybsnapValueAllocPtr(const robj *o) {
  * HYBSNAP_NOFORK arena; otherwise HYBSNAP_FORK. The background scan serializes
  * HYBSNAP_NOFORK keys itself and ships HYBSNAP_FORK keys to the fork child, so this
  * is correct regardless of policy drift. */
-static int hybsnapKeyClass(const robj *o) {
+static hybsnapValueClass hybsnapKeyClass(const robj *o) {
     if (!hybsnapEncodingIsNoforkClass(o->type, o->encoding)) return HYBSNAP_FORK;
     if (hybsnapValueIsInline(o->type, o->encoding)) return HYBSNAP_NOFORK;
     /* No arena: nothing is placed, the class is a pure size decision. */
@@ -763,7 +771,7 @@ void hybsnapPlaceValueArena(robj *o) {
     case OBJ_ENCODING_RAW: {
         sds s = o->ptr;
         void *a = sdsAllocPtr(s);
-        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(a));
+        hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(a));
         int in = zmalloc_is_nofork(a);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapSdsMove(s, 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapSdsMove(s, 0);
@@ -771,7 +779,7 @@ void hybsnapPlaceValueArena(robj *o) {
     }
     case OBJ_ENCODING_LISTPACK: {
         unsigned char *lp = o->ptr;
-        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(lp));
+        hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(lp));
         int in = zmalloc_is_nofork(lp);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 0);
@@ -779,7 +787,7 @@ void hybsnapPlaceValueArena(robj *o) {
     }
     case OBJ_ENCODING_INTSET: {
         intset *is = o->ptr;
-        int want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(is));
+        hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(is));
         int in = zmalloc_is_nofork(is);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 0);
@@ -1023,7 +1031,7 @@ static void hybsnapPlacementDriftReply(client *c, redisDb *db, int limit) {
             if (zmalloc_is_nofork(lpt) != zmalloc_is_nofork(lpt->lp)) drift = "listpackex-split";
         } else {
             void *a = hybsnapValueAllocPtr(kv);
-            int want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
+            hybsnapValueClass want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
             int in = zmalloc_is_nofork(a);
             if (want == HYBSNAP_NOFORK && !in) drift = "nofork-outside";
             if (want == HYBSNAP_FORK && in) drift = "fork-inside";
@@ -1053,7 +1061,7 @@ static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
         int hdr_in = zmalloc_is_nofork(kv);
         if (hdr_in) st->headers_in_arena++; else { st->headers_outside++; st->violations++; }
 
-        int cls = hybsnapKeyClass(kv);
+        hybsnapValueClass cls = hybsnapKeyClass(kv);
         if (cls == HYBSNAP_NOFORK) st->class_nofork++; else st->class_fork++;
 
         if (getModuleMetaBits(kv->metabits)) {
@@ -1088,7 +1096,7 @@ static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
             continue;
         }
         void *a = hybsnapValueAllocPtr(kv);
-        int want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
+        hybsnapValueClass want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
         int in = zmalloc_is_nofork(a);
         if (want == HYBSNAP_NOFORK && !in) st->drift_nofork_outside++;
         if (want == HYBSNAP_FORK && in) st->drift_fork_inside++;
@@ -1150,7 +1158,7 @@ static void hybsnapSetWindowBuckets(unsigned long n) { hybsnap_window_buckets = 
 static unsigned long hybsnapGetWindowBuckets(void) { return hybsnap_window_buckets; }
 
 static inline dict *hybsnapTableDict(hybsnapScanCtx *ctx, int s, int didx);
-static inline uint8_t hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
+static inline hybsnapSlotState hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 
 /* The scan order as integers. A position packs (ord, phase, idx): ord is the
  * dict's ordinal (its store's base plus didx, the real slot), phase 0 the
@@ -1220,7 +1228,7 @@ static uint64_t hybsnapWindowAdvance(hybsnapScanCtx *ctx, uint64_t from, unsigne
         for (; didx < ctx->store[s].num_dicts; didx++, phase = 0, idx = 0) {
             dict *d = ctx->store[s].frozen ? hybsnapTableDict(ctx, s, didx) : NULL;
             if (!d) continue;
-            uint8_t st = hybsnapDictStateOf(ctx, d);
+            hybsnapSlotState st = hybsnapDictStateOf(ctx, d);
             if (st == HYBSNAP_SLOT_SCANNED || st == HYBSNAP_SLOT_DONE) continue;
             uint64_t ord = hybsnapOrd(ctx, s, didx);
             if (++dicts > HYBSNAP_ADVANCE_DICTS) {
@@ -1416,16 +1424,16 @@ static inline dict *hybsnapTableDict(hybsnapScanCtx *ctx, int s, int didx) {
 }
 
 /* Either thread: the state of a table dict (its word carries this save's generation). */
-static inline uint8_t hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d) {
+static inline hybsnapSlotState hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d) {
     uint64_t w = hybsnapWordLoad(d);
     serverAssert(HYBSNAP_WORD_GEN(w) == ctx->gen);
-    return HYBSNAP_WORD_STATE(w);
+    return (hybsnapSlotState)HYBSNAP_WORD_STATE(w);
 }
 
 /* Main thread: the state of the live dict d of slot (s, didx): DONE for a
  * store that is not scanned (empty at the fork instant, or completed), after
  * the end, and for a dict that is not the save's. */
-static uint8_t hybsnapScanDictStateMain(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
+static hybsnapSlotState hybsnapScanDictStateMain(hybsnapScanCtx *ctx, int s, int didx, dict *d) {
     if (ctx->ended || !ctx->store[s].frozen) return HYBSNAP_SLOT_DONE;
     if (d != hybsnapTableDict(ctx, s, didx)) return HYBSNAP_SLOT_DONE;
     return hybsnapDictStateOf(ctx, d);
@@ -1629,7 +1637,7 @@ static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *k
     /* The state after the cap: the thread may have claimed the dict while it
      * ran free. A write to a dict the thread has not reached attaches it
      * without pausing it. */
-    uint8_t st = hybsnapDictStateOf(ctx, d);
+    hybsnapSlotState st = hybsnapDictStateOf(ctx, d);
     if (st >= HYBSNAP_SLOT_SCANNED) return NULL;
     int pause = (st == HYBSNAP_SLOT_SCANNING);
     if (!write && !pause) return NULL;   /* a read of a dict the thread is not reading */
@@ -2350,8 +2358,8 @@ int hybsnapDebugCommand(client *c) {
  * whole. When the bucket is inside and 'win' is given, *win receives its
  * overlay window: the aligned run of ov_block buckets around it (at most the
  * table), tagged with the position of its last bucket. */
-static int hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
-    uint8_t st = hybsnapScanDictStateMain(ctx, s, didx, d);
+static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
+    hybsnapSlotState st = hybsnapScanDictStateMain(ctx, s, didx, d);
     if (st >= HYBSNAP_SLOT_SCANNED) return HYBSNAP_POS_BEHIND;
     if (st == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) return HYBSNAP_POS_AHEAD;
     uint64_t base = HYBSNAP_POS(hybsnapOrd(ctx, s, didx), 1 + table, 0);
@@ -2424,7 +2432,7 @@ static void hybsnapSaveEmitBucket(hybsnapSave *sv, int s, int didx, dict *d, int
             atomicIncr(sv->keys_skipped, 1);
             continue;
         }
-        int cls = hybsnapKeyClass(kv);
+        hybsnapValueClass cls = hybsnapKeyClass(kv);
         if (cls == HYBSNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = HYBSNAP_FORK;
         if (cls == HYBSNAP_FORK) {
             /* The child resolves kv->ptr in its own memory: it must be forkable. */
@@ -2529,7 +2537,7 @@ static void hybsnapSaveWindowDone(void *priv) {
  * bucket ahead, emit it and set the bit, and later raise hi over it. A later
  * look in the same section sees the bucket inside the window, but the thread
  * will skip it (it reads the bit after reading hi), so it is not owed. */
-static int hybsnapBucketOwed(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, int *pos, kvstoreOvWindow *win) {
+static int hybsnapBucketOwed(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, hybsnapBucketPos *pos, kvstoreOvWindow *win) {
     *pos = hybsnapBucketPosition(ctx, s, didx, d, table, idx, win);
     if (*pos == HYBSNAP_POS_BEHIND) return 0;
     return !hybsnapScanBucketEmitted(ctx, s, didx, table, idx);
@@ -2538,11 +2546,12 @@ static int hybsnapBucketOwed(hybsnapScanCtx *ctx, int s, int didx, dict *d, int 
 /* Overlay 'prepare' hook (privdata = the store's hybsnapGuardPriv): may the frozen chain of
  * 'key' be written in place? Emits the bucket first when the thread has not
  * reached it; defers it, in the window *win, when the thread is reading it. */
-static int hybsnapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
+static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
     int s = ((struct hybsnapGuardPriv *)privdata)->s;
     hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
-    int table, pos;
+    int table;
+    hybsnapBucketPos pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
     if (dictIsRehashing(d) && hybsnapScanDictStateMain(sv->scan, s, didx, d) == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) {
@@ -2675,10 +2684,11 @@ int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv) {
     int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
     dict *d = kvstoreGetDict(db->keys, slot);
     if (!d) return 0;
-    uint8_t st = hybsnapScanDictStateMain(sv->scan, s, slot, d);
+    hybsnapSlotState st = hybsnapScanDictStateMain(sv->scan, s, slot, d);
     if (st == HYBSNAP_SLOT_SCANNED || st == HYBSNAP_SLOT_DONE) return 0;
     hybsnapSectionOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
-    int table, pos;
+    int table;
+    hybsnapBucketPos pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
     if (!hybsnapBucketOwed(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
@@ -2883,7 +2893,7 @@ static int hybsnapOutDrainList(hybsnapSave *sv, list *l, int fd, size_t *head_of
 
 /* Scan thread: push both pipes. Returns -1 when a pipe is broken (child
  * gone) or a BOUND wait saw an abort. */
-static int hybsnapOutDrain(hybsnapSave *sv, int mode, size_t target) {
+static int hybsnapOutDrain(hybsnapSave *sv, hybsnapDrainMode mode, size_t target) {
     for (;;) {
         int rs = hybsnapOutDrainList(sv, sv->oq, sv->pipe_wr, &sv->oq_head_off, 1);
         int rb = hybsnapOutDrainList(sv, sv->bq, sv->big_wr, &sv->bq_head_off, 0);
@@ -3016,7 +3026,7 @@ static void hybsnapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         sv->stage_dbid = s;
         sv->stage_slot = didx;
     }
-    int cls = hybsnapKeyClass(kv);
+    hybsnapValueClass cls = hybsnapKeyClass(kv);
     /* Module key metadata is serialized through module callbacks: child only. */
     if (cls == HYBSNAP_NOFORK && getModuleMetaBits(kv->metabits)) cls = HYBSNAP_FORK;
 
@@ -3531,7 +3541,7 @@ static const kvstoreSnapHooks hybsnap_server_hooks = {
 
 /* Main thread: the save object, its channel, queues and scan context for a
  * frozen-to-be keyspace. NULL on failure (logged). */
-static hybsnapSave *hybsnapSaveCreate(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+static hybsnapSave *hybsnapSaveCreate(hybsnapSaveKind kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     serverAssert(hybsnap_save == NULL);
 
     kvstoreOverlayStatsReset();   /* the overlay counters of INFO describe this save */
@@ -3720,7 +3730,7 @@ static int hybsnapSaveBackgroundAof(void) {
  * is logged once per blocking module). Returns C_OK when the hybrid save
  * started, C_ERR when it was taken and failed to start, HYBSNAP_NOT_TAKEN when
  * the caller must run the classic fork child. */
-int hybsnapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+int hybsnapSaveTryStart(hybsnapSaveKind kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (!hybsnapHybridEnabled()) return HYBSNAP_NOT_TAKEN;
     /* A functions-only transfer has no keyspace content for the scan thread;
      * the classic child serves it (redisFork maps the arena). A slot snapshot
@@ -3743,7 +3753,7 @@ int hybsnapSaveTryStart(int kind, int req, char *filename, rdbSaveInfo *rsi, int
     case HYBSNAP_SAVE_SOCKETS: return hybsnapSaveToSlavesSockets(req, rsi);
     case HYBSNAP_SAVE_AOF:     return hybsnapSaveBackgroundAof();
     }
-    serverPanic("unknown hybrid save kind %d", kind);
+    serverPanic("unknown hybrid save kind %d", (int)kind);
 }
 
 /* Start a hybrid background save: freeze the keyspace (overlay), fork the
@@ -3940,7 +3950,7 @@ void hybsnapOnChildEnd(int exitcode, int bysignal) {
 /* Test helper: HYBSNAP_SLOT_* of (store, dict), from either thread. DONE for a
  * slot the save holds nothing of (empty at the fork instant, created since, or
  * completed). */
-static int hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx) {
+static hybsnapSlotState hybsnapScanSlotState(hybsnapScanCtx *ctx, int store_idx, int didx) {
     if (ctx->ended || !ctx->store[store_idx].frozen) return HYBSNAP_SLOT_DONE;
     dict *d = hybsnapTableDict(ctx, store_idx, didx);
     if (!d) return HYBSNAP_SLOT_DONE;
@@ -4166,7 +4176,7 @@ static int hybsnapTestAllUnfrozen(kvstore **stores) {
     return 1;
 }
 
-static int hybsnapTestAllState(hybsnapScanCtx *ctx, int state) {
+static int hybsnapTestAllState(hybsnapScanCtx *ctx, hybsnapSlotState state) {
     for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
         for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++)
             if (hybsnapScanSlotState(ctx, s, didx) != state) return 0;
@@ -4468,12 +4478,12 @@ static void hybsnapScanTests(int accurate) {
         uint64_t c1 = HYBSNAP_POS(o11, 1, 5) + 1;
         test_cond("cap: a thread found past H gets hi = cur + 1, and the dict it is in is paused",
                   ctx->hi == c1 && __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST) == c1 && d11->pauserehash == 1);
-        int pos;
+        hybsnapBucketPos pos;
         hybsnapSectionOpen();
         int in = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 3, &pos, NULL);
-        int p_in = pos;
+        hybsnapBucketPos p_in = pos;
         int ahead = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 6, &pos, NULL);
-        int p_ahead = pos;
+        hybsnapBucketPos p_ahead = pos;
         hybsnapSectionClose();
         test_cond("cap: below cur + 1 the bucket may be being read, at it the thread cannot be",
                   in && p_in == HYBSNAP_POS_INSIDE && ahead && p_ahead == HYBSNAP_POS_AHEAD);
@@ -4533,7 +4543,7 @@ static void hybsnapScanTests(int accurate) {
         dict *d = kvstoreGetDict(stores[0], 3);   /* populated */
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
         uint64_t o = hybsnapOrd(ctx, 0, 3), b0 = HYBSNAP_POS(o, 1, 0);
-        int pos, p_ahead, p_after, p_other, p_behind;
+        hybsnapBucketPos pos, p_ahead, p_after, p_other, p_behind;
         test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
         hybsnapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
         hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));   /* as the thread's claim would */
@@ -5221,7 +5231,7 @@ static void hybsnapOverlayBucketTests(void) {
 /* The window the test 'prepare' hook defers every write in: half a table
  * (the half the bucket is in), its last position ov_test_seq. */
 static uint64_t ov_test_seq;
-static int ovTestPrepareHalves(void *priv, int didx, dict *d, const void *key, kvstoreOvWindow *w) {
+static kvstoreOverlayPrepareResult ovTestPrepareHalves(void *priv, int didx, dict *d, const void *key, kvstoreOvWindow *w) {
     UNUSED(priv); UNUSED(didx);
     int t;
     unsigned long i;

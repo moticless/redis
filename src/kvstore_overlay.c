@@ -363,7 +363,7 @@ static inline void kvsoEnter(kvstoreDictOverlay *ov) {
  * not, *w is the window the bucket is deferred in. Must be called after
  * kvsoEnter() (the answer is only stable inside a write section). Without a
  * prepare hook the overlay is pure copy-on-write, one window per table. */
-static inline int kvsoPrepare(int didx, kvstoreDictOverlay *ov, const void *key, int table, kvstoreOvWindow *w) {
+static inline kvstoreOverlayPrepareResult kvsoPrepare(int didx, kvstoreDictOverlay *ov, const void *key, int table, kvstoreOvWindow *w) {
     if (!ov->h->prepare) {
         w->last = 0;
         w->table = table;
@@ -410,21 +410,26 @@ int kvstoreOverlayIsFrozen(kvstore *kvs, int didx) {
 }
 
 /* What a write to 'key' of a frozen dict works on. */
-enum { KVSO_W_INPLACE = 0, KVSO_W_BUCKET = 1, KVSO_W_ABSENT = 2 };
+typedef enum kvsoWriteTarget {
+    KVSO_W_INPLACE = 0,   /* the dict itself: the snapshot holds the bucket */
+    KVSO_W_BUCKET  = 1,   /* the bucket's overlay */
+    KVSO_W_ABSENT  = 2,   /* neither: the key is not there and no overlay covers it */
+} kvsoWriteTarget;
 
 /* Write intent on the bucket of 'key' (inside the write section): the dict
  * itself when the snapshot holds the bucket (KVSO_W_INPLACE), else the bucket's
  * overlay (KVSO_W_BUCKET), created now when the scan thread may be reading the
  * chain. With 'miss_ok' false, a key the dict does not hold and no overlay
  * covers is KVSO_W_ABSENT and nothing is created. */
-static int kvsoWriteBucket(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int miss_ok, kvsoBucket **out) {
+static kvsoWriteTarget kvsoWriteBucket(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key, int miss_ok, kvsoBucket **out) {
     (void)kvs;
     dict *d = ov->d;
     /* The bucket of the key must not move while it is decided on (a lookup
      * steps a rehash): the dict's layout is held for the whole decision, and
      * for as long as any bucket is overlayed (kvsoBucketCreate). */
     dictPauseRehashing(d);
-    int t, w;
+    int t;
+    kvsoWriteTarget w;
     unsigned long i;
     dictKeyBucket(d, key, &t, &i);
     kvsoBucket *ob = kvsoLookup(ov, t, i);
@@ -817,7 +822,7 @@ dictEntryLink kvsoDictTwoPhaseUnlinkFind(kvstore *kvs, int didx, kvstoreDictOver
     ov->unlink_frozen = 0;
     ov->unlink_ob = NULL;
     kvsoBucket *ob;
-    int w = kvsoWriteBucket(kvs, didx, ov, key, 0, &ob);
+    kvsoWriteTarget w = kvsoWriteBucket(kvs, didx, ov, key, 0, &ob);
     if (w == KVSO_W_ABSENT) return NULL;
     if (w == KVSO_W_INPLACE) {
         dictEntryLink l = dictTwoPhaseUnlinkFind(ov->d, key, table_index);
@@ -859,7 +864,7 @@ void kvsoDictTwoPhaseUnlinkFreeKey(kvstore *kvs, int didx, kvstoreDictOverlay *o
 int kvsoDictDelete(kvstore *kvs, int didx, kvstoreDictOverlay *ov, const void *key) {
     kvsoEnter(ov);
     kvsoBucket *ob;
-    int w = kvsoWriteBucket(kvs, didx, ov, key, 0, &ob);
+    kvsoWriteTarget w = kvsoWriteBucket(kvs, didx, ov, key, 0, &ob);
     if (w == KVSO_W_ABSENT) return DICT_ERR;
     if (w == KVSO_W_INPLACE) {
         int ret = dictDelete(ov->d, key);
