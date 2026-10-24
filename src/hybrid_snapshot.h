@@ -9,11 +9,12 @@
  *
  * WHAT IS HYBRID SNAPSHOT?
  * ------------------------
- * A point-in-time snapshot (BGSAVE, full sync, AOF rewrite) that cuts fork()
- * page-table and copy-on-write cost. Unlike the classic fork(), small values
+ * It is a point-in-time snapshot (BGSAVE, full sync, AOF rewrite) that cuts fork()
+ * page-table and copy-on-write cost. i.e, Unlike the classic fork(), small values
  * and selected structures live in a dedicated jemalloc arena such that pages are
  * marked MADV_DONTFORK and are serialized by a background thread of the parent.
- * The fork child serializes only the big ones. Toggled at runtime with `hybrid-snapshot`.
+ * The fork child serializes only the big ones. This feature can be toggled at
+ * runtime with `hybrid-snapshot`.
  *
  * Every value has a class, decided by where its memory is:
  *   HYBSNAP_NOFORK  single-allocation value (string, listpack, intset) of at most
@@ -130,7 +131,7 @@ struct aeEventLoop;
 
 /* ---- hybrid arena ---------------------------------------------------- */
 
-/* Create the arena: once, main thread, before the first zmalloc_hybrid*(); a no-op without support. */
+/* If supported create the arena: once, main thread, before the first zmalloc_hybrid*() */
 void hybsnapArenaInit(void);
 
 /* 1 if the arena exists (DONTFORK or currently forkable). */
