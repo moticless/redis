@@ -487,7 +487,7 @@ void hybsnapArenaInit(void) {
 
 static int hybsnap_arena_fallback = 0;        /* flipped forkable for a non-hybrid child, flip back on reap */
 static int hybsnap_forking_no_keyspace = 0;   /* set around hybsnapForkNoKeyspace()'s redisFork() */
-static int hybsnap_child_no_keyspace = 0;     /* this process is a child forked without the keyspace */
+static int hybsnap_child_no_keyspace = 0;     /* Is this process is a child forked without hybrid arena */
 int hybsnapChildNoKeyspace(void) { return hybsnap_child_no_keyspace; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
@@ -512,7 +512,7 @@ static void hybsnapHybridFallbackLog(void) {
  * O(1) in keys; that child pays classic copy-on-write. */
 int hybsnapArenaForkable(void) {
 #ifdef HAVE_NOFORK_ARENA
-    return hybsnapArenaAvailable() && zmalloc_nofork_arena_forkable();
+    return hybsnapArenaExists() && zmalloc_nofork_arena_forkable();
 #else
     return 0;
 #endif
@@ -520,7 +520,7 @@ int hybsnapArenaForkable(void) {
 
 static int hybsnapArenaSetForkable(int forkable) {
 #ifdef HAVE_NOFORK_ARENA
-    if (!hybsnapArenaAvailable()) return 0;
+    if (!hybsnapArenaExists()) return 0;
     if (!zmalloc_nofork_arena_set_forkable(forkable)) {
         serverLog(LL_WARNING, "HYBSNAP_NOFORK arena: madvise(%s) failed: %s",
                   forkable ? "MADV_DOFORK" : "MADV_DONTFORK", strerror(errno));
@@ -535,7 +535,7 @@ static int hybsnapArenaSetForkable(int forkable) {
 
 void hybsnapArenaBeforeFork(int purpose) {
     UNUSED(purpose);
-    if (hybsnap_forking_no_keyspace || !hybsnapArenaAvailable() || hybsnapArenaForkable()) return;
+    if (hybsnap_forking_no_keyspace || !hybsnapArenaExists() || hybsnapArenaForkable()) return;
     /* A classic child (RDB with the feature off, diskless sync, AOF rewrite,
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
     if (hybsnapArenaSetForkable(1)) {
@@ -590,7 +590,7 @@ int hybsnapForkNoKeyspace(int purpose) {
     hybsnap_forking_no_keyspace = 0;
     if (childpid == 0) {
         hybsnap_child_no_keyspace = 1;
-        if (hybsnapArenaAvailable() && !hybsnapArenaForkable()) hybsnapChildReserveArenaRange();
+        if (hybsnapArenaExists() && !hybsnapArenaForkable()) hybsnapChildReserveArenaRange();
     }
     return childpid;
 }
@@ -607,7 +607,7 @@ int hybsnapHybridConfigApply(const char **err) {
         *err = "hybrid-snapshot cannot change while a save, rewrite, module fork or debugger child is running";
         return 0;
     }
-    if (hybsnapArenaAvailable()) {
+    if (hybsnapArenaExists()) {
         /* On: children stop mapping the arena; off: they must map it. Values
          * placed so far stay where they are, the switch itself is O(1). */
         if (!hybsnapArenaSetForkable(!server.hybrid_snapshot)) {
@@ -618,7 +618,7 @@ int hybsnapHybridConfigApply(const char **err) {
         hybsnap_arena_fallback = 0;
     }
     serverLog(LL_NOTICE, "Hybrid snapshot switched %s at runtime%s", server.hybrid_snapshot ? "on" : "off",
-              hybsnapArenaAvailable() ? "" : " (no HYBSNAP_NOFORK arena on this platform)");
+              hybsnapArenaExists() ? "" : " (no HYBSNAP_NOFORK arena on this platform)");
     return 1;
 }
 
@@ -626,7 +626,7 @@ int hybsnapHybridConfigApply(const char **err) {
 static size_t hybsnapArenaVaReserved(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t reserved = 0;
-    if (hybsnapArenaAvailable()) zmalloc_nofork_va_stats(&reserved, NULL);
+    if (hybsnapArenaExists()) zmalloc_nofork_va_stats(&reserved, NULL);
     return reserved;
 #else
     return 0;
@@ -636,7 +636,7 @@ static size_t hybsnapArenaVaReserved(void) {
 static size_t hybsnapArenaVaUsed(void) {
 #ifdef HAVE_NOFORK_ARENA
     size_t used = 0;
-    if (hybsnapArenaAvailable()) zmalloc_nofork_va_stats(NULL, &used);
+    if (hybsnapArenaExists()) zmalloc_nofork_va_stats(NULL, &used);
     return used;
 #else
     return 0;
@@ -706,7 +706,7 @@ static hybsnapValueClass hybsnapKeyClass(const robj *o) {
     if (!hybsnapEncodingIsNoforkClass(o->type, o->encoding)) return HYBSNAP_FORK;
     if (hybsnapValueIsInline(o->type, o->encoding)) return HYBSNAP_NOFORK;
     /* No arena: nothing is placed, the class is a pure size decision. */
-    if (!hybsnapArenaAvailable()) {
+    if (!hybsnapArenaExists()) {
         void *a = hybsnapValueAllocPtr(o);
         return hybsnapClassify(o->type, o->encoding, a ? zmalloc_size(a) : 0);
     }
@@ -879,7 +879,7 @@ static void *hybsnapOverlayCloneKey(void *privdata, int didx, void *orig_) {
      * Single-allocation values are therefore always copied in that mode;
      * only multi-allocation values (never dereferenced by the scan thread)
      * are shared. */
-    int to_arena = hybsnapArenaAvailable();
+    int to_arena = hybsnapArenaExists();
     int shared = hybsnapOriginalSharesValue(orig);
     int nofork = !shared;
     if (!hybsnapValueIsInline(orig->type, orig->encoding)) {
@@ -965,7 +965,7 @@ static int hybsnapOriginalSharesValue(const kvobj *orig) {
     case OBJ_ENCODING_INTSET:
     case OBJ_ENCODING_LISTPACK_EX:
         if (!hybsnapEncodingIsNoforkClass(orig->type, orig->encoding)) return 1;
-        return hybsnapArenaAvailable() ? !zmalloc_is_nofork(orig->ptr) : 0;
+        return hybsnapArenaExists() ? !zmalloc_is_nofork(orig->ptr) : 0;
     default:
         return 1;
     }
@@ -992,7 +992,7 @@ static void hybsnapOverlayFreeOriginal(void *privdata, int didx, void *orig_) {
  * (e.g. a listpack becoming the first quicklist node): every piece of a
  * HYBSNAP_FORK value has to be readable by the fork child. */
 void hybsnapValueDetachFromArena(robj *o) {
-    if (!hybsnapArenaAvailable()) return;
+    if (!hybsnapArenaExists()) return;
     switch (o->encoding) {
     case OBJ_ENCODING_RAW: {
         void *a = sdsAllocPtr(o->ptr);
@@ -2225,7 +2225,7 @@ sds hybsnapInfoMemory(sds info) {
         "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
         "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
         "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
-        "snap_nofork_arena_available:%d\r\n", hybsnapArenaAvailable(),
+        "snap_nofork_arena_available:%d\r\n", hybsnapArenaExists(),
         "snap_nofork_arena_forkable:%d\r\n", hybsnapArenaForkable(),
         "snap_nofork_va_reserved:%zu\r\n", hybsnapArenaVaReserved(),
         "snap_nofork_va_used:%zu\r\n", hybsnapArenaVaUsed()));
@@ -2317,7 +2317,7 @@ int hybsnapDebugCommand(client *c) {
         addReplyBulkCString(c, "keys"); addReplyLongLong(c, st.keys);
         addReplyBulkCString(c, "dict_tables_in_arena"); addReplyLongLong(c, st.dict_tables_in_arena);
         addReplyBulkCString(c, "dict_tables_outside"); addReplyLongLong(c, st.dict_tables_outside);
-        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, hybsnapArenaAvailable());
+        addReplyBulkCString(c, "arena_available"); addReplyLongLong(c, hybsnapArenaExists());
         addReplyBulkCString(c, "headers_in_arena"); addReplyLongLong(c, st.headers_in_arena);
         addReplyBulkCString(c, "headers_outside"); addReplyLongLong(c, st.headers_outside);
         addReplyBulkCString(c, "class_nofork"); addReplyLongLong(c, st.class_nofork);
@@ -4613,7 +4613,7 @@ static void hybsnapScanTests(int accurate) {
 
 /* ---- Placement / range-aware allocator tests ---- */
 static void hybsnapPlacementTests(void) {
-    if (!hybsnapArenaAvailable()) return;
+    if (!hybsnapArenaExists()) return;
     server.save_small_max_bytes = 4096;
 
     /* Generic allocator paths keep arena memory in the arena. */
@@ -5501,9 +5501,9 @@ int hybsnapTest(int argc, char **argv, int flags) {
     hybsnapArenaInit();
 
 #ifdef HAVE_NOFORK_ARENA
-    test_cond("HYBSNAP_NOFORK arena is available on Linux+jemalloc", hybsnapArenaAvailable());
+    test_cond("HYBSNAP_NOFORK arena is available on Linux+jemalloc", hybsnapArenaExists());
 #else
-    test_cond("HYBSNAP_NOFORK arena reported unavailable on this platform", !hybsnapArenaAvailable());
+    test_cond("HYBSNAP_NOFORK arena reported unavailable on this platform", !hybsnapArenaExists());
     void *fb = zmalloc_nofork(100);
     test_cond("fallback alloc goes to the default allocator", fb != NULL && !zmalloc_is_nofork(fb));
     zfree(fb);

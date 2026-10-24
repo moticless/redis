@@ -1540,7 +1540,7 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_resident,
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
-        if (hybsnapArenaAvailable()) {
+        if (hybsnapArenaExists()) {
             zmalloc_get_allocator_info_by_arena(zmalloc_nofork_arena_index(),
                                                 0,
                                                 &server.cron_malloc_stats.nofork_allocator_allocated,
@@ -7930,7 +7930,7 @@ void dismissMemoryInChild(void) {
     /* Hybrid snapshot: the keyspace kvstores live in the DONTFORK arena and are
      * not mapped in the child at all unless the arena was flipped forkable for
      * this (stock) child; touching them here would fault otherwise. */
-    if ((!hybsnapArenaAvailable() || hybsnapArenaForkable()) &&
+    if ((!hybsnapArenaExists() || hybsnapArenaForkable()) &&
         (server.in_fork_child == CHILD_TYPE_RDB || server.in_fork_child == CHILD_TYPE_AOF)) {
         for (int dbid = 0; dbid < server.dbnum; dbid++) {
             dismissKvstoreBucketsMemory(server.db[dbid].expires);

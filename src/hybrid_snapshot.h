@@ -134,7 +134,7 @@ struct aeEventLoop;
 void hybsnapArenaInit(void);
 
 /* 1 if the arena exists (DONTFORK or currently forkable). */
-static inline int hybsnapArenaAvailable(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
+static inline int hybsnapArenaExists(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
 
 /* Fork visibility: DONTFORK for a child forked without the keyspace, flipped forkable around any other fork. */
 int hybsnapArenaForkable(void);
