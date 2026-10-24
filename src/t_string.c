@@ -630,7 +630,7 @@ void setrangeCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(kv);
         kv->ptr = sdsgrowzero(kv->ptr,offset+value_len);
-        hybsnapPlaceValue(kv); /* may leave the HYBSNAP_NOFORK arena when crossing the threshold */
+        hybsnapPlaceValue(kv); /* may leave the hybrid arena when crossing the threshold */
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), kv, oldsize, kvobjAllocSize(kv));
         memcpy((char*)kv->ptr+offset,value,value_len);
@@ -1392,7 +1392,7 @@ void appendCommand(client *c) {
         if (server.memory_tracking_enabled)
             oldsize = kvobjAllocSize(o);
         o->ptr = sdscatlen(o->ptr,append->ptr,append_len);
-        hybsnapPlaceValue(o); /* may leave the HYBSNAP_NOFORK arena when crossing the threshold */
+        hybsnapPlaceValue(o); /* may leave the hybrid arena when crossing the threshold */
         if (server.memory_tracking_enabled)
             updateSlotAllocSize(c->db, getKeySlot(c->argv[1]->ptr), o, oldsize, kvobjAllocSize(o));
         totlen = sdslen(o->ptr);

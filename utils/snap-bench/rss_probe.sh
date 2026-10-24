@@ -16,7 +16,7 @@ bench.populate($PORT, '$DS', 1.0)"
 PID=$($CLI -p $PORT info server | grep process_id | tr -d '\r' | cut -d: -f2)
 dump() {
   echo "--- $1"
-  $CLI -p $PORT info memory | grep -E "^(used_memory|used_memory_rss|allocator_allocated|allocator_active|allocator_resident|allocator_frag_bytes|allocator_rss_bytes|rss_overhead_bytes|mem_fragmentation_ratio|allocator_allocated_nofork|allocator_active_nofork|allocator_resident_nofork|snap_nofork_arena_va_used):" | tr -d '\r' | tr '\n' ' '; echo
+  $CLI -p $PORT info memory | grep -E "^(used_memory|used_memory_rss|allocator_allocated|allocator_active|allocator_resident|allocator_frag_bytes|allocator_rss_bytes|rss_overhead_bytes|mem_fragmentation_ratio|allocator_allocated_hybrid_arena|allocator_active_hybrid_arena|allocator_resident_hybrid_arena|snap_hybrid_arena_va_used):" | tr -d '\r' | tr '\n' ' '; echo
   grep -E "^(RssAnon|RssFile|VmSwap)" /proc/$PID/status | tr '\n' ' '; echo
   $CLI -p $PORT memory malloc-stats | grep -E "^Allocated|^arenas\[[0-9]+\]:$|^(dirty|muzzy|retained|allocated|active|mapped|resident):" | head -40
 }

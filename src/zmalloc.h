@@ -25,24 +25,24 @@
  * Out of memory aborts the server, unless a caller uses a ztry variant.
  *
  *
- * HYBSNAP_NOFORK ARENA
+ * HYBRID ARENA
  * -----------------
  * Used by the hybrid snapshot (hybrid_snapshot.h) to keep memory out of fork
  * children. A dedicated jemalloc arena takes all its extents from ONE
  * reserved virtual address range (64 GB to 16 TB, the largest that mmap
  * grants, PROT_NONE and MAP_NORESERVE) marked MADV_DONTFORK, so a fork child
  * never maps it: what lives there costs nothing at fork() and nothing in
- * copy-on-write. 64-bit Linux with jemalloc only (HAVE_NOFORK_ARENA);
- * elsewhere the zmalloc_nofork*() entry points are the default allocators and
+ * copy-on-write. 64-bit Linux with jemalloc only (HAVE_HYBRID_ARENA);
+ * elsewhere the zmalloc_hybrid*() entry points are the default allocators and
  * the hybrid save runs without an arena (see hybrid_snapshot.h).
  *
  * - Ownership is an address test. The range is contiguous, so "is this block
- *   in the arena" is two compares (zmalloc_is_nofork). zfree() and zrealloc()
+ *   in the arena" is two compares (zmalloc_in_hybrid_arena). zfree() and zrealloc()
  *   use it to keep arena memory in the arena: a block stays there across
  *   realloc, is freed back to it and never goes through a default-arena
  *   thread cache. sds, listpack, dict and the rest need not know.
- * - New arena allocations come only from the zmalloc_nofork*() entry points,
- *   and only while zmalloc_nofork_enabled() (hybrid-snapshot on). With the
+ * - New arena allocations come only from the zmalloc_hybrid*() entry points,
+ *   and only while zmalloc_hybrid_arena_enabled() (hybrid-snapshot on). With the
  *   feature off they are plain zmalloc() and the layout is the classic one;
  *   blocks already in the arena still route by address.
  * - The arena's extents come from a bump pointer in the range through
@@ -52,10 +52,10 @@
  *   decommit would replace the mapping and lose it.
  * - Each thread has its own explicit tcache for the arena, so arena blocks
  *   never mix with default allocations. serverCron flushes the calling
- *   thread's cache once a second (zmalloc_nofork_tcache_flush).
+ *   thread's cache once a second (zmalloc_hybrid_arena_tcache_flush).
  * - Fork visibility is switchable. The range is DONTFORK normally; around
  *   any other fork (classic child, module fork, Lua debugger) it is flipped
- *   to MADV_DOFORK with zmalloc_nofork_arena_set_forkable() and back when no
+ *   to MADV_DOFORK with zmalloc_hybrid_arena_set_forkable() and back when no
  *   child is left (driven by hybrid_snapshot.c).
  * - In the hybrid child the range is absent, so the kernel may hand its
  *   addresses to the child's own mmaps; the child re-reserves the range
@@ -190,70 +190,70 @@ void zfree_with_flags(void *ptr, int flags);
 void zfree_with_size_and_flags(void *ptr, size_t size, int flags);
 #endif
 
-/* ---- HYBSNAP_NOFORK arena: see "HYBSNAP_NOFORK ARENA" at the top of this file. ---- */
+/* ---- Hybrid arena: see "HYBRID ARENA" at the top of this file. ---- */
 #include <stdint.h>
 #include <limits.h>
 #include "config.h"   /* likely / unlikely */
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
-#define HAVE_NOFORK_ARENA 1
+#define HAVE_HYBRID_ARENA 1
 /* Three globals exported for the two inline hot-path checks below only (one
  * load and one compare per free, one load per placement); no other code reads
- * them. Cold callers use zmalloc_nofork_arena_range(). */
-extern char *zmalloc_nofork_lo;   /* [lo, hi) reserved range; both NULL when unavailable. */
-extern char *zmalloc_nofork_hi;
-extern int zmalloc_nofork_active;       /* 1 while NEW HYBSNAP_NOFORK requests go to the arena (hybrid-snapshot on) */
+ * them. Cold callers use zmalloc_hybrid_arena_range(). */
+extern char *zmalloc_hybrid_arena_lo;    /* [lo, hi) reserved range; both NULL when unavailable. */
+extern char *zmalloc_hybrid_arena_hi;
+extern int zmalloc_hybrid_arena_active;  /* 1 while NEW HYBSNAP_NOFORK requests go to the arena (hybrid-snapshot on) */
 /* hi is NULL while there is no arena: one load and one compare decide. */
-static inline int zmalloc_is_nofork(const void *p) {
-    return (const char *)p < zmalloc_nofork_hi && (const char *)p >= zmalloc_nofork_lo;
+static inline int zmalloc_in_hybrid_arena(const void *p) {
+    return (const char *)p < zmalloc_hybrid_arena_hi && (const char *)p >= zmalloc_hybrid_arena_lo;
 }
 /* Placement gate for new allocations (hybrid-snapshot on). */
-static inline int zmalloc_nofork_enabled(void) { return zmalloc_nofork_active; }
-void zmalloc_nofork_set_active(int active);          /* follows CONFIG hybrid-snapshot; no-op without an arena */
-int zmalloc_nofork_arena_init(void);                 /* 1 on success, 0 if unavailable */
-int zmalloc_nofork_arena_set_forkable(int forkable); /* MADV_DOFORK (1) / MADV_DONTFORK (0) on the range; 1 on success */
-int zmalloc_nofork_arena_forkable(void);             /* 1 while a fork child would map the arena */
-void zmalloc_nofork_tcache_flush(void);              /* return this thread's cached arena regions to the bins */
-unsigned zmalloc_nofork_arena_index(void);           /* UINT_MAX if unavailable */
-int zmalloc_nofork_arena_range(void **lo, size_t *len); /* the reserved range; 0 (and NULL/0) when unavailable */
+static inline int zmalloc_hybrid_arena_enabled(void) { return zmalloc_hybrid_arena_active; }
+void zmalloc_hybrid_arena_set_active(int active);       /* follows CONFIG hybrid-snapshot; no-op without an arena */
+int zmalloc_hybrid_arena_init(void);                    /* 1 on success, 0 if unavailable */
+int zmalloc_hybrid_arena_set_forkable(int forkable);    /* MADV_DOFORK (1) / MADV_DONTFORK (0) on the range; 1 on success */
+int zmalloc_hybrid_arena_forkable(void);                /* 1 while a fork child would map the arena */
+void zmalloc_hybrid_arena_tcache_flush(void);           /* return this thread's cached arena regions to the bins */
+unsigned zmalloc_hybrid_arena_index(void);              /* UINT_MAX if unavailable */
+int zmalloc_hybrid_arena_range(void **lo, size_t *len); /* the reserved range; 0 (and NULL/0) when unavailable */
 /* The arena entry points: with no arena they ARE the default allocators (one
  * predictable branch, inlined), so a server with hybrid-snapshot off pays nothing. */
-__attribute__((malloc)) void *zmalloc_nofork_slow(size_t size);
-__attribute__((malloc)) void *zcalloc_nofork_slow(size_t size);
-void *zmalloc_nofork_usable_slow(size_t size, size_t *usable);
-static inline void *zmalloc_nofork(size_t size) {
-    return unlikely(zmalloc_nofork_enabled()) ? zmalloc_nofork_slow(size) : zmalloc(size);
+__attribute__((malloc)) void *zmalloc_hybrid_slow(size_t size);
+__attribute__((malloc)) void *zcalloc_hybrid_slow(size_t size);
+void *zmalloc_hybrid_usable_slow(size_t size, size_t *usable);
+static inline void *zmalloc_hybrid(size_t size) {
+    return unlikely(zmalloc_hybrid_arena_enabled()) ? zmalloc_hybrid_slow(size) : zmalloc(size);
 }
-static inline void *zcalloc_nofork(size_t size) {
-    return unlikely(zmalloc_nofork_enabled()) ? zcalloc_nofork_slow(size) : zcalloc(size);
+static inline void *zcalloc_hybrid(size_t size) {
+    return unlikely(zmalloc_hybrid_arena_enabled()) ? zcalloc_hybrid_slow(size) : zcalloc(size);
 }
-static inline void *zmalloc_nofork_usable(size_t size, size_t *usable) {
-    return unlikely(zmalloc_nofork_enabled()) ? zmalloc_nofork_usable_slow(size, usable) : zmalloc_usable(size, usable);
+static inline void *zmalloc_hybrid_usable(size_t size, size_t *usable) {
+    return unlikely(zmalloc_hybrid_arena_enabled()) ? zmalloc_hybrid_usable_slow(size, usable) : zmalloc_usable(size, usable);
 }
-void *zrealloc_nofork(void *ptr, size_t size);   /* zrealloc, which keeps an arena block in the arena; NULL allocates in the arena */
-__attribute__((malloc)) void *zmalloc_nofork_no_tcache(size_t size);
-void *ztrycalloc_nofork(size_t size);           /* NULL on OOM */
-void zmalloc_nofork_va_stats(size_t *reserved, size_t *used);
+void *zrealloc_hybrid(void *ptr, size_t size);   /* zrealloc, which keeps an arena block in the arena; NULL allocates in the arena */
+__attribute__((malloc)) void *zmalloc_hybrid_arena_no_tcache(size_t size);
+void *ztrycalloc_hybrid(size_t size);           /* NULL on OOM */
+void zmalloc_hybrid_arena_va_stats(size_t *reserved, size_t *used);
 /* Allocate 'size' bytes in the same arena as 'like' (default or HYBSNAP_NOFORK),
  * for containers that replace a buffer instead of reallocating it in place. */
 static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *usable) {
-    return zmalloc_is_nofork(like) ? zmalloc_nofork_usable(size, usable) : zmalloc_usable(size, usable);
+    return zmalloc_in_hybrid_arena(like) ? zmalloc_hybrid_usable(size, usable) : zmalloc_usable(size, usable);
 }
 #else
-static inline int zmalloc_is_nofork(const void *p) { (void)p; return 0; }
+static inline int zmalloc_in_hybrid_arena(const void *p) { (void)p; return 0; }
 static inline void *zmalloc_usable_like(const void *like, size_t size, size_t *usable) {
     (void)like;
     return zmalloc_usable(size, usable);
 }
 /* No arena on this platform: the HYBSNAP_NOFORK entry points are the defaults. */
-#define zmalloc_nofork(size) zmalloc(size)
-#define zcalloc_nofork(size) zcalloc(size)
-#define zmalloc_nofork_usable(size, usable) zmalloc_usable(size, usable)
-#define zrealloc_nofork(ptr, size) zrealloc(ptr, size)
-#define ztrycalloc_nofork(size) ztrycalloc(size)
-static inline int zmalloc_nofork_enabled(void) { return 0; }
-static inline unsigned zmalloc_nofork_arena_index(void) { return UINT_MAX; }
-void zmalloc_nofork_set_active(int active);   /* no-op stubs in zmalloc.c: nothing to gate, no arena tcache to flush */
-void zmalloc_nofork_tcache_flush(void);
+#define zmalloc_hybrid(size) zmalloc(size)
+#define zcalloc_hybrid(size) zcalloc(size)
+#define zmalloc_hybrid_usable(size, usable) zmalloc_usable(size, usable)
+#define zrealloc_hybrid(ptr, size) zrealloc(ptr, size)
+#define ztrycalloc_hybrid(size) ztrycalloc(size)
+static inline int zmalloc_hybrid_arena_enabled(void) { return 0; }
+static inline unsigned zmalloc_hybrid_arena_index(void) { return UINT_MAX; }
+void zmalloc_hybrid_arena_set_active(int active);   /* no-op stubs in zmalloc.c: nothing to gate, no arena tcache to flush */
+void zmalloc_hybrid_arena_tcache_flush(void);
 #endif
 
 #if (defined(USE_JEMALLOC) && defined(HAVE_DEFRAG))

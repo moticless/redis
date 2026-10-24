@@ -362,38 +362,38 @@ void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
 #endif
 
 /* ============================================================================
- * HYBSNAP_NOFORK arena: reserved DONTFORK address range + jemalloc extent hooks
+ * Hybrid arena: reserved DONTFORK address range + jemalloc extent hooks
  * ============================================================================ */
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
 #include <sys/mman.h>
 #include <stdbool.h>
 
-char *zmalloc_nofork_lo = NULL;
-char *zmalloc_nofork_hi = NULL;
-static char *nofork_bump = NULL;                 /* atomic bump pointer inside [lo,hi) */
-static unsigned zmalloc_nofork_arena = UINT_MAX;   /* jemalloc arena index; zmalloc_nofork_arena_index() */
-int zmalloc_nofork_active = 0;              /* placement gate, see zmalloc.h */
-static extent_hooks_t *nofork_default_hooks = NULL;
-static extent_hooks_t nofork_hooks;              /* must outlive the arena */
-static __thread int nofork_thread_flags = 0;     /* MALLOCX_ARENA|MALLOCX_TCACHE, 0 = uninit */
-static int nofork_forkable = 0;                  /* 1 while the range is MADV_DOFORK (stock fork fallback) */
+char *zmalloc_hybrid_arena_lo = NULL;
+char *zmalloc_hybrid_arena_hi = NULL;
+static char *hybrid_arena_bump = NULL;               /* atomic bump pointer inside [lo,hi) */
+static unsigned zmalloc_hybrid_arena = UINT_MAX;     /* jemalloc arena index; zmalloc_hybrid_arena_index() */
+int zmalloc_hybrid_arena_active = 0;                 /* placement gate, see zmalloc.h */
+static extent_hooks_t *hybrid_arena_default_hooks = NULL;
+static extent_hooks_t hybrid_arena_hooks;            /* must outlive the arena */
+static __thread int hybrid_arena_thread_flags = 0;   /* MALLOCX_ARENA|MALLOCX_TCACHE, 0 = uninit */
+static int hybrid_arena_forkable = 0;                /* 1 while the range is MADV_DOFORK (stock fork fallback) */
 
 /* Carve [aligned, aligned+size) out of the reservation and make it RW. The
  * whole reservation carries VM_DONTCOPY; mprotect splits the VMA but keeps
  * the flag. Fresh pages are zero. new_addr hints are honoured only when they
  * coincide with the bump pointer (jemalloc falls back gracefully on NULL). */
-static void *noforkExtentAlloc(extent_hooks_t *hooks, void *new_addr, size_t size,
+static void *hybridArenaExtentAlloc(extent_hooks_t *hooks, void *new_addr, size_t size,
                                size_t alignment, bool *zero, bool *commit, unsigned arena_ind)
 {
     (void)hooks; (void)arena_ind;
     char *cur, *aligned, *next;
     do {
-        cur = __atomic_load_n(&nofork_bump, __ATOMIC_RELAXED);
+        cur = __atomic_load_n(&hybrid_arena_bump, __ATOMIC_RELAXED);
         aligned = (char *)(((uintptr_t)cur + alignment - 1) & ~((uintptr_t)alignment - 1));
         if (new_addr != NULL && (char *)new_addr != aligned) return NULL;
         next = aligned + size;
-        if (next < aligned || next > zmalloc_nofork_hi) return NULL;   /* reservation exhausted */
-    } while (!__atomic_compare_exchange_n(&nofork_bump, &cur, next, 0,
+        if (next < aligned || next > zmalloc_hybrid_arena_hi) return NULL;   /* reservation exhausted */
+    } while (!__atomic_compare_exchange_n(&hybrid_arena_bump, &cur, next, 0,
                                           __ATOMIC_ACQ_REL, __ATOMIC_RELAXED));
     if (mprotect(aligned, size, PROT_READ | PROT_WRITE) != 0) return NULL;
     *zero = true;
@@ -402,16 +402,16 @@ static void *noforkExtentAlloc(extent_hooks_t *hooks, void *new_addr, size_t siz
 }
 
 /* Never give VA back: report failure so jemalloc retains the extent. */
-static bool noforkExtentDalloc(extent_hooks_t *hooks, void *addr, size_t size, bool committed, unsigned arena_ind) {
+static bool hybridArenaExtentDalloc(extent_hooks_t *hooks, void *addr, size_t size, bool committed, unsigned arena_ind) {
     (void)hooks; (void)addr; (void)size; (void)committed; (void)arena_ind;
     return true;
 }
 
-static void noforkExtentDestroy(extent_hooks_t *hooks, void *addr, size_t size, bool committed, unsigned arena_ind) {
+static void hybridArenaExtentDestroy(extent_hooks_t *hooks, void *addr, size_t size, bool committed, unsigned arena_ind) {
     (void)hooks; (void)addr; (void)size; (void)committed; (void)arena_ind;
 }
 
-static bool noforkExtentCommit(extent_hooks_t *hooks, void *addr, size_t size, size_t offset,
+static bool hybridArenaExtentCommit(extent_hooks_t *hooks, void *addr, size_t size, size_t offset,
                                size_t length, unsigned arena_ind)
 {
     (void)hooks; (void)size; (void)arena_ind;
@@ -422,14 +422,14 @@ static bool noforkExtentCommit(extent_hooks_t *hooks, void *addr, size_t size, s
  * MADV_FREE via the default purge hooks, which keep the VMA flags). This is
  * the same behaviour as the default hooks on an overcommitting Linux. A real
  * decommit via mmap(MAP_FIXED) would replace the mapping and lose DONTFORK. */
-static bool noforkExtentDecommit(extent_hooks_t *hooks, void *addr, size_t size, size_t offset,
+static bool hybridArenaExtentDecommit(extent_hooks_t *hooks, void *addr, size_t size, size_t offset,
                                  size_t length, unsigned arena_ind)
 {
     (void)hooks; (void)addr; (void)size; (void)offset; (void)length; (void)arena_ind;
     return true;
 }
 
-static int noforkReserve(void) {
+static int hybridArenaReserve(void) {
     static const size_t sizes[] = {
         (size_t)1 << 44, (size_t)1 << 42, (size_t)1 << 40, (size_t)1 << 38, (size_t)1 << 36
     };
@@ -440,29 +440,29 @@ static int noforkReserve(void) {
             munmap(p, sizes[i]);
             return 0;
         }
-        zmalloc_nofork_lo = p;
-        zmalloc_nofork_hi = (char *)p + sizes[i];
-        nofork_bump = p;
+        zmalloc_hybrid_arena_lo = p;
+        zmalloc_hybrid_arena_hi = (char *)p + sizes[i];
+        hybrid_arena_bump = p;
         return 1;
     }
     return 0;
 }
 
-int zmalloc_nofork_arena_init(void) {
-    if (zmalloc_nofork_arena != UINT_MAX) return 1;
+int zmalloc_hybrid_arena_init(void) {
+    if (zmalloc_hybrid_arena != UINT_MAX) return 1;
 
     size_t sz = sizeof(extent_hooks_t *);
-    if (je_mallctl("arena.0.extent_hooks", &nofork_default_hooks, &sz, NULL, 0) != 0 ||
-        nofork_default_hooks == NULL)
+    if (je_mallctl("arena.0.extent_hooks", &hybrid_arena_default_hooks, &sz, NULL, 0) != 0 ||
+        hybrid_arena_default_hooks == NULL)
         return 0;
-    if (!noforkReserve()) return 0;
+    if (!hybridArenaReserve()) return 0;
 
-    nofork_hooks = *nofork_default_hooks;       /* keeps NULL purge hooks when unsupported */
-    nofork_hooks.alloc = noforkExtentAlloc;
-    nofork_hooks.dalloc = noforkExtentDalloc;
-    nofork_hooks.destroy = noforkExtentDestroy;
-    nofork_hooks.commit = noforkExtentCommit;
-    nofork_hooks.decommit = noforkExtentDecommit;
+    hybrid_arena_hooks = *hybrid_arena_default_hooks;       /* keeps NULL purge hooks when unsupported */
+    hybrid_arena_hooks.alloc = hybridArenaExtentAlloc;
+    hybrid_arena_hooks.dalloc = hybridArenaExtentDalloc;
+    hybrid_arena_hooks.destroy = hybridArenaExtentDestroy;
+    hybrid_arena_hooks.commit = hybridArenaExtentCommit;
+    hybrid_arena_hooks.decommit = hybridArenaExtentDecommit;
     /* purge_lazy, purge_forced, split, merge: defaults (madvise / bookkeeping). */
 
     /* arenas.create would allocate the arena's own metadata through these
@@ -470,21 +470,21 @@ int zmalloc_nofork_arena_init(void) {
      * variant lets metadata use the default (forkable) mappings. Mirrors
      * jemalloc 5.3's internal arena_config_t. */
     struct { extent_hooks_t *extent_hooks; bool metadata_use_hooks; } cfg = {
-        .extent_hooks = &nofork_hooks,
+        .extent_hooks = &hybrid_arena_hooks,
         .metadata_use_hooks = false,
     };
     unsigned arena;
     sz = sizeof(arena);
     if (je_mallctl("experimental.arenas_create_ext", &arena, &sz, &cfg, sizeof(cfg)) != 0) {
-        munmap(zmalloc_nofork_lo, zmalloc_nofork_hi - zmalloc_nofork_lo);
-        zmalloc_nofork_lo = zmalloc_nofork_hi = nofork_bump = NULL;
+        munmap(zmalloc_hybrid_arena_lo, zmalloc_hybrid_arena_hi - zmalloc_hybrid_arena_lo);
+        zmalloc_hybrid_arena_lo = zmalloc_hybrid_arena_hi = hybrid_arena_bump = NULL;
         return 0;
     }
-    zmalloc_nofork_arena = arena;
+    zmalloc_hybrid_arena = arena;
     return 1;
 }
 
-void zmalloc_nofork_set_active(int active) { zmalloc_nofork_active = (zmalloc_nofork_arena != UINT_MAX) && active; }
+void zmalloc_hybrid_arena_set_active(int active) { zmalloc_hybrid_arena_active = (zmalloc_hybrid_arena != UINT_MAX) && active; }
 
 /* Flip the whole reserved range between MADV_DONTFORK (children never map it)
  * and MADV_DOFORK (a stock fork child sees it, at copy-on-write cost). The
@@ -492,90 +492,90 @@ void zmalloc_nofork_set_active(int active) { zmalloc_nofork_active = (zmalloc_no
  * so one madvise over [lo, hi) covers every extent, present and future
  * (alloc/commit never re-apply a flag). Affects forks made after the call
  * only; running children are unaffected. Returns 1 on success. */
-int zmalloc_nofork_arena_set_forkable(int forkable) {
-    if (zmalloc_nofork_arena == UINT_MAX) return 0;
-    if (nofork_forkable == !!forkable) return 1;
-    if (madvise(zmalloc_nofork_lo, zmalloc_nofork_hi - zmalloc_nofork_lo,
+int zmalloc_hybrid_arena_set_forkable(int forkable) {
+    if (zmalloc_hybrid_arena == UINT_MAX) return 0;
+    if (hybrid_arena_forkable == !!forkable) return 1;
+    if (madvise(zmalloc_hybrid_arena_lo, zmalloc_hybrid_arena_hi - zmalloc_hybrid_arena_lo,
                 forkable ? MADV_DOFORK : MADV_DONTFORK) != 0)
         return 0;
-    nofork_forkable = !!forkable;
+    hybrid_arena_forkable = !!forkable;
     return 1;
 }
-int zmalloc_nofork_arena_forkable(void) { return nofork_forkable; }
-unsigned zmalloc_nofork_arena_index(void) { return zmalloc_nofork_arena; }
+int zmalloc_hybrid_arena_forkable(void) { return hybrid_arena_forkable; }
+unsigned zmalloc_hybrid_arena_index(void) { return zmalloc_hybrid_arena; }
 
-void zmalloc_nofork_va_stats(size_t *reserved, size_t *used) {
-    if (reserved) *reserved = zmalloc_nofork_hi - zmalloc_nofork_lo;
-    if (used) *used = __atomic_load_n(&nofork_bump, __ATOMIC_RELAXED) - zmalloc_nofork_lo;
+void zmalloc_hybrid_arena_va_stats(size_t *reserved, size_t *used) {
+    if (reserved) *reserved = zmalloc_hybrid_arena_hi - zmalloc_hybrid_arena_lo;
+    if (used) *used = __atomic_load_n(&hybrid_arena_bump, __ATOMIC_RELAXED) - zmalloc_hybrid_arena_lo;
 }
 
-int zmalloc_nofork_arena_range(void **lo, size_t *len) {
-    *lo = zmalloc_nofork_lo;
-    *len = zmalloc_nofork_hi - zmalloc_nofork_lo;
-    return zmalloc_nofork_lo != NULL;
+int zmalloc_hybrid_arena_range(void **lo, size_t *len) {
+    *lo = zmalloc_hybrid_arena_lo;
+    *len = zmalloc_hybrid_arena_hi - zmalloc_hybrid_arena_lo;
+    return zmalloc_hybrid_arena_lo != NULL;
 }
 
 /* Per-thread flags: the arena plus an explicit tcache created lazily. Explicit
  * tcaches may be used by one thread at a time (jemalloc), hence per thread;
  * only arena blocks ever pass through them, so they cannot hand arena memory
  * to default allocations or vice versa. Threads are long lived: never destroyed. */
-static int noforkThreadFlagsInit(void) {
+static int hybridArenaThreadFlagsInit(void) {
     unsigned tcache;
     size_t sz = sizeof(tcache);
-    int flags = MALLOCX_ARENA(zmalloc_nofork_arena);
+    int flags = MALLOCX_ARENA(zmalloc_hybrid_arena);
     if (je_mallctl("tcache.create", &tcache, &sz, NULL, 0) == 0)
         flags |= MALLOCX_TCACHE(tcache);
     else
         flags |= MALLOCX_TCACHE_NONE;
-    nofork_thread_flags = flags;
+    hybrid_arena_thread_flags = flags;
     return flags;
 }
 
-static inline int noforkFlags(void) {
-    int flags = nofork_thread_flags;
-    if (flags == 0) flags = noforkThreadFlagsInit();
+static inline int hybridArenaFlags(void) {
+    int flags = hybrid_arena_thread_flags;
+    if (flags == 0) flags = hybridArenaThreadFlagsInit();
     return flags;
 }
 
 /* Slow halves of the inline entry points in zmalloc.h: only reached when the
  * arena exists. */
-void *zmalloc_nofork_slow(size_t size) {
-    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), noforkFlags());
+void *zmalloc_hybrid_slow(size_t size) {
+    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), hybridArenaFlags());
 }
 
-void *zcalloc_nofork_slow(size_t size) {
-    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
+void *zcalloc_hybrid_slow(size_t size) {
+    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), hybridArenaFlags() | MALLOCX_ZERO);
 }
 
-void *zmalloc_nofork_usable_slow(size_t size, size_t *usable) {
-    void *ptr = zmalloc_nofork_slow(size);
+void *zmalloc_hybrid_usable_slow(size_t size, size_t *usable) {
+    void *ptr = zmalloc_hybrid_slow(size);
     if (usable) *usable = zmalloc_size(ptr);
     return ptr;
 }
 
-void *zrealloc_nofork(void *ptr, size_t size) {
-    if (ptr == NULL) return zmalloc_nofork(size);
+void *zrealloc_hybrid(void *ptr, size_t size) {
+    if (ptr == NULL) return zmalloc_hybrid(size);
     return zrealloc(ptr, size);   /* range-aware: an arena pointer stays in the arena */
 }
 
-void *ztrycalloc_nofork(size_t size) {
-    if (!zmalloc_nofork_enabled()) return ztrycalloc(size);
+void *ztrycalloc_hybrid(size_t size) {
+    if (!zmalloc_hybrid_arena_enabled()) return ztrycalloc(size);
     if (size >= SIZE_MAX/2) return NULL;
-    void *ptr = mallocx(MALLOC_MIN_SIZE(size), noforkFlags() | MALLOCX_ZERO);
+    void *ptr = mallocx(MALLOC_MIN_SIZE(size), hybridArenaFlags() | MALLOCX_ZERO);
     if (ptr) update_zmalloc_stat_alloc(zmalloc_size(ptr));
     return ptr;
 }
 
 /* For defrag: bypass the thread cache so a freed block cannot be handed back. */
-void *zmalloc_nofork_no_tcache(size_t size) {
-    if (zmalloc_nofork_arena == UINT_MAX) return zmalloc(size);
-    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), MALLOCX_ARENA(zmalloc_nofork_arena) | MALLOCX_TCACHE_NONE);
+void *zmalloc_hybrid_arena_no_tcache(size_t size) {
+    if (zmalloc_hybrid_arena == UINT_MAX) return zmalloc(size);
+    return zmalloc_with_flags(MALLOC_MIN_SIZE(size), MALLOCX_ARENA(zmalloc_hybrid_arena) | MALLOCX_TCACHE_NONE);
 }
 
 /* Realloc of an arena pointer: stays in the arena. */
-static inline void *noforkRealloc(void *ptr, size_t size, size_t *usable, size_t *old_usable) {
+static inline void *hybridArenaRealloc(void *ptr, size_t size, size_t *usable, size_t *old_usable) {
     size_t oldsize = zmalloc_size(ptr);
-    void *newptr = rallocx(ptr, size, noforkFlags());
+    void *newptr = rallocx(ptr, size, hybridArenaFlags());
     if (newptr == NULL) {
         if (usable) *usable = 0;
         if (old_usable) *old_usable = oldsize;
@@ -588,7 +588,7 @@ static inline void *noforkRealloc(void *ptr, size_t size, size_t *usable, size_t
     if (old_usable) *old_usable = oldsize;
     return newptr;
 }
-#endif /* HAVE_NOFORK_ARENA */
+#endif /* HAVE_HYBRID_ARENA */
 
 /* Allocation and free functions that bypass the thread cache
  * and go straight to the allocator arena bins.
@@ -605,9 +605,9 @@ void *zmalloc_no_tcache(size_t size) {
 void zfree_no_tcache(void *ptr) {
     if (ptr == NULL) return;
     update_zmalloc_stat_free(zmalloc_size(ptr));
-#ifdef HAVE_NOFORK_ARENA
-    if (zmalloc_is_nofork(ptr)) {
-        dallocx(ptr, MALLOCX_ARENA(zmalloc_nofork_arena_index()) | MALLOCX_TCACHE_NONE);
+#ifdef HAVE_HYBRID_ARENA
+    if (zmalloc_in_hybrid_arena(ptr)) {
+        dallocx(ptr, MALLOCX_ARENA(zmalloc_hybrid_arena_index()) | MALLOCX_TCACHE_NONE);
         return;
     }
 #endif
@@ -728,9 +728,9 @@ static inline void *ztryrealloc_usable_internal(void *ptr, size_t size, size_t *
         *old_usable = oldsize;
         return NULL;
     }
-#ifdef HAVE_NOFORK_ARENA
-    /* HYBSNAP_NOFORK arena memory must stay in the arena. */
-    if (unlikely(zmalloc_is_nofork(ptr))) return noforkRealloc(ptr, size, usable, old_usable);
+#ifdef HAVE_HYBRID_ARENA
+    /* Hybrid arena memory must stay in the arena. */
+    if (unlikely(zmalloc_in_hybrid_arena(ptr))) return hybridArenaRealloc(ptr, size, usable, old_usable);
 #endif
 #ifdef HAVE_ALLOC_WITH_USIZE
     newptr = realloc_with_usize(ptr, size, &oldsize, &size);
@@ -829,20 +829,20 @@ size_t zmalloc_usable_size(void *ptr) {
 }
 #endif
 
-#ifdef HAVE_NOFORK_ARENA
-static void __attribute__((noinline, cold)) zfreeNoforkCold(void *ptr) { zfree_with_flags(ptr, noforkFlags()); }
-static void __attribute__((noinline, cold)) zfreeNoforkSizeCold(void *ptr, size_t size) { je_sdallocx(ptr, size, noforkFlags()); }
-static void __attribute__((noinline, cold)) zfreeNoforkUsableCold(void *ptr, size_t *usable) {
+#ifdef HAVE_HYBRID_ARENA
+static void __attribute__((noinline, cold)) zfreeHybridCold(void *ptr) { zfree_with_flags(ptr, hybridArenaFlags()); }
+static void __attribute__((noinline, cold)) zfreeHybridSizeCold(void *ptr, size_t size) { je_sdallocx(ptr, size, hybridArenaFlags()); }
+static void __attribute__((noinline, cold)) zfreeHybridUsableCold(void *ptr, size_t *usable) {
     size_t oldsize = zmalloc_size(ptr);
-    zfree_with_size_and_flags(ptr, oldsize, noforkFlags());
+    zfree_with_size_and_flags(ptr, oldsize, hybridArenaFlags());
     if (usable) *usable = oldsize;
 }
 #endif
 
 void zfree(void *ptr) {
     if (ptr == NULL) return;
-#ifdef HAVE_NOFORK_ARENA
-    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkCold(ptr); return; }
+#ifdef HAVE_HYBRID_ARENA
+    if (unlikely(zmalloc_in_hybrid_arena(ptr))) { zfreeHybridCold(ptr); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -872,8 +872,8 @@ void zfree_usable(void *ptr, size_t *usable) {
         if (usable) *usable = 0;
         return;
     }
-#ifdef HAVE_NOFORK_ARENA
-    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkUsableCold(ptr, usable); return; }
+#ifdef HAVE_HYBRID_ARENA
+    if (unlikely(zmalloc_in_hybrid_arena(ptr))) { zfreeHybridUsableCold(ptr, usable); return; }
 #endif
 
 #ifdef HAVE_ALLOC_WITH_USIZE
@@ -899,8 +899,8 @@ void zfree_with_size(void *ptr, size_t size) {
     if (ptr == NULL) return;
 #ifdef USE_JEMALLOC
     update_zmalloc_stat_free(size);
-#ifdef HAVE_NOFORK_ARENA
-    if (unlikely(zmalloc_is_nofork(ptr))) { zfreeNoforkSizeCold(ptr, size); return; }
+#ifdef HAVE_HYBRID_ARENA
+    if (unlikely(zmalloc_in_hybrid_arena(ptr))) { zfreeHybridSizeCold(ptr, size); return; }
 #endif
     je_sdallocx(ptr, size, 0);
 #else
@@ -1336,10 +1336,10 @@ void set_jemalloc_bg_thread(int enable) {
  * kept 30 MB of arena slabs resident, which the arena purge below cannot
  * release. Called by jemalloc_purge() (FLUSHALL/FLUSHDB, lazyfree, MEMORY
  * PURGE). */
-static void noforkTcacheFlush(void) {
-#ifdef HAVE_NOFORK_ARENA
-    int flags = nofork_thread_flags;
-    if (zmalloc_nofork_arena == UINT_MAX || flags == 0) return;
+static void hybridArenaTcacheFlush(void) {
+#ifdef HAVE_HYBRID_ARENA
+    int flags = hybrid_arena_thread_flags;
+    if (zmalloc_hybrid_arena == UINT_MAX || flags == 0) return;
     unsigned tc = ((unsigned)flags >> 8) & 0xfff;   /* MALLOCX_TCACHE(t) == (t+2) << 8 */
     if (tc >= 2) { tc -= 2; je_mallctl("tcache.flush", NULL, NULL, &tc, sizeof(tc)); }
 #endif
@@ -1352,14 +1352,14 @@ static void noforkTcacheFlush(void) {
  * cannot bring the arena's fragmentation down (found by unit/memefficiency
  * with hybrid-snapshot yes: 12.5 MB of the 12.9 MB it could not remove were in
  * the arena). */
-void zmalloc_nofork_tcache_flush(void) { noforkTcacheFlush(); }
+void zmalloc_hybrid_arena_tcache_flush(void) { hybridArenaTcacheFlush(); }
 
 int jemalloc_purge(void) {
     /* return all unused (reserved) pages to the OS */
     char tmp[32];
     unsigned narenas = 0;
     size_t sz = sizeof(unsigned);
-    noforkTcacheFlush();
+    hybridArenaTcacheFlush();
     if (!je_mallctl("arenas.narenas", &narenas, &sz, NULL, 0)) {
         snprintf(tmp, sizeof(tmp), "arena.%u.purge", narenas);
         if (!je_mallctl(tmp, NULL, 0, NULL, 0))
@@ -1394,9 +1394,9 @@ void set_jemalloc_bg_thread(int enable) {
     ((void)(enable));
 }
 
-void zmalloc_nofork_set_active(int active) { (void)active; }
-void zmalloc_nofork_tcache_flush(void) { }
-int zmalloc_nofork_arena_range(void **lo, size_t *len) { *lo = NULL; *len = 0; return 0; }
+void zmalloc_hybrid_arena_set_active(int active) { (void)active; }
+void zmalloc_hybrid_arena_tcache_flush(void) { }
+int zmalloc_hybrid_arena_range(void **lo, size_t *len) { *lo = NULL; *len = 0; return 0; }
 
 int jemalloc_purge(void) {
     return 0;

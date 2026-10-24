@@ -336,7 +336,7 @@ static hybsnapSave *hybsnap_save = NULL;   /* the running hybrid save, main thre
 
 /* ---- Function declarations (used only in this file) ------------------- */
 
-/* ---- HYBSNAP_NOFORK arena ------------------------------------------------ */
+/* ---- hybrid arena ------------------------------------------------ */
 
 /* Address range reserved for the arena, and the part handed to jemalloc so far (0 if unavailable). */
 static size_t hybsnapArenaVaReserved(void);
@@ -466,19 +466,19 @@ void updateSlotAllocSize(redisDb *db, int didx, kvobj *kv, int64_t oldsize, int6
  * listpack, intset and dict code keep arena memory in the arena without
  * knowing about classes. These are the snapshot-facing entry points. */
 void hybsnapArenaInit(void) {
-#ifdef HAVE_NOFORK_ARENA
-    if (!zmalloc_nofork_arena_init()) {
-        serverLog(LL_WARNING, "HYBSNAP_NOFORK arena disabled: could not reserve a DONTFORK address "
+#ifdef HAVE_HYBRID_ARENA
+    if (!zmalloc_hybrid_arena_init()) {
+        serverLog(LL_WARNING, "Hybrid arena disabled: could not reserve a DONTFORK address "
                               "range or create the jemalloc arena; hybrid snapshot runs without it.");
         return;
     }
-    zmalloc_nofork_set_active(server.hybrid_snapshot);       /* new headers, tables and values go there only when on */
+    zmalloc_hybrid_arena_set_active(server.hybrid_snapshot);       /* new headers, tables and values go there only when on */
     if (!server.hybrid_snapshot) hybsnapArenaSetForkable(1);   /* nothing is placed in it; classic forks map it */
-    serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena created (jemalloc arena %u, %zu GB of address space reserved, "
-                         "%s).", zmalloc_nofork_arena_index(), hybsnapArenaVaReserved() >> 30,
+    serverLog(LL_NOTICE, "Hybrid arena created (jemalloc arena %u, %zu GB of address space reserved, "
+                         "%s).", zmalloc_hybrid_arena_index(), hybsnapArenaVaReserved() >> 30,
                          server.hybrid_snapshot ? "MADV_DONTFORK: hybrid snapshot on" : "forkable: hybrid-snapshot no");
 #else
-    serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena unavailable on this platform/allocator (needs 64-bit Linux "
+    serverLog(LL_NOTICE, "Hybrid arena unavailable on this platform/allocator (needs 64-bit Linux "
                          "with jemalloc); hybrid snapshot, if enabled, runs without it.");
 #endif
 }
@@ -511,18 +511,18 @@ static void hybsnapHybridFallbackLog(void) {
  * back once no child is left (hybsnapArenaChildExited). One madvise each way,
  * O(1) in keys; that child pays classic copy-on-write. */
 int hybsnapArenaForkable(void) {
-#ifdef HAVE_NOFORK_ARENA
-    return hybsnapArenaExists() && zmalloc_nofork_arena_forkable();
+#ifdef HAVE_HYBRID_ARENA
+    return hybsnapArenaExists() && zmalloc_hybrid_arena_forkable();
 #else
     return 0;
 #endif
 }
 
 static int hybsnapArenaSetForkable(int forkable) {
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
     if (!hybsnapArenaExists()) return 0;
-    if (!zmalloc_nofork_arena_set_forkable(forkable)) {
-        serverLog(LL_WARNING, "HYBSNAP_NOFORK arena: madvise(%s) failed: %s",
+    if (!zmalloc_hybrid_arena_set_forkable(forkable)) {
+        serverLog(LL_WARNING, "Hybrid arena: madvise(%s) failed: %s",
                   forkable ? "MADV_DOFORK" : "MADV_DONTFORK", strerror(errno));
         return 0;
     }
@@ -540,7 +540,7 @@ void hybsnapArenaBeforeFork(int purpose) {
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
     if (hybsnapArenaSetForkable(1)) {
         hybsnap_arena_fallback = 1;
-        serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena made forkable for a %s child (classic copy-on-write applies)",
+        serverLog(LL_NOTICE, "Hybrid arena made forkable for a %s child (classic copy-on-write applies)",
                   strChildType(purpose));
     }
 }
@@ -550,20 +550,20 @@ void hybsnapArenaChildExited(void) {
     if (hasActiveChildProcess() || ldbPendingChildren()) return;   /* another classic child still runs */
     hybsnap_arena_fallback = 0;
     if (server.hybrid_snapshot && hybsnapArenaSetForkable(0))
-        serverLog(LL_NOTICE, "HYBSNAP_NOFORK arena back to MADV_DONTFORK");
+        serverLog(LL_NOTICE, "Hybrid arena back to MADV_DONTFORK");
 }
 
 /* Child forked without the keyspace, first thing after the fork: the arena's
  * range is not mapped here (MADV_DONTFORK), so the kernel would hand its
  * addresses to our own allocations as the heap grows; zmalloc routes frees and
- * reallocs by address (zmalloc_is_nofork), so such a block would be
+ * reallocs by address (zmalloc_in_hybrid_arena), so such a block would be
  * reallocated in the parent-only arena and the write would fault (seen as a
  * crash in the hybrid child's pipe reader). Reserve the whole range PROT_NONE
  * so nothing of ours can land in it. */
 static void hybsnapChildReserveArenaRange(void) {
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
     void *lo; size_t len;
-    if (!zmalloc_nofork_arena_range(&lo, &len)) return;
+    if (!zmalloc_hybrid_arena_range(&lo, &len)) return;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
@@ -596,7 +596,7 @@ int hybsnapForkNoKeyspace(int purpose) {
 }
 
 /* CONFIG SET hybrid-snapshot apply hook: flips the arena, refuses mid-save.
- * Saves take the hybrid path whether or not the HYBSNAP_NOFORK arena exists
+ * Saves take the hybrid path whether or not the hybrid arena exists
  * (without it the CoW benefit is gone but the mechanics are identical, which
  * is what sanitizer builds exercise). Switching is O(1): the arena is flipped
  * forkable when off, and values allocated meanwhile simply live in the
@@ -611,22 +611,22 @@ int hybsnapHybridConfigApply(const char **err) {
         /* On: children stop mapping the arena; off: they must map it. Values
          * placed so far stay where they are, the switch itself is O(1). */
         if (!hybsnapArenaSetForkable(!server.hybrid_snapshot)) {
-            *err = "HYBSNAP_NOFORK arena: madvise failed, see the server log";
+            *err = "Hybrid arena: madvise failed, see the server log";
             return 0;
         }
-        zmalloc_nofork_set_active(server.hybrid_snapshot);
+        zmalloc_hybrid_arena_set_active(server.hybrid_snapshot);
         hybsnap_arena_fallback = 0;
     }
     serverLog(LL_NOTICE, "Hybrid snapshot switched %s at runtime%s", server.hybrid_snapshot ? "on" : "off",
-              hybsnapArenaExists() ? "" : " (no HYBSNAP_NOFORK arena on this platform)");
+              hybsnapArenaExists() ? "" : " (no hybrid arena on this platform)");
     return 1;
 }
 
 
 static size_t hybsnapArenaVaReserved(void) {
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
     size_t reserved = 0;
-    if (hybsnapArenaExists()) zmalloc_nofork_va_stats(&reserved, NULL);
+    if (hybsnapArenaExists()) zmalloc_hybrid_arena_va_stats(&reserved, NULL);
     return reserved;
 #else
     return 0;
@@ -634,9 +634,9 @@ static size_t hybsnapArenaVaReserved(void) {
 }
 
 static size_t hybsnapArenaVaUsed(void) {
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
     size_t used = 0;
-    if (hybsnapArenaExists()) zmalloc_nofork_va_stats(NULL, &used);
+    if (hybsnapArenaExists()) zmalloc_hybrid_arena_va_stats(NULL, &used);
     return used;
 #else
     return 0;
@@ -699,7 +699,7 @@ static void *hybsnapValueAllocPtr(const robj *o) {
 /* Actual class of a stored key, decided by where its value memory IS: a key is
  * HYBSNAP_NOFORK when its value has no separate allocation or when its single
  * allocation (for listpack-ex: both the struct and its listpack) lies in the
- * HYBSNAP_NOFORK arena; otherwise HYBSNAP_FORK. The background scan serializes
+ * hybrid arena; otherwise HYBSNAP_FORK. The background scan serializes
  * HYBSNAP_NOFORK keys itself and ships HYBSNAP_FORK keys to the fork child, so this
  * is correct regardless of policy drift. */
 static hybsnapValueClass hybsnapKeyClass(const robj *o) {
@@ -716,37 +716,37 @@ static hybsnapValueClass hybsnapKeyClass(const robj *o) {
      * by the background thread, wherever the listpack itself lives. */
     /* The arena is a range: the value pointer is as good as its allocation
      * start, and is never dereferenced (hybsnapOriginalSharesValue relies on it). */
-    if (o->ptr == NULL || !zmalloc_is_nofork(o->ptr)) return HYBSNAP_FORK;
+    if (o->ptr == NULL || !zmalloc_in_hybrid_arena(o->ptr)) return HYBSNAP_FORK;
     return HYBSNAP_NOFORK;
 }
 
 /* Copy an sds into the requested arena. */
-static sds hybsnapSdsCopy(sds s, int to_nofork) {
+static sds hybsnapSdsCopy(sds s, int to_arena) {
     size_t len = sdslen(s);
     char type = sdsReqType(len);
     size_t need = sdsReqSize(len, type);
     size_t usable = 0;
-    char *buf = to_nofork ? zmalloc_nofork_usable(need, &usable) : zmalloc_usable(need, &usable);
+    char *buf = to_arena ? zmalloc_hybrid_usable(need, &usable) : zmalloc_usable(need, &usable);
     return sdsnewplacement(buf, usable, type, s, len);
 }
 
 /* Copy an sds into the requested arena and free the original. */
-static sds hybsnapSdsMove(sds s, int to_nofork) {
-    sds ns = hybsnapSdsCopy(s, to_nofork);
+static sds hybsnapSdsMove(sds s, int to_arena) {
+    sds ns = hybsnapSdsCopy(s, to_arena);
     sdsfree(s); /* range-aware */
     return ns;
 }
 
 /* Copy 'bytes' bytes of a blob (listpack, intset, struct) into the requested arena. */
-static void *hybsnapBlobCopy(void *p, size_t bytes, int to_nofork) {
-    void *n = to_nofork ? zmalloc_nofork(bytes) : zmalloc(bytes);
+static void *hybsnapBlobCopy(void *p, size_t bytes, int to_arena) {
+    void *n = to_arena ? zmalloc_hybrid(bytes) : zmalloc(bytes);
     memcpy(n, p, bytes);
     return n;
 }
 
 /* Same, freeing the original. */
-static void *hybsnapBlobMove(void *p, size_t bytes, int to_nofork) {
-    void *n = hybsnapBlobCopy(p, bytes, to_nofork);
+static void *hybsnapBlobMove(void *p, size_t bytes, int to_arena) {
+    void *n = hybsnapBlobCopy(p, bytes, to_arena);
     zfree(p); /* range-aware */
     return n;
 }
@@ -772,7 +772,7 @@ void hybsnapPlaceValueArena(robj *o) {
         sds s = o->ptr;
         void *a = sdsAllocPtr(s);
         hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(a));
-        int in = zmalloc_is_nofork(a);
+        int in = zmalloc_in_hybrid_arena(a);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapSdsMove(s, 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapSdsMove(s, 0);
         break;
@@ -780,7 +780,7 @@ void hybsnapPlaceValueArena(robj *o) {
     case OBJ_ENCODING_LISTPACK: {
         unsigned char *lp = o->ptr;
         hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(lp));
-        int in = zmalloc_is_nofork(lp);
+        int in = zmalloc_in_hybrid_arena(lp);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(lp, lpBytes(lp), 0);
         break;
@@ -788,7 +788,7 @@ void hybsnapPlaceValueArena(robj *o) {
     case OBJ_ENCODING_INTSET: {
         intset *is = o->ptr;
         hybsnapValueClass want = force_fork ? HYBSNAP_FORK : hybsnapClassify(o->type, o->encoding, zmalloc_size(is));
-        int in = zmalloc_is_nofork(is);
+        int in = zmalloc_in_hybrid_arena(is);
         if (want == HYBSNAP_NOFORK && !in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 1);
         else if (want == HYBSNAP_FORK && in) o->ptr = hybsnapBlobMove(is, intsetBlobLen(is), 0);
         break;
@@ -802,8 +802,8 @@ void hybsnapPlaceValueArena(robj *o) {
          * listpack must be outside too, or the fork child would dereference
          * arena memory. */
         listpackEx *lpt = o->ptr;
-        int lp_in = zmalloc_is_nofork(lpt->lp);
-        int st_in = zmalloc_is_nofork(lpt);
+        int lp_in = zmalloc_in_hybrid_arena(lpt->lp);
+        int st_in = zmalloc_in_hybrid_arena(lpt);
         if (force_fork) {
             /* Module metadata: both pieces must leave the arena. Moving the
              * struct is only legal while its ExpireMeta is not registered in
@@ -814,7 +814,7 @@ void hybsnapPlaceValueArena(robj *o) {
                 lpt = hybsnapBlobMove(lpt, sizeof(*lpt), 0);
                 o->ptr = lpt;
             }
-            if (zmalloc_is_nofork(lpt->lp)) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
+            if (zmalloc_in_hybrid_arena(lpt->lp)) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 0);
             break;
         }
         if (st_in && !lp_in) lpt->lp = hybsnapBlobMove(lpt->lp, lpBytes(lpt->lp), 1);
@@ -830,10 +830,10 @@ static void hybsnapPlacementScanTables(kvstore *kvs, hybsnapPlacementStats *st) 
     for (int didx = 0; didx < kvstoreNumDicts(kvs); didx++) {
         dict *d = kvstoreGetDict(kvs, didx);
         if (d == NULL) continue;
-        if (zmalloc_is_nofork(d)) st->dict_tables_in_arena++; else st->dict_tables_outside++;
+        if (zmalloc_in_hybrid_arena(d)) st->dict_tables_in_arena++; else st->dict_tables_outside++;
         for (int t = 0; t < 2; t++) {
             if (d->ht_table[t] == NULL) continue;
-            if (zmalloc_is_nofork(d->ht_table[t])) st->dict_tables_in_arena++; else st->dict_tables_outside++;
+            if (zmalloc_in_hybrid_arena(d->ht_table[t])) st->dict_tables_in_arena++; else st->dict_tables_outside++;
         }
     }
 }
@@ -846,7 +846,7 @@ static void hybsnapPlacementScanTables(kvstore *kvs, hybsnapPlacementStats *st) 
 static kvobj *hybsnapKvobjCloneHeader(kvobj *orig) {
     char *alloc = kvobjGetAllocPtr(orig);
     size_t size = zmalloc_size(alloc);
-    char *nalloc = zmalloc_nofork(size);
+    char *nalloc = zmalloc_hybrid(size);
     memcpy(nalloc, alloc, size);
     kvobj *kv = (kvobj *)(nalloc + ((char *)orig - alloc));
     if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
@@ -900,9 +900,9 @@ static void *hybsnapOverlayCloneKey(void *privdata, int didx, void *orig_) {
             /* Private copy (struct + listpack) with a fresh ExpireMeta. */
             listpackEx *o = orig->ptr;
             if (nofork) {
-                listpackEx *n = zcalloc_nofork(sizeof(*n));
+                listpackEx *n = zcalloc_hybrid(sizeof(*n));
                 n->meta.trash = 1;
-                n->lp = hybsnapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_is_nofork(o->lp));
+                n->lp = hybsnapBlobCopy(o->lp, lpBytes(o->lp), zmalloc_in_hybrid_arena(o->lp));
                 kv->ptr = n;
             } else {
                 shared = 1;
@@ -965,7 +965,7 @@ static int hybsnapOriginalSharesValue(const kvobj *orig) {
     case OBJ_ENCODING_INTSET:
     case OBJ_ENCODING_LISTPACK_EX:
         if (!hybsnapEncodingIsNoforkClass(orig->type, orig->encoding)) return 1;
-        return hybsnapArenaExists() ? !zmalloc_is_nofork(orig->ptr) : 0;
+        return hybsnapArenaExists() ? !zmalloc_in_hybrid_arena(orig->ptr) : 0;
     default:
         return 1;
     }
@@ -996,14 +996,14 @@ void hybsnapValueDetachFromArena(robj *o) {
     switch (o->encoding) {
     case OBJ_ENCODING_RAW: {
         void *a = sdsAllocPtr(o->ptr);
-        if (zmalloc_is_nofork(a)) o->ptr = hybsnapSdsMove(o->ptr, 0);
+        if (zmalloc_in_hybrid_arena(a)) o->ptr = hybsnapSdsMove(o->ptr, 0);
         break;
     }
     case OBJ_ENCODING_LISTPACK:
-        if (zmalloc_is_nofork(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, lpBytes(o->ptr), 0);
+        if (zmalloc_in_hybrid_arena(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, lpBytes(o->ptr), 0);
         break;
     case OBJ_ENCODING_INTSET:
-        if (zmalloc_is_nofork(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, intsetBlobLen(o->ptr), 0);
+        if (zmalloc_in_hybrid_arena(o->ptr)) o->ptr = hybsnapBlobMove(o->ptr, intsetBlobLen(o->ptr), 0);
         break;
     default:
         break;
@@ -1021,18 +1021,18 @@ static void hybsnapPlacementDriftReply(client *c, redisDb *db, int limit) {
     while ((de = kvstoreIteratorNext(&kvs_it)) != NULL && n < limit) {
         kvobj *kv = dictGetKV(de);
         const char *drift = NULL;
-        if (!zmalloc_is_nofork(kv)) drift = "header-outside";
+        if (!zmalloc_in_hybrid_arena(kv)) drift = "header-outside";
         else if (!hybsnapEncodingIsNoforkClass(kv->type, kv->encoding)) {
-            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) drift = "fork-value-in-arena";
+            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_in_hybrid_arena(kv->ptr)) drift = "fork-value-in-arena";
         } else if (hybsnapValueIsInline(kv->type, kv->encoding)) {
             drift = NULL;
         } else if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
             listpackEx *lpt = kv->ptr;
-            if (zmalloc_is_nofork(lpt) != zmalloc_is_nofork(lpt->lp)) drift = "listpackex-split";
+            if (zmalloc_in_hybrid_arena(lpt) != zmalloc_in_hybrid_arena(lpt->lp)) drift = "listpackex-split";
         } else {
             void *a = hybsnapValueAllocPtr(kv);
             hybsnapValueClass want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
-            int in = zmalloc_is_nofork(a);
+            int in = zmalloc_in_hybrid_arena(a);
             if (want == HYBSNAP_NOFORK && !in) drift = "nofork-outside";
             if (want == HYBSNAP_FORK && in) drift = "fork-inside";
         }
@@ -1058,7 +1058,7 @@ static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
     while ((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
         kvobj *kv = dictGetKV(de);
         st->keys++;
-        int hdr_in = zmalloc_is_nofork(kv);
+        int hdr_in = zmalloc_in_hybrid_arena(kv);
         if (hdr_in) st->headers_in_arena++; else { st->headers_outside++; st->violations++; }
 
         hybsnapValueClass cls = hybsnapKeyClass(kv);
@@ -1070,26 +1070,26 @@ static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
             if (cls == HYBSNAP_NOFORK && !hybsnapValueIsInline(kv->type, kv->encoding)) st->violations++;
             if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
                 listpackEx *lpt = kv->ptr;
-                if (zmalloc_is_nofork(lpt) || zmalloc_is_nofork(lpt->lp)) st->violations++;
+                if (zmalloc_in_hybrid_arena(lpt) || zmalloc_in_hybrid_arena(lpt->lp)) st->violations++;
             }
             continue;
         }
 
         if (!hybsnapEncodingIsNoforkClass(kv->type, kv->encoding)) {
             /* Multi-allocation value: its top-level allocation must be forkable. */
-            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_is_nofork(kv->ptr)) st->violations++;
+            if (kv->ptr && kv->encoding != OBJ_ENCODING_INT && zmalloc_in_hybrid_arena(kv->ptr)) st->violations++;
             /* Quicklists adopt listpacks: every node must be forkable too. */
             if (kv->encoding == OBJ_ENCODING_QUICKLIST) {
                 quicklist *ql = kv->ptr;
                 for (quicklistNode *node = ql->head; node; node = node->next)
-                    if (zmalloc_is_nofork(node->entry)) st->violations++;
+                    if (zmalloc_in_hybrid_arena(node->entry)) st->violations++;
             }
             continue;
         }
         if (hybsnapValueIsInline(kv->type, kv->encoding)) continue;
         if (kv->encoding == OBJ_ENCODING_LISTPACK_EX) {
             listpackEx *lpt = kv->ptr;
-            int st_in = zmalloc_is_nofork(lpt), lp_in = zmalloc_is_nofork(lpt->lp);
+            int st_in = zmalloc_in_hybrid_arena(lpt), lp_in = zmalloc_in_hybrid_arena(lpt->lp);
             if (st_in && !lp_in) st->drift_nofork_outside++;
             if (!st_in && lp_in) st->violations++;   /* child would read arena memory */
             if (!st_in && hdr_in) st->drift_nofork_outside++;   /* legacy struct outside */
@@ -1097,7 +1097,7 @@ static void hybsnapPlacementScan(redisDb *db, hybsnapPlacementStats *st) {
         }
         void *a = hybsnapValueAllocPtr(kv);
         hybsnapValueClass want = hybsnapClassify(kv->type, kv->encoding, zmalloc_size(a));
-        int in = zmalloc_is_nofork(a);
+        int in = zmalloc_in_hybrid_arena(a);
         if (want == HYBSNAP_NOFORK && !in) st->drift_nofork_outside++;
         if (want == HYBSNAP_FORK && in) st->drift_fork_inside++;
     }
@@ -2221,14 +2221,14 @@ static long long hybsnapSaveMainKeys(void) { long long n = 0; if (hybsnap_save) 
  * default arena's) and its fork visibility. */
 sds hybsnapInfoMemory(sds info) {
     return sdscatprintf(info, FMTARGS(
-        "allocator_allocated_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_allocated,
-        "allocator_active_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_active,
-        "allocator_resident_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_resident,
-        "allocator_frag_bytes_nofork:%zu\r\n", server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes,
-        "snap_nofork_arena_available:%d\r\n", hybsnapArenaExists(),
-        "snap_nofork_arena_forkable:%d\r\n", hybsnapArenaForkable(),
-        "snap_nofork_va_reserved:%zu\r\n", hybsnapArenaVaReserved(),
-        "snap_nofork_va_used:%zu\r\n", hybsnapArenaVaUsed()));
+        "allocator_allocated_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_allocated,
+        "allocator_active_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_active,
+        "allocator_resident_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_resident,
+        "allocator_frag_bytes_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_frag_smallbins_bytes,
+        "snap_hybrid_arena_available:%d\r\n", hybsnapArenaExists(),
+        "snap_hybrid_arena_forkable:%d\r\n", hybsnapArenaForkable(),
+        "snap_hybrid_arena_va_reserved:%zu\r\n", hybsnapArenaVaReserved(),
+        "snap_hybrid_arena_va_used:%zu\r\n", hybsnapArenaVaUsed()));
 }
 
 /* current_save_keys_processed during a hybrid save: the child sees only the
@@ -2438,7 +2438,7 @@ static void hybsnapSaveEmitBucket(hybsnapSave *sv, int s, int didx, dict *d, int
             /* The child resolves kv->ptr in its own memory: it must be forkable. */
             char *alloc = kvobjGetAllocPtr(kv);
             debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
-                              !zmalloc_is_nofork(kv->ptr));
+                              !zmalloc_in_hybrid_arena(kv->ptr));
             size_t len = zmalloc_size(alloc);
             sds copy = hybsnapMsgNew(len);
             copy = sdscatlen(copy, alloc, len);
@@ -3036,7 +3036,7 @@ static void hybsnapSaveDispatch(void *priv, int s, int didx, kvobj *kv) {
         size_t len = zmalloc_size(alloc);
         /* The child resolves kv->ptr in its own memory: it must be forkable. */
         debugServerAssert(kv->encoding == OBJ_ENCODING_INT || kv->encoding == OBJ_ENCODING_EMBSTR ||
-                          !zmalloc_is_nofork(kv->ptr));
+                          !zmalloc_in_hybrid_arena(kv->ptr));
         hybsnapSendMsg(sv, HYBSNAP_MSG_KVOBJ, s, didx, alloc, len, (uint32_t)((char *)kv - alloc), (uint64_t)(uintptr_t)alloc);
         atomicIncr(sv->keys_fork, 1);
         hybsnapSaveKeyDelay(sv, 1);
@@ -3764,7 +3764,7 @@ static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int 
         /* Only a Lua debugger session can leave the arena forkable with no
          * exclusive child around. The hybrid child never touches the arena, so
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
-        serverLog(LL_NOTICE, "Hybrid snapshot: the HYBSNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+        serverLog(LL_NOTICE, "Hybrid snapshot: the hybrid arena is forkable (debugger child); the save child will map it");
     }
     hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_RDB, req, filename, rsi, rdbflags);
     if (!sv) return C_ERR;
@@ -3791,7 +3791,7 @@ static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
      * drained the pipe. */
     if (server.rdb_pipe_conns) return C_ERR;
     if (hybsnapArenaForkable())
-        serverLog(LL_NOTICE, "Hybrid snapshot: the HYBSNAP_NOFORK arena is forkable (debugger child); the save child will map it");
+        serverLog(LL_NOTICE, "Hybrid snapshot: the hybrid arena is forkable (debugger child); the save child will map it");
 
     hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_SOCKETS, req, NULL, rsi, RDBFLAGS_REPLICATION);
     if (!sv) return C_ERR;
@@ -4047,9 +4047,9 @@ static int hybsnapTestChildWriteFaults(void *p) {
     return -1;
 }
 
-/* Fork a child that exercises the allocator (zmalloc + zmalloc_nofork are both
+/* Fork a child that exercises the allocator (zmalloc + zmalloc_hybrid are both
  * forbidden/unmapped for the arena, so only the default arena is used) to
- * prove jemalloc's post-fork state is intact with the HYBSNAP_NOFORK arena
+ * prove jemalloc's post-fork state is intact with the hybrid arena
  * present. Returns 1 on success. */
 static int hybsnapTestChildAllocatorAlive(void) {
     pid_t pid = fork();
@@ -4111,11 +4111,11 @@ static int hybsnapTestCountMaps(void) {
 }
 
 static void hybsnapTestPurgeArena(void) {
-#ifdef HAVE_NOFORK_ARENA
+#ifdef HAVE_HYBRID_ARENA
     char buf[64];
-    snprintf(buf, sizeof(buf), "arena.%u.purge", zmalloc_nofork_arena_index());
+    snprintf(buf, sizeof(buf), "arena.%u.purge", zmalloc_hybrid_arena_index());
     je_mallctl(buf, NULL, 0, NULL, 0);
-    snprintf(buf, sizeof(buf), "arena.%u.decay", zmalloc_nofork_arena_index());
+    snprintf(buf, sizeof(buf), "arena.%u.decay", zmalloc_hybrid_arena_index());
     je_mallctl(buf, NULL, 0, NULL, 0);
 #endif
 }
@@ -4618,35 +4618,35 @@ static void hybsnapPlacementTests(void) {
 
     /* Generic allocator paths keep arena memory in the arena. */
     {
-        char *p = zmalloc_nofork(100);
+        char *p = zmalloc_hybrid(100);
         p = zrealloc(p, 5000);
-        test_cond("zrealloc() of an arena pointer stays in the arena (grow)", zmalloc_is_nofork(p));
+        test_cond("zrealloc() of an arena pointer stays in the arena (grow)", zmalloc_in_hybrid_arena(p));
         p = zrealloc(p, 40);
-        test_cond("zrealloc() of an arena pointer stays in the arena (shrink)", zmalloc_is_nofork(p));
+        test_cond("zrealloc() of an arena pointer stays in the arena (shrink)", zmalloc_in_hybrid_arena(p));
         zfree(p);
         char *q = zmalloc(100);
         q = zrealloc(q, 5000);
-        test_cond("zrealloc() of a default pointer stays outside the arena", !zmalloc_is_nofork(q));
+        test_cond("zrealloc() of a default pointer stays outside the arena", !zmalloc_in_hybrid_arena(q));
         zfree(q);
 
         const int N = 2000;
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_hybrid(64);
         for (int i = 0; i < N; i++) zfree(a[i]);                     /* generic zfree */
         int leaked = 0;
-        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_in_hybrid_arena(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("arena blocks freed with plain zfree() never come back from zmalloc()", leaked == 0);
-        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_hybrid(64);
         for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);       /* sized generic free */
         leaked = 0;
-        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_in_hybrid_arena(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("arena blocks freed with zfree_with_size() never come back from zmalloc()", leaked == 0);
         zfree(a);
-#if defined(HAVE_NOFORK_ARENA) && defined(HAVE_DEFRAG)
-        void *nt = zmalloc_nofork_no_tcache(300);   /* the no-tcache entry points exist only with the arena and defrag */
-        test_cond("zmalloc_nofork_no_tcache() allocates in the arena", zmalloc_is_nofork(nt));
+#if defined(HAVE_HYBRID_ARENA) && defined(HAVE_DEFRAG)
+        void *nt = zmalloc_hybrid_arena_no_tcache(300);   /* the no-tcache entry points exist only with the arena and defrag */
+        test_cond("zmalloc_hybrid_arena_no_tcache() allocates in the arena", zmalloc_in_hybrid_arena(nt));
         zfree_no_tcache(nt);
 #endif
     }
@@ -4655,9 +4655,9 @@ static void hybsnapPlacementTests(void) {
     {
         sds s = sdsnewlen("x", 1);
         sds t = hybsnapSdsMove(s, 1);
-        test_cond("sds moved into the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
+        test_cond("sds moved into the arena", zmalloc_in_hybrid_arena(sdsAllocPtr(t)));
         t = sdsMakeRoomFor(t, 20000);
-        test_cond("sdsMakeRoomFor() on an arena sds stays in the arena", zmalloc_is_nofork(sdsAllocPtr(t)));
+        test_cond("sdsMakeRoomFor() on an arena sds stays in the arena", zmalloc_in_hybrid_arena(sdsAllocPtr(t)));
         sdsfree(t);
     }
 
@@ -4690,32 +4690,32 @@ static void hybsnapPlacementTests(void) {
     memset(buf, 'v', sizeof(buf));
     {
         kvobj *kv = kvobjSet(key, createRawStringObject(buf, 100), 0);
-        test_cond("kvobj header (raw string) is in the arena", zmalloc_is_nofork(kv));
-        test_cond("small raw string value moved into the arena", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+        test_cond("kvobj header (raw string) is in the arena", zmalloc_in_hybrid_arena(kv));
+        test_cond("small raw string value moved into the arena", zmalloc_in_hybrid_arena(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         test_cond("value content preserved after the move", sdslen(kv->ptr) == 100 && memcmp(kv->ptr, buf, 100) == 0);
         /* Unbounded in-place growth keeps the arena; the policy hook moves it out. */
         kv->ptr = sdscatlen(kv->ptr, buf, 10000);
-        test_cond("grown string still in the arena before the policy hook", zmalloc_is_nofork(sdsAllocPtr(kv->ptr)));
+        test_cond("grown string still in the arena before the policy hook", zmalloc_in_hybrid_arena(sdsAllocPtr(kv->ptr)));
         hybsnapPlaceValue(kv);
         test_cond("hybsnapPlaceValue() moves a string over the threshold out of the arena",
-                  !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
+                  !zmalloc_in_hybrid_arena(sdsAllocPtr(kv->ptr)) && zmalloc_in_hybrid_arena(kv) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         test_cond("content preserved after moving out", sdslen(kv->ptr) == 10100 && memcmp(kv->ptr, buf, 100) == 0);
         decrRefCount(kv);
     }
     {
         kvobj *kv = kvobjSet(key, createRawStringObject(buf, 10000), 0);
         test_cond("large raw string: header in arena, value outside, class FORK",
-                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
+                  zmalloc_in_hybrid_arena(kv) && !zmalloc_in_hybrid_arena(sdsAllocPtr(kv->ptr)) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     {
         kvobj *kv = kvobjSet(key, createStringObject("tiny", 4), 0);
         test_cond("embstr value: header in arena, class NOFORK",
-                  kv->encoding == OBJ_ENCODING_EMBSTR && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+                  kv->encoding == OBJ_ENCODING_EMBSTR && zmalloc_in_hybrid_arena(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         decrRefCount(kv);
         kv = kvobjSet(key, createStringObjectFromLongLongForValue(1234567), 0);
         test_cond("int value: header in arena, class NOFORK",
-                  kv->encoding == OBJ_ENCODING_INT && zmalloc_is_nofork(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+                  kv->encoding == OBJ_ENCODING_INT && zmalloc_in_hybrid_arena(kv) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         decrRefCount(kv);
     }
     {
@@ -4724,15 +4724,15 @@ static void hybsnapPlacementTests(void) {
         o->ptr = lpAppend(o->ptr, (unsigned char*)"field", 5);
         o->ptr = lpAppend(o->ptr, (unsigned char*)"value", 5);
         kvobj *kv = kvobjSet(key, o, 0);
-        test_cond("small listpack hash moved into the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+        test_cond("small listpack hash moved into the arena", zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         unsigned char *p = lpFirst(kv->ptr);
         int64_t l; unsigned char *sv = lpGet(p, &l, NULL);
         test_cond("listpack content preserved", sv && l == 5 && memcmp(sv, "field", 5) == 0);
         /* Grow in place past the threshold: stays in the arena, class stays NOFORK by placement. */
         kv->ptr = lpAppend(kv->ptr, (unsigned char*)buf, 6000);
-        test_cond("listpack grown in place stays in the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
+        test_cond("listpack grown in place stays in the arena", zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK);
         hybsnapPlaceValue(kv);
-        test_cond("policy hook moves an oversized listpack out", !zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
+        test_cond("policy hook moves an oversized listpack out", !zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     {
@@ -4740,23 +4740,23 @@ static void hybsnapPlacementTests(void) {
         uint8_t ok;
         for (long long i = 0; i < 50; i++) o->ptr = intsetAdd(o->ptr, i * 7, &ok);
         kvobj *kv = kvobjSet(key, o, 0);
-        test_cond("intset moved into the arena", zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK && intsetLen(kv->ptr) == 50);
+        test_cond("intset moved into the arena", zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK && intsetLen(kv->ptr) == 50);
         decrRefCount(kv);
     }
     {
         robj *o = createSetObject();   /* hashtable encoding */
         kvobj *kv = kvobjSet(key, o, 0);
         test_cond("hashtable set: header in arena, dict outside, class FORK",
-                  zmalloc_is_nofork(kv) && !zmalloc_is_nofork(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
+                  zmalloc_in_hybrid_arena(kv) && !zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_FORK);
         decrRefCount(kv);
     }
     sdsfree(key);
 
-    /* Keyspace-style dicts (nofork_alloc) put struct, tables and entry nodes in the arena. */
+    /* Keyspace-style dicts (hybrid_arena_alloc) put struct, tables and entry nodes in the arena. */
     {
         dictType nofork = KvstoreDictTestType;
         nofork.no_value = 1;
-        nofork.nofork_alloc = 1;
+        nofork.hybrid_arena_alloc = 1;
         dictType plain = KvstoreDictTestType;
         plain.no_value = 1;
         kvstore *ks = kvstoreCreate(&KvstoreTestType, &nofork, 0, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
@@ -4768,15 +4768,15 @@ static void hybsnapPlacementTests(void) {
         }
         dict *ds = kvstoreGetDict(ks, 0), *dp = kvstoreGetDict(kp, 0);
         while (dictIsRehashing(ds)) dictRehash(ds, 100);
-        test_cond("nofork_alloc dict: kvstore struct, dict struct and bucket array are in the arena",
-                  zmalloc_is_nofork(ks) && zmalloc_is_nofork(ds) && zmalloc_is_nofork(ds->ht_table[0]));
+        test_cond("hybrid_arena_alloc dict: kvstore struct, dict struct and bucket array are in the arena",
+                  zmalloc_in_hybrid_arena(ks) && zmalloc_in_hybrid_arena(ds) && zmalloc_in_hybrid_arena(ds->ht_table[0]));
         test_cond("default dict: struct and bucket array are outside the arena",
-                  !zmalloc_is_nofork(kp) && !zmalloc_is_nofork(dp) && !zmalloc_is_nofork(dp->ht_table[0]));
+                  !zmalloc_in_hybrid_arena(kp) && !zmalloc_in_hybrid_arena(dp) && !zmalloc_in_hybrid_arena(dp->ht_table[0]));
         /* Force another expand (rehash allocates a new table) and check it too. */
         for (int i = 3000; i < 9000; i++)
             serverAssert(kvstoreDictAddRaw(ks, 0, hybsnapTestKey(0, 0, i), NULL) != NULL);
-        test_cond("nofork_alloc dict: table allocated by rehash is in the arena",
-                  zmalloc_is_nofork(ds->ht_table[0]) && (ds->ht_table[1] == NULL || zmalloc_is_nofork(ds->ht_table[1])));
+        test_cond("hybrid_arena_alloc dict: table allocated by rehash is in the arena",
+                  zmalloc_in_hybrid_arena(ds->ht_table[0]) && (ds->ht_table[1] == NULL || zmalloc_in_hybrid_arena(ds->ht_table[1])));
         kvstoreRelease(ks);
         kvstoreRelease(kp);
     }
@@ -5500,12 +5500,12 @@ int hybsnapTest(int argc, char **argv, int flags) {
     server.hybrid_snapshot = 1;
     hybsnapArenaInit();
 
-#ifdef HAVE_NOFORK_ARENA
-    test_cond("HYBSNAP_NOFORK arena is available on Linux+jemalloc", hybsnapArenaExists());
+#ifdef HAVE_HYBRID_ARENA
+    test_cond("Hybrid arena is available on Linux+jemalloc", hybsnapArenaExists());
 #else
-    test_cond("HYBSNAP_NOFORK arena reported unavailable on this platform", !hybsnapArenaExists());
-    void *fb = zmalloc_nofork(100);
-    test_cond("fallback alloc goes to the default allocator", fb != NULL && !zmalloc_is_nofork(fb));
+    test_cond("Hybrid arena reported unavailable on this platform", !hybsnapArenaExists());
+    void *fb = zmalloc_hybrid(100);
+    test_cond("fallback alloc goes to the default allocator", fb != NULL && !zmalloc_in_hybrid_arena(fb));
     zfree(fb);
     /* The background scan and the keyspace overlay do not depend on the arena. */
     hybsnapScanTests(accurate);
@@ -5520,11 +5520,11 @@ int hybsnapTest(int argc, char **argv, int flags) {
 #endif
 
     /* 1. predicate */
-    char *p = zmalloc_nofork(100);
+    char *p = zmalloc_hybrid(100);
     char *q = zmalloc(100);
     memset(p, 'x', 100);
-    test_cond("zmalloc_is_nofork() is true for an arena pointer", zmalloc_is_nofork(p));
-    test_cond("zmalloc_is_nofork() is false for a zmalloc pointer", !zmalloc_is_nofork(q));
+    test_cond("zmalloc_in_hybrid_arena() is true for an arena pointer", zmalloc_in_hybrid_arena(p));
+    test_cond("zmalloc_in_hybrid_arena() is false for a zmalloc pointer", !zmalloc_in_hybrid_arena(q));
     test_cond("zmalloc_size() >= requested size", zmalloc_size(p) >= 100);
 
     /* 2. fork visibility */
@@ -5541,16 +5541,16 @@ int hybsnapTest(int argc, char **argv, int flags) {
     test_cond("flip: fork child faults again on the same allocation", hybsnapTestChildWriteFaults(p) == 1);
 
     /* Large (>= 2MB, multi-page-run) allocation is also DONTFORK. */
-    char *big = zmalloc_nofork(5 * 1024 * 1024);
+    char *big = zmalloc_hybrid(5 * 1024 * 1024);
     memset(big, 1, 5 * 1024 * 1024);
-    test_cond("large HYBSNAP_NOFORK allocation is in the arena", zmalloc_is_nofork(big));
+    test_cond("large HYBSNAP_NOFORK allocation is in the arena", zmalloc_in_hybrid_arena(big));
     test_cond("fork child faults on a large HYBSNAP_NOFORK allocation (first page)", hybsnapTestChildWriteFaults(big) == 1);
     test_cond("fork child faults on a large HYBSNAP_NOFORK allocation (last page)",
               hybsnapTestChildWriteFaults(big + 5 * 1024 * 1024 - 1) == 1);
 
     /* realloc keeps the class */
-    p = zrealloc_nofork(p, 5000);
-    test_cond("zrealloc_nofork() result stays in the arena", zmalloc_is_nofork(p));
+    p = zrealloc_hybrid(p, 5000);
+    test_cond("zrealloc_hybrid() result stays in the arena", zmalloc_in_hybrid_arena(p));
     test_cond("fork child faults after realloc", hybsnapTestChildWriteFaults(p) == 1);
     zfree(p);
     zfree(q);
@@ -5567,7 +5567,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
                 seed = seed * 1103515245u + 12345u;
                 size_t sz = 8 + (seed >> 8) % 8192;
                 if (i % 5000 == 0) sz = 3 * 1024 * 1024 + (seed % 1024) * 1024;
-                ptrs[i] = zmalloc_nofork(sz);
+                ptrs[i] = zmalloc_hybrid(sz);
                 ((char*)ptrs[i])[0] = 1;
                 ((char*)ptrs[i])[sz-1] = 1;
             }
@@ -5575,18 +5575,18 @@ int hybsnapTest(int argc, char **argv, int flags) {
             hybsnapTestPurgeArena();
             for (int i = 1; i < N; i += 2) {
                 seed = seed * 1103515245u + 12345u;
-                ptrs[i] = zrealloc_nofork(ptrs[i], 8 + (seed >> 8) % 16384);
+                ptrs[i] = zrealloc_hybrid(ptrs[i], 8 + (seed >> 8) % 16384);
             }
             hybsnapTestPurgeArena();
             for (int i = 1; i < N; i += (N / 32)) {
-                if (!zmalloc_is_nofork(ptrs[i])) bad_class++;
+                if (!zmalloc_in_hybrid_arena(ptrs[i])) bad_class++;
                 if (hybsnapTestChildWriteFaults(ptrs[i]) != 1) bad_fork++;
             }
             for (int i = 1; i < N; i += 2) zfree(ptrs[i]);
             hybsnapTestPurgeArena();
         }
         /* Fresh allocation after purge cycles must still be DONTFORK (commit path). */
-        void *fresh = zmalloc_nofork(4096 * 3);
+        void *fresh = zmalloc_hybrid(4096 * 3);
         memset(fresh, 2, 4096 * 3);
         test_cond("mapping after purge cycles carries the dc flag", hybsnapTestMappingIsDontcopy(fresh) == 1);
         test_cond("stress: sampled live pointers are all in the arena", bad_class == 0);
@@ -5601,30 +5601,30 @@ int hybsnapTest(int argc, char **argv, int flags) {
     {
         const int N = 2000;
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_hybrid(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
         int leaked = 0;
-        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_is_nofork(a[i])) leaked++; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc(64); if (zmalloc_in_hybrid_arena(a[i])) leaked++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
         test_cond("freed HYBSNAP_NOFORK blocks are never handed to zmalloc()", leaked == 0);
 
         for (int i = 0; i < N; i++) a[i] = zmalloc(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
         int wrong = 0;
-        for (int i = 0; i < N; i++) { a[i] = zmalloc_nofork(64); if (!zmalloc_is_nofork(a[i])) wrong++; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc_hybrid(64); if (!zmalloc_in_hybrid_arena(a[i])) wrong++; }
         for (int i = 0; i < N; i++) zfree(a[i]);
-        test_cond("freed zmalloc blocks are never handed to zmalloc_nofork()", wrong == 0);
+        test_cond("freed zmalloc blocks are never handed to zmalloc_hybrid()", wrong == 0);
         zfree(a);
     }
 
     /* 5. accounting */
     {
         size_t before = zmalloc_used_memory();
-        void *x = zmalloc_nofork(10000);
+        void *x = zmalloc_hybrid(10000);
         size_t mid = zmalloc_used_memory();
         zfree_with_size(x, zmalloc_size(x));
         size_t after = zmalloc_used_memory();
-        test_cond("zmalloc_nofork allocations are counted in zmalloc_used_memory()", mid > before && after == before);
+        test_cond("zmalloc_hybrid allocations are counted in zmalloc_used_memory()", mid > before && after == before);
     }
 
     /* 6. microbenchmark (reported, not asserted) */
@@ -5639,7 +5639,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
         double z_pair = (double)(t1 - t0) / N;
 
         t0 = hybsnapTestNowNs();
-        for (int i = 0; i < N; i++) { void *x = zmalloc_nofork(64); zfree(x); }
+        for (int i = 0; i < N; i++) { void *x = zmalloc_hybrid(64); zfree(x); }
         t1 = hybsnapTestNowNs();
         double s_pair = (double)(t1 - t0) / N;
 
@@ -5650,19 +5650,19 @@ int hybsnapTest(int argc, char **argv, int flags) {
         double z_bulk = (double)(t1 - t0) / N;
 
         t0 = hybsnapTestNowNs();
-        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_hybrid(64);
         for (int i = 0; i < N; i++) zfree(a[i]);
         t1 = hybsnapTestNowNs();
         double s_bulk = (double)(t1 - t0) / N;
 
         t0 = hybsnapTestNowNs();
-        for (int i = 0; i < N; i++) a[i] = zmalloc_nofork(64);
+        for (int i = 0; i < N; i++) a[i] = zmalloc_hybrid(64);
         for (int i = 0; i < N; i++) zfree_with_size(a[i], 64);
         t1 = hybsnapTestNowNs();
         double s_bulk_sized = (double)(t1 - t0) / N;
 
-        printf("BENCH alloc+free 64B, N=%d: zmalloc/zfree pair %.1f ns, zmalloc_nofork pair %.1f ns; "
-               "bulk zmalloc %.1f ns/op, bulk zmalloc_nofork %.1f ns/op, bulk zmalloc_nofork sized-free %.1f ns/op\n",
+        printf("BENCH alloc+free 64B, N=%d: zmalloc/zfree pair %.1f ns, zmalloc_hybrid pair %.1f ns; "
+               "bulk zmalloc %.1f ns/op, bulk zmalloc_hybrid %.1f ns/op, bulk zmalloc_hybrid sized-free %.1f ns/op\n",
                N, z_pair, s_pair, z_bulk, s_bulk, s_bulk_sized);
         zfree(a);
         test_cond("microbenchmark ran", 1);
@@ -5675,7 +5675,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
         const int N = large ? 10000000 : 1000000;
         int maps_before = hybsnapTestCountMaps();
         void **a = zmalloc(sizeof(void*) * N);
-        for (int i = 0; i < N; i++) { a[i] = zmalloc_nofork(96); ((char*)a[i])[0] = 1; }
+        for (int i = 0; i < N; i++) { a[i] = zmalloc_hybrid(96); ((char*)a[i])[0] = 1; }
         int maps_after = hybsnapTestCountMaps();
         for (int i = 0; i < N; i++) zfree(a[i]);
         zfree(a);

@@ -5351,7 +5351,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     if (hasActiveChildProcess()) return C_ERR;
     /* Hybrid snapshot: only functions-only and slots-snapshot transfers reach
      * this stock child (see startBgsaveForReplication()); redisFork() flips
-     * the HYBSNAP_NOFORK arena forkable for it (see hybsnapArenaBeforeFork()). */
+     * the hybrid arena forkable for it (see hybsnapArenaBeforeFork()). */
 
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */

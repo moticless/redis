@@ -1971,10 +1971,10 @@ struct malloc_stats {
     size_t lua_allocator_active;
     size_t lua_allocator_resident;
     size_t lua_allocator_frag_smallbins_bytes;
-    size_t nofork_allocator_allocated;
-    size_t nofork_allocator_active;
-    size_t nofork_allocator_resident;
-    size_t nofork_allocator_frag_smallbins_bytes;
+    size_t hybrid_arena_allocated;
+    size_t hybrid_arena_active;
+    size_t hybrid_arena_resident;
+    size_t hybrid_arena_frag_smallbins_bytes;
 };
 
 /* Tick-local cache used by computeDefragCycles() to avoid duplicating the
@@ -2586,7 +2586,7 @@ struct redisServer {
     int sort_bypattern;
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
-    int hybrid_snapshot;              /* Hybrid snapshot: HYBSNAP_NOFORK arena + background scan (hybrid_snapshot.c). Runtime switch. */
+    int hybrid_snapshot;              /* Hybrid snapshot: hybrid arena + background scan (hybrid_snapshot.c). Runtime switch. */
     long long stat_hybsnap_saves;      /* Hybrid saves started (INFO snap_saves). */
     long long stat_hybsnap_inplace_writes;  /* Writes to already-scanned keys served in place (no clone). */
     size_t save_small_max_bytes;    /* Max value size for HYBSNAP_NOFORK class (hybrid_snapshot.c). */

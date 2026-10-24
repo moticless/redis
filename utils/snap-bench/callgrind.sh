@@ -2,8 +2,8 @@
 # Deterministic steady-state cost of the feature: instructions executed inside processCommand()
 # for 200k SET (fill) and 200k SET + 200k GET, feature off vs on, same PLAIN binary, under callgrind.
 # Instruction counts do not depend on CPU frequency or on other load, unlike ops/s.
-# LIMITATION (2026-09-25): under valgrind the SNAP_NOFORK arena reports unavailable
-# (snap_nofork_arena_available:0 in the INFO line printed per run), so "on" measures the feature's
+# LIMITATION (2026-09-25): under valgrind the hybrid arena reports unavailable
+# (snap_hybrid_arena_available:0 in the INFO line printed per run), so "on" measures the feature's
 # code path with values in the default allocator, not the arena mallocx path. For the arena cost
 # use perf stat -e instructions on the server pid (needs kernel.perf_event_paranoid <= 1 or root).
 #   callgrind.sh [binary]     -> Ir per mode and phase, plus the on/off ratio
@@ -21,7 +21,7 @@ run() {  # run <mode> <phases: set | setget>
   for i in $(seq 1 300); do $CLI -p $PORT ping 2>/dev/null | grep -q PONG && break; sleep 0.2; done
   $BENCH -p $PORT -q -t set -n $N -P $P -c $C -d $D -r $R > /dev/null
   [ $phases = setget ] && $BENCH -p $PORT -q -t get -n $N -P $P -c $C -d $D -r $R > /dev/null
-  $CLI -p $PORT info | grep -E "^snap_nofork_arena_available|^snap_nofork_va_used|^used_memory:" | tr -d '\r' | tr '\n' ' ' >&2; echo >&2
+  $CLI -p $PORT info | grep -E "^snap_hybrid_arena_available|^snap_hybrid_arena_va_used|^used_memory:" | tr -d '\r' | tr '\n' ' ' >&2; echo >&2
   $CLI -p $PORT shutdown nosave > /dev/null 2>&1; wait $vp
   grep "^summary:" $f | awk '{print $2}'
 }

@@ -3244,7 +3244,7 @@ int rewriteAppendOnlyFileBackground(void) {
     pid_t childpid;
 
     if (hasActiveChildProcess()) return C_ERR;
-    /* Hybrid snapshot: redisFork() flips the HYBSNAP_NOFORK arena forkable for this
+    /* Hybrid snapshot: redisFork() flips the hybrid arena forkable for this
      * child (stock copy-on-write while it runs), see hybsnapArenaBeforeFork(). */
     if (server.backup_state == BACKUP_STATE_SNAPSHOTTING ||
         server.backup_state == BACKUP_STATE_INCREMENTING)

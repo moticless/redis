@@ -157,11 +157,11 @@ typedef struct dictType {
     void *(*prefetchEntryValue)(const dictEntry *de);
 
     /* Allocate the dict struct, bucket arrays and entry nodes in the
-     * HYBSNAP_NOFORK arena (hybrid snapshot, keyspace dicts only). Frees need no
+     * hybrid arena (hybrid snapshot, keyspace dicts only). Frees need no
      * special handling: the generic zfree/zrealloc are arena-aware. Kept
      * last so that positional dictType initializers in upstream code (e.g.
      * t_stream.c) keep their meaning. */
-    unsigned int nofork_alloc:1;
+    unsigned int hybrid_arena_alloc:1;
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))

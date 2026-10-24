@@ -22,7 +22,7 @@ The hybrid splits every key's **value** into one of two classes:
 
 | class | what | where it lives | who serializes it |
 |---|---|---|---|
-| HYBSNAP_NOFORK | every kvobj header; the keyspace and expires hash tables; single-allocation values up to `save-small-max-bytes` (default 4096): strings, listpack, intset, listpackEx | the HYBSNAP_NOFORK arena, a jemalloc arena whose extents carry `MADV_DONTFORK`; the child never maps it | a scan thread in the parent, reading the live memory |
+| HYBSNAP_NOFORK | every kvobj header; the keyspace and expires hash tables; single-allocation values up to `save-small-max-bytes` (default 4096): strings, listpack, intset, listpackEx | the hybrid arena, a jemalloc arena whose extents carry `MADV_DONTFORK`; the child never maps it | a scan thread in the parent, reading the live memory |
 | HYBSNAP_FORK | multi-allocation encodings (hash table, skiplist, quicklist, stream), module types, template hashes, any eligible encoding above the cap, any key with module key metadata | the default arena, forkable | the fork child, from its copy-on-write snapshot, exactly as the classic save |
 
 Because headers and tables are in the arena, the child cannot walk the keyspace at all. It is a
@@ -43,7 +43,7 @@ to it, stays. `DEBUG SNAP-PLACEMENT` and `DEBUG SNAP-DRIFT` report where values 
 their class says they should be.
 
 **The arena.** One address range (16 TB on 64-bit) reserved at startup, `MADV_DONTFORK` applied in
-the extent hooks on allocation and recommit. Allocation goes through `zmalloc_nofork*` with
+the extent hooks on allocation and recommit. Allocation goes through `zmalloc_hybrid*` with
 `MALLOCX_ARENA` and a per-thread explicit tcache; `zfree()` and `zrealloc()` recognise arena
 blocks by address range, so no caller needs to know the class to free. The arena exists whenever
 the platform supports it (64-bit Linux, jemalloc) so the switch can change at runtime; while
@@ -252,7 +252,7 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 
 | memory | where | bound |
 |---|---|---|
-| copy-on-write on HYBSNAP_FORK values written during the save | child, kernel | the forkable memory: `allocator_active` minus `allocator_active_nofork`, reached only if every forkable page is written |
+| copy-on-write on HYBSNAP_FORK values written during the save | child, kernel | the forkable memory: `allocator_active` minus `allocator_active_hybrid_arena`, reached only if every forkable page is written |
 | child page tables | child | proportional to the forkable range; sets the fork stall |
 | retained originals: fork-instant HYBSNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket's overlay window |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded within the thread's next `W` buckets or at the end of its dict |
@@ -387,10 +387,10 @@ the single-child rule applies as for any fork.
 
 | field | meaning |
 |---|---|
-| `allocator_allocated_nofork`, `allocator_active_nofork`, `allocator_resident_nofork`, `allocator_frag_bytes_nofork` | jemalloc statistics of the arena; forkable memory is the process total minus these |
-| `snap_nofork_arena_available` | 1 when the arena exists |
-| `snap_nofork_arena_forkable` | 1 while a classic child has it mapped |
-| `snap_nofork_va_reserved`, `snap_nofork_va_used` | the arena's address range and how much of it has been handed out |
+| `allocator_allocated_hybrid_arena`, `allocator_active_hybrid_arena`, `allocator_resident_hybrid_arena`, `allocator_frag_bytes_hybrid_arena` | jemalloc statistics of the arena; forkable memory is the process total minus these |
+| `snap_hybrid_arena_available` | 1 when the arena exists |
+| `snap_hybrid_arena_forkable` | 1 while a classic child has it mapped |
+| `snap_hybrid_arena_va_reserved`, `snap_hybrid_arena_va_used` | the arena's address range and how much of it has been handed out |
 
 **INFO persistence**
 
@@ -429,7 +429,7 @@ the child)`, `Hybrid AOF rewrite started ...`, `Hybrid snapshot done, N HYBSNAP_
 the child`, `Hybrid snapshot: ... past hybrid-snapshot-max-retained-bytes ...: aborting the save`,
 `Hybrid snapshot: scan aborted, keyspace overlay drained`, `Hybrid snapshot: db N flushed during the
 save, its keyspace stays with the save`, `Hybrid snapshot: falling back to the fork child, module
-'...' has not declared ...`, `HYBSNAP_NOFORK arena made forkable for a ... child` and `... back to
+'...' has not declared ...`, `Hybrid arena made forkable for a ... child` and `... back to
 MADV_DONTFORK`.
 
 **Unit tests**: `redis-server test hybrid_snapshot` (scan engine, placement, overlay, references),

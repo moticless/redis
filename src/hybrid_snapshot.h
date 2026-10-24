@@ -24,7 +24,7 @@
  * value's class, so the child never touches the parent's dicts. Placement is
  * applied on each insertion and when a value grows or changes encoding
  * (hybsnapPlaceValue): only the value moves, never the header. Allocation goes
- * through zmalloc_nofork*(); frees and reallocs route by address.
+ * through zmalloc_hybrid*(); frees and reallocs route by address.
  * Any other fork (module, Lua debugger, a classic child while the feature is
  * off) needs the keyspace in the child, so the arena is flipped forkable around
  * it (hybsnapArenaBeforeFork / hybsnapArenaChildExited); a module fork that declares
@@ -121,20 +121,20 @@
 
 /* Key classes: the class of a key's VALUE allocation (headers are always in the arena). */
 typedef enum hybsnapValueClass {
-    HYBSNAP_NOFORK = 0,   /* Value in the DONTFORK arena; serialized by the scan thread. */
+    HYBSNAP_NOFORK = 0,   /* Value in the hybrid arena; serialized by the scan thread. */
     HYBSNAP_FORK   = 1,   /* Value in forkable memory; serialized by the fork child. */
 } hybsnapValueClass;
 
 struct listpackEx;
 struct aeEventLoop;
 
-/* ---- HYBSNAP_NOFORK arena ---------------------------------------------------- */
+/* ---- hybrid arena ---------------------------------------------------- */
 
-/* Create the arena: once, main thread, before the first zmalloc_nofork*(); a no-op without support. */
+/* Create the arena: once, main thread, before the first zmalloc_hybrid*(); a no-op without support. */
 void hybsnapArenaInit(void);
 
 /* 1 if the arena exists (DONTFORK or currently forkable). */
-static inline int hybsnapArenaExists(void) { return zmalloc_nofork_arena_index() != UINT_MAX; }
+static inline int hybsnapArenaExists(void) { return zmalloc_hybrid_arena_index() != UINT_MAX; }
 
 /* Fork visibility: DONTFORK for a child forked without the keyspace, flipped forkable around any other fork. */
 int hybsnapArenaForkable(void);
@@ -154,7 +154,7 @@ int hybsnapChildNoKeyspace(void);
 void hybsnapPlaceValueArena(robj *o);
 
 static inline void hybsnapPlaceValue(robj *o) {
-    if (unlikely(zmalloc_nofork_enabled())) hybsnapPlaceValueArena(o);
+    if (unlikely(zmalloc_hybrid_arena_enabled())) hybsnapPlaceValueArena(o);
 }
 /* Move a value out of the arena */
 void hybsnapValueDetachFromArena(robj *o);

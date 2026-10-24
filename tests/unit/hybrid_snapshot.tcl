@@ -7,22 +7,22 @@ start_server {tags {"snapshot"} overrides {hybrid-snapshot yes}} {
         assert_equal 4096 [lindex [r config get save-small-max-bytes] 1]
     }
 
-    test {INFO memory exposes HYBSNAP_NOFORK arena stats} {
+    test {INFO memory exposes hybrid arena stats} {
         set info [r info memory]
-        assert_match {*allocator_allocated_nofork:*} $info
-        assert_match {*allocator_active_nofork:*} $info
-        assert_match {*allocator_resident_nofork:*} $info
-        assert_match {*allocator_frag_bytes_nofork:*} $info
-        assert_match {*snap_nofork_arena_available:*} $info
+        assert_match {*allocator_allocated_hybrid_arena:*} $info
+        assert_match {*allocator_active_hybrid_arena:*} $info
+        assert_match {*allocator_resident_hybrid_arena:*} $info
+        assert_match {*allocator_frag_bytes_hybrid_arena:*} $info
+        assert_match {*snap_hybrid_arena_available:*} $info
         # On Linux + jemalloc the arena must be available, and once it holds
         # keys its resident figure is a real number (the per-arena stats read
         # jemalloc's stats.arenas.<i>.resident).
         if {[string match {*jemalloc*} [s mem_allocator]] && $::tcl_platform(os) eq "Linux"} {
-            assert_equal 1 [s snap_nofork_arena_available]
+            assert_equal 1 [s snap_hybrid_arena_available]
             r debug populate 1000 resident 100
             after 1100   ;# the figures are sampled by cron, once a second
-            assert {[s allocator_resident_nofork] > 0}
-            assert {[s allocator_resident_nofork] >= [s allocator_active_nofork]}
+            assert {[s allocator_resident_hybrid_arena] > 0}
+            assert {[s allocator_resident_hybrid_arena] >= [s allocator_active_hybrid_arena]}
         }
     }
 }
@@ -32,9 +32,9 @@ proc snap_placement {{db ""}} {
     return [dict create {*}[r debug snap-placement $db]]
 }
 
-# The hybrid save path runs with or without the HYBSNAP_NOFORK arena (sanitizer
+# The hybrid save path runs with or without the hybrid arena (sanitizer
 # builds use libc and have no arena); placement checks only make sense with it.
-proc snap_arena_available {} { expr {[s snap_nofork_arena_available] == 1} }
+proc snap_arena_available {} { expr {[s snap_hybrid_arena_available] == 1} }
 proc snap_arena_test {name body} {
     if {[snap_arena_available]} { uplevel 1 [list test $name $body] }
 }
@@ -1845,14 +1845,14 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
 
 # ---------------------------------------------------------------------------
 # Arena fork visibility (TASK-1.22): classic fork children (AOF rewrite, diskless
-# sync, module fork) map the HYBSNAP_NOFORK arena while they run, the hybrid child
+# sync, module fork) map the hybrid arena while they run, the hybrid child
 # never does, and hybrid-snapshot is a runtime switch.
 # ---------------------------------------------------------------------------
 set ::snap_fork_module [file normalize tests/modules/fork.so]
 
 proc snap_wait_forkable {want} {
     if {![snap_arena_available]} return
-    wait_for_condition 100 20 {[s snap_nofork_arena_forkable] == $want} else {
+    wait_for_condition 100 20 {[s snap_hybrid_arena_forkable] == $want} else {
         fail "arena forkable flag did not become $want"
     }
 }
@@ -2114,8 +2114,8 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
     }
 
     test {Arena fork visibility: INFO exposes it and it is DONTFORK while the feature is on} {
-        assert_match {*snap_nofork_arena_forkable:*} [r info memory]
-        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        assert_match {*snap_hybrid_arena_forkable:*} [r info memory]
+        if {[snap_arena_available]} { assert_equal 0 [s snap_hybrid_arena_forkable] }
     }
 
     test {BGREWRITEAOF with hybrid-snapshot on and the RDB preamble: the hybrid scan writes the base file, the arena stays DONTFORK, the AOF reloads} {
@@ -2125,7 +2125,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         r config set rdb-key-save-delay 300
         r config set appendonly yes   ;# starts the rewrite
         wait_for_condition 100 20 {[s snap_save_in_progress] == 1} else { fail "hybrid rewrite not started" }
-        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        if {[snap_arena_available]} { assert_equal 0 [s snap_hybrid_arena_forkable] }
         r config set rdb-key-save-delay 0
         waitForBgrewriteaof r
         assert_equal ok [s aof_last_bgrewrite_status]
@@ -2180,7 +2180,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         r config set rdb-key-save-delay 300
         r config set appendonly yes   ;# starts the rewrite
         snap_wait_save_started
-        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        if {[snap_arena_available]} { assert_equal 0 [s snap_hybrid_arena_forkable] }
         r config set rdb-key-save-delay 0
         waitForBgrewriteaof r
         assert_equal ok [s aof_last_bgrewrite_status]
@@ -2207,7 +2207,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
             assert_equal $digest [debug_digest]
             assert_equal [expr {$saves0 + 1}] [s -1 snap_saves]
             assert {[count_log_message -1 "Background RDB transfer started by pid"] >= 1}
-            if {[snap_arena_available]} { assert_equal 0 [s -1 snap_nofork_arena_forkable] }
+            if {[snap_arena_available]} { assert_equal 0 [s -1 snap_hybrid_arena_forkable] }
             r replicaof no one
         }
     }
@@ -2225,13 +2225,13 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_fallback_dataset
         set digest [debug_digest]
         set loglines [count_log_lines 0]
-        set flips [count_log_message 0 "HYBSNAP_NOFORK arena made forkable for a MODULE child"]
+        set flips [count_log_message 0 "Hybrid arena made forkable for a MODULE child"]
         r fork.nokeyspace k:1 1500000   ;# probes the keyspace APIs on an existing key, then lives 1.5 s
         wait_for_log_messages 0 {"*nokeyspace child started*"} $loglines 50 100
         if {[snap_arena_available]} {
             # sampled through the child's life: never flipped for it
             for {set i 0} {$i < 10} {incr i} {
-                assert_equal 0 [s snap_nofork_arena_forkable]
+                assert_equal 0 [s snap_hybrid_arena_forkable]
                 after 50
             }
         }
@@ -2240,7 +2240,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         wait_for_condition 100 100 {[r fork.exitcode] != -1} else { fail "module fork did not exit" }
         assert_equal 0 [r fork.exitcode]
         wait_for_log_messages 0 {"*called RedisModule_OpenKey inside a module fork child created with REDISMODULE_FORK_NO_KEYSPACE*"} $loglines 50 10
-        assert_equal $flips [count_log_message 0 "HYBSNAP_NOFORK arena made forkable for a MODULE child"]
+        assert_equal $flips [count_log_message 0 "Hybrid arena made forkable for a MODULE child"]
         snap_wait_forkable 0
         r del during:nokeyspace
         assert_equal $digest [debug_digest]
@@ -2253,7 +2253,7 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_wait_save_started
         assert_match {*scheduled*} [r bgrewriteaof]
         assert_equal 1 [s aof_rewrite_scheduled]
-        if {[snap_arena_available]} { assert_equal 0 [s snap_nofork_arena_forkable] }
+        if {[snap_arena_available]} { assert_equal 0 [s snap_hybrid_arena_forkable] }
         r config set rdb-key-save-delay 0
         snap_wait_bgsave_done
         assert_equal ok [s rdb_last_bgsave_status]
@@ -2268,12 +2268,12 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
         snap_fallback_dataset
         r fork.create 0 1500000   ;# a module fork is a classic (fallback) child: the arena is made forkable for it; it exits after 1.5 s
         if {[snap_arena_available]} {
-            wait_for_condition 100 20 {[s snap_nofork_arena_forkable] == 1} else { fail "arena not forkable for the module child" }
+            wait_for_condition 100 20 {[s snap_hybrid_arena_forkable] == 1} else { fail "arena not forkable for the module child" }
         }
         set saves [s snap_saves]
         assert_match {*scheduled*} [r bgsave schedule]
         assert_equal 0 [s snap_save_in_progress]
-        if {[snap_arena_available]} { assert_equal 1 [s snap_nofork_arena_forkable] }
+        if {[snap_arena_available]} { assert_equal 1 [s snap_hybrid_arena_forkable] }
         wait_for_condition 100 100 {[r fork.exitcode] != -1} else { fail "module fork did not exit" }
         wait_for_condition 200 50 {
             [s snap_saves] == $saves + 1 && [s rdb_bgsave_in_progress] == 0 && [s snap_save_in_progress] == 0
@@ -2325,9 +2325,9 @@ start_server {tags {"snapshot fallback external:skip"} overrides {hybrid-snapsho
     test {Runtime switch: the arena is forkable from startup when the feature starts off} {
         start_server {overrides {hybrid-snapshot no save ""}} {
             if {[snap_arena_available]} {
-                assert_equal 1 [s snap_nofork_arena_forkable]
+                assert_equal 1 [s snap_hybrid_arena_forkable]
                 r config set hybrid-snapshot yes
-                assert_equal 0 [s snap_nofork_arena_forkable]
+                assert_equal 0 [s snap_hybrid_arena_forkable]
             }
             populate 100 k: 40
             set d [debug_digest]

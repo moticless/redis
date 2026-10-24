@@ -3737,8 +3737,8 @@ start_cluster 2 0 {tags {external:skip cluster} overrides {cluster-node-timeout 
             # the arena unmapped in its child.
             assert_equal 1 [status [Rn 0] snap_save_in_progress]
             assert_equal 3 [status [Rn 0] snap_save_slots_total]
-            if {[status [Rn 0] snap_nofork_arena_available] == 1} {
-                assert_equal 0 [status [Rn 0] snap_nofork_arena_forkable]
+            if {[status [Rn 0] snap_hybrid_arena_available] == 1} {
+                assert_equal 0 [status [Rn 0] snap_hybrid_arena_forkable]
             }
 
             # Writes during the transfer: one to a migrating slot (through the

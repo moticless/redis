@@ -22,7 +22,7 @@ for mode in on off; do
   while [ "$($CLI -p $PORT info persistence | grep -c 'aof_rewrite_in_progress:1')" = 1 ]; do sleep 0.05; done
   t1=$(date +%s.%N); wait
   info=$($CLI -p $PORT info | tr -d '\r')
-  echo "hybrid-snapshot $mode: $used; rewrite $(echo "$t1 - $t0" | bc) s; aof_last_cow_size=$(echo "$info" | grep '^aof_last_cow_size' | cut -d: -f2) B; latest_fork_usec=$(echo "$info" | grep '^latest_fork_usec' | cut -d: -f2); arena_forkable_now=$(echo "$info" | grep '^snap_nofork_arena_forkable' | cut -d: -f2); status=$(echo "$info" | grep '^aof_last_bgrewrite_status' | cut -d: -f2)"
+  echo "hybrid-snapshot $mode: $used; rewrite $(echo "$t1 - $t0" | bc) s; aof_last_cow_size=$(echo "$info" | grep '^aof_last_cow_size' | cut -d: -f2) B; latest_fork_usec=$(echo "$info" | grep '^latest_fork_usec' | cut -d: -f2); arena_forkable_now=$(echo "$info" | grep '^snap_hybrid_arena_forkable' | cut -d: -f2); status=$(echo "$info" | grep '^aof_last_bgrewrite_status' | cut -d: -f2)"
   grep -c "arena made forkable" $D/$mode/log | sed 's/^/  arena flips logged: /'
 done
 $CLI -p $PORT shutdown nosave >/dev/null 2>&1

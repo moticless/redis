@@ -661,7 +661,7 @@ dictType dbDictType = {
     .keyFromStoredKey = kvGetKey,    /* get key from stored-key */
     .prefetchEntryKey = dbDictPrefetchEntryKey,
     .prefetchEntryValue = dbDictPrefetchEntryValue,
-    .nofork_alloc = 1,      /* hybrid snapshot: tables live in the HYBSNAP_NOFORK arena */
+    .hybrid_arena_alloc = 1,      /* hybrid snapshot: tables live in the hybrid arena */
 };
 
 /* Db->expires */
@@ -676,7 +676,7 @@ dictType dbExpiresDictType = {
     .no_value = 1,              /* keys and values are unified (kvobj) */
     .keys_are_odd = 0,          /* simple kvobj (robj) struct */
     .keyFromStoredKey = kvGetKey,   /* get key from stored-key */
-    .nofork_alloc = 1,          /* hybrid snapshot: tables live in the HYBSNAP_NOFORK arena */
+    .hybrid_arena_alloc = 1,          /* hybrid snapshot: tables live in the hybrid arena */
 };
 
 /* Command table. sds string -> command struct pointer. */
@@ -866,7 +866,7 @@ void resetChildState(void) {
     updateDictResizePolicy();
     closeChildInfoPipe();
     /* Reaped or killed (killRDBChild/killAppendOnlyChild/TerminateModuleForkChild
-     * come here without checkChildrenDone): the HYBSNAP_NOFORK arena may go back
+     * come here without checkChildrenDone): the hybrid arena may go back
      * to DONTFORK now that no exclusive child is left. */
     hybsnapArenaChildExited();
     moduleFireServerEvent(REDISMODULE_EVENT_FORK_CHILD,
@@ -1480,7 +1480,7 @@ void checkChildrenDone(void) {
                 exit(1);
             }
             if (!bysignal && exitcode == 0) receiveChildInfo();
-            resetChildState();   /* flips the HYBSNAP_NOFORK arena back if needed */
+            resetChildState();   /* flips the hybrid arena back if needed */
         } else {
             if (!ldbRemoveChild(pid)) {
                 serverLog(LL_WARNING,
@@ -1541,12 +1541,12 @@ void cronUpdateMemoryStats(void) {
                                                 &server.cron_malloc_stats.lua_allocator_frag_smallbins_bytes);
         }
         if (hybsnapArenaExists()) {
-            zmalloc_get_allocator_info_by_arena(zmalloc_nofork_arena_index(),
+            zmalloc_get_allocator_info_by_arena(zmalloc_hybrid_arena_index(),
                                                 0,
-                                                &server.cron_malloc_stats.nofork_allocator_allocated,
-                                                &server.cron_malloc_stats.nofork_allocator_active,
-                                                &server.cron_malloc_stats.nofork_allocator_resident,
-                                                &server.cron_malloc_stats.nofork_allocator_frag_smallbins_bytes);
+                                                &server.cron_malloc_stats.hybrid_arena_allocated,
+                                                &server.cron_malloc_stats.hybrid_arena_active,
+                                                &server.cron_malloc_stats.hybrid_arena_resident,
+                                                &server.cron_malloc_stats.hybrid_arena_frag_smallbins_bytes);
         }
         /* Publish the just-measured (Lua-arena-subtracted) fragmentation
          * values into the defrag-side tick-local cache so
@@ -1794,10 +1794,10 @@ int serverCron(struct aeEventLoop *eventLoop, long long id, void *clientData) {
      * clear the AOF error in case of success to make the DB writable again,
      * however to try every second is enough in case of 'hz' is set to
      * a higher frequency. */
-    /* HYBSNAP_NOFORK arena: return this thread's cached regions to the bins, so
+    /* Hybrid arena: return this thread's cached regions to the bins, so
      * an idle keyspace or an active-defrag pass (tcache bypassed) does not
      * leave slabs pinned by the explicit tcache (see zmalloc.c). */
-    run_with_period(1000) zmalloc_nofork_tcache_flush();
+    run_with_period(1000) zmalloc_hybrid_arena_tcache_flush();
 
     run_with_period(1000) {
         if ((server.aof_state == AOF_ON || server.aof_state == AOF_WAIT_REWRITE) &&
@@ -7750,7 +7750,7 @@ int redisFork(int purpose) {
         openChildInfoPipe();
     }
 
-    hybsnapArenaBeforeFork(purpose);   /* stock children must map the HYBSNAP_NOFORK arena */
+    hybsnapArenaBeforeFork(purpose);   /* stock children must map the hybrid arena */
 
     int childpid;
     long long start = ustime();
@@ -7927,7 +7927,7 @@ void dismissMemoryInChild(void) {
 
     /* Dismiss expires kvstore bucket arrays since the child process never
      * accesses them, expire times are embedded in key objects. */
-    /* Hybrid snapshot: the keyspace kvstores live in the DONTFORK arena and are
+    /* Hybrid snapshot: the keyspace kvstores live in the hybrid arena and are
      * not mapped in the child at all unless the arena was flipped forkable for
      * this (stock) child; touching them here would fault otherwise. */
     if ((!hybsnapArenaExists() || hybsnapArenaForkable()) &&

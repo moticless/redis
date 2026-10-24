@@ -315,7 +315,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     if (type->kvstoreMetadataBytes)
         kvsize += type->kvstoreMetadataBytes(NULL);
     
-    kvstore *kvs = dtype->nofork_alloc ? zcalloc_nofork(kvsize) : zcalloc(kvsize);
+    kvstore *kvs = dtype->hybrid_arena_alloc ? zcalloc_hybrid(kvsize) : zcalloc(kvsize);
     memcpy(&kvs->dtype, dtype, sizeof(kvs->dtype));
     kvs->flags = flags;
     kvs->type = type;
@@ -337,7 +337,7 @@ kvstore *kvstoreCreate(kvstoreType *type, dictType *dtype, int num_dicts_bits, i
     kvs->refcount = 1;   /* the owner's; every dict adds one */
     kvs->num_dicts_bits = num_dicts_bits;
     kvs->num_dicts = 1 << kvs->num_dicts_bits;
-    kvs->dicts = dtype->nofork_alloc ? zcalloc_nofork(sizeof(dict*) * kvs->num_dicts)
+    kvs->dicts = dtype->hybrid_arena_alloc ? zcalloc_hybrid(sizeof(dict*) * kvs->num_dicts)
                                      : zcalloc(sizeof(dict*) * kvs->num_dicts);
     if (!(kvs->flags & KVSTORE_ALLOCATE_DICTS_ON_DEMAND)) {
         for (int i = 0; i < kvs->num_dicts; i++)
