@@ -110,15 +110,19 @@ typedef struct kvstoreType {
  * in a new, larger structure. */
 typedef struct {
     listNode *rehashing_node;   /* list node in rehashing list */
-    int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
-    /* The extension slot: owned by whatever extends the store's dicts (today the
-     * hybrid snapshot's save state, hybrid_snapshot.c). The store never reads these two
-     * fields; the extension stamps the word and allocates and frees the state,
-     * with __atomic builtins where two threads meet. 0 / NULL when none. */
+
+    /* Snapshot (hybrid snapshot; 0 / NULL outside a save). ext_word and ext are
+     * the extension slot, owned by whatever extends the store's dicts (today the
+     * save's per-dict state, hybrid_snapshot.c): the store never reads them, the
+     * extension stamps the word and allocates and frees the state, with __atomic
+     * builtins where two threads meet. */
     uint64_t ext_word;
     void *ext;
     struct kvstoreDictOverlay *ov;  /* the dict's overlay while it is frozen (kvstore_overlay.c), else NULL;
-                                   main thread stores (release), scan thread loads (acquire) */
+                                       main thread stores (release), scan thread loads (acquire) */
+
+    /* Dict identity and lifetime (set for every dict of the store). */
+    int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
     int refcount;               /* holders: the owning store, a running save; atomic */
     int detached;               /* out of the store's slot table, kept by a holder: the dict callbacks
                                    skip the store's bookkeeping for it */
