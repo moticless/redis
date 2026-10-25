@@ -13937,7 +13937,7 @@ int moduleOnLoad(int (*onload)(void *, void **, int), const char *path, void *ha
         ACLRecomputeCommandBitsFromCommandRulesAllUsers();
     }
     if (path) serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
-    if (hybsnapEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) &&
+    if (hybsnapIsEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) &&
         moduleHasSaveCallbacks(ctx.module))
         serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT: "
                               "hybrid snapshot falls back to the fork child while it is loaded", ctx.module->name);

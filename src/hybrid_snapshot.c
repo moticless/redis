@@ -27,6 +27,7 @@
 
 #include "server.h"
 #include "hybrid_snapshot.h"
+#include "kvstore_overlay.h"
 #include "cluster.h"
 #include "cluster_asm.h"
 #include "fmtargs.h"
@@ -593,7 +594,7 @@ void hybsnapChildNoKeyspaceInit(void) {
  * default allocator. */
 int hybsnapConfigApply(const char **err) {
     if (server.loading) return 1;   /* applied again by the startup path */
-    if (hasActiveChildProcess() || hybsnapSaveInProgress() || ldbPendingChildren()) {
+    if (hasActiveChildProcess() || hybsnapSaveIsInProgress() || ldbPendingChildren()) {
         *err = "hybrid-snapshot cannot change while a save, rewrite, module fork or debugger child is running";
         return 0;
     }
@@ -1493,7 +1494,7 @@ static void hybsnapScanBitmapAlloc(hybsnapScanCtx *ctx, hybsnapDictState *sn, di
     }
 }
 
-/* Attach the keyspace overlay (kvstore.h) to the scan: a dict gets an
+/* Attach the keyspace overlay (kvstore_overlay.h) to the scan: a dict gets an
  * overlay the first time the guard attaches it; its overlayed buckets are written back on
  * the main thread once the thread has passed them and it is released when its slot
  * completes. Only the overlay callbacks of 'hooks' (clone, free_orig, enter,
@@ -1610,7 +1611,7 @@ static struct kvstoreDictOverlay *hybsnapScanAttach(hybsnapScanCtx *ctx, int s, 
     return hybsnapMeta(d)->ov;
 }
 
-/* kvstore snapshot guard (kvstore.h): every access to a dict without an
+/* kvstore snapshot guard (kvstore_overlay.h): every access to a dict without an
  * overlay while the scan runs lands here. */
 static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *kvs, int didx, int write) {
     struct hybsnapGuardPriv *g = privdata;
@@ -1636,7 +1637,7 @@ static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *k
     return hybsnapScanAttach(ctx, s, didx, d, pause);
 }
 
-/* The store-level snapshot hooks (kvstore.h): the guard above and the stage
+/* The store-level snapshot hooks (kvstore_overlay.h): the guard above and the stage
  * B rehash and shrink hooks of attached dicts. */
 static void hybsnapGuardRehashStarted(void *privdata, int didx, dict *d) {
     struct hybsnapGuardPriv *g = privdata;
@@ -2153,8 +2154,9 @@ static long long hybsnap_last_inplace_writes = 0;
 static long long hybsnapSaveInplaceWrites(void) { return hybsnap_save ? hybsnap_save->inplace_writes : 0; }
 static long long hybsnapSaveLastInplaceWrites(void) { return hybsnap_last_inplace_writes; }
 
+int hybsnapIsEnabled(void) { return server.hybrid_snapshot; }
 
-int hybsnapSaveInProgress(void) {
+int hybsnapSaveIsInProgress(void) {
     return hybsnap_save != NULL && !hybsnap_save->aborted;
 }
 
@@ -2227,7 +2229,7 @@ sds hybsnapInfoMemory(sds info) {
  * HYBSNAP_FORK keys, so the figure is what the scan thread and the main thread
  * dispatched so far; 'classic' otherwise. */
 size_t hybsnapSaveKeysProcessed(size_t classic) {
-    if (!hybsnapSaveInProgress()) return classic;
+    if (!hybsnapSaveIsInProgress()) return classic;
     long slots_total, slots_done;
     long long keys_nofork, keys_fork, bytes_sent;
     hybsnapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
@@ -2244,7 +2246,7 @@ sds hybsnapInfoPersistence(sds info) {
     long long stalls, stall_us, grants;
     hybsnapScanWindowStats(hybsnap_save ? hybsnap_save->scan : NULL, &stalls, &stall_us, &grants);
     return sdscatprintf(info, FMTARGS(
-        "snap_save_in_progress:%d\r\n", hybsnapSaveInProgress(),
+        "snap_save_in_progress:%d\r\n", hybsnapSaveIsInProgress(),
         "snap_save_slots_total:%ld\r\n", slots_total,
         "snap_save_slots_done:%ld\r\n", slots_done,
         "snap_save_keys_nofork:%lld\r\n", keys_nofork,
@@ -3723,7 +3725,7 @@ int hybsnapStartRewriteAofBackground(void) {
  * module). Returns 1 when the caller starts the hybrid save, 0 when it must
  * run the classic fork child. */
 int hybsnapSaveEligible(int req) {
-    if (!hybsnapEnabled()) return 0;
+    if (!hybsnapIsEnabled()) return 0;
     /* A functions-only transfer has no keyspace content for the scan thread;
      * the classic child serves it (redisFork maps the arena). A slot snapshot
      * (atomic slot migration) is a hybrid save over the migrating slots. */

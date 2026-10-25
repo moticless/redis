@@ -12,7 +12,7 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-/* Opt in to the private overlay header. */
+/* Opt in to the overlay header's INTERNALS. */
 #define INCLUDE_KVSTORE_OVERLAY_H
 
 #include "fmacros.h"
@@ -259,7 +259,7 @@ static int kvstoreDictShrinkAllowed(dict *d) {
     return kvs->snap_hooks->shrink_allowed(kvs->snap_priv, metadata->didx);
 }
 
-/* The snapshot's hooks on this store (kvstore.h kvstoreSnapHooks). NULL hooks
+/* The snapshot's hooks on this store (kvstore_overlay.h kvstoreSnapHooks). NULL hooks
  * turn the snapshot off for the store. While hooks are set, every access to a
  * dict of the store that meets no overlay asks the guard (write = 1 for
  * structural writes); the guard may attach an overlay (kvstoreOverlayAttach)

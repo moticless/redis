@@ -71,7 +71,7 @@
  * Inside a section a bucket the main thread writes is:
  *   behind  below lo: written in place;
  *   inside  in [lo, hi): the thread may be reading it, so the write goes to
- *           a duplicate of the bucket's chain (kvstore.h, KVSTORE OVERLAY);
+ *           a duplicate of the bucket's chain (kvstore_overlay.h);
  *   ahead   hi and above: serialized by the main thread first (emit-ahead,
  *           marked so the thread skips it), then written in place.
  * The thread waits only when it reaches hi during a long section, and once at
@@ -106,8 +106,8 @@
  * WHERE TO LOOK
  * -------------
  * hybrid_snapshot.c: the implementation (its head lists its sections) and the unit
- * tests (redis-server test hybrid_snapshot). kvstore.h, KVSTORE OVERLAY: the overlay
- * contract (frozen dicts, overlayed buckets); kvstore_overlay.h / kvstore_overlay.c: its
+ * tests (redis-server test hybrid_snapshot). kvstore_overlay.h: the overlay
+ * contract (frozen dicts, overlayed buckets) and its design; kvstore_overlay.c: its
  * implementation.
  * zmalloc.c: the arena.
  * All functions here are prefixed "hybsnap".
@@ -200,18 +200,17 @@ int hybsnapStartSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rd
 int hybsnapStartSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
 int hybsnapStartRewriteAofBackground(void);
 
-static inline int hybsnapEnabled(void) { return server.hybrid_snapshot; }
-
 int hybsnapConfigApply(const char **err);
 
-/* A hybrid save is running. */
-int hybsnapSaveInProgress(void);
+int hybsnapIsEnabled(void);
+
+int hybsnapSaveIsInProgress(void);
 
 /* Events during a save: a store the save is scanning; FLUSHDB/SWAPDB hand their dbs to the save. */
 int hybsnapSaveOwnsKvstore(kvstore *kvs);
 
 int hybsnapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict *stream_idmp_keys, kvstore *blessed);
-/* Main thread: stop the scan and complete every slot (not the child, see killRDBChild). */
+/* Main thread: stop the scan (not the child, see killRDBChild). */
 void hybsnapSaveAbort(void);
 /* The one child-end hook, for every child type, before the type's done handler. */
 void hybsnapOnChildEnd(int exitcode, int bysignal);

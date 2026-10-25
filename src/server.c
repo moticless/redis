@@ -354,7 +354,7 @@ static void dictDestructorKV(dict *d, void *key) {
         size_t alloc_size = kvobjAllocSize(kv);
         if (alloc_size > meta->alloc_size)
             serverLog(LL_WARNING, "slot alloc_size drift: key '%s' type %d enc %d size %zu > meta %zu (hybrid save in progress: %d)",
-                      kvobjGetKey(kv), kv->type, kv->encoding, alloc_size, meta->alloc_size, hybsnapSaveInProgress());
+                      kvobjGetKey(kv), kv->type, kv->encoding, alloc_size, meta->alloc_size, hybsnapSaveIsInProgress());
         debugServerAssert(alloc_size <= meta->alloc_size);
         meta->alloc_size -= alloc_size;
         /* kvstoreMeta may be NULL when freeing kvstore created with kvstoreBaseType

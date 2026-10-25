@@ -12,12 +12,11 @@
  * Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
  */
 
-/* Snapshot overlay of a kvstore (hybrid snapshot): the contract is the
- * KVSTORE OVERLAY section of kvstore.h, the design of this file (who includes
- * what, the overlayed buckets and their index, the lifecycle) is the head of
- * kvstore_overlay.h. */
+/* Snapshot overlay of a kvstore (hybrid snapshot): the contract and the design
+ * of this file (who includes what, the overlayed buckets and their index, the
+ * lifecycle) are the head of kvstore_overlay.h. */
 
-/* Opt in to the private overlay header. */
+/* Opt in to the overlay header's INTERNALS. */
 #define INCLUDE_KVSTORE_OVERLAY_H
 
 #include "fmacros.h"
@@ -85,7 +84,7 @@ typedef struct kvstoreDictOverlay {
     dict *d;                    /* the frozen dict itself (the store's dict of slot didx while owned) */
     int nb;                     /* overlayed buckets */
     long delta;                 /* logical size - dict size: the adds minus the deletes of the overlayed buckets */
-    const kvstoreSnapHooks *h;  /* the store's hooks at attach time (kvstore.h kvstoreSnapHooks) */
+    const kvstoreSnapHooks *h;  /* the store's hooks at attach time (kvstore_overlay.h kvstoreSnapHooks) */
     int paused;                 /* rehash and auto-resize are held while buckets are overlayed */
     long long paused_at;        /* when, us (kvso_stats) */
     int unlink_frozen;          /* the pending two-phase unlink targets the frozen dict */
