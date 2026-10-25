@@ -184,7 +184,7 @@ void kvsoDetachFromStore(dict *d);
 /* Enumeration: scan, iterator (phase 0 the dict, 1 a replaced bucket's chain, 2 buckets the dict has no entry for; next is fetched first, the caller may delete what it got), random keys. */
 unsigned long long kvsoScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsigned long long cursor,
                           dictScanFunction *scan_cb, void *privdata);
-dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, kvsoCursor *cur);
+dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, kvsoCursor *cur);
 dictEntry *kvsoRandomEntry(kvstore *kvs, int didx, kvstoreDictOverlay *ov, int fair);
 unsigned int kvsoGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned int count);
 

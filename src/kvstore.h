@@ -41,11 +41,13 @@
 
 typedef struct _kvstore kvstore;
 
+/* Snapshot overlay: an iterator's position over a frozen dict and its overlayed buckets. */
 typedef struct kvstoreOvCursor {
-    int slot, last, skipn;
+    int phase;                  /* 0 = frozen dict, 1 = a replaced bucket's chain, 2 = buckets the dict has no entry for */
+    int slot, last, skipn;      /* phases 1 and 2: position in the overlay's bucket chains */
     long bucket;
     dictEntry *next;
-} kvstoreOvCursor;   /* snapshot overlay: iterator position in the overlay's bucket chains (phases 1, 2) */
+} kvstoreOvCursor;
 
 /* Structure for kvstore iterator that allows iterating across multiple dicts. */
 typedef struct _kvstoreIterator {
@@ -53,8 +55,7 @@ typedef struct _kvstoreIterator {
     long long didx;
     long long next_didx;
     dictIterator di;
-    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = a replaced bucket's chain, 2 = buckets the dict has no entry for */
-    kvstoreOvCursor ov_cur;     /* overlay position in phases 1 and 2 */
+    kvstoreOvCursor ov_cur;     /* snapshot overlay: position over a frozen dict */
 } kvstoreIterator;
 
 /* Structure for kvstore dict iterator that allows iterating the corresponding dict. */
@@ -62,8 +63,7 @@ typedef struct _kvstoreDictIterator {
     kvstore *kvs;
     long long didx;
     dictIterator di;
-    int ov_phase;               /* snapshot overlay: 0 = frozen dict, 1 = a replaced bucket's chain, 2 = buckets the dict has no entry for */
-    kvstoreOvCursor ov_cur;     /* overlay position in phases 1 and 2 */
+    kvstoreOvCursor ov_cur;     /* snapshot overlay: position over a frozen dict */
 } kvstoreDictIterator;
 
 /* ---- Dict references (see KVSTORE OVERLAY above) ---------------------------- */

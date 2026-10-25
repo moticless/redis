@@ -27,7 +27,6 @@
 #include "redisassert.h"
 #include "monotonic.h"
 
-#include "fwtree.h"
 
 struct _kvstore {
     int flags;
@@ -794,7 +793,6 @@ void kvstoreMoveDict(kvstore *kvs, kvstore *dst, int didx) {
 void kvstoreIteratorInit(kvstoreIterator *kvs_it, kvstore *kvs) {
     kvs_it->kvs = kvs;
     kvs_it->didx = -1;
-    kvs_it->ov_phase = 0;
     memset(&kvs_it->ov_cur, 0, sizeof(kvs_it->ov_cur));
     kvs_it->next_didx = kvstoreGetFirstNonEmptyDictIndex(kvs_it->kvs); /* Finds first non-empty dict index. */
     dictInitSafeIterator(&kvs_it->di, NULL);
@@ -828,7 +826,6 @@ dict *kvstoreIteratorNextDict(kvstoreIterator *kvs_it) {
 
     kvs_it->didx = kvs_it->next_didx;
     kvs_it->next_didx = kvstoreGetNextNonEmptyDictIndex(kvs_it->kvs, kvs_it->didx);
-    kvs_it->ov_phase = 0;
     memset(&kvs_it->ov_cur, 0, sizeof(kvs_it->ov_cur));
     return kvs_it->kvs->dicts[kvs_it->didx];
 }
@@ -842,7 +839,7 @@ int kvstoreIteratorGetCurrentDictIndex(kvstoreIterator *kvs_it) {
 dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
     for (;;) {
         kvstoreDictOverlay *ov = (kvs_it->didx >= 0) ? kvsoRead(kvs_it->kvs, kvs_it->didx) : NULL;
-        dictEntry *de = ov ? kvsoIteratorNext(ov, &kvs_it->di, &kvs_it->ov_phase, &kvs_it->ov_cur)
+        dictEntry *de = ov ? kvsoIteratorNext(ov, &kvs_it->di, &kvs_it->ov_cur)
                            : (kvs_it->di.d ? dictNext(&kvs_it->di) : NULL);
         if (de) return de;
         /* No current dict or reached the end of the dictionary.
@@ -926,7 +923,6 @@ void kvstoreInitDictIterator(kvstoreDictIterator *kvs_di, kvstore *kvs, int didx
 {
     kvs_di->kvs = kvs;
     kvs_di->didx = didx;
-    kvs_di->ov_phase = 0;
     memset(&kvs_di->ov_cur, 0, sizeof(kvs_di->ov_cur));
     dict *d = kvstoreGetDict(kvs, didx);
     dictInitIterator(&kvs_di->di, d);
@@ -936,7 +932,6 @@ void kvstoreInitDictSafeIterator(kvstoreDictIterator *kvs_di, kvstore *kvs, int 
 {
     kvs_di->kvs = kvs;
     kvs_di->didx = didx;
-    kvs_di->ov_phase = 0;
     memset(&kvs_di->ov_cur, 0, sizeof(kvs_di->ov_cur));
     dict *d = kvstoreGetDict(kvs, didx);
     dictInitSafeIterator(&kvs_di->di, d);
@@ -959,7 +954,7 @@ dictEntry *kvstoreDictIteratorNext(kvstoreDictIterator *kvs_di)
     /* The dict may be deleted during the iteration process, so here need to check for NULL. */
     if (!kvs_di->di.d) return NULL;
     kvstoreDictOverlay *ov = kvsoRead(kvs_di->kvs, kvs_di->didx);
-    if (ov) return kvsoIteratorNext(ov, &kvs_di->di, &kvs_di->ov_phase, &kvs_di->ov_cur);
+    if (ov) return kvsoIteratorNext(ov, &kvs_di->di, &kvs_di->ov_cur);
     if (!kvstoreGetDict(kvs_di->kvs, kvs_di->didx)) return NULL;
     return dictNext(&kvs_di->di);
 }

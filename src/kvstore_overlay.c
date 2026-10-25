@@ -624,18 +624,18 @@ static int kvsoHandedOut(kvstoreDictOverlay *ov, kvsoBucket *ob, int n, dictEntr
  * of an overlayed bucket is not handed out, its bucket's chain is instead
  * (phase 1, 'cur'), once. Phase 2: the buckets the dict has no entry for.
  * NULL once everything is exhausted. */
-dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase, kvsoCursor *cur) {
+dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, kvsoCursor *cur) {
     for (;;) {
-        if (*phase != 0) {
+        if (cur->phase != 0) {
             dictEntry *de = cur->next;
             if (de) {
                 cur->next = dictGetNext(de);   /* fetched ahead: the caller may delete what it got */
-                if (*phase == 1 && cur->skipn &&
+                if (cur->phase == 1 && cur->skipn &&
                     kvsoHandedOut(ov, kvsoLookup(ov, (int)(cur->bucket & 1), (unsigned long)cur->bucket >> 1), cur->skipn, de))
                     continue;
                 return de;
             }
-            if (*phase == 1) { *phase = 0; continue; }
+            if (cur->phase == 1) { cur->phase = 0; continue; }
             /* Phase 2: the next bucket without originals. */
             kvsoBucket *ob = kvsoNextBare(ov, &cur->slot, &cur->bucket);
             if (!ob) return NULL;
@@ -645,7 +645,7 @@ dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase
         dictEntry *de = di->d ? dictNext(di) : NULL;
         if (!de) {
             if (!di->d) return NULL;
-            *phase = 2;
+            cur->phase = 2;
             cur->slot = 0;
             cur->bucket = 0;
             cur->next = NULL;
@@ -667,7 +667,7 @@ dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, int *phase
         cur->last = 1;
         cur->bucket = bucket;
         cur->skipn = p;
-        *phase = 1;
+        cur->phase = 1;
         cur->next = ob->chain;
     }
 }
