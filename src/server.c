@@ -7739,7 +7739,7 @@ void closeChildUnusedResourceAfterFork(void) {
     server.pidfile = NULL;
 }
 
-/* purpose is one of CHILD_TYPE_ types; flags is 0 or REDIS_FORK_NO_KEYSPACE. */
+/* purpose is one of CHILD_TYPE_ types; flags is REDIS_FORK_DEFAULT or REDIS_FORK_NO_KEYSPACE. */
 int redisFork(int purpose, int flags) {
     if (isMutuallyExclusiveChildType(purpose)) {
         if (hasActiveChildProcess()) {

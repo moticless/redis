@@ -1143,12 +1143,9 @@ int startBgsaveForReplication(int mincapa, int req) {
     /* Only do rdbSave* when rsiptr is not NULL,
      * otherwise slave will miss repl-stream-db. */
     if (rsiptr) {
-        if (socket_target) {
-            /* Hybrid snapshot: the child streams the replicas from the scan
-             * thread's channels; the stock child when hybrid_snapshot.c declines. */
-            retval = hybsnapSaveEligible(req) ? hybsnapStartSaveToSlavesSockets(req, rsiptr)
-                                              : rdbSaveToSlavesSockets(req,rsiptr);
-        } else {
+        if (socket_target)
+            retval = rdbSaveToSlavesSockets(req,rsiptr);
+        else {
             /* Keep the page cache since it'll get used soon */
             retval = rdbSaveBackground(req, server.rdb_filename, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE);
         }
