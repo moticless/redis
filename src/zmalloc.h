@@ -211,7 +211,7 @@ static inline int zmalloc_hybrid_arena_enabled(void) { return zmalloc_hybrid_are
 void zmalloc_hybrid_arena_set_active(int active);       /* follows CONFIG hybrid-snapshot; no-op without an arena */
 int zmalloc_hybrid_arena_init(void);                    /* 1 on success, 0 if unavailable */
 int zmalloc_hybrid_arena_set_forkable(int forkable);    /* MADV_DOFORK (1) / MADV_DONTFORK (0) on the range; 1 on success */
-int zmalloc_hybrid_arena_forkable(void);                /* 1 while a fork child would map the arena */
+int zmalloc_hybrid_arena_is_forkable(void);             /* 1 while a fork child would map the arena */
 void zmalloc_hybrid_arena_tcache_flush(void);           /* return this thread's cached arena regions to the bins */
 unsigned zmalloc_hybrid_arena_index(void);              /* UINT_MAX if unavailable */
 int zmalloc_hybrid_arena_range(void **lo, size_t *len); /* the reserved range; 0 (and NULL/0) when unavailable */

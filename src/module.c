@@ -7836,7 +7836,7 @@ static int moduleHybridChildGuard(struct RedisModule *module, moduleHybridGuardA
         [MODULE_HYBRID_GUARD_CALL]      = "RedisModule_Call",
     };
     static unsigned logged = 0;   /* one bit per api, this child only */
-    if (!hybsnapChildNoKeyspace()) return 0;
+    if (!hybsnapIsChildNoKeyspace()) return 0;
     if (!(logged & (1u << api))) {
         logged |= 1u << api;
         if (server.in_fork_child == CHILD_TYPE_MODULE)
@@ -12662,7 +12662,7 @@ static int moduleFork(struct RedisModule *module, int flags, RedisModuleForkDone
 
     /* Hybrid snapshot arena: redisFork() flips it forkable for this child,
      * unless the child declared it does not need the keyspace. */
-    childpid = no_keyspace ? hybsnapForkNoKeyspace(CHILD_TYPE_MODULE) : redisFork(CHILD_TYPE_MODULE);
+    childpid = redisFork(CHILD_TYPE_MODULE, no_keyspace ? REDIS_FORK_NO_KEYSPACE : REDIS_FORK_DEFAULT);
     if (childpid == 0) {
         /* Child */
         redisSetProcTitle("redis-module-fork");
@@ -13937,7 +13937,7 @@ int moduleOnLoad(int (*onload)(void *, void **, int), const char *path, void *ha
         ACLRecomputeCommandBitsFromCommandRulesAllUsers();
     }
     if (path) serverLog(LL_NOTICE,"Module '%s' loaded from %s",ctx.module->name,path);
-    if (hybsnapHybridEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) &&
+    if (hybsnapEnabled() && !(ctx.module->options & REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT) &&
         moduleHasSaveCallbacks(ctx.module))
         serverLog(LL_WARNING, "Module '%s' has save callbacks but did not declare REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT: "
                               "hybrid snapshot falls back to the fork child while it is loaded", ctx.module->name);

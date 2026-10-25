@@ -7739,8 +7739,8 @@ void closeChildUnusedResourceAfterFork(void) {
     server.pidfile = NULL;
 }
 
-/* purpose is one of CHILD_TYPE_ types */
-int redisFork(int purpose) {
+/* purpose is one of CHILD_TYPE_ types; flags is 0 or REDIS_FORK_NO_KEYSPACE. */
+int redisFork(int purpose, int flags) {
     if (isMutuallyExclusiveChildType(purpose)) {
         if (hasActiveChildProcess()) {
             errno = EEXIST;
@@ -7750,7 +7750,7 @@ int redisFork(int purpose) {
         openChildInfoPipe();
     }
 
-    hybsnapArenaBeforeFork(purpose);   /* stock children must map the hybrid arena */
+    hybsnapArenaBeforeFork(purpose, flags);   /* stock children must map the hybrid arena */
 
     int childpid;
     long long start = ustime();
@@ -7761,7 +7761,10 @@ int redisFork(int purpose) {
          * Setup signal handlers first because a signal could fire at any time.
          * Adjust OOM score before everything else to assist the OOM killer if
          * memory resources are low.
+         * A child without the keyspace reserves the hybrid arena's range before
+         * anything else, as nothing may allocate before that.
          */
+        if (flags & REDIS_FORK_NO_KEYSPACE) hybsnapChildNoKeyspaceInit();
         server.in_fork_child = purpose;
         setupChildSignalHandlers();
         setOOMScoreAdj(CONFIG_OOM_BGCHILD);
@@ -7930,7 +7933,7 @@ void dismissMemoryInChild(void) {
     /* Hybrid snapshot: the keyspace kvstores live in the hybrid arena and are
      * not mapped in the child at all unless the arena was flipped forkable for
      * this (stock) child; touching them here would fault otherwise. */
-    if ((!hybsnapArenaExists() || hybsnapArenaForkable()) &&
+    if (hybsnapForkSeesKeyspace() &&
         (server.in_fork_child == CHILD_TYPE_RDB || server.in_fork_child == CHILD_TYPE_AOF)) {
         for (int dbid = 0; dbid < server.dbnum; dbid++) {
             dismissKvstoreBucketsMemory(server.db[dbid].expires);

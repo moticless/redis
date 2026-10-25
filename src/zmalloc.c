@@ -501,7 +501,7 @@ int zmalloc_hybrid_arena_set_forkable(int forkable) {
     hybrid_arena_forkable = !!forkable;
     return 1;
 }
-int zmalloc_hybrid_arena_forkable(void) { return hybrid_arena_forkable; }
+int zmalloc_hybrid_arena_is_forkable(void) { return hybrid_arena_forkable; }
 unsigned zmalloc_hybrid_arena_index(void) { return zmalloc_hybrid_arena; }
 
 void zmalloc_hybrid_arena_va_stats(size_t *reserved, size_t *used) {

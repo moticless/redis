@@ -103,6 +103,12 @@ typedef void (hybsnapScanSlotDoneFn)(void *privdata, int store_idx, int didx, in
 /* Scan thread, after the last slot or on abort, before the scan is published as finished. */
 typedef void (hybsnapScanThreadDoneFn)(void *privdata, int aborted);
 typedef struct hybsnapSave hybsnapSave;
+/* What a hybrid save writes. */
+typedef enum hybsnapSaveKind {
+    HYBSNAP_SAVE_RDB     = 0,   /* BGSAVE or disk-based full sync: a file (filename, rsi, rdbflags) */
+    HYBSNAP_SAVE_SOCKETS = 1,   /* diskless full sync: the replicas' sockets (rsi) */
+    HYBSNAP_SAVE_AOF     = 2,   /* BGREWRITEAOF: the AOF base file */
+} hybsnapSaveKind;
 
 /* Keyspace placement statistics (DEBUG SNAP-PLACEMENT, SNAP-DRIFT). */
 typedef struct hybsnapPlacementStats {
@@ -415,14 +421,7 @@ static int hybsnapOriginalSharesValue(const kvobj *orig);
 static void hybsnapSaveRetainedAdd(kvobj *orig, int value_shared);
 static void hybsnapSaveRetainedSub(kvobj *orig, int value_shared);
 static redisDb *hybsnapStoreOwnerDb(hybsnapSave *sv, int s);
-static void hybsnapSaveDrainSideTables(void);
-
-/* ---- The save --------------------------------------------------------- */
-
-/* The three saves it dispatches to: same contracts as rdbSaveBackground, rdbSaveToSlavesSockets, rewriteAppendOnlyFileBackground. */
-static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags);
-static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
-static int hybsnapSaveBackgroundAof(void);
+static void hybsnapSectionDrain(void);
 
 /* ---- Messages to the child -------------------------------------------- */
 
@@ -486,14 +485,13 @@ void hybsnapArenaInit(void) {
 /* ---- Fork visibility of the arena (see hybrid_snapshot.h) ---------------------- */
 
 static int hybsnap_arena_fallback = 0;        /* flipped forkable for a non-hybrid child, flip back on reap */
-static int hybsnap_forking_no_keyspace = 0;   /* set around hybsnapForkNoKeyspace()'s redisFork() */
 static int hybsnap_child_no_keyspace = 0;     /* Is this process is a child forked without hybrid arena */
-int hybsnapChildNoKeyspace(void) { return hybsnap_child_no_keyspace; }
+int hybsnapIsChildNoKeyspace(void) { return hybsnap_child_no_keyspace; }
 
 /* Main thread: a hybrid save was requested but a loaded module has not
  * declared REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT; the classic child runs
  * instead. Logged when the blocking module changes, not on every save. */
-static void hybsnapHybridFallbackLog(void) {
+static void hybsnapFallbackLog(void) {
     static sds last = NULL;
     const char *who = moduleHybridSnapshotBlockedBy();
     if (last && !strcmp(last, who)) return;
@@ -505,14 +503,16 @@ static void hybsnapHybridFallbackLog(void) {
 
 /* Fork visibility of the arena: DONTFORK, so a child forked without the
  * keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module fork:
- * hybsnapForkNoKeyspace) never maps it. Any other fork (classic save, diskless
+ * redisFork() with REDIS_FORK_NO_KEYSPACE) never maps it. Any other fork (classic save, diskless
  * sync, AOF rewrite, module, Lua debugger) needs the keyspace, so redisFork()
  * flips it to DOFORK (hybsnapArenaBeforeFork) and the child reap path flips it
  * back once no child is left (hybsnapArenaChildExited). One madvise each way,
- * O(1) in keys; that child pays classic copy-on-write. */
-int hybsnapArenaForkable(void) {
+ * O(1) in keys; that child pays classic copy-on-write.
+ *
+ * Returns 1 iff hybrid arena exists and set to MADV_DOFORK. 0, otherwise. */
+int hybsnapArenaIsForkable(void) {
 #ifdef HAVE_HYBRID_ARENA
-    return hybsnapArenaExists() && zmalloc_hybrid_arena_forkable();
+    return hybsnapArenaExists() && zmalloc_hybrid_arena_is_forkable();
 #else
     return 0;
 #endif
@@ -533,9 +533,9 @@ static int hybsnapArenaSetForkable(int forkable) {
 #endif
 }
 
-void hybsnapArenaBeforeFork(int purpose) {
-    UNUSED(purpose);
-    if (hybsnap_forking_no_keyspace || !hybsnapArenaExists() || hybsnapArenaForkable()) return;
+void hybsnapArenaBeforeFork(int purpose, int flags) {
+    if ((flags & REDIS_FORK_NO_KEYSPACE) || hybsnapForkSeesKeyspace()) return;
+
     /* A classic child (RDB with the feature off, diskless sync, AOF rewrite,
      * module or Lua debugger fork) walks the keyspace: it must map the arena. */
     if (hybsnapArenaSetForkable(1)) {
@@ -553,17 +553,26 @@ void hybsnapArenaChildExited(void) {
         serverLog(LL_NOTICE, "Hybrid arena back to MADV_DONTFORK");
 }
 
-/* Child forked without the keyspace, first thing after the fork: the arena's
- * range is not mapped here (MADV_DONTFORK), so the kernel would hand its
- * addresses to our own allocations as the heap grows; zmalloc routes frees and
- * reallocs by address (zmalloc_in_hybrid_arena), so such a block would be
- * reallocated in the parent-only arena and the write would fault (seen as a
- * crash in the hybrid child's pipe reader). Reserve the whole range PROT_NONE
- * so nothing of ours can land in it. */
-static void hybsnapChildReserveArenaRange(void) {
+/* redisFork(), child side, first thing after the fork of a child that never
+ * touches the keyspace (REDIS_FORK_NO_KEYSPACE: the hybrid save child, a
+ * REDISMODULE_FORK_NO_KEYSPACE module fork). From here on the keyspace module
+ * APIs are refused (hybsnapIsChildNoKeyspace), with the feature on or off: one
+ * contract whatever the configuration.
+ *
+ * The arena was left DONTFORK (no page tables copied for it, no copy-on-write
+ * on it while the child runs), so its range is not mapped here and the kernel
+ * would hand its addresses to our own allocations as the heap grows; zmalloc
+ * routes frees and reallocs by address (zmalloc_in_hybrid_arena), so such a
+ * block would be reallocated in the parent-only arena and the write would
+ * fault (seen as a crash in the hybrid child's pipe reader). Reserve the whole
+ * range PROT_NONE so nothing of ours can land in it. When the arena is
+ * forkable anyway (feature off, a debugger child) the child has it mapped and
+ * there is nothing to reserve. */
+void hybsnapChildNoKeyspaceInit(void) {
+    hybsnap_child_no_keyspace = 1;
 #ifdef HAVE_HYBRID_ARENA
     void *lo; size_t len;
-    if (!zmalloc_hybrid_arena_range(&lo, &len)) return;
+    if (hybsnapForkSeesKeyspace() || !zmalloc_hybrid_arena_range(&lo, &len)) return;
     int flags = MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE;
 #ifdef MAP_FIXED_NOREPLACE
     flags |= MAP_FIXED_NOREPLACE;
@@ -576,32 +585,13 @@ static void hybsnapChildReserveArenaRange(void) {
 #endif
 }
 
-/* redisFork() for a child that never touches the keyspace: the hybrid save
- * child and a REDISMODULE_FORK_NO_KEYSPACE module fork. The arena is left
- * DONTFORK (no page tables copied for it, no copy-on-write on it while the
- * child runs); in the child the arena's range is reserved and the keyspace
- * module APIs are refused (hybsnapChildNoKeyspace). When the arena is forkable
- * anyway (feature off, a debugger child) the child has it mapped and needs no
- * reservation, but the refusals apply all the same: one contract whatever the
- * configuration. Same return as redisFork(). */
-int hybsnapForkNoKeyspace(int purpose) {
-    hybsnap_forking_no_keyspace = 1;
-    int childpid = redisFork(purpose);
-    hybsnap_forking_no_keyspace = 0;
-    if (childpid == 0) {
-        hybsnap_child_no_keyspace = 1;
-        if (hybsnapArenaExists() && !hybsnapArenaForkable()) hybsnapChildReserveArenaRange();
-    }
-    return childpid;
-}
-
 /* CONFIG SET hybrid-snapshot apply hook: flips the arena, refuses mid-save.
  * Saves take the hybrid path whether or not the hybrid arena exists
  * (without it the CoW benefit is gone but the mechanics are identical, which
  * is what sanitizer builds exercise). Switching is O(1): the arena is flipped
  * forkable when off, and values allocated meanwhile simply live in the
  * default allocator. */
-int hybsnapHybridConfigApply(const char **err) {
+int hybsnapConfigApply(const char **err) {
     if (server.loading) return 1;   /* applied again by the startup path */
     if (hasActiveChildProcess() || hybsnapSaveInProgress() || ldbPendingChildren()) {
         *err = "hybrid-snapshot cannot change while a save, rewrite, module fork or debugger child is running";
@@ -1194,7 +1184,10 @@ static struct {
 #define hybsnap_lo (hybsnap_pos_thread.lo)
 static uint64_t hybsnap_hi __attribute__((aligned(CACHE_LINE_SIZE))) = HYBSNAP_POS_INF;   /* main thread: seq_cst at the cap, release otherwise */
 static hybsnapScanCtx *hybsnap_live = NULL;      /* main thread: the scan whose thread runs (the cap and grants apply) */
-redisAtomic uint64_t hybsnap_section_seq = 0;
+/* Write-section counter: odd while the main thread is inside a write section,
+ * +1 at each open and close. The scan thread reads it once, at the end, to
+ * wait for an open section to close (hybsnapWalkerQuiesce). */
+static redisAtomic uint64_t hybsnap_section_seq = 0;
 
 static inline uint64_t hybsnapPosLoLoad(void) { return __atomic_load_n(&hybsnap_lo, __ATOMIC_ACQUIRE); }
 
@@ -1354,19 +1347,18 @@ static void hybsnapSectionOpen(void) {
     if (hybsnap_live) hybsnapWindowCap(hybsnap_live);
 }
 
-void hybsnapSectionCloseSlow(void) {
+void hybsnapSectionClose(void) {
     uint64_t v;
     atomicGet(hybsnap_section_seq, v);
-    if (v & 1) {
-        /* At a point where no caller holds a link: write back what the
-         * thread has passed, then let it run free. */
-        hybsnapSaveDrainSideTables();
-        if (hybsnap_live) {
-            hybsnap_live->hi = HYBSNAP_POS_INF;
-            __atomic_store_n(&hybsnap_hi, HYBSNAP_POS_INF, __ATOMIC_RELEASE);
-        }
-        atomicSetWithSync(hybsnap_section_seq, v + 1);
+    if (likely(!(v & 1))) return;    /* outside a section */
+    /* At a point where no caller holds a link: write back what the
+     * thread has passed, then let it run free. */
+    hybsnapSectionDrain();
+    if (hybsnap_live) {
+        hybsnap_live->hi = HYBSNAP_POS_INF;
+        __atomic_store_n(&hybsnap_hi, HYBSNAP_POS_INF, __ATOMIC_RELEASE);
     }
+    atomicSetWithSync(hybsnap_section_seq, v + 1);
 }
 
 /* The scan thread's waits for hi and the grants raised inside sections, of
@@ -2226,7 +2218,7 @@ sds hybsnapInfoMemory(sds info) {
         "allocator_resident_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_resident,
         "allocator_frag_bytes_hybrid_arena:%zu\r\n", server.cron_malloc_stats.hybrid_arena_frag_smallbins_bytes,
         "snap_hybrid_arena_available:%d\r\n", hybsnapArenaExists(),
-        "snap_hybrid_arena_forkable:%d\r\n", hybsnapArenaForkable(),
+        "snap_hybrid_arena_forkable:%d\r\n", hybsnapArenaIsForkable(),
         "snap_hybrid_arena_va_reserved:%zu\r\n", hybsnapArenaVaReserved(),
         "snap_hybrid_arena_va_used:%zu\r\n", hybsnapArenaVaUsed()));
 }
@@ -2290,7 +2282,7 @@ sds hybsnapInfoPersistence(sds info) {
 const char *const *hybsnapCrashReportInfoSections(void) {
     static const char *const keep[] = {"server", "clients", "persistence", "stats", "replication", "threads",
                                        "cpu", "module_list", "errorstats", "cluster", NULL};
-    return hybsnapChildNoKeyspace() ? keep : NULL;
+    return hybsnapIsChildNoKeyspace() ? keep : NULL;
 }
 
 static redisDb *hybsnapDebugDbArg(client *c) {
@@ -2596,7 +2588,7 @@ static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int did
  * those of the overlay windows wholly below lo. Called at the end of every
  * section and from cron; a no-op until lo has moved since the last drain. */
 static uint64_t hybsnap_drain_lo = 0;
-static void hybsnapSaveDrainSideTables(void) {
+static void hybsnapSectionDrain(void) {
     hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return;
     uint64_t lo = hybsnapPosLoLoad();
@@ -2778,7 +2770,7 @@ void hybsnapSaveCron(void) {
      * here too, so an overlayed bucket never outlives that by more than a tick. */
     if (hybsnapSaveSideEntries()) {
         hybsnapSectionOpen();
-        hybsnapSaveDrainSideTables();
+        hybsnapSectionDrain();
         hybsnapSectionClose();
     }
     size_t queued;
@@ -3669,7 +3661,7 @@ static int hybsnapSaveLaunch(hybsnapSave *sv) {
     hybsnapScanFreeze(sv->scan);
     latencyEndMonitor(freeze_lat);
     latencyAddSampleIfNeeded("hybrid-freeze", freeze_lat);
-    pid_t childpid = hybsnapForkNoKeyspace(hybsnapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB);
+    pid_t childpid = redisFork(hybsnapIsAof(sv) ? CHILD_TYPE_AOF : CHILD_TYPE_RDB, REDIS_FORK_NO_KEYSPACE);
     if (childpid == 0) {
         hybsnapSaveChild(sv);   /* never returns */
     }
@@ -3714,7 +3706,7 @@ static int hybsnapSaveLaunch(hybsnapSave *sv) {
  * is where the INCR file's history starts; backgroundRewriteDoneHandler does
  * the manifest work on the temp file the child leaves behind, as for the classic
  * child. */
-static int hybsnapSaveBackgroundAof(void) {
+int hybsnapStartRewriteAofBackground(void) {
     if (hasActiveChildProcess()) return C_ERR;
     hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
     if (!sv) return C_ERR;
@@ -3726,41 +3718,36 @@ static int hybsnapSaveBackgroundAof(void) {
  * of a fork-based snapshot (rdbSaveBackground, startBgsaveForReplication,
  * rewriteAppendOnlyFileBackground): the switch is on, the request has
  * keyspace content (functions-only transfers keep the classic child; a slot
- * snapshot is a hybrid save over the migrating slots) and every relevant module has opted in (otherwise the fallback
- * is logged once per blocking module). Returns C_OK when the hybrid save
- * started, C_ERR when it was taken and failed to start, HYBSNAP_NOT_TAKEN when
- * the caller must run the classic fork child. */
-int hybsnapSaveTryStart(hybsnapSaveKind kind, int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
-    if (!hybsnapHybridEnabled()) return HYBSNAP_NOT_TAKEN;
+ * snapshot is a hybrid save over the migrating slots) and every relevant
+ * module has opted in (otherwise the fallback is logged once per blocking
+ * module). Returns 1 when the caller starts the hybrid save, 0 when it must
+ * run the classic fork child. */
+int hybsnapSaveEligible(int req) {
+    if (!hybsnapEnabled()) return 0;
     /* A functions-only transfer has no keyspace content for the scan thread;
      * the classic child serves it (redisFork maps the arena). A slot snapshot
      * (atomic slot migration) is a hybrid save over the migrating slots. */
-    if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return HYBSNAP_NOT_TAKEN;
-    if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return HYBSNAP_NOT_TAKEN;
+    if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return 0;
+    if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return 0;
     /* Scan positions number every dict of every db in HYBSNAP_POS_ORD_BITS bits. */
     if ((long long)server.dbnum * (server.cluster_enabled ? CLUSTER_SLOTS : 1) >= (1LL << HYBSNAP_POS_ORD_BITS)) {
         static int logged = 0;
         if (!logged) serverLog(LL_NOTICE, "Hybrid snapshot: too many databases for the scan positions, the classic child serves the save");
         logged = 1;
-        return HYBSNAP_NOT_TAKEN;
+        return 0;
     }
     if (!moduleAllModulesHandleHybridSnapshot()) {
-        hybsnapHybridFallbackLog();   /* a module's save callbacks need the keyspace */
-        return HYBSNAP_NOT_TAKEN;
+        hybsnapFallbackLog();   /* a module's save callbacks need the keyspace */
+        return 0;
     }
-    switch (kind) {
-    case HYBSNAP_SAVE_RDB:     return hybsnapSaveBackground(req, filename, rsi, rdbflags);
-    case HYBSNAP_SAVE_SOCKETS: return hybsnapSaveToSlavesSockets(req, rsi);
-    case HYBSNAP_SAVE_AOF:     return hybsnapSaveBackgroundAof();
-    }
-    serverPanic("unknown hybrid save kind %d", (int)kind);
+    return 1;
 }
 
 /* Start a hybrid background save: freeze the keyspace (overlay), fork the
  * writer child, spawn the scan thread. Same contract as rdbSaveBackground(). */
-static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
+int hybsnapStartSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     if (hasActiveChildProcess()) return C_ERR;
-    if (hybsnapArenaForkable()) {
+    if (hybsnapArenaIsForkable()) {
         /* Only a Lua debugger session can leave the arena forkable with no
          * exclusive child around. The hybrid child never touches the arena, so
          * mapping it is harmless; it just pays copy-on-write on it meanwhile. */
@@ -3780,7 +3767,7 @@ static int hybsnapSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int 
  * writes the classic rdb pipe that the parent fans out to the sockets, and
  * waits on the safe-to-exit pipe before exiting. The classic socket done
  * handler (RDB_CHILD_TYPE_SOCKET) does the replica bookkeeping afterwards. */
-static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
+int hybsnapStartSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listIter li;
     listNode *ln;
     int pipefds[2];
@@ -3790,7 +3777,7 @@ static int hybsnapSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     /* Even if the previous fork child exited, don't start a new one until we
      * drained the pipe. */
     if (server.rdb_pipe_conns) return C_ERR;
-    if (hybsnapArenaForkable())
+    if (hybsnapArenaIsForkable())
         serverLog(LL_NOTICE, "Hybrid snapshot: the hybrid arena is forkable (debugger child); the save child will map it");
 
     hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_SOCKETS, req, NULL, rsi, RDBFLAGS_REPLICATION);
@@ -5534,10 +5521,10 @@ int hybsnapTest(int argc, char **argv, int flags) {
     test_cond("fork child faults when writing a HYBSNAP_NOFORK allocation", hybsnapTestChildWriteFaults(p) == 1);
     test_cond("fork child can write a zmalloc allocation", hybsnapTestChildWriteFaults(q) == 0);
     /* Fork visibility flip: one madvise over the reservation. */
-    test_cond("arena is DONTFORK by default", !hybsnapArenaForkable());
-    test_cond("flip: arena made forkable", hybsnapArenaSetForkable(1) && hybsnapArenaForkable());
+    test_cond("arena is DONTFORK by default", !hybsnapArenaIsForkable());
+    test_cond("flip: arena made forkable", hybsnapArenaSetForkable(1) && hybsnapArenaIsForkable());
     test_cond("flip: fork child can write a HYBSNAP_NOFORK allocation while forkable", hybsnapTestChildWriteFaults(p) == 0);
-    test_cond("flip: arena back to DONTFORK", hybsnapArenaSetForkable(0) && !hybsnapArenaForkable());
+    test_cond("flip: arena back to DONTFORK", hybsnapArenaSetForkable(0) && !hybsnapArenaIsForkable());
     test_cond("flip: fork child faults again on the same allocation", hybsnapTestChildWriteFaults(p) == 1);
 
     /* Large (>= 2MB, multi-page-run) allocation is also DONTFORK. */

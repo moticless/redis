@@ -361,7 +361,7 @@ A module's own forks are a separate declaration, made per fork call. `RedisModul
 classic child: it may walk the keyspace, so the arena is flipped forkable for it. A child that
 works on module memory only (an index, a cache) is forked with
 `RedisModule_ForkWithFlags(ctx, REDISMODULE_FORK_NO_KEYSPACE, cb, user_data)`. It is forked the way
-the hybrid child is (`hybsnapForkNoKeyspace`): the arena stays `MADV_DONTFORK`, the child reserves its
+the hybrid child is (`redisFork()` with `REDIS_FORK_NO_KEYSPACE`): the arena stays `MADV_DONTFORK`, the child reserves its
 range, the same keyspace APIs are refused there with the same once-per-API log, and the crash
 report skips the INFO sections that read the keyspace. The refusals apply with the feature on or
 off, so the contract does not depend on the configuration. Rule 2 above applies to the whole

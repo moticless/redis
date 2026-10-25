@@ -3730,7 +3730,10 @@ void sendChildInfo(childInfoType info_type, size_t keys, char *pname);
 void receiveChildInfo(void);
 
 /* Fork helpers */
-int redisFork(int purpose);
+#define REDIS_FORK_DEFAULT     (0)
+#define REDIS_FORK_NO_KEYSPACE (1<<0)   /* the child never touches the keyspace (the hybrid save child, a
+                                           REDISMODULE_FORK_NO_KEYSPACE module fork): the hybrid arena stays DONTFORK */
+int redisFork(int purpose, int flags);
 int hasActiveChildProcess(void);
 const char *strChildType(int type);
 void resetChildState(void);

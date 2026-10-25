@@ -3288,20 +3288,19 @@ int rewriteAppendOnlyFileBackground(void) {
      * child like a BGSAVE, as an RDB with the preamble or in AOF command
      * form without it; the INCR file opened above takes the writes from the
      * fork instant on. The stock child below runs when hybrid_snapshot.c declines. */
-    int hybrid = hybsnapSaveTryStart(HYBSNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, 0);
-    if (hybrid == C_ERR) {
-        server.aof_lastbgrewrite_status = C_ERR;
-        serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");
-        return C_ERR;
-    }
-    if (hybrid == C_OK) {
+    if (hybsnapSaveEligible(SLAVE_REQ_NONE)) {
+        if (hybsnapStartRewriteAofBackground() == C_ERR) {
+            server.aof_lastbgrewrite_status = C_ERR;
+            serverLog(LL_WARNING, "Can't rewrite append only file in background (hybrid)");
+            return C_ERR;
+        }
         serverLog(LL_NOTICE,
             "Background append only file rewriting started by pid %ld (hybrid)", (long) server.child_pid);
         aofRewriteStarted();
         return C_OK;
     }
 
-    if ((childpid = redisFork(CHILD_TYPE_AOF)) == 0) {
+    if ((childpid = redisFork(CHILD_TYPE_AOF, REDIS_FORK_DEFAULT)) == 0) {
         char tmpfile[256];
 
         /* Child */

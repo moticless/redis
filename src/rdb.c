@@ -2267,14 +2267,13 @@ int rdbSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rdbflags) {
     /* Hybrid snapshot: the scan thread and its child write the file; the
      * stock child below runs only when hybrid_snapshot.c declines (switch off,
      * functions-only request, or a module without the opt-in). */
-    int hybrid = hybsnapSaveTryStart(HYBSNAP_SAVE_RDB, req, filename, rsi, rdbflags);
-    if (hybrid != HYBSNAP_NOT_TAKEN) return hybrid;
+    if (hybsnapSaveEligible(req)) return hybsnapStartSaveBackground(req, filename, rsi, rdbflags);
     server.stat_rdb_saves++;
 
     server.dirty_before_bgsave = server.dirty;
     server.lastbgsave_try = time(NULL);
 
-    if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
+    if ((childpid = redisFork(CHILD_TYPE_RDB, REDIS_FORK_DEFAULT)) == 0) {
         int retval;
 
         /* Child */
@@ -5405,7 +5404,7 @@ int rdbSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     }
 
     /* Create the child process. */
-    if ((childpid = redisFork(CHILD_TYPE_RDB)) == 0) {
+    if ((childpid = redisFork(CHILD_TYPE_RDB, REDIS_FORK_DEFAULT)) == 0) {
         /* Child */
         int retval, dummy;
         rio rdb;

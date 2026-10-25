@@ -1146,8 +1146,8 @@ int startBgsaveForReplication(int mincapa, int req) {
         if (socket_target) {
             /* Hybrid snapshot: the child streams the replicas from the scan
              * thread's channels; the stock child when hybrid_snapshot.c declines. */
-            retval = hybsnapSaveTryStart(HYBSNAP_SAVE_SOCKETS, req, NULL, rsiptr, 0);
-            if (retval == HYBSNAP_NOT_TAKEN) retval = rdbSaveToSlavesSockets(req,rsiptr);
+            retval = hybsnapSaveEligible(req) ? hybsnapStartSaveToSlavesSockets(req, rsiptr)
+                                              : rdbSaveToSlavesSockets(req,rsiptr);
         } else {
             /* Keep the page cache since it'll get used soon */
             retval = rdbSaveBackground(req, server.rdb_filename, rsiptr, RDBFLAGS_REPLICATION | RDBFLAGS_KEEP_CACHE);
