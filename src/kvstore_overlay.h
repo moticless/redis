@@ -16,9 +16,8 @@
  *
  * While a scan runs over a store, the snapshot's hooks are installed on it
  * (kvstoreSnapGuardSet): every access to a dict without an overlay asks the
- * guard first, which may attach one. A dict with an overlay is "frozen": its
- * bucket layout is fixed (no resize; rehash steps are reported to the
- * snapshot), and before every structural write the snapshot's 'prepare' hook
+ * guard first, which may attach one. A dict with an overlay is "frozen":
+ * before every structural write the snapshot's 'prepare' hook
  * says whether the bucket's chain may be written in place. If not (DEFER:
  * the scan thread may be reading the bucket), the bucket is "overlayed": its
  * chain is duplicated, every key through 'clone' so in-place mutation by the
@@ -50,7 +49,7 @@
  * halves of those entry points and the overlayed buckets themselves. The store
  * struct is private to kvstore.c and the overlay struct is private to
  * kvstore_overlay.c: the two files meet only through the INTERNALS prototypes.
- * The save's own per-dict state (bucket bitmaps, pause) is hybrid_snapshot.c's,
+ * The save's own per-dict state (the pause) is hybrid_snapshot.c's,
  * in the dict's extension slot next to the overlay, and is not seen here.
  *
  * THE OVERLAYED BUCKETS
@@ -105,9 +104,6 @@
 
 /* Guard: a dict with no overlay is accessed (write = structural): attach one and return it, or NULL. */
 typedef struct kvstoreDictOverlay *(kvstoreSnapGuardFn)(void *privdata, kvstore *kvs, int didx, int write);
-/* Layout hooks: a dict started / finished an incremental rehash; may the dict shrink right now. */
-typedef void (kvstoreSnapRehashFn)(void *privdata, int didx, dict *d);
-typedef int (kvstoreSnapShrinkAllowedFn)(void *privdata, int didx);
 /* Overlay callbacks: a private copy of a frozen key for the bucket's duplicate, and the release of a frozen original after the write-back. */
 typedef void *(kvstoreOverlayCloneFn)(void *privdata, int didx, void *orig);
 typedef void (kvstoreOverlayFreeOrigFn)(void *privdata, int didx, void *orig);
@@ -125,9 +121,6 @@ typedef kvstoreOverlayPrepareResult (kvstoreOverlayPrepareFn)(void *privdata, in
 /* The snapshot's hooks on a store, one struct and one privdata; it must outlive every overlay attached while installed. */
 typedef struct kvstoreSnapHooks {
     kvstoreSnapGuardFn *guard;
-    kvstoreSnapRehashFn *rehash_started;
-    kvstoreSnapRehashFn *rehash_completed;
-    kvstoreSnapShrinkAllowedFn *shrink_allowed;
     kvstoreOverlayCloneFn *clone;
     kvstoreOverlayFreeOrigFn *free_orig;
     kvstoreOverlayEnterFn *enter;

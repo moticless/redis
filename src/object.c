@@ -82,10 +82,13 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     size_t min_size = sizeof(robj) + sizeof(kvBits);
     min_size += sizeMetas;
     min_size += key_sds_size;
+    int epoch_mode = hybsnap_epoch_mode;
+    if (epoch_mode == HYBSNAP_EPOCH_ALWAYS) min_size += sizeof(uint32_t);
 
     /* Allocate object memory. Every kvobj header lives in the HYBSNAP_NOFORK
      * arena (hybrid snapshot): the fork child never reads headers directly. */
-    char *alloc = zmalloc_hybrid(min_size);
+    size_t usable = 0;
+    char *alloc = zmalloc_hybrid_usable(min_size, &usable);
     kvobj *kv = (kvobj *) (alloc + sizeMetas);
     kv->type = type;
     kv->encoding = OBJ_ENCODING_RAW;
@@ -96,11 +99,14 @@ kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits) {
     kv->metabits = keyMetaBits;
     kvobjBits(kv)->key_sds_type = key_sds_type;
     kvobjBits(kv)->no_evict = 0;
+    kvobjBits(kv)->has_epoch = epoch_mode == HYBSNAP_EPOCH_ALWAYS ||
+        (epoch_mode == HYBSNAP_EPOCH_IF_FREE && usable - min_size >= sizeof(uint32_t));
     kvobjBits(kv)->unused = 0;
 
     /* Store embedded key, right after the kvBits. */
     char *data = (char *) (kvobjBits(kv) + 1);
     sdsnewplacement(data, key_sds_size, key_sds_type, key, key_sds_len);
+    if (kvobjBits(kv)->has_epoch) kvobjSetEpoch(kv, hybsnap_epoch_stamp);
 
     /* Reset each allocated metadata to its reset_value (such as Expiry=-1, etc) */
     keyMetaResetValues(kv);
@@ -184,6 +190,8 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     size_t min_size = sizeof(robj) + sizeof(kvBits) + val_sds_size;
     min_size += sizeMetas;
     min_size += key_sds_size;
+    int epoch_mode = hybsnap_epoch_mode;
+    if (epoch_mode == HYBSNAP_EPOCH_ALWAYS) min_size += sizeof(uint32_t);
 
     /* Allocate object memory (hybrid arena, see kvobjCreate). */
     size_t bufsize = 0;
@@ -206,9 +214,13 @@ static kvobj *kvobjCreateEmbedString(const char *val_ptr, size_t val_len,
     data += key_sds_size;
 
     /* Copy embedded value (EMBSTR) always as SDS TYPE 8. Account for unused
-     * memory in the SDS alloc field. */
+     * memory in the SDS alloc field, less the epoch's 4 bytes at the end. */
     size_t remaining_size = bufsize - (data - alloc);
+    kvobjBits(o)->has_epoch = epoch_mode == HYBSNAP_EPOCH_ALWAYS ||
+        (epoch_mode == HYBSNAP_EPOCH_IF_FREE && remaining_size - val_sds_size >= sizeof(uint32_t));
+    if (kvobjBits(o)->has_epoch) remaining_size -= sizeof(uint32_t);
     o->ptr = sdsnewplacement(data, remaining_size, SDS_TYPE_8, val_ptr, val_len);
+    if (kvobjBits(o)->has_epoch) kvobjSetEpoch(o, hybsnap_epoch_stamp);
     
     keyMetaResetValues(o); /* modules + expire */
     
@@ -259,6 +271,75 @@ sds kvobjGetKey(const kvobj *kv) {
     return (sds) ((char *) (bits + 1) + kvobjKeyHdrSize[bits->key_sds_type]);
 }
 
+/* Where the save epoch is: after the embedded value of an EMBSTR (its sds
+ * alloc stops 4 bytes short of the allocation's end), else after the key's
+ * terminator. An EMBSTR kvobj never changes encoding in place (a new object
+ * is created), nor does the key, so the place holds for the object's life. */
+static unsigned char *kvobjEpochPtr(const kvobj *kv) {
+    if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
+        return (unsigned char *)kv->ptr + sdsalloc(kv->ptr) + 1;
+    sds key = kvobjGetKey(kv);
+    return (unsigned char *)key + sdslen(key) + 1;
+}
+
+uint32_t kvobjGetEpoch(const kvobj *kv) {
+    if (!kvobjBits(kv)->has_epoch) return 0;
+    uint32_t e;
+    memcpy(&e, kvobjEpochPtr(kv), sizeof(e));
+    return e;
+}
+
+void kvobjSetEpoch(kvobj *kv, uint32_t epoch) {
+    debugServerAssert(kvobjBits(kv)->has_epoch);
+    memcpy(kvobjEpochPtr(kv), &epoch, sizeof(epoch));
+}
+
+/* Give 'kv' a save epoch set to 'epoch'. In place when its allocation has 4
+ * free bytes at the end (returns kv); else into a new allocation that takes
+ * over the header, the key and an embedded value but not the reference to a
+ * separate value (returns it): the caller repoints every reference from 'kv'
+ * to it and frees the old allocation alone, zfree(kvobjGetAllocPtr(kv)),
+ * never through decrRefCount. */
+kvobj *kvobjAddEpoch(kvobj *kv, uint32_t epoch) {
+    if (kvobjBits(kv)->has_epoch) {
+        kvobjSetEpoch(kv, epoch);
+        return kv;
+    }
+    char *alloc = kvobjGetAllocPtr(kv);
+    int embstr = kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR;
+    /* The bytes in use: up to the key's terminator, or the embedded value's. */
+    char *end;
+    if (embstr) {
+        if (sdsavail(kv->ptr) >= sizeof(uint32_t)) {
+            sdssetalloc(kv->ptr, sdsalloc(kv->ptr) - sizeof(uint32_t));
+            kvobjBits(kv)->has_epoch = 1;
+            kvobjSetEpoch(kv, epoch);
+            return kv;
+        }
+        end = (char *)kv->ptr + sdslen(kv->ptr) + 1;
+    } else {
+        sds key = kvobjGetKey(kv);
+        end = key + sdslen(key) + 1;
+        if ((size_t)(alloc + zmalloc_size(alloc) - end) >= sizeof(uint32_t)) {
+            kvobjBits(kv)->has_epoch = 1;
+            kvobjSetEpoch(kv, epoch);
+            return kv;
+        }
+    }
+    size_t used = end - alloc, usable = 0;
+    char *nalloc = zmalloc_hybrid_usable(used + sizeof(uint32_t), &usable);
+    memcpy(nalloc, alloc, used);
+    kvobj *nkv = (kvobj *)(nalloc + ((char *)kv - alloc));
+    if (embstr) {
+        nkv->ptr = (char *)kv->ptr + (nalloc - alloc);
+        /* The value's buffer runs to 4 bytes before the end, terminator included. */
+        sdssetalloc(nkv->ptr, (size_t)(nalloc + usable - sizeof(uint32_t) - (char *)nkv->ptr) - 1);
+    }
+    kvobjBits(nkv)->has_epoch = 1;
+    kvobjSetEpoch(nkv, epoch);
+    return nkv;
+}
+
 long long kvobjGetExpire(const kvobj *kv) {
     if (kv->metabits & KEY_META_MASK_EXPIRE) {
         return (long long) (*kvobjMetaRef((kvobj *)kv, KEY_META_ID_EXPIRE));
@@ -298,6 +379,9 @@ kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits) {
         size_t size = sizeof(kvobj) + sizeof(kvBits);
         size += (key != NULL) * (sdslen(key) + 2); /* sds hdr (1) + nullterm (1) */
         size += 4 + len; /* embstr header (3) + nullterm (1) */
+        /* A hybrid snapshot save epoch is not counted: it may end past the
+         * cache line, where only a save reads it, rather than turn the value
+         * into a separate allocation. */
         if (size <= CACHE_LINE_SIZE) {
             kv = kvobjCreateEmbedString(val->ptr, len, key, keyMetaBits);
         } else {
@@ -1396,6 +1480,9 @@ size_t kvobjAllocSize(kvobj *o) {
     /* Add embedded string size */
     if (o->encoding == OBJ_ENCODING_EMBSTR)
         asize += sdsAllocSize(o->ptr);
+    /* Add the hybrid snapshot save epoch */
+    if (kvobjBits(o)->has_epoch)
+        asize += sizeof(uint32_t);
 
     if (o->type == OBJ_STRING) {
         asize += stringObjectAllocSize(o);

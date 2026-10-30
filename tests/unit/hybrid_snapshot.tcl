@@ -956,7 +956,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             for {set i 0} {$i < 5000} {incr i} { r set sd:$i [string repeat d 40] }
             assert_equal 1 [s snap_save_in_progress]
             assert {[s snap_save_side_entries] > 0}
-            assert {[s snap_save_main_buckets] > 0}
+            assert {[s snap_save_main_keys] > 0}
             # the overlay's counters: buckets overlayed, keys cloned by them
             # (at least one per bucket), most buckets at once (the pending ones
             # are a lower bound), and the rehash held while any was overlayed
@@ -1391,19 +1391,51 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             assert_equal $digest [debug_digest]
         }
 
-        test {Hybrid snapshot harness: the bucket bitmaps exist only while a save runs, and only once a slot needs them} {
-            snap_populate_race 0 0
-            assert_equal 0 [s snap_save_bitmap_bytes]
-            r config set rdb-key-save-delay 1000
-            r bgsave
-            snap_wait_save_started
-            # on demand: the freeze allocates nothing; the first write to the
-            # slot not DONE yet (or the walker's arrival) attaches the bitmap
-            r set bitmap:probe 1
-            assert {[s snap_save_bitmap_bytes] > 0}
-            r config set rdb-key-save-delay 0
-            snap_wait_bgsave_done
-            assert_equal 0 [s snap_save_bitmap_bytes]
+        foreach prealloc {yes no} {
+            test "Hybrid snapshot: emit-ahead serializes only the written key, the scan skips it by its epoch (epoch-prealloc $prealloc)" {
+                r config set hybrid-snapshot-epoch-prealloc $prealloc
+                r flushall
+                # created under the policy: with prealloc every key has an
+                # epoch, without it only those with 4 free bytes in their
+                # allocation; the others get one in a new allocation when
+                # written ahead of the walker, with their TTL and field TTLs
+                # repointed to it
+                populate 20000 ea: 20
+                for {set i 0} {$i < 20000} {incr i 7} { r pexpire ea:$i 100000000 }
+                for {set i 0} {$i < 200} {incr i} {
+                    r hset eh:$i f v g w
+                    r hpexpire eh:$i 100000000 FIELDS 1 f
+                }
+                wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+                set ref [debug_digest]
+                r config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+                r bgsave
+                snap_wait_save_started
+                # distinct fork-instant keys, written in place by commands that
+                # keep the TTL: each is emitted ahead (one key, not its bucket)
+                # or, inside the window, overlayed
+                for {set i 0} {$i < 2000} {incr i 10} { r append ea:$i x }
+                for {set i 0} {$i < 200} {incr i 2} { r hset eh:$i g x }
+                assert_equal 1 [s snap_save_in_progress]
+                assert_equal 300 [expr {[s snap_save_main_keys] + [s snap_save_overlay_buckets]}]
+                if {$prealloc} {
+                    assert_equal 0 [s snap_save_epoch_reallocs]
+                } else {
+                    assert {[s snap_save_epoch_reallocs] > 0}
+                }
+                # the TTLs follow a key given an epoch in a new allocation
+                assert {[r pttl ea:0] > 0}
+                assert {[r hpttl eh:0 FIELDS 1 f] > 0}
+                r pexpire ea:0 200000000
+                r hpexpire eh:0 200000000 FIELDS 1 f
+                r config set rdb-key-save-delay 0
+                snap_wait_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                assert {[r pttl ea:0] > 100000000}
+                r debug reload nosave
+                assert_equal $ref [debug_digest]
+                r config set hybrid-snapshot-epoch-prealloc yes
+            }
         }
 
         test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the classic child keeps them} {
@@ -1539,7 +1571,6 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
                 for {set n 0} {$n < 50} {incr n} { snap_random_op 0 1 }
                 snap_wait_bgsave_done
                 assert_equal err [s rdb_last_bgsave_status]
-                assert_equal 0 [s snap_save_bitmap_bytes]
             }
             r config set rdb-key-save-delay 0
             after 600
@@ -1730,7 +1761,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
             assert_equal ok [s rdb_last_bgsave_status]
         }
 
-        test {Hybrid snapshot harness (cluster mode): a slot written before the scan reaches it keeps growing; its bitmap follows the table} {
+        test {Hybrid snapshot harness (cluster mode): a slot written before the scan reaches it grows and shrinks} {
             r flushall
             r config set rdbcompression no
             # a slot the walker reaches last (high index), non-empty at the fork
@@ -1750,12 +1781,14 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
             # several times while the save runs, with the fork-instant seeds
             # still pending save
             for {set i 0} {$i < 600} {incr i} { r set "$tag:$i" v }
+            # a seed written ahead of the walker: emitted, then in place
+            r append "$tag:seed0" x
+            # and back down: the dict shrinks while the save holds it
+            for {set i 0} {$i < 600} {incr i} { r del "$tag:$i" }
             assert_equal 1 [s snap_save_in_progress]
-            assert {[s snap_save_grown_dicts] >= 1}
             r config set rdb-key-save-delay 0
             snap_wait_bgsave_done
             assert_equal ok [s rdb_last_bgsave_status]
-            assert_equal 0 [s snap_save_bitmap_bytes]
             r debug reload nosave
             assert_equal $digest [debug_digest]   ;# the seeds, none of the 600
             r config set rdbcompression yes

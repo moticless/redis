@@ -22,7 +22,7 @@ if [ "$MODE" != nosave ]; then $C bgsave > /dev/null; sleep 0.5; fi
 $BIN/redis-benchmark -p $PORT -t set -n $NINS -r 1000000000 -d 16 -P 8 -c 20 --threads 2 -q 2>&1 | tr '\r' '\n' | tail -n 2
 echo "== after inserts (save running: $($C info persistence | grep -E '^(rdb_bgsave_in_progress)' | tr -d '\r'))"
 $C debug htstats 0 full | grep -E "table size|number of elements|max chain|avg chain|chain length" | tr '\n' ' '; echo
-$C info persistence | grep -E "snap_save_overlay|snap_save_side_entries|snap_save_main_buckets" | tr -d '\r' | tr '\n' ' '; echo
+$C info persistence | grep -E "snap_save_overlay|snap_save_side_entries|snap_save_main_keys" | tr -d '\r' | tr '\n' ' '; echo
 $C latency histogram set 2>/dev/null | grep -E "p99|p99.9|max" | head -3
 # wait for the save to end, then report its length and the final layout
 for i in $(seq 600); do [ "$($C info persistence | grep '^rdb_bgsave_in_progress' | tr -d '\r')" = "rdb_bgsave_in_progress:0" ] && break; sleep 0.5; done

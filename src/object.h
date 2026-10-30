@@ -127,7 +127,8 @@ typedef struct __attribute__ ((__packed__)) kvBits {
      * Keys are never longer than 4GB, so SDS_TYPE_64 is not needed. */
     unsigned key_sds_type : 2;
     unsigned no_evict : 1;    /* Protected from maxmemory eviction. */
-    unsigned unused : 5;       /* Free bits. Available for future use. */
+    unsigned has_epoch : 1;   /* A 4-byte hybrid snapshot save epoch ends the allocation (kvobjGetEpoch). */
+    unsigned unused : 4;       /* Free bits. Available for future use. */
 } kvBits;
 
 /* Returns the kvBits that follow the robj. Valid only if kv->iskvobj is set.
@@ -135,6 +136,13 @@ typedef struct __attribute__ ((__packed__)) kvBits {
 static inline kvBits *kvobjBits(const kvobj *kv) {
     return (kvBits *) (void *) (kv + 1);
 }
+
+/* The hybrid snapshot save epoch of a kvobj (hybrid_snapshot.h): 4 bytes at
+ * the end of the allocation, after the embedded key or, for EMBSTR, after the
+ * embedded value (whose sds alloc excludes them). 0 when there is none. */
+uint32_t kvobjGetEpoch(const kvobj *kv);
+void kvobjSetEpoch(kvobj *kv, uint32_t epoch);
+kvobj *kvobjAddEpoch(kvobj *kv, uint32_t epoch);
 
 kvobj *kvobjCreate(int type, const sds key, void *ptr, uint32_t keyMetaBits);
 kvobj *kvobjSet(sds key, robj *val, uint32_t keyMetaBits);

@@ -63,8 +63,8 @@ memory.
 | 1 | Capture per-db (and per-slot) key and expire counts for `RESIZEDB` / `SLOT_INFO`. | | |
 | 2 | **Freeze**: for every non-empty keyspace dict take one reference, stamp it `(generation, PENDING)` and record it in the save's table; install the store's snapshot guard. Nothing is paused, nothing allocated per dict. | | |
 | 3 | `redisFork()`. The arena stays `MADV_DONTFORK`. | | Inherits the HYBSNAP_FORK values (copy-on-write), the forkable half of the server, no headers, no tables, no small values. Reserves the arena's address range `PROT_NONE` so its own mappings cannot land there. |
-| 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts in scan order (section 3, the credit window). For each dict: claim it, announce its layout position and read its table sizes, then announce batches of 128 buckets (plus the prefetch lookahead) and read their chains with atomic loads, staying below `hi` and skipping buckets whose bitmap bit is set; publish `lo` behind each bucket. HYBSNAP_NOFORK keys are serialized into a 64 KB staging buffer; HYBSNAP_FORK keys become KVOBJ messages. Every `W` buckets (default 1024) and at the end of each dict forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
-| 5 | Write back overlayed buckets at the end of every write section and once per cron tick: a bucket the thread has passed (its overlay window wholly below `lo`) gets its duplicate chain installed in the dict and its originals released. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, free the bitmaps, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, set `lo` and `cur` past every position, wait once for an open write section to close (it may still be emitting), drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
+| 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts in scan order (section 3, the credit window). For each dict: claim it, announce its layout position and read its table sizes, then announce batches of 128 buckets (plus the prefetch lookahead) and read their chains with atomic loads, staying below `hi` and skipping keys whose save epoch is the save's (emitted ahead, or created after the fork instant); publish `lo` behind each bucket. HYBSNAP_NOFORK keys are serialized into a 64 KB staging buffer; HYBSNAP_FORK keys become KVOBJ messages. Every `W` buckets (default 1024) and at the end of each dict forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
+| 5 | Write back overlayed buckets at the end of every write section and once per cron tick: a bucket the thread has passed (its overlay window wholly below `lo`) gets its duplicate chain installed in the dict and its originals released. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, set `lo` and `cur` past every position, wait once for an open write section to close (it may still be emitting), drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
 | 6 | `checkChildrenDone` -> the classic done handler -> `hybsnapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
 
 ![One hybrid save in flight](images/hybrid-snapshot-flow.png)
@@ -118,9 +118,25 @@ compares it with the dict's state and the credit window (below):
 | position | condition | action |
 |---|---|---|
 | behind | dict SCANNED or DONE, or `p < lo` | write in place; nothing is pending save |
-| emitted | the bucket's bitmap bit is set, whatever the position | write in place; the thread skips the bucket |
-| inside | `lo <= p < hi`, bit clear | never touch the dict's slot or chain: on the first write duplicate the whole chain of the bucket (every key cloned) into an overlayed bucket and apply this and later writes to the duplicate; a delete unlinks from the duplicate, an add links into it; the originals stay in the dict for the thread |
-| ahead | dict PENDING and not paused (wholly beyond `hi`), or `p >= hi`, bit clear | **emit first**: serialize the bucket's whole fork-instant chain on the main thread (HYBSNAP_NOFORK records into the staging area, HYBSNAP_FORK keys as header copies) into `mq`, set the bit, then write in place |
+| inside | `lo <= p < hi` | never touch the dict's slot or chain: on the first write duplicate the whole chain of the bucket (every key cloned) into an overlayed bucket and apply this and later writes to the duplicate; a delete unlinks from the duplicate, an add links into it; the originals stay in the dict for the thread |
+| ahead | dict PENDING and not paused (wholly beyond `hi`), or `p >= hi` | if the key exists and its epoch is older than the save's, **emit it first**: serialize that key alone on the main thread (a HYBSNAP_NOFORK record into the staging area, a HYBSNAP_FORK key as a header copy) into `mq` and stamp it with the save's epoch; then write in place. The bucket's other keys stay for the thread; a key the write adds is newer than the fork instant (stamped at creation) |
+
+**Save epochs.** Every save takes the next 32-bit epoch at its freeze. A kvobj may carry a 4-byte
+epoch at the end of its allocation (`kvBits.has_epoch`; after the embedded key, or after an EMBSTR
+value whose sds `alloc` stops 4 bytes short; `kvobjGetEpoch`). The thread skips a key whose epoch is
+at least the save's: the main thread emitted it ahead (and stamped it before writing it in place),
+or it was created after the fork instant (every kvobj created while a save runs gets the save's
+epoch). A key with an older epoch, or none, is fork-instant; stamps of earlier saves are never
+cleared. Only the main thread writes epochs, only at or beyond `hi` inside a write section, so the
+thread's acquire of a `hi` past the bucket orders the stamp before its read: no atomics on the key.
+Which kvobjs get an epoch at creation outside a save is `hybrid-snapshot-epoch-prealloc` (hidden,
+default yes): every one while the feature is on, else only those with 4 free bytes in their
+allocation. A key written ahead without one gets it in place when its allocation has room, else in
+a copy that takes over the dict entry, `db->expires`, `db->subexpires` and the slot accounting; the
+old allocation is freed when the write section closes (`snap_save_epoch_reallocs`). A kvobj
+recreated by any flow (`kvobjSet`: overwrite, the expire slot, RENAME/MOVE/COPY/RESTORE, encoding
+changes) gets an epoch by the same rule, so a stamp the running save needs is never lost, and an
+older one is dropped unless the policy keeps it.
 
 **The credit window.** The scan visits a fixed order, and each bucket has a position in it: a
 64-bit integer packing the dict's ordinal (its store's base plus the slot, so a slot filter's
@@ -192,13 +208,11 @@ soft count.
 
 **Attach and pause.** A dict acquires its per-save state on demand: the store's guard, which runs
 on every access to a dict without an overlay while the scan runs, attaches on the first
-structural write, or on any access while the thread is on the dict. Attaching allocates one
-bitmap per hash table and the overlay. A dict's rehashing and auto-resize are paused before `hi`
-may pass its layout (`advance`), or by the guard while the thread is on it. A dict beyond `hi` may
-keep growing: when it starts
-a rehash the bitmap of the old table is replicated into the new one (bucket `i` of `n` becomes
-`i + j*n` of `k*n`), and emit-ahead on such a dict marks the whole bucket class in both tables.
-A shrink merges buckets, which a bitmap cannot follow, so it is refused for attached dicts.
+structural write, or on any access while the thread is on the dict. Attaching allocates the
+overlay. A dict's rehashing and auto-resize are paused before `hi` may pass its layout
+(`advance`), or by the guard while the thread is on it: positions name buckets by `(table, idx)`.
+A dict beyond `hi` may keep growing and shrinking, attached or not: what the main thread emitted
+ahead is recorded in the keys' epochs, which move with the keys.
 
 **The overlayed buckets.** Indexed by the overlay window they were deferred in: the overlay's
 `prepare` hook returns the window with its verdict, the aligned run of `W` buckets (rounded up to
@@ -233,7 +247,7 @@ main thread writes back every overlayed bucket of the windows whose last positio
 detached dicts included, with no per-bucket position check: the dict's slot is set to the duplicate chain, the
 dict's entry count is adjusted by the difference, and each original is released (its header; its
 value too unless the clone took it over). When the thread publishes SCANNED for a dict, the main
-thread writes back what is left, resumes rehashing and auto-resize, frees the bitmaps, marks the
+thread writes back what is left, resumes rehashing and auto-resize, marks the
 dict DONE and drops the save's reference. From then on writes to it are classic writes.
 
 **References.** A dict is owned by its store (one reference) and held by a running save (one
@@ -257,13 +271,14 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 | retained originals: fork-instant HYBSNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket's overlay window |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded within the thread's next `W` buckets or at the end of its dict |
 | the scan thread's queues to the child (`oq` + `bq`) | parent | `hybrid-snapshot-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
-| per-dict bitmaps and the overlay index | parent | one bit per bucket per table of attached and paused dicts; per overlay window holding buckets an array of one pointer per bucket of the window (8 KB at the default 1024) and its bitmap, plus the duplicated chains; grants stop at 16 windows in use |
+| the overlay index | parent | per overlay window holding buckets an array of one pointer per bucket of the window (8 KB at the default 1024) and its bitmap of the offsets in use, plus the duplicated chains; grants stop at 16 windows in use |
+| save epochs | parent, permanent | 4 bytes at the end of a kvobj: every kvobj created while the feature is on (`hybrid-snapshot-epoch-prealloc yes`), or only those with room for it and those written ahead of the thread or created during a save (`no`); a jemalloc size class step only when the 4 bytes cross one |
 
 The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
 retained originals plus the bytes the main thread has queued and the thread has not yet handed to
 its own queues. `hybsnapSaveCron` aborts the save when it is exceeded, and reports the save as failed
 (`rdb_last_bgsave_status:err`, `snap_hard_mark_aborts`). The worst-case memory a save holds in the
-parent is the sum of the two bounds. The queues, the retained originals, the bitmaps and the save's
+parent is the sum of the two bounds. The queues, the retained originals and the save's
 fixed bookkeeping (per-slot size tables, dict tables, completion ring) are excluded from the eviction
 calculation, like the replication buffers, so a save never causes evictions by itself: that memory
 is what the classic child would hold in its own process.
@@ -313,7 +328,7 @@ What happens when something else touches the keyspace or the child during a hybr
 | hybrid AOF rewrite and FLUSHALL | the rewrite finishes on the detached dbs; the FLUSHALL lands in the INCR file | yes, the classic save keeps its AOF child |
 | atomic slot migration's slot snapshot | start, success, failure and cancel run through replication's hooks into the migration's state machine (`asmSlotSnapshotAndStreamStart`, `asmSlotSnapshotSucceed`, `asmSlotSnapshotFailed`, `killRDBChild` on cancel), the same path a hybrid full sync takes; the slot set is fixed at the fork instant from the migrate task, like the trim set below | yes |
 | atomic slot migration's trim | keys of slots under a trim job at the fork instant are skipped and counted in the "keys skipped" log line, as the classic child skips them; a trim that starts during the save is not in that set, its moved slot dicts stay with the save (references), are serialized to the end and freed when their slots complete | yes |
-| rehash and resize | dicts are paused before `hi` may pass their layout, and while the thread is on them; dicts beyond `hi` grow with their bitmap, shrink is refused for attached dicts | the classic save avoids resizing while a child exists |
+| rehash and resize | dicts are paused before `hi` may pass their layout, and while the thread is on them; dicts beyond `hi` grow and shrink freely (the keys carry their epochs) | the classic save avoids resizing while a child exists |
 | active defrag | off while a child exists (classic rule); the arena's tcache is flushed once a second by cron | yes |
 | key expiry and eviction | active expiry and eviction continue; deletes go through the funnel; LRU/LFU updates on lookups are skipped while a child exists | yes |
 | hash-field expiry | active field expiry is suspended for the save; lazy field expiry and `HRANDFIELD` skip deletion on keys pending save (expired fields are invisible, not deleted, as on a replica) | hybrid-specific |
@@ -399,7 +414,9 @@ the single-child rule applies as for any fork.
 | `snap_save_in_progress` | a hybrid save is running |
 | `snap_save_slots_total`, `snap_save_slots_done` | fork-instant dicts to scan and completed |
 | `snap_save_keys_nofork`, `snap_save_keys_fork`, `snap_save_bytes_sent` | records produced by the scan thread so far, by class, and bytes sent to the child |
-| `snap_save_main_buckets`, `snap_save_main_keys` | buckets and keys the main thread emitted ahead of the window |
+| `snap_save_main_keys` | keys the main thread emitted ahead of the window |
+| `snap_save_scan_stamped_keys` | keys the scan thread skipped for their epoch (emitted ahead, or created after the fork instant) |
+| `snap_save_epoch_reallocs` | keys written ahead that got their epoch in a new allocation (no room in theirs) |
 | `snap_save_scan_stalls`, `snap_save_scan_stall_ms` | times the scan thread waited at `hi`, and the time it spent waiting, in the current or last save |
 | `snap_save_window_grants` | times a write section raised `hi` (the thread was half way through its credit), in the current or last save |
 | `snap_save_retained_bytes`, `snap_last_save_retained_peak` | fork-instant originals kept alive by overlayed buckets, now and at the last save's peak |
@@ -408,8 +425,6 @@ the single-child rule applies as for any fork.
 | `snap_save_overlay_buckets`, `snap_save_overlay_clones` | writes that overlayed a bucket (collisions with the window) and the keys cloned by them, since the current or last save started |
 | `snap_save_overlay_peak_buckets` | most buckets overlayed at once, over every dict |
 | `snap_save_overlay_paused_ms` | dict-time rehash and auto-resize were held by overlayed buckets (summed over dicts) |
-| `snap_save_bitmap_bytes` | bytes of per-save bucket bitmaps |
-| `snap_save_grown_dicts` | attached dicts that expanded during the save and had their bitmap remapped |
 | `snap_retained_dicts` | across saves, dicts their store let go of before the save completed them |
 | `snap_save_inplace_writes`, `snap_last_save_inplace_writes`, `snap_inplace_writes_total` | writes served in place on scanned keys |
 | `snap_hard_mark_aborts` | saves aborted at the hard mark |
@@ -459,9 +474,11 @@ MADV_DONTFORK`.
   and lifts the cap at its end.
 - **funnel**: the overlay's `prepare` hook and the three outcomes of a write: in place, overlayed
   bucket, emit-ahead.
-- **emit-ahead**: serializing a bucket's fork-instant chain on the main thread before writing it
-  in place, marking it in the bitmap so the thread skips it.
-- **bitmap**: one bit per bucket per table of an attached dict; set means emitted.
+- **emit-ahead**: serializing a fork-instant key on the main thread before writing it in place,
+  stamping it with the save's epoch so the thread skips it.
+- **save epoch**: a 32-bit number per save, taken at the freeze; a kvobj's optional 4-byte epoch
+  at the end of its allocation says the save of that epoch, or a later one, must not serialize it
+  from the scan.
 - **overlay** / **overlayed bucket**: for each bucket written while it was inside the window, a
   duplicate of its chain, indexed by its overlay window, (clones, adds, no deleted keys) that the main
   thread uses in place of the dict's chain until the write-back.
@@ -478,18 +495,19 @@ MADV_DONTFORK`.
    every keyspace write to a bucket pending save goes through the funnel, which emits or clones before the
    dict changes.
 2. The thread reads chain pointers only below `hi` and after announcing them in `cur`; the main
-   thread writes chains only outside `[lo, hi)` and only inside a write section; a bitmap bit is
-   set only at or beyond `hi`, before `hi` is raised over it.
+   thread writes chains only outside `[lo, hi)` and only inside a write section; a key's epoch is
+   written only at or beyond `hi`, before `hi` is raised over it.
 3. Every fork-instant key reaches the output exactly once: by the thread, by the main thread's
-   emit-ahead (bit set, thread skips), or by the child from a header copy. A key deleted while its
+   emit-ahead (key stamped, thread skips), or by the child from a header copy. A key deleted while its
    bucket is inside the window stays in the dict, as an original, until the bucket is written back.
 4. The snapshot is the fork instant: a key's record is its state at the fork, under its
    fork-instant db id, with its fork-instant TTL and field TTLs read from the value.
 5. Memory held by a save in the parent is bounded by the hard mark plus the queue bound, and is
    released when the save ends; the previous dump is untouched by a failed or aborted save.
 6. The hybrid child never dereferences the arena; module APIs that would are refused.
-7. No state the save attached to a dict outlives the save: every reference, bitmap, overlay and
-   pause is released before the store's guard comes off.
+7. No state the save attached to a dict outlives the save: every reference, overlay and
+   pause is released before the store's guard comes off. The keys' epochs outlive it by design:
+   they are older than the next save's.
 8. The main thread never waits for the scan thread or the child; the scan thread waits for the
    main thread only inside a write section once it reaches `hi` (for at most the rest of that
    section) and once at the end, and for the child only at the queue bound.

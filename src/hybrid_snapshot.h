@@ -72,8 +72,10 @@
  *   behind  below lo: written in place;
  *   inside  in [lo, hi): the thread may be reading it, so the write goes to
  *           a duplicate of the bucket's chain (kvstore_overlay.h);
- *   ahead   hi and above: serialized by the main thread first (emit-ahead,
- *           marked so the thread skips it), then written in place.
+ *   ahead   hi and above: the written key is serialized by the main thread
+ *           first (emit-ahead) and stamped with the save's epoch so the
+ *           thread skips it, then written in place; the bucket's other
+ *           keys stay for the thread.
  * The thread waits only when it reaches hi during a long section, and once at
  * the end for an open section to close; the main thread never waits. The cap
  * is a seq_cst store-load pair on each side (thread: store cur, load hi;
@@ -84,12 +86,15 @@
  *
  * MEMORY
  * ------
- * The hybrid keeps three things alive beyond the classic save: fork-instant originals
+ * The hybrid keeps two things alive beyond the classic save: fork-instant originals
  * that were replaced or deleted while pending save (retained bytes, bounded by
- * `hybrid-snapshot-max-retained-bytes`, the save aborts above it), records
+ * `hybrid-snapshot-max-retained-bytes`, the save aborts above it) and records
  * queued for the child (`hybrid-snapshot-max-queued-bytes`, the thread waits
- * above it), and one bit per bucket of every dict the save touched. INFO
- * memory and persistence report all three (hybsnapInfoMemory/Persistence).
+ * above it). INFO memory and persistence report both (hybsnapInfoMemory/Persistence).
+ * Permanently, a kvobj may carry a 4-byte save epoch at its end (object.h
+ * kvobjGetEpoch): every one created while the feature is on, or only those with
+ * 4 free bytes in their allocation and those written during a save
+ * (hybrid-snapshot-epoch-prealloc, hybsnapEpochMode).
  *
  * ENTRY POINTS
  * ------------
@@ -169,6 +174,22 @@ static inline void hybsnapPlaceValue(robj *o) {
 /* As obj value increase, move it to "common" arena to make it avail to child */
 void hybsnapValueDetachFromArena(robj *o);
 
+/* ---- Save epochs (object.h kvobjGetEpoch) ---------------------------------- */
+
+/* Which kvobjs get a save epoch when they are created (kvobjCreate*): every
+ * one while a save runs (a key born after the fork instant must be skipped by
+ * the scan), else per hybrid-snapshot-epoch-prealloc: every one (ALWAYS) or
+ * those whose allocation has 4 free bytes anyway (IF_FREE); none while the
+ * feature is off. New kvobjs are stamped with hybsnap_epoch_stamp: the running
+ * save's epoch, else the last save's (older than the next one). Main thread. */
+typedef enum hybsnapEpochMode {
+    HYBSNAP_EPOCH_NONE    = 0,
+    HYBSNAP_EPOCH_IF_FREE = 1,
+    HYBSNAP_EPOCH_ALWAYS  = 2,
+} hybsnapEpochMode;
+extern int hybsnap_epoch_mode;
+extern uint32_t hybsnap_epoch_stamp;
+
 /* ---- Credit window and write sections ------------------------------------ */
 
 /* End the open write section, if any: write back the overlayed buckets the
@@ -201,6 +222,7 @@ int hybsnapStartSaveToSlavesSockets(int req, rdbSaveInfo *rsi);
 int hybsnapStartRewriteAofBackground(void);
 
 int hybsnapConfigApply(const char **err);
+int hybsnapEpochConfigApply(const char **err);
 
 int hybsnapIsEnabled(void);
 

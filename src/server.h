@@ -2587,6 +2587,7 @@ struct redisServer {
     int sort_store;
     /* Zip structure config, see redis.conf for more information  */
     int hybrid_snapshot;              /* Hybrid snapshot: hybrid arena + background scan (hybrid_snapshot.c). Runtime switch. */
+    int hybrid_snapshot_epoch_prealloc; /* Hybrid snapshot: every kvobj gets a save epoch at creation (else only where it is free). Hidden. */
     long long stat_hybsnap_saves;      /* Hybrid saves started (INFO snap_saves). */
     long long stat_hybsnap_inplace_writes;  /* Writes to already-scanned keys served in place (no clone). */
     size_t save_small_max_bytes;    /* Max value size for HYBSNAP_NOFORK class (hybrid_snapshot.c). */
