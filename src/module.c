@@ -15295,16 +15295,16 @@ size_t moduleCount(void) {
  * -------------------------------------------------------------------------- */
 
 /* RM_SetLRU / RM_SetLFU write the kvobj header, which the hybrid snapshot scan
- * thread reads for the IDLE / FREQ opcodes while the key is owed to it. A
+ * thread reads for the IDLE / FREQ opcodes while the key is pending save. A
  * handle opened with REDISMODULE_WRITE already went through the write funnel
  * at open time; a READ handle (the documented way to set the idle time
  * without touching it first, READ|NOTOUCH) is handed over here: the write
- * lookup emits or clones the owed bucket, and the pointer is refreshed since
+ * lookup emits or clones its bucket, and the pointer is refreshed since
  * a clone replaces the frozen original. Returns 0 when there is no key. */
 static int moduleKeyPrepareLruWrite(RedisModuleKey *key) {
     if (!key->kv) return 0;
     if (key->mode & REDISMODULE_WRITE) return 1;
-    /* A READ handle: during a hybrid snapshot an owed key goes through the
+    /* A READ handle: during a hybrid snapshot a key pending save goes through the
      * write funnel first, as a WRITE handle did at open time. */
     kvobj *kv = hybsnapPrepareMutation(key->db, key->key, key->kv);
     if (!kv) return 0;

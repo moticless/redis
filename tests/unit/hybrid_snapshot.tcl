@@ -257,7 +257,7 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             r config set rdb-key-save-delay 5000
             r bgsave
             wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
-            # mutate owed keys of every kind while the scan runs
+            # mutate keys pending save of every kind while the scan runs
             r set str:small changed
             r del str:raw
             r set brand:new 1
@@ -279,7 +279,7 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             r expire hash:ht 1000
             r expire list:ql 1000
             r persist list:ql
-            # encoding conversions on owed HYBSNAP_NOFORK clones
+            # encoding conversions on HYBSNAP_NOFORK clones of keys pending save
             for {set i 0} {$i < 600} {incr i} { r hset hash:lp c$i v }
             assert_equal hashtable [r object encoding hash:lp]
             r sadd set:intset notanint
@@ -492,7 +492,7 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             r set swapped:probe 1                  ;# a write through the swapped db reaches the right kvstore
             r select 10
             assert_equal 3000 [r dbsize]
-            r set filler:0 [string repeat s 60]    ;# in-place write on an owed key of the swapped store
+            r set filler:0 [string repeat s 60]    ;# in-place write on a key pending save of the swapped store
             r select 9
             r config set rdb-key-save-delay 0
             wait_hybrid_snapshot_done
@@ -1039,7 +1039,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             r config set rdb-key-save-delay 2000
             r bgsave
             snap_wait_save_started
-            # write them while owed: the pre-write emission ships them to the child
+            # write them while pending save: the pre-write emission ships them to the child
             r append km:str more
             r set km:embstr other
             r hset km:hash f3 v3
@@ -1398,7 +1398,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             r bgsave
             snap_wait_save_started
             # on demand: the freeze allocates nothing; the first write to the
-            # owed slot (or the walker's arrival) attaches the bitmap
+            # slot not DONE yet (or the walker's arrival) attaches the bitmap
             r set bitmap:probe 1
             assert {[s snap_save_bitmap_bytes] > 0}
             r config set rdb-key-save-delay 0
@@ -1564,7 +1564,7 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             snap_wait_save_started
             # A key the scan already passed is freed at once on DEL and its
             # slot is the first the allocator hands out again for the same
-            # size; a key still owed is retained until its bucket is scanned,
+            # size; a key still pending save is retained until its bucket is scanned,
             # so its address cannot come back. Scan order is bucket order, so
             # walking the keys in creation order meets both kinds.
             set reused 0
@@ -1748,7 +1748,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
             snap_wait_save_started
             # 600 keys into the unreached slot: its dict expands from 4 buckets
             # several times while the save runs, with the fork-instant seeds
-            # still owed to the scan thread
+            # still pending save
             for {set i 0} {$i < 600} {incr i} { r set "$tag:$i" v }
             assert_equal 1 [s snap_save_in_progress]
             assert {[s snap_save_grown_dicts] >= 1}
@@ -1765,7 +1765,7 @@ start_cluster 1 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
             r flushall
             populate 30000 cl: 20
             # a high slot (the walker reaches it last) with no key at the fork
-            # instant: its dict does not exist yet, nothing in it is owed
+            # instant: its dict does not exist yet, nothing in it is pending save
             set tag ""
             for {set i 0} {$i < 400} {incr i} {
                 set slot [r cluster keyslot "{e$i}"]
@@ -2085,7 +2085,7 @@ start_server {tags {"snapshot modules external:skip"} overrides {hybrid-snapshot
         snap_wait_save_started
         # [SetLRU read, SetLRU write, SetLFU read, SetLFU write] under the LRU
         # policy: both handles succeed, the READ one after the funnel emitted or
-        # cloned the owed key (a WRITE handle did that at open time)
+        # cloned the key (a WRITE handle did that at open time)
         r config set maxmemory-policy allkeys-lru
         assert_equal {1 1 0 0} [r hv.setlru plain]
         assert {[r object idletime plain] >= 1}

@@ -239,7 +239,7 @@ static inline void activeSubexpiresCycle(int type) {
     static int currentSlot = -1;
 
     /* Hybrid snapshot: field expiry rewrites hash values in place; fork-instant
-     * originals of owed slots must not be touched. Suspended for the save. */
+     * originals of slots not DONE must not be touched. Suspended for the save. */
     if (hybsnapSaveIsInProgress()) return;
 
     /* Tracks the count of fields actively expired for the current database.

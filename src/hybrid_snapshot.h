@@ -78,14 +78,14 @@
  * the end for an open section to close; the main thread never waits. The cap
  * is a seq_cst store-load pair on each side (thread: store cur, load hi;
  * main: store hi, load cur): either the main thread sees where the thread is,
- * or the thread sees the cap. A slot (dict) is "owed" to the save until its
+ * or the thread sees the cap. A slot (dict) is held by the save until its
  * state is HYBSNAP_SLOT_DONE. The encoding and the code: hybrid_snapshot.c,
  * "Scan positions".
  *
  * MEMORY
  * ------
  * The hybrid keeps three things alive beyond the classic save: fork-instant originals
- * that were replaced or deleted while owed (retained bytes, bounded by
+ * that were replaced or deleted while pending save (retained bytes, bounded by
  * `hybrid-snapshot-max-retained-bytes`, the save aborts above it), records
  * queued for the child (`hybrid-snapshot-max-queued-bytes`, the thread waits
  * above it), and one bit per bucket of every dict the save touched. INFO
@@ -214,19 +214,19 @@ int hybsnapSaveDetachDb(kvstore *keys, kvstore *expires, void *subexpires, dict 
 void hybsnapSaveAbort(void);
 /* The one child-end hook, for every child type, before the type's done handler. */
 void hybsnapOnChildEnd(int exitcode, int bysignal);
+
 /* serverCron/beforeSleep: act on a pending hard-mark abort. */
 void hybsnapSaveCron(void);
-/* CONFIG SET rdb-key-save-delay: reaches the running scan thread. */
-void hybsnapSaveSetKeySaveDelay(int usec);
 
-/* Owed objects on read paths: a fork-instant original the save has not taken yet (opens the command's write section). */
-int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv);
-/* A read path about to write 'kv' in place: the object to write (the clone when the key was owed). */
+/* Read paths: is 'kv' a fork-instant original the save has not serialized yet (opens the command's write section). */
+int hybsnapKvobjIsPendingSave(redisDb *db, kvobj *kv);
+
+/* A read path about to write 'kv' in place: the object to write (the clone when the key was pending save). */
 kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv);
-/* Debug-build predicate and assertion at the write funnels. */
-int hybsnapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv);
-#define hybsnapDebugAssertNotFrozenOriginal(db, kv) \
-    debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !hybsnapKvobjIsFrozenOriginal((db), (kvobj *)(kv)))
+/* Debug-build predicate and assertion at the write funnels: pending save, and the value may move on write. */
+int hybsnapKvobjIsPendingSaveMovable(redisDb *db, kvobj *kv);
+#define hybsnapDebugAssertNotPendingSaveMovable(db, kv) \
+    debugServerAssert((kv) == NULL || !((robj *)(kv))->iskvobj || !hybsnapKvobjIsPendingSaveMovable((db), (kvobj *)(kv)))
 
 /* ---- Observability -------------------------------------------------------- */
 
@@ -240,7 +240,11 @@ const char *const *hybsnapCrashReportInfoSections(void);
 size_t hybsnapSaveOverheadBytes(void);
 size_t hybsnapSaveKeysProcessed(size_t classic);
 
-/* ---- Tests --------------------------------------------------------------- */
+/* ---- debug and tests ------------------------------------------------------ */
+
+/* CONFIG SET rdb-key-save-delay: reaches the running scan thread (DEBUG) */
+void hybsnapSaveSetKeySaveDelay(int usec);
+
 #ifdef REDIS_TEST
 int hybsnapTest(int argc, char *argv[], int flags);
 #endif

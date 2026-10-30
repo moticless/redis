@@ -117,7 +117,7 @@ compares it with the dict's state and the credit window (below):
 
 | position | condition | action |
 |---|---|---|
-| behind | dict SCANNED or DONE, or `p < lo` | write in place; nothing is owed |
+| behind | dict SCANNED or DONE, or `p < lo` | write in place; nothing is pending save |
 | emitted | the bucket's bitmap bit is set, whatever the position | write in place; the thread skips the bucket |
 | inside | `lo <= p < hi`, bit clear | never touch the dict's slot or chain: on the first write duplicate the whole chain of the bucket (every key cloned) into an overlayed bucket and apply this and later writes to the duplicate; a delete unlinks from the duplicate, an add links into it; the originals stay in the dict for the thread |
 | ahead | dict PENDING and not paused (wholly beyond `hi`), or `p >= hi`, bit clear | **emit first**: serialize the bucket's whole fork-instant chain on the main thread (HYBSNAP_NOFORK records into the staging area, HYBSNAP_FORK keys as header copies) into `mq`, set the bit, then write in place |
@@ -316,9 +316,9 @@ What happens when something else touches the keyspace or the child during a hybr
 | rehash and resize | dicts are paused before `hi` may pass their layout, and while the thread is on them; dicts beyond `hi` grow with their bitmap, shrink is refused for attached dicts | the classic save avoids resizing while a child exists |
 | active defrag | off while a child exists (classic rule); the arena's tcache is flushed once a second by cron | yes |
 | key expiry and eviction | active expiry and eviction continue; deletes go through the funnel; LRU/LFU updates on lookups are skipped while a child exists | yes |
-| hash-field expiry | active field expiry is suspended for the save; lazy field expiry and `HRANDFIELD` skip deletion on owed keys (expired fields are invisible, not deleted, as on a replica) | hybrid-specific |
+| hash-field expiry | active field expiry is suspended for the save; lazy field expiry and `HRANDFIELD` skip deletion on keys pending save (expired fields are invisible, not deleted, as on a replica) | hybrid-specific |
 | `RM_SetLRU` / `RM_SetLFU` on a READ handle | routed through the write funnel first | hybrid-specific |
-| `PFCOUNT` cache write on an owed key | re-enters through the write path | hybrid-specific |
+| `PFCOUNT` cache write on a key pending save | re-enters through the write path | hybrid-specific |
 | SHUTDOWN | kills the child; the hybrid abort runs through `killRDBChild` | yes |
 | child killed or crashed | the done handler aborts the scan, joins the thread, releases every state; the previous dump is untouched; a child crash report skips the keyspace sections it cannot read | yes |
 | hard mark exceeded | the save is aborted and reported as failed | hybrid-specific |
@@ -345,7 +345,7 @@ A module is compatible with `hybrid-snapshot yes` when:
    `RedisModuleKey *`) and dereference them in a save callback. Both are invalid past the command
    by the API contract already; in the hybrid child they fault.
 3. On the main thread it mutates a key only through a handle opened with `REDISMODULE_WRITE`, and
-   from a module thread only under the GIL. The write lookup emits or clones the owed bucket, so a
+   from a module thread only under the GIL. The write lookup emits or clones the key's bucket, so a
    later in-place write through a DMA pointer or a type API is covered.
 
 A module declares compliance with `REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT`. A module is relevant
@@ -445,7 +445,7 @@ MADV_DONTFORK`.
   SWAPDB and FLUSHDB change which db owns it.
 - **slot** / **dict**: one kvstore dict, a hash table; one per db in standalone mode, one per
   cluster slot in cluster mode. Slot states: PENDING, SCANNING, SCANNED, DONE.
-- **owed**: a bucket (and the keys in it) whose fork-instant content the save has not taken yet;
+- **pending save**: a bucket (and the keys in it) whose fork-instant content the save has not taken yet;
   a write to it must go through the funnel.
 - **position**: a bucket's place in the scan order, one integer: dict ordinal, phase (layout,
   table 0, table 1), bucket index.
@@ -475,7 +475,7 @@ MADV_DONTFORK`.
 ## 10. Invariants
 
 1. The scan thread reads a fork-instant header or HYBSNAP_NOFORK value only while it is unchanged:
-   every keyspace write to an owed bucket goes through the funnel, which emits or clones before the
+   every keyspace write to a bucket pending save goes through the funnel, which emits or clones before the
    dict changes.
 2. The thread reads chain pointers only below `hi` and after announcing them in `cur`; the main
    thread writes chains only outside `[lo, hi)` and only inside a write section; a bitmap bit is

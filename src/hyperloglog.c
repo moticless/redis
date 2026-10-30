@@ -1748,7 +1748,7 @@ void pfcountCommand(client *c) {
     } else {
         if (isHLLObjectOrReply(c,o) != C_OK) return;
         /* The cache update below writes the value in place: during a hybrid
-         * BGSAVE take an owed key through the write funnel first, as every
+         * BGSAVE take a key pending save through the write funnel first, as every
          * write command does. The read lookup above settled expiry, so the
          * key is there either way. */
         o = hybsnapPrepareMutation(c->db, c->argv[1], o);

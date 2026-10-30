@@ -42,7 +42,7 @@
 
 /* ---- Constants -------------------------------------------------------- */
 
-/* Slot (dict) states, monotonic; the slot is owed to the save until DONE. The
+/* Slot (dict) states, monotonic; the save holds the slot until DONE. The
  * order is relied on (st >= HYBSNAP_SLOT_SCANNED: the thread is finished with
  * it); stored in the low byte of the dict's word (HYBSNAP_WORD). */
 typedef enum hybsnapSlotState {
@@ -168,7 +168,7 @@ struct hybsnapScanCtx {
     size_t bitmap_bytes;            /* Bucket bitmaps attached to the table dicts. Main thread. */
     long retained_dicts;            /* Table dicts their store let go of before the save completed them (freed here). Main thread. */
     redisAtomic int64_t cur_slot;   /* The slot the thread is scanning (claimed, not yet SCANNED), HYBSNAP_SCAN_ENC, -1 none: the abort sweep completes it. */
-    int ended;                      /* Main thread: every store completed; nothing is owed any more. */
+    int ended;                      /* Main thread: every store completed; the save holds no slot any more. */
     long dicts_grown;               /* attached dicts that expanded during the save (bitmap remapped), main thread */
     uint64_t gen;                   /* this save's generation (never 0): stamps every dict it touches (kvstoreDictMetaBase.ext_word) */
     const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
@@ -309,7 +309,7 @@ struct hybsnapSave {
     sds mscratch;                       /* main thread only: one record at a time */
     redisAtomic size_t mq_bytes;        /* allocation bytes of the messages in mq, not yet forwarded */
     long long main_buckets;             /* main thread only */
-    redisAtomic long long main_keys;    /* keys the main thread emitted ahead (read by the scan thread: it owes their save delay) */
+    redisAtomic long long main_keys;    /* keys the main thread emitted ahead (read by the scan thread: their save delay is due on it) */
     long long delayed_main_keys;        /* scan thread only: main-emitted keys it has slept the key-save delay for */
     /* Outbound queue: every message the scan thread produces or
      * forwards waits here for the pipe, which is written non-blockingly, so a
@@ -962,7 +962,7 @@ static int hybsnapOriginalSharesValue(const kvobj *orig) {
     }
 }
 
-/* A key deleted while its bucket is still owed keeps its fork-instant original
+/* A key deleted while its bucket is still pending save keeps its fork-instant original
  * for the scan, in its overlayed bucket, until the bucket is written back;
  * when the clone took over its value, only the header is released.
  * Released through hybsnapOverlayFreeOriginal. */
@@ -2017,7 +2017,7 @@ static int hybsnapScanHandleCompletions(hybsnapScanCtx *ctx) {
 /* Main thread, the thread joined or never started: complete what the save
  * still holds as aborted (the dict the thread was reading, then every
  * remaining entry of the save's table: a pointer per slot), then every
- * store. Nothing is owed after this. */
+ * store. Every slot is DONE after this. */
 static void hybsnapScanFinishAll(hybsnapScanCtx *ctx) {
     int64_t cur;
     atomicGet(ctx->cur_slot, cur);
@@ -2075,7 +2075,7 @@ static void hybsnapScanRelease(hybsnapScanCtx *ctx) {
     if (ctx->started)
         hybsnapScanWindowStats(ctx, &hybsnap_last_window.stalls, &hybsnap_last_window.stall_us, &hybsnap_last_window.grants);
     if (ctx->started) {
-        /* Drain the tail, then complete whatever the thread left owed (it
+        /* Drain the tail, then complete the slots the thread left unfinished (it
          * stopped early on a broken channel) so no slot stays frozen. */
         hybsnapScanHandleCompletions(ctx);
         hybsnapScanFinishAll(ctx);
@@ -2523,15 +2523,16 @@ static void hybsnapSaveWindowDone(void *priv) {
 }
 
 /* Inside a write section: is the frozen chain of bucket (table, idx) of dict
- * d of slot (s, didx) still owed to the snapshot, i.e. neither read by the
- * thread already nor emitted by the main thread? Only an owed chain must not
+ * d of slot (s, didx) still pending save, i.e. neither read by the thread
+ * already nor emitted by the main thread? Only a chain pending save must not
  * be written in place. *pos receives the bucket's position.
  *
  * The emitted bit is checked whatever the position: a section may see the
  * bucket ahead, emit it and set the bit, and later raise hi over it. A later
  * look in the same section sees the bucket inside the window, but the thread
- * will skip it (it reads the bit after reading hi), so it is not owed. */
-static int hybsnapBucketOwed(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, hybsnapBucketPos *pos, kvstoreOvWindow *win) {
+ * will skip it (it reads the bit after reading hi), so it is no longer
+ * pending save. */
+static int hybsnapBucketPendingSave(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, hybsnapBucketPos *pos, kvstoreOvWindow *win) {
     *pos = hybsnapBucketPosition(ctx, s, didx, d, table, idx, win);
     if (*pos == HYBSNAP_POS_BEHIND) return 0;
     return !hybsnapScanBucketEmitted(ctx, s, didx, table, idx);
@@ -2556,9 +2557,9 @@ static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int did
          * keeps the scan thread from reading those moved entries later. */
         unsigned long n = DICTHT_SIZE(d->ht_size_exp[0]), size1 = DICTHT_SIZE(d->ht_size_exp[1]);
         unsigned long i0 = (table == 0) ? idx : (idx & (n - 1));
-        int owed = !hybsnapScanBucketEmitted(sv->scan, s, didx, 0, i0);
-        for (unsigned long j = i0; !owed && j < size1; j += n) owed = !hybsnapScanBucketEmitted(sv->scan, s, didx, 1, j);
-        if (!owed) {
+        int pending = !hybsnapScanBucketEmitted(sv->scan, s, didx, 0, i0);
+        for (unsigned long j = i0; !pending && j < size1; j += n) pending = !hybsnapScanBucketEmitted(sv->scan, s, didx, 1, j);
+        if (!pending) {
             sv->inplace_writes++;
             server.stat_hybsnap_inplace_writes++;
             return KVSTORE_OV_INPLACE;
@@ -2574,7 +2575,7 @@ static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int did
         }
         return KVSTORE_OV_INPLACE;
     }
-    if (!hybsnapBucketOwed(sv->scan, s, didx, d, table, idx, &pos, win)) {
+    if (!hybsnapBucketPendingSave(sv->scan, s, didx, d, table, idx, &pos, win)) {
         sv->inplace_writes++;
         server.stat_hybsnap_inplace_writes++;
         return KVSTORE_OV_INPLACE;
@@ -2656,24 +2657,32 @@ static void hybsnapSaveFreeFlushed(hybsnapSave *sv, int s) {
     emptyDbDataAsync(f->keys, f->expires, f->subexpires, f->stream_idmp_keys, f->blessed, NULL, NULL);
 }
 
-/* Scan callback: store s has no slot left owed (completed or aborted). */
+/* Scan callback: every slot of store s is DONE (completed or aborted). */
 static void hybsnapSaveStoreDone(void *privdata, int s) {
     hybsnapSave *sv = privdata;
     hybsnapSaveFreeFlushed(sv, s);
 }
 
-/* 1 if 'kv' is a fork-instant original the running save has not taken yet:
- * its bucket is ahead of the scan thread and not emitted by the main thread,
- * or the thread is reading it right now. Such an object must not be mutated
- * in place. Opens the command's write section. The answer stays valid until
- * the command ends: a bucket behind the thread or emitted stays so, and one
- * still owed is only treated as owed for longer than needed; a read path that would mutate (lazy field expiry) skips the mutation when
- * this returns 1, a read path that must mutate calls hybsnapPrepareMutation. */
-int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv) {
+/* Returns 1 if 'kv' is pending save: a fork-instant object the running save
+ * still has to serialize, so it must not be mutated in place. That is the case
+ * when its bucket is ahead of the scan thread and the main thread has not
+ * emitted it, or when the thread may be reading the bucket right now. A clone
+ * in an overlayed bucket is never pending save (0); only the frozen original
+ * is. A per-object answer, not the slot state PENDING: a key of a PENDING slot
+ * may be emitted already, one of a SCANNING slot may still be pending save.
+ *
+ * Side effect: opens the command's write section, which caps the thread. The
+ * answer therefore holds until the command ends: a 0 cannot turn into a 1
+ * (behind the thread or emitted stays so), while a 1 may become stale only in
+ * the safe direction (the object is treated as pending save a little longer).
+ *
+ * Callers: a read path that may skip its mutation (lazy field expiry) skips it
+ * on 1; a read path that must mutate calls hybsnapPrepareMutation() instead. */
+int hybsnapKvobjIsPendingSave(redisDb *db, kvobj *kv) {
     hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
     int s = hybsnapStoreIndexOf(sv, db->keys);
-    if (s < 0) return 0;   /* a keyspace created after the fork: nothing in it is owed */
+    if (s < 0) return 0;   /* a keyspace created after the fork: nothing in it is pending save */
     sds key = kvobjGetKey(kv);
     int slot = server.cluster_enabled ? calculateKeySlot(key) : 0;
     dict *d = kvstoreGetDict(db->keys, slot);
@@ -2685,37 +2694,38 @@ int hybsnapKvobjIsOwed(redisDb *db, kvobj *kv) {
     hybsnapBucketPos pos;
     unsigned long idx;
     dictKeyBucket(d, key, &table, &idx);
-    if (!hybsnapBucketOwed(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
-    /* Ahead and not emitted, or being read: the frozen entry itself is owed,
-     * its clone in an overlayed bucket is not. */
+    if (!hybsnapBucketPendingSave(sv->scan, s, slot, d, table, idx, &pos, NULL)) return 0;
+    /* Ahead and not emitted, or being read: the frozen entry itself is pending
+     * save, its clone in an overlayed bucket is not. */
     dictEntryLink l = dictFindLink(d, key, NULL);
     return l && dictGetKV(*l) == kv;
 }
 
 /* A read-path command about to write 'kv' in place (PFCOUNT's cache, a module
- * setting LRU/LFU through a READ handle): if the object is owed, take the key
+ * setting LRU/LFU through a READ handle): if the object is pending save, take the key
  * through the write funnel (a write lookup that emits or clones its bucket)
  * and return the object to write, which may be the clone; else 'kv'. NULL
  * only if the key is gone. */
 kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
-    if (!hybsnapKvobjIsOwed(db, kv)) return kv;
+    if (!hybsnapKvobjIsPendingSave(db, kv)) return kv;
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
 }
 
-/* Debug-build check at the write funnels. A HYBSNAP_FORK value whose top-level
+/* Debug-build check at the write funnels: is 'kv' pending save and of a type
+ * whose value may move on write? A HYBSNAP_FORK value whose top-level
  * pointer never moves (stream, hashtable, skiplist, quicklist, module type)
- * may be mutated in place even while owed: the child serializes its own
+ * may be mutated in place even while pending save: the child serializes its own
  * copy-on-write image from the fork instant, and the header copy taken later
  * still points at the same object (only its LRU field may be a little stale).
  * XACK/XACKDEL reach such values through a read lookup (write-path audit,
  * streams row), which is why this exemption exists. Single-allocation values
  * (raw strings, listpacks, intsets) may move on write and stay checked. */
-int hybsnapKvobjIsFrozenOriginal(redisDb *db, kvobj *kv) {
+int hybsnapKvobjIsPendingSaveMovable(redisDb *db, kvobj *kv) {
     if (kv->type == OBJ_STREAM || kv->type == OBJ_MODULE ||
         kv->encoding == OBJ_ENCODING_HT || kv->encoding == OBJ_ENCODING_SKIPLIST ||
         kv->encoding == OBJ_ENCODING_QUICKLIST)
         return 0;
-    return hybsnapKvobjIsOwed(db, kv);
+    return hybsnapKvobjIsPendingSave(db, kv);
 }
 
 /* CONFIG SET rdb-key-save-delay apply hook: reaches the running scan thread. */
@@ -3076,7 +3086,7 @@ static void hybsnapSaveThreadDone(void *priv, int aborted) {
         hybsnapSendMsg(sv, HYBSNAP_MSG_ABORT, -1, -1, NULL, 0, 0, 0);
         hybsnapOutDrain(sv, HYBSNAP_DRAIN_ALL, 0);
     } else {
-        /* The delay owed for the keys the main thread emitted ahead (their
+        /* The delay due for the keys the main thread emitted ahead (their
          * records were forwarded as the thread went, so the drain was never
          * held back): slept here, before END, so a save of N fork-instant keys
          * still lasts N delays whoever produced the records. */
@@ -3902,7 +3912,7 @@ void hybsnapOnChildEnd(int exitcode, int bysignal) {
     if (!hybsnap_save) return;
     hybsnapSave *sv = hybsnap_save;
     /* The child is gone. If the scan did not complete (or the thread stopped
-     * on its own when the channel broke, leaving slots owed), stop it and
+     * on its own when the channel broke, leaving slots unfinished), stop it and
      * complete every remaining slot. Harmless after a clean finish. */
     if (!(!bysignal && exitcode == 0) || !hybsnapScanIsFinished(sv->scan))
         hybsnapScanAbort(sv->scan);
@@ -3964,7 +3974,7 @@ static int hybsnapScanStart(hybsnapScanCtx *ctx) {
 }
 
 /* Test helper: 1 while slot (store, dict) is not DONE. */
-static int hybsnapScanKeyIsOwed(hybsnapScanCtx *ctx, int store_idx, int didx) {
+static int hybsnapScanSlotNotDone(hybsnapScanCtx *ctx, int store_idx, int didx) {
     return hybsnapScanSlotState(ctx, store_idx, didx) != HYBSNAP_SLOT_DONE;
 }
 #include "testhelp.h"
@@ -4226,7 +4236,7 @@ static void hybsnapScanTests(int accurate) {
     hybsnapScanCtx *ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     st->dispatch_sleep_us = 0;
-    test_cond("scan: nothing is owed before start", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
+    test_cond("scan: every slot is DONE before start", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
     hybsnapScanFreeze(ctx);   /* guard installed, no thread yet: the checks below are deterministic */
     {
         /* On-demand freeze: the freeze pauses nothing; the
@@ -4319,7 +4329,7 @@ static void hybsnapScanTests(int accurate) {
     test_cond("scan: every populated slot completed exactly once, none aborted",
               done_once && completions == HYBSNAP_TEST_STORES * HYBSNAP_TEST_DICTS - empty_slots);
     test_cond("scan: all slots DONE at the end", hybsnapTestAllState(ctx, HYBSNAP_SLOT_DONE));
-    test_cond("scan: no slot is owed after completion", !hybsnapScanKeyIsOwed(ctx, 0, 0) && !hybsnapScanKeyIsOwed(ctx, 1, 3));
+    test_cond("scan: every slot is DONE after completion", !hybsnapScanSlotNotDone(ctx, 0, 0) && !hybsnapScanSlotNotDone(ctx, 1, 3));
     test_cond("scan: all dicts unfrozen at the end", hybsnapTestAllUnfrozen(stores));
     /* With the on-demand freeze a dict left mid-rehash at start may finish
      * rehashing through main-thread reads before the thread reaches it (the
@@ -4469,9 +4479,9 @@ static void hybsnapScanTests(int accurate) {
                   ctx->hi == c1 && __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST) == c1 && d11->pauserehash == 1);
         hybsnapBucketPos pos;
         hybsnapSectionOpen();
-        int in = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 3, &pos, NULL);
+        int in = hybsnapBucketPendingSave(ctx, 1, 1, d11, 0, 3, &pos, NULL);
         hybsnapBucketPos p_in = pos;
-        int ahead = hybsnapBucketOwed(ctx, 1, 1, d11, 0, 6, &pos, NULL);
+        int ahead = hybsnapBucketPendingSave(ctx, 1, 1, d11, 0, 6, &pos, NULL);
         hybsnapBucketPos p_ahead = pos;
         hybsnapSectionClose();
         test_cond("cap: below cur + 1 the bucket may be being read, at it the thread cannot be",
@@ -4522,8 +4532,8 @@ static void hybsnapScanTests(int accurate) {
     }
     hybsnapScanRelease(ctx);
 
-    /* ---- Owed: a bucket emitted ahead of the window stays not-owed once the
-     * window moves over it (the thread skips it by its bit). Simulates one
+    /* ---- Pending save: a bucket emitted ahead of the window stays not pending
+     * once the window moves over it (the thread skips it by its bit). Simulates one
      * write section spanning a window publish, with no thread running. ---- */
     ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
@@ -4533,22 +4543,22 @@ static void hybsnapScanTests(int accurate) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]), mid = size / 2;
         uint64_t o = hybsnapOrd(ctx, 0, 3), b0 = HYBSNAP_POS(o, 1, 0);
         hybsnapBucketPos pos, p_ahead, p_after, p_other, p_behind;
-        test_cond("owed: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
+        test_cond("pending save: test dict exists and has at least 8 buckets", d != NULL && size >= 8);
         hybsnapScanAttach(ctx, 0, 3, d, 1);            /* bitmap and pause, as the guard would */
         hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));   /* as the thread's claim would */
         hybsnapTestWindow(ctx, b0, b0 + mid);          /* the thread may read [0, mid) */
         hybsnapSectionOpen();                           /* a command opens its write section */
-        int owed_ahead = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
+        int pending_ahead = hybsnapBucketPendingSave(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_ahead = pos;
         hybsnapScanMarkBucketEmitted(ctx, 0, 3, 0, mid + 1);   /* ... and emits the bucket */
         hybsnapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant later in the same section moves the window over it */
-        int owed_after = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
-        int owed_other = hybsnapBucketOwed(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
-        int owed_behind = hybsnapBucketOwed(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
+        int pending_after = hybsnapBucketPendingSave(ctx, 0, 3, d, 0, mid + 1, &pos, NULL); p_after = pos;
+        int pending_other = hybsnapBucketPendingSave(ctx, 0, 3, d, 0, mid + 2, &pos, NULL); p_other = pos;
+        int pending_behind = hybsnapBucketPendingSave(ctx, 0, 3, d, 0, 0, &pos, NULL); p_behind = pos;
         hybsnapSectionClose();
-        test_cond("owed: a bucket ahead of the window and not emitted is owed", owed_ahead && p_ahead == HYBSNAP_POS_AHEAD);
-        test_cond("owed: the same bucket, emitted, is not owed after the window moved over it", !owed_after && p_after == HYBSNAP_POS_INSIDE);
-        test_cond("owed: an unemitted bucket inside the window is owed", owed_other && p_other == HYBSNAP_POS_INSIDE);
-        test_cond("owed: a bucket behind the window is not owed", !owed_behind && p_behind == HYBSNAP_POS_BEHIND);
+        test_cond("pending save: a bucket ahead of the window and not emitted is pending", pending_ahead && p_ahead == HYBSNAP_POS_AHEAD);
+        test_cond("pending save: the same bucket, emitted, is not pending after the window moved over it", !pending_after && p_after == HYBSNAP_POS_INSIDE);
+        test_cond("pending save: an unemitted bucket inside the window is pending", pending_other && p_other == HYBSNAP_POS_INSIDE);
+        test_cond("pending save: a bucket behind the window is not pending", !pending_behind && p_behind == HYBSNAP_POS_BEHIND);
 
         /* The layout phase: the thread has claimed the dict and reads its table
          * sizes, no chain yet (hi just past the layout position). Every bucket
@@ -4556,21 +4566,21 @@ static void hybsnapScanTests(int accurate) {
          * then goes in place. */
         hybsnapTestWindow(ctx, HYBSNAP_POS(o, 0, 0), HYBSNAP_POS(o, 0, 0) + 1);
         hybsnapSectionOpen();
-        int layout_ahead = 1, layout_owed = 1;
+        int layout_ahead = 1, layout_pending = 1;
         for (int t = 0; t < 2; t++) {
             if (!d->ht_table[t]) continue;
             unsigned long tsize = DICTHT_SIZE(d->ht_size_exp[t]);
             unsigned long probe[3] = { 0, tsize / 2, tsize - 1 };
             for (int j = 0; j < 3; j++) {
-                int owed = hybsnapBucketOwed(ctx, 0, 3, d, t, probe[j], &pos, NULL);
+                int pending = hybsnapBucketPendingSave(ctx, 0, 3, d, t, probe[j], &pos, NULL);
                 if (pos != HYBSNAP_POS_AHEAD) layout_ahead = 0;
-                if (!owed) layout_owed = 0;
+                if (!pending) layout_pending = 0;
             }
         }
         hybsnapSectionClose();
         hybsnapWindowReset(NULL);
-        test_cond("owed: in the layout phase every bucket of every table is ahead of the window and owed",
-                  layout_ahead && layout_owed);
+        test_cond("pending save: in the layout phase every bucket of every table is ahead of the window and pending",
+                  layout_ahead && layout_pending);
     }
     hybsnapScanAbort(ctx);   /* frozen, never started: unfreezes */
     hybsnapScanRelease(ctx);
@@ -4850,7 +4860,7 @@ static void hybsnapRefcountTests(void) {
               kvstoreDictRefcount(d0) == 2 && kvstoreDictRefcount(d3) == 2 && kvstoreDictRefcount(kvstoreGetDict(ks, 1)) == 1);
     test_cond("refs: an empty or missing dict holds nothing of the save: DONE from the start",
               hybsnapScanSlotState(ctx, 0, 3) == HYBSNAP_SLOT_PENDING && hybsnapScanSlotState(ctx, 0, 1) == HYBSNAP_SLOT_DONE &&
-              !hybsnapScanKeyIsOwed(ctx, 0, 2) && kvstoreRefcount(ks) == 1 + 3);
+              !hybsnapScanSlotNotDone(ctx, 0, 2) && kvstoreRefcount(ks) == 1 + 3);
     serverAssert(kvstoreDictAddRaw(ks, 1, hybsnapTestKey(0, 1, 5), NULL) != NULL);   /* post-fork keys the dispatch would flag as bad */
     serverAssert(kvstoreDictAddRaw(ks, 2, hybsnapTestKey(0, 2, 5), NULL) != NULL);
     test_cond("refs: writes to dicts outside the table attach nothing",
@@ -4880,7 +4890,7 @@ static void hybsnapRefcountTests(void) {
               dispatched == 100 && bad == 0 && kd == 100 && st->seen[0][3][7]);
     test_cond("refs: two table entries, both completed, the moved dict freed by the save",
               t == 2 && sc == 2 && dn == 2 && st->done_calls[0][0] == 1 && st->done_calls[0][3] == 1 &&
-              hybsnapScanRetainedDicts(ctx) == 1 && !hybsnapScanKeyIsOwed(ctx, 0, 3));
+              hybsnapScanRetainedDicts(ctx) == 1 && !hybsnapScanSlotNotDone(ctx, 0, 3));
     hybsnapScanRelease(ctx);
 
     /* ---- B: the store emptied (FLUSH) while the save reads it ---- */
@@ -4977,7 +4987,7 @@ static void hybsnapOverlayTests(int abort_variant) {
     hybsnapScanSetOverlay(ctx, &hooks, privs);
     test_cond("overlay: start", hybsnapScanStart(ctx) == C_OK);
     test_cond("overlay: nothing is attached at start, the empty slot is DONE",
-              !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !hybsnapScanKeyIsOwed(ctx, 0, 3));
+              !kvstoreOverlayIsFrozen(ks, 0) && !kvstoreOverlayIsFrozen(ks, 3) && !hybsnapScanSlotNotDone(ctx, 0, 3));
     dict *frozen = kvstoreGetDict(ks, 0);
 
     /* Read: original, no clone. */
@@ -5000,7 +5010,7 @@ static void hybsnapOverlayTests(int abort_variant) {
     /* Delete an untouched key: duplicate the bucket, then delete from the duplicate. */
     int table;
     link = kvstoreDictTwoPhaseUnlinkFind(ks, 0, "k:0:0:7", &table);
-    test_cond("overlay: two-phase unlink find on an owed key returns a temp link", link != NULL && dictGetKey(*link) != orig7);
+    test_cond("overlay: two-phase unlink find on a key pending save returns a temp link", link != NULL && dictGetKey(*link) != orig7);
     kvstoreDictTwoPhaseUnlinkFree(ks, 0, link, table);
     test_cond("overlay: deleted key is invisible", kvstoreDictFind(ks, 0, "k:0:0:7") == NULL);
     test_cond("overlay: frozen dict still holds the deleted original", dictGetKey(dictFind(frozen, "k:0:0:7")) == orig7);
