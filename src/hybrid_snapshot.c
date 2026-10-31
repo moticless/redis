@@ -287,7 +287,7 @@ struct hybsnapSave {
     /* Scan-thread staging buffer. */
     sds stage;
     int stage_dbid, stage_slot;
-    redisAtomic long long keys_nofork, keys_fork, bytes_sent, msgs_sent;
+    redisAtomic long long keys_nofork, keys_fork, bytes_sent;
     /* Cluster mode: the slots an atomic slot migration was trimming at the
      * fork instant, one bit each (NULL when none). Their keys are leaving the
      * node: the classic child skips them, reading the fork-instant copy of the
@@ -1457,8 +1457,6 @@ static void hybsnapRetiredFree(void) {
 static inline kvstoreDictMetaBase *hybsnapMeta(dict *d) { return (kvstoreDictMetaBase *)dictMetadata(d); }
 static inline uint64_t hybsnapWordLoad(dict *d) { return __atomic_load_n(&hybsnapMeta(d)->ext_word, __ATOMIC_ACQUIRE); }
 static inline void hybsnapWordStore(dict *d, uint64_t w) { __atomic_store_n(&hybsnapMeta(d)->ext_word, w, __ATOMIC_RELEASE); }
-/* The attached state, either thread (the main thread publishes it with release). */
-static inline hybsnapDictState *hybsnapStateOf(dict *d) { return __atomic_load_n(&hybsnapMeta(d)->ext, __ATOMIC_ACQUIRE); }
 
 /* The save's table of fork-instant dicts (filled at freeze, one reference
  * each). Entries are cleared at completion, on the main thread, after the
@@ -2893,7 +2891,6 @@ static int hybsnapOutEnqueue(hybsnapSave *sv, sds m, uint32_t type) {
     atomicGet(sv->mq_bytes, mqb);
     atomicGet(sv->queued_peak, peak);
     if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
-    atomicIncr(sv->msgs_sent, 1);
     atomicIncr(sv->bytes_sent, (long long)n);
     int rc = hybsnapOutDrain(sv, HYBSNAP_DRAIN_TRY, 0);
     if (rc == 0 && sv->oq_limit) {
