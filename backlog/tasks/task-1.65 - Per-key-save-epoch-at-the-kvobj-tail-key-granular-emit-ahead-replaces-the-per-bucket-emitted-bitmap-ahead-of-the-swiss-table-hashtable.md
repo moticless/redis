@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-30 13:35'
-updated_date: '2026-10-30 20:19'
+updated_date: '2026-10-30 23:10'
 labels:
   - bgsave
   - persistence
@@ -88,7 +88,7 @@ Valkey bgiteration.c uses a uint32_t iterator_epoch per entry, consistent_modifi
 - [ ] #5 Ten or more consecutive saves (some aborted) followed by a successful one reload equal: stale epochs from earlier saves are treated as fork-instant
 - [ ] #6 No new atomics on the kvobj creation path or in the scan thread; the main thread never waits for the scan thread (invariant 8)
 - [ ] #7 The overlay clones a key lazily on its first write, not the whole chain on DEFER; a test with a multi-key INSIDE bucket and a single-key write shows one clone
-- [ ] #8 Memory overhead measured on the snap-bench matrix (keys touched during a save vs idle, hybrid on vs off) and save time/latency compared to the bucket-emit baseline; results recorded in the task notes
+- [x] #8 Memory overhead measured on the snap-bench matrix (keys touched during a save vs idle, hybrid on vs off) and save time/latency compared to the bucket-emit baseline; results recorded in the task notes
 - [ ] #9 docs/hybrid-snapshot.md updated: epoch semantics, layout, attach/keep policy, rehash pause rule, and why it differs from the removed save_gen
 - [ ] #10 Rehash/resize is paused only on dicts the window covers (SCANNING and those inside the current grant); attached-but-unreached dicts grow and shrink freely; a test grows and shrinks PENDING and DONE dicts during a save and the reload is equal
 - [ ] #11 Every flow that rebuilds a kvobj through kvobjSet()/kvobjCreate() (TTL attach, keymeta attach, overwrite with new metabits, RENAME/MOVE/COPY/RESTORE, encoding conversions) decides again: during a save it carries the running save's epoch, outside a save the creation policy decides whether to keep the 4 bytes. Defrag and in-place writes keep the bytes as they are. A test rebuilds stamped keys during a save and the reload has no duplicate
@@ -121,4 +121,8 @@ BENCHMARK: proto-bucket-cow vs proto-key-epoch with policy A and with policy B, 
 Keep/drop of the 4 epoch bytes on reallocation (decided 2026-10-30): every flow that rebuilds a kvobj through kvobjSet()/kvobjCreate() (TTL attach via kvobjSetExpire, keymeta attach, overwrite with new metabits, RENAME/MOVE/COPY/RESTORE, conversions) re-decides per the current mode, so under prealloc=no with no live save the bytes are dropped unless the new allocation has slack. Defrag (activeDefragKvobj) copies the allocation verbatim and KEEPS the epoch by decision - simpler code, no per-flow helper. In-place writes (APPEND on RAW, HSET) also keep it.
 
 2026-10-30: AC1 unit test hybsnapEpochEmitAheadTests: 6 keys hashed into one bucket ahead of the thread; the real prepare hook emits and stamps only the written key; a second write and an insert emit nothing; the thread emits the other 5 once and skips the stamped one. Unit tests 217/217. Phase 1 committed on proto-key-epoch.
+
+Run 165 (2026-10-30, c7i.4xlarge 54.176.49.7, CSVs utils/snap-bench/run165-*.csv): hybrid-before 37dcc99a2 vs 9f75125c8 policy A (prealloc yes) and B (prealloc no), 4 GB small/mixed/mixed1m, 0/20k/50k x2, mixed 50k HOT=0.2. All saves ok. (1) Main-thread emits 30-37% fewer keys (old build emitted ~1.55 keys per bucket; new key count ~= old bucket count). (2) p99/p999/max latency and main-thread CPU equal. (3) used_memory before save: A +38..47 MB (+0.9..1.2%), B = before. (4) Peak during save: small A +3..5 MB extra (before +8), B +72..79 MB: B reallocs ~25% of the keys it stamps (71k at 20k, 172k at 50k), each rewrites a dict-table pointer shared with the fork child -> ~70 MB child CoW; on mixed the big-value CoW (0.7-1.5 GB) dominates for all. Conclusion: keep A as default. (5) OPEN: mixed1m save time A 25.0-26.5 s vs before 22.4-22.9 s in 3 of 4 cached cells (20k rep1 equal at 26.1 vs 26.5); small and mixed show no difference. Not yet explained; needs more reps and a profile. bench.py change: LIVE_STATS keeps the in-progress snap_save_* counters seen during the save (they read 0 once it ends); counters valid from small r20000 rep 2 on.
+
+Run 165p (2026-10-31, same host; CSVs utils/snap-bench/run165r-mixed1m.csv, run165p-mixed1m.csv): the mixed1m save-time gap was noise. 8 interleaved reps at 50k, rep 1 warm-up dropped: before 24.99 +-1.71 s (22.3-26.7), A 24.79 +-1.39 s (22.8-26.3); scan thread done at 20.48 vs 20.40 s, child tail after the scan 4.51 vs 4.38 s; main CPU 10.99 vs 10.92 s; main-thread emits 317k vs 208k (-34%). perf (system-wide on the server cores, one profiled save each): child 45.8% vs 46.7% of samples, scan thread 30.2% vs 32.6%, main 17.5% vs 15.2%; child top functions identical (lzf_compress 28%, entryGetValue 5%, crc64 3%, fwrite 3%); scan thread hybsnapScanThreadMain 4.6% -> 6.3% (the entry callback, now with the epoch read, is inlined there; hybsnapKeyClass 1.7% no longer shows separately). The save's critical path on mixed1m is the child serializing big values after the scan ends. AC8 done: no save-time or latency regression; A costs about 1% memory idle and has the lowest peak.
 <!-- SECTION:NOTES:END -->

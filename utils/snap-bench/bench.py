@@ -235,14 +235,27 @@ def save_mode(r):
     return "fork"
 
 IMPL_STATS = ["snap_last_save_retained_peak", "snap_last_save_queued_peak", "snap_hard_mark_aborts", "snap_save_main_keys",
+              "snap_save_main_buckets", "snap_save_scan_stamped_keys", "snap_save_epoch_reallocs",
+              "snap_save_overlay_buckets", "snap_save_overlay_clones", "snap_save_inplace_writes",
               "forkless_retained_peak", "forkless_snapshot_peak", "forkless_limit_aborts", "forkless_copied_values",
               "forkless_retained_strings", "forkless_priority_keys", "forkless_copy_usec", "forkless_reader_wait_usec",
               "rdb_last_bgsave_type"]
 
+# Counters of the save in progress (0 once it ends): wait_save keeps the last value seen during the save.
+LIVE_STATS = ["snap_save_main_keys", "snap_save_main_buckets", "snap_save_scan_stamped_keys", "snap_save_epoch_reallocs",
+              "snap_save_overlay_buckets", "snap_save_overlay_clones", "snap_save_inplace_writes"]
+LIVE_SEEN = {}
+
 def wait_save(r, poll=0.02):
+    LIVE_SEEN.clear(); t0 = time.time()
     while True:
         p = r.info("persistence")
         if not p.get("rdb_bgsave_in_progress") and not p.get("snap_save_in_progress", 0): return time.time()
+        # When the scan thread finished its last slot (the child may still be busy after it).
+        if "scan_done_s" not in LIVE_SEEN and p.get("snap_save_slots_total") and p.get("snap_save_slots_done") == p.get("snap_save_slots_total"):
+            LIVE_SEEN["scan_done_s"] = round(time.time() - t0, 2)
+        for k in LIVE_STATS:
+            if k in p: LIVE_SEEN[k] = max(LIVE_SEEN.get(k, 0), p[k])
         time.sleep(poll)
 
 # ------------------------------------------------------------------ full sync (TASK-1.14)
@@ -453,7 +466,7 @@ def run_cell(a, dataset, rate, est_save):
                cpu_child_s=round(sampler.child_cpu / tick, 2),
                snap_retained_peak_mb=round(p1.get("snap_last_save_retained_peak", 0) / 2**20, 1) if "snap_last_save_retained_peak" in p1 else None,
                snap_hard_mark_aborts=p1.get("snap_hard_mark_aborts"),
-               impl_stats=" ".join(f"{k}={p1[k]}" for k in IMPL_STATS if k in p1))
+               impl_stats=" ".join([f"{k}={LIVE_SEEN.get(k, p1[k])}" for k in IMPL_STATS if k in p1] + [f"{k}={v}" for k, v in LIVE_SEEN.items() if k not in IMPL_STATS]))
     row.update(sync)
     if sync.get("asm_cow_mb") is not None: row["cow_mb"] = sync["asm_cow_mb"]
     base = st0.get("RssAnon", 0) + st0.get("VmSwap", 0)

@@ -2411,3 +2411,72 @@ Same matrix as Run 40 (server on 0-3,8-11, 1 rep at 0 writes/s, 2 reps otherwise
 - Hybrid saves in about 55% of stock's time on mixed and mixed1m and uses 40-60% of stock's copy-on-write memory under writes; on small (all in the arena) it is 16% faster with no fork pause (1.6 ms vs 41 ms).
 - Valkey forkless is slower than stock here (7-27%), uses almost no extra memory, and has the lowest max stall (1.6-6 ms) but a higher ping p99 (0.8-1.75 ms vs 0.3-0.65).
 - Hybrid's max stall on mixed (10-18 ms) is the fork of the remaining non-arena memory (15-18 ms), well under stock's 32-41 ms.
+
+
+## Run 165 (2026-10-30/31): per-key save epoch (TASK-1.65) vs bucket emit-ahead, 4 GB datasets, fresh c7i.4xlarge
+
+Three builds of our branch, interleaved per cell: **before** = 37dcc99a2 (a write ahead of the scan emits the whole bucket and marks it in the per-dict bitmap), **A** = 9f75125c8 with `hybrid-snapshot-epoch-prealloc yes` (default: every kvobj carries the 4-byte epoch while the feature is on), **B** = the same binary with `prealloc no` (`hybrid2-b` in run.sh: the epoch only where the allocation has room, else attached on the first write ahead of the scan, in place or by a realloc). Server on 0-3,8-11, load on 4-7,12-15, writes/s 0/20k/50k uniform plus mixed 50k on a 20% hot set, 2 reps per cell; medians shown; each dataset's first cell (run right after a live populate) is left out. CSVs: run165-small.csv, run165-mixed.csv, run165-mixed-hot.csv, run165-mixed1m.csv; the mixed1m 50k repeat: run165r-mixed1m.csv (8 reps, rep 1 a warm-up), run165p-mixed1m.csv (one profiled save each). Driver `~/run165.sh` (`CFGS="hybrid-before hybrid2 hybrid2-b"`, `HYB_BEFORE`/`HYB2`). bench.py now keeps the `snap_save_*` counters of the save in progress as last seen while polling (they read 0 once the save ends; valid from small 20k rep 2 on) and records `scan_done_s`, when the scan thread finished its last slot.
+
+**small** (18.9 M keys)
+
+| writes/s | config | save s | fork stall ms | peak MB | extra MB | main CPU s | PING max ms | write p99 ms | write max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| idle | before (bucket emit) | 27.7 | 1.6 | 4030 | 2 | 0.4 | 2.2 |  |  |
+| idle | A (epoch, prealloc) | 28.0 | 1.5 | 4073 | 2 | 0.4 | 1.0 |  |  |
+| idle | B (epoch, on demand) | 28.1 | 1.6 | 4030 | 2 | 0.4 | 1.0 |  |  |
+| 20k | before (bucket emit) | 28.5 | 1.6 | 4036 | 8 | 6.2 | 1.9 | 0.69 | 2.6 |
+| 20k | A (epoch, prealloc) | 29.6 | 1.5 | 4074 | 4 | 6.2 | 1.3 | 0.70 | 2.7 |
+| 20k | B (epoch, on demand) | 29.7 | 1.6 | 4100 | 72 | 6.3 | 3.5 | 0.70 | 4.6 |
+| 50k | before (bucket emit) | 28.1 | 1.6 | 4036 | 8 | 13.1 | 1.0 | 0.33 | 4.2 |
+| 50k | A (epoch, prealloc) | 28.6 | 1.5 | 4076 | 4 | 12.8 | 3.3 | 0.37 | 4.8 |
+| 50k | B (epoch, on demand) | 28.7 | 1.6 | 4106 | 78 | 13.0 | 1.9 | 0.36 | 4.8 |
+
+**mixed** (19.5 M keys)
+
+| writes/s | config | save s | fork stall ms | peak MB | extra MB | main CPU s | PING max ms | write p99 ms | write max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| idle | before (bucket emit) | 18.7 | 15.9 | 3928 | 5 | 0.3 | 16.9 |  |  |
+| idle | A (epoch, prealloc) | 17.6 | 16.3 | 3962 | 4 | 0.3 | 16.4 |  |  |
+| idle | B (epoch, on demand) | 18.9 | 16.1 | 3918 | 8 | 0.3 | 15.3 |  |  |
+| 20k | before (bucket emit) | 18.1 | 17.4 | 4638 | 717 | 4.9 | 14.9 | 0.71 | 19.0 |
+| 20k | A (epoch, prealloc) | 17.5 | 16.5 | 4622 | 682 | 4.5 | 13.8 | 0.69 | 17.9 |
+| 20k | B (epoch, on demand) | 18.5 | 16.7 | 4639 | 722 | 4.7 | 14.1 | 0.69 | 18.2 |
+| 50k | before (bucket emit) | 19.0 | 17.2 | 5216 | 1308 | 8.5 | 16.1 | 0.61 | 20.1 |
+| 50k | A (epoch, prealloc) | 18.6 | 16.9 | 5220 | 1276 | 8.9 | 14.2 | 0.39 | 19.6 |
+| 50k | B (epoch, on demand) | 18.9 | 17.1 | 5212 | 1304 | 9.1 | 16.0 | 0.36 | 19.5 |
+| 50k, 20% hot | before (bucket emit) | 18.5 | 17.1 | 4412 | 501 | 8.6 | 14.2 | 0.41 | 19.6 |
+| 50k, 20% hot | A (epoch, prealloc) | 18.1 | 17.0 | 4436 | 494 | 8.1 | 14.0 | 0.39 | 19.2 |
+| 50k, 20% hot | B (epoch, on demand) | 18.1 | 16.9 | 4404 | 496 | 8.1 | 13.7 | 0.43 | 19.2 |
+
+**mixed1m** (19.2 M keys)
+
+| writes/s | config | save s | fork stall ms | peak MB | extra MB | main CPU s | PING max ms | write p99 ms | write max ms |
+|---|---|---|---|---|---|---|---|---|---|
+| idle | before (bucket emit) | 28.1 | 14.1 | 4160 | 86 | 0.4 | 10.9 |  |  |
+| idle | A (epoch, prealloc) | 27.0 | 13.9 | 4204 | 92 | 0.4 | 11.0 |  |  |
+| idle | B (epoch, on demand) | 27.3 | 14.0 | 4176 | 100 | 0.4 | 14.8 |  |  |
+| 20k | before (bucket emit) | 24.5 | 14.7 | 4992 | 916 | 5.9 | 13.8 | 0.70 | 16.4 |
+| 20k | A (epoch, prealloc) | 26.0 | 14.7 | 5046 | 935 | 6.1 | 14.9 | 0.70 | 16.0 |
+| 20k | B (epoch, on demand) | 24.9 | 14.6 | 4996 | 918 | 5.9 | 11.9 | 0.70 | 16.1 |
+| 50k | before (bucket emit) | 22.6 | 15.3 | 5564 | 1487 | 10.2 | 12.6 | 0.56 | 17.2 |
+| 50k | A (epoch, prealloc) | 25.4 | 15.2 | 5640 | 1530 | 10.7 | 13.3 | 0.61 | 17.3 |
+| 50k | B (epoch, on demand) | 24.6 | 15.3 | 5615 | 1536 | 10.9 | 15.5 | 0.44 | 17.7 |
+| 50k (7 reps, run 165r) | before (bucket emit) | 25.6 | 15.3 | 5627 | 1550 | 11.3 | 13.9 | 0.41 | 17.5 |
+| 50k (7 reps, run 165r) | A (epoch, prealloc) | 25.2 | 15.3 | 5636 | 1524 | 11.0 | 14.4 | 0.45 | 17.5 |
+
+Main-thread emit-ahead (keys serialized by the main thread before an in-place write ahead of the scan), per save:
+
+| cell | before: keys (buckets) | A | B |
+|---|---|---|---|
+| small 50k | 1.07 M (690 k) / 1.04 M (675 k) | 698 k / 696 k | 697 k / 700 k |
+| mixed 20k | 237 k / 242 k | 154 k / 143 k | 157 k / 155 k |
+| mixed 50k | 526 k / 487 k | 348 k / 343 k | 335 k / 339 k |
+| mixed 50k, 20% hot | 364 k / 359 k | 233 k / 234 k | 225 k / 230 k |
+| mixed1m 50k (7 reps, mean) | 317 k | 208 k | |
+
+- **Emit-ahead is 30-37% smaller** on today's dict: the old build serialized about 1.55 keys per bucket (its key count is about 1.55x its bucket count, and the new key count is about the old bucket count). On a swiss-table hashtable (about 5 keys per bucket) the gap grows accordingly.
+- **Save time, fork stall, latency and main-thread CPU are unchanged.** The 2-rep mixed1m cells showed A about 2.5 s slower; 8 interleaved reps at 50k (rep 1 dropped) say otherwise: before 24.99 +- 1.71 s (22.3-26.7), A 24.79 +- 1.39 s (22.8-26.3); scan thread done at 20.48 vs 20.40 s, the child's tail after it 4.51 vs 4.38 s. Single cells on mixed1m vary by about 4 s, so read the 2-rep save seconds as +-2 s.
+- **Memory before the save: A costs 38-47 MB (0.9-1.2%)**, keys that crossed a jemalloc size class with the 4 bytes; B matches before. The test key of string.tcl's MEMORY USAGE check (32 B exact fit) is such a key: 40 B under A.
+- **Peak during the save: B is the worst on small.** B reallocates about 25% of the keys it stamps (71 k at 20k, 172 k at 50k; 17-48 k on mixed and mixed1m). Each realloc repoints the dict table entry (and the expires entry), which lives in memory shared with the fork child, so the child's private dirty grows by about 70 MB (extra 72-78 MB vs A's 4 and before's 8). On mixed and mixed1m the big values' copy-on-write (0.5-1.5 GB) dominates and the three are equal. A keeps the default.
+- **Overlay (writes into the scan window):** 5-50 buckets per save, 0.001-0.004% of the writes, about 1.6 keys cloned per bucket. The new build overlays about 1.5-2x more buckets than before: a bucket emitted ahead earlier was skipped whole by the old scan (bitmap), so writes into it stayed in place once the window reached it; now only the written key is stamped and the thread still walks the bucket. A lazy per-key clone (TASK-1.65 phase 2) would save some 20-30 clones per save.
+- **Profile** (perf record -a on the server cores, mixed1m 50k, one save each): child 45.8% vs 46.7% of the samples, scan thread 30.2% vs 32.6%, main thread 17.5% vs 15.2%. The child's top functions are identical (lzf_compress 28%, entryGetValue 5%, crc64 3%, fwrite 3%) and it is the save's critical path (it finishes 4-5 s after the scan). In the scan thread hybsnapScanThreadMain goes from 4.6% to 6.3%: the entry callback with the epoch read is inlined there, and hybsnapKeyClass (1.7% before) no longer shows separately.

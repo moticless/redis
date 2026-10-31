@@ -1,7 +1,7 @@
 #!/bin/bash
 # Start each binary with identical flags (pinned to cores 0-7), run bench.py (snapload.py traffic), stop it.
 #   run.sh <csv> [rates] [datasets] [scale] [reps]
-# CFGS env: space-separated subset of "base up up-1ch up-nocomp hybrid hybrid-off hybrid-nocomp hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
+# CFGS env: space-separated subset of "base up up-1ch up-nocomp hybrid hybrid-off hybrid-nocomp hybrid-q16 hybrid-q2 hybrid-1ch hybrid-before hybrid2 hybrid2-b hybrid3 valkey-fork valkey-forkless yinon-fork yinon-hybrid yinon-forkless"
 # Parity: small-value cap pinned to 4096 B on both POCs (ours save-small-max-bytes, theirs forkless-string-max);
 # retained-memory budgets left at each POC's default (ours 256 MB hard mark, theirs unlimited) and recorded in the CSV.
 cd "$(dirname "$0")"
@@ -52,6 +52,7 @@ for cfg in ${CFGS:-base hybrid}; do
     up-1ch)          start up-1ch "$UP" --repl-rdb-channel no ;;
     hybrid-before)   start hybrid-before "$HYB_BEFORE" --hybrid-snapshot yes ;;
     hybrid2)         start hybrid2 "$HYB2" --hybrid-snapshot yes ;;
+    hybrid2-b)       start hybrid2-b "$HYB2" --hybrid-snapshot yes --hybrid-snapshot-epoch-prealloc no ;;   # TASK-1.65 policy B: the epoch only where the allocation has room
     hybrid3)         start hybrid3 "$HYB3" --hybrid-snapshot yes ;;
     valkey-fork)     start valkey-fork "$VALKEY" ;;
     valkey-forkless) start valkey-forkless "$VALKEY" --forkless-infrastructure-enabled yes --bgsave-default-method forkless ;;
