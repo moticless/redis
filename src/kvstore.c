@@ -839,6 +839,9 @@ dictEntry *kvstoreIteratorNext(kvstoreIterator *kvs_it) {
  * unless skip_cb indicates otherwise. It first tries to shrink if needed, and
  * if it doesn't try to shrink, it tries to expand. */
 void kvstoreTryResizeDicts(kvstore *kvs, int limit, kvstoreResizeShouldSkipDictIndex *skip_cb) {
+    /* Bypasses the guard: never on a store a snapshot holds (the caller,
+     * databasesCron, runs it only without a child, and a hybrid save has one). */
+    debugAssert(kvs->snap_hooks == NULL);
     if (limit > kvs->num_dicts)
         limit = kvs->num_dicts;
 
@@ -861,6 +864,7 @@ void kvstoreTryResizeDicts(kvstore *kvs, int limit, kvstoreResizeShouldSkipDictI
  * The function returns the amount of microsecs spent if some rehashing was
  * performed, otherwise 0 is returned. */
 uint64_t kvstoreIncrementallyRehash(kvstore *kvs, uint64_t threshold_us) {
+    debugAssert(kvs->snap_hooks == NULL);   /* as kvstoreTryResizeDicts() */
     if (listLength(kvs->rehashing) == 0)
         return 0;
 
