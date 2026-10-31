@@ -74,7 +74,7 @@ the frozen dict through a window (`[lo, hi)` in the credit window's terms). Behi
 goes to a duplicate of the bucket's chain (kv3, kv7 are written, kv4, kv8 deleted, on the duplicate)
 while the scan reads the fork-instant originals in the dict: small values (kv3-kv5) go into 64 KB buffers, big values (kv6-kv8) travel
 as header copies and the child serializes them from its own snapshot. Ahead of the window the
-main thread serializes kv9's whole bucket into a buffer, marks the bucket emitted so the scan
+main thread serializes kv9 alone into a buffer and stamps it with the save's epoch so the scan
 skips it, then writes in place. kv8 is deleted during the save and still reaches the file.
 
 The figure draws the overlay per key ("dup", "tomb"). In the implemented bucket overlay a write inside the window duplicates the whole chain of its bucket, a deleted key is absent from the duplicate and no tombstone exists; the figure has not been redrawn.*
@@ -84,7 +84,7 @@ The figure draws the overlay per key ("dup", "tomb"). In the implemented bucket 
 ```
  main thread                           scan thread                              child
  ───────────                           ───────────                              ─────
- emit-ahead: serialize a bucket        staging buffer (64 KB) ──┐
+ emit-ahead: serialize a key           staging buffer (64 KB) ──┐
    into mstage ──► mq ─────────────────► forwarded every W        │
    (mutex, taken by the thread          buckets and per dict      ▼
     every W buckets)                                      oq: small-channel queue ──► pipe A (BUFFER) ──► small-first loop
@@ -136,7 +136,15 @@ a copy that takes over the dict entry, `db->expires`, `db->subexpires` and the s
 old allocation is freed when the write section closes (`snap_save_epoch_reallocs`). A kvobj
 recreated by any flow (`kvobjSet`: overwrite, the expire slot, RENAME/MOVE/COPY/RESTORE, encoding
 changes) gets an epoch by the same rule, so a stamp the running save needs is never lost, and an
-older one is dropped unless the policy keeps it.
+older one is dropped unless the policy keeps it. Active defrag and in-place writes keep the 4
+bytes as they are.
+
+**Why an epoch and not a generation byte.** An earlier design kept a small save generation in
+`kvBits` (`save_gen`, removed). It needed byte-wide atomics on every kvobj creation and writes from
+the scan thread, and its few bits wrapped, so it carried a trust counter and a clone-everything
+fallback. The epoch needs none of that: the credit window orders the main thread's stamp before the
+thread's read, the thread never writes a key, 2^32 saves do not wrap in practice, and it takes one
+unused `kvBits` bit.
 
 **The credit window.** The scan visits a fixed order, and each bucket has a position in it: a
 64-bit integer packing the dict's ordinal (its store's base plus the slot, so a slot filter's
@@ -159,10 +167,14 @@ at or above `hi`, read up to `min(batch end, hi)`, store `lo` after each bucket.
   either the main thread sees the thread's announcement, or the thread's next load of `hi` sees
   `H`: after the cap the thread is at most on `cur`, and no later position it reaches can pass the
   cap. The main thread never waits.
-- **Inside a section (grants).** Every later hook checks whether `lo` has reached the midpoint
+- **Inside a section (grants), between statements only.** Before each statement of EXEC or a
+  script (`hybsnapSectionGrant`) the main thread checks whether `lo` has reached the midpoint
   recorded at the last grant (`advance(lo, W/2)`) and, if so, raises `hi` to `advance(lo, W)`
-  (release). A grant is skipped while 16 overlay windows hold buckets: they are written back only
-  at the section's end, and the thread then waits for it.
+  (release). Never in the middle of a command: a command keeps writing in place through the links
+  and kvobj pointers its lookups handed out ahead of `hi`, so those buckets must stay out of the
+  thread's reach until it returns. Not for an EXEC or a script run by `RM_Call` either: its module
+  may hold a key open. A grant is skipped while 16 overlay windows hold buckets: they are written
+  back only at the section's end, and the thread then waits for it.
 - **Section close.** Write back the overlayed buckets the thread has passed, then set `hi`
   unlimited.
 
@@ -178,13 +190,17 @@ the layout of its 64th dict.
 - A bucket in `[lo, hi)` may be being read: the main thread overlays it and never writes its chain.
   A stale `lo` only makes this conservative.
 - A bucket at or beyond `hi` cannot be reached until the main thread raises `hi`, which it does
-  only after any emit-ahead and bit it set (the release store of `hi` orders them; the thread reads
-  the bit after its load of `hi`). The thread then skips it.
-- A bucket the main thread only read while it was ahead may become readable by the thread later in
-  the same section: concurrent reads are fine, and a later write in the section goes through
+  only after the stamps it wrote there (the release store of `hi` orders them; the thread reads a
+  key's epoch after its load of `hi`). The thread then skips the stamped keys and reads the rest.
+- `hi` moves only between statements, so a bucket a command found ahead stays ahead until the
+  command returns, whatever it writes through the links and kvobj pointers it holds (in place,
+  inserts, unlinks, frees). The thread does not skip such a bucket as a whole: it walks its chain
+  and reads its other keys once `hi` passes it, which is why `hi` must not pass it earlier.
+- Links the funnel hands out point into an overlayed bucket's chain, into a bucket behind the
+  thread, or into a bucket ahead of `hi`, which stays ahead until the command returns.
+- A bucket a statement only read while it was ahead may become readable by the thread at a later
+  statement of the same section: concurrent reads are fine, and a later write goes through
   `prepare` again, which classifies it anew.
-- Links the funnel hands out point into an overlayed bucket's chain or into the chain of a bucket
-  behind the thread or emitted, which the thread no longer reads. Raising `hi` changes neither.
 - A dict claimed by the thread while `hi` was unlimited is paused at the next section's cap (it
   finds the thread there), by `advance` (it enters the dict), or by the guard (an access to a
   SCANNING dict pauses it); the main thread touched no frozen dict in between.
@@ -200,11 +216,12 @@ the layout of its 64th dict.
   after sees every bucket behind the thread.
 
 Value mutations that do not go through the hook (`APPEND`, `INCR`, `HSET` on a listpack) need no
-protection: their bucket was emitted or walked before the command ran and the thread never returns
-to a bucket. The scan thread never blocks the main thread. The main thread holds the scan thread
-back only inside a section, and only once the thread reaches `hi`: a section that stops making
-keyspace accesses (one access, then a long computation), or one whose overlay windows reached the
-soft count.
+further protection: the write lookup before them went through it, so the key is behind the thread,
+in an overlayed bucket, or stamped ahead of `hi`, where it stays until the command returns. The
+scan thread never blocks the main thread. The main thread holds the scan thread back only inside a
+section, and only once the thread reaches `hi`: for the rest of a command (one command is never
+granted more), until the next statement of EXEC or a script, or while its overlay windows are at
+the soft count.
 
 **Attach and pause.** A dict acquires its per-save state on demand: the store's guard, which runs
 on every access to a dict without an overlay while the scan runs, attaches on the first
@@ -418,7 +435,7 @@ the single-child rule applies as for any fork.
 | `snap_save_scan_stamped_keys` | keys the scan thread skipped for their epoch (emitted ahead, or created after the fork instant) |
 | `snap_save_epoch_reallocs` | keys written ahead that got their epoch in a new allocation (no room in theirs) |
 | `snap_save_scan_stalls`, `snap_save_scan_stall_ms` | times the scan thread waited at `hi`, and the time it spent waiting, in the current or last save |
-| `snap_save_window_grants` | times a write section raised `hi` (the thread was half way through its credit), in the current or last save |
+| `snap_save_window_grants` | times a write section raised `hi` between two statements of EXEC or a script (the thread was half way through its credit), in the current or last save |
 | `snap_save_retained_bytes`, `snap_last_save_retained_peak` | fork-instant originals kept alive by overlayed buckets, now and at the last save's peak |
 | `snap_save_queued_bytes`, `snap_last_save_queued_peak` | bytes in the scan thread's queues and the main thread's queue, now and at the last save's peak |
 | `snap_save_side_entries` | overlayed buckets pending write-back (the name predates the bucket overlay) |
@@ -466,7 +483,8 @@ MADV_DONTFORK`.
   table 0, table 1), bucket index.
 - **credit window**: `[lo, hi)`, the positions the scan thread may be reading. The thread moves
   `lo`; the main thread alone moves `hi`, unlimited outside write sections, capped at a section's
-  start and raised by `W` buckets inside it (a **grant**).
+  start and raised by `W` buckets between its statements (a **grant**), never in the middle of a
+  command.
 - **overlay window**: the aligned run of `W` buckets (power of two) an overlayed bucket is indexed
   by; written back once the thread is past its last bucket.
 - **write section**: the interval on the main thread from a command's first hook on a frozen
@@ -496,7 +514,8 @@ MADV_DONTFORK`.
    dict changes.
 2. The thread reads chain pointers only below `hi` and after announcing them in `cur`; the main
    thread writes chains only outside `[lo, hi)` and only inside a write section; a key's epoch is
-   written only at or beyond `hi`, before `hi` is raised over it.
+   written only at or beyond `hi`, before `hi` is raised over it; `hi` is raised only between
+   statements, so a bucket a command found ahead stays ahead until the command returns.
 3. Every fork-instant key reaches the output exactly once: by the thread, by the main thread's
    emit-ahead (key stamped, thread skips), or by the child from a header copy. A key deleted while its
    bucket is inside the window stays in the dict, as an original, until the bucket is written back.

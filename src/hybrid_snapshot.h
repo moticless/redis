@@ -69,8 +69,9 @@
  * touches the keyspace only inside a write section: opened by a command's
  * first access to a frozen dict, closed when the outermost command returns,
  * at beforeSleep and when a module thread releases the GIL. Opening one caps
- * hi about W buckets past lo (default 1024, DEBUG SNAP-WINDOW-BUCKETS); outside
- * sections the thread runs free. A written bucket is
+ * hi about W buckets past lo (default 1024, DEBUG SNAP-WINDOW-BUCKETS); hi moves
+ * again only between the statements of EXEC or a script, never in the middle
+ * of a command; outside sections the thread runs free. A written bucket is
  *   behind  below lo        in place
  *   inside  in [lo, hi)     overlay (rule 3)
  *   ahead   hi and above    emit-ahead, then in place (rule 2)
@@ -190,6 +191,12 @@ extern int hybsnap_epoch_mode;
 extern uint32_t hybsnap_epoch_stamp;
 
 /* ---- Credit window and write sections ------------------------------------ */
+
+/* Between two statements of EXEC or a script (no link or kvobj pointer of the
+ * outer command is live): grant the thread more of the dict if it is half way
+ * through its grant. Never called in the middle of a command. A no-op outside
+ * a section. */
+void hybsnapSectionGrant(void);
 
 /* End the open write section, if any: write back the overlayed buckets the
  * thread has passed and lift the cap. Called at the end of the outermost

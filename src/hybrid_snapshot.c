@@ -1151,9 +1151,13 @@ static inline hybsnapSlotState hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 /* The credit window (hybrid_snapshot.h). Here:
  * cur is the last position of the batch the thread reads next (its prefetch
  * lookahead included), lo is stored after every bucket. hi is capped by
- * hybsnapWindowCap at section open and raised by hybsnapWindowRefill each time
- * lo passes half the grant, unless HYBSNAP_OV_SLOTS_SOFT overlay windows are in
- * use. The cap is a seq_cst store-load pair on each side (thread: store cur,
+ * hybsnapWindowCap at section open and raised by hybsnapWindowRefill, at the
+ * statement boundaries of EXEC and scripts only (hybsnapSectionGrant), each
+ * time lo passes half the grant, unless HYBSNAP_OV_SLOTS_SOFT overlay windows
+ * are in use. Never in the middle of a command: a key it handed out ahead of
+ * the thread (a link, a kvobj pointer) is written in place until the command
+ * ends, so its bucket must stay out of the thread's reach until then.
+ * The cap is a seq_cst store-load pair on each side (thread: store cur,
  * load hi; main: store hi, load cur): either the main thread sees where the
  * thread is, or the thread sees the cap. After the cap the thread is at most
  * on cur, and any later position it reaches sees it. */
@@ -1251,9 +1255,10 @@ static void hybsnapWindowCap(hybsnapScanCtx *ctx) {
     ctx->mid = mid;
 }
 
-/* Main thread, inside a section: once the thread is half way through its
- * grant, grant the next W buckets (pausing the dicts they open). Not while
- * many overlay windows are in use: the section's drain has to come first. */
+/* Main thread, at a statement boundary inside a section (hybsnapSectionGrant):
+ * once the thread is half way through its grant, grant the next W buckets
+ * (pausing the dicts they open). Not while many overlay windows are in use:
+ * the section's drain has to come first. */
 static void hybsnapWindowRefill(hybsnapScanCtx *ctx) {
     if (hybsnapPosLoLoad() < ctx->mid) return;
     if (kvstoreOverlaySlotsInUse() >= HYBSNAP_OV_SLOTS_SOFT) return;
@@ -1313,18 +1318,24 @@ static void hybsnapWalkerQuiesce(hybsnapScanCtx *ctx) {
 
 /* Write sections (hybrid_snapshot.h, "The credit window"). Opened by the first
  * guard or funnel hook of a command, reads included: caps the thread
- * (hybsnapWindowCap), and every later hook may raise the cap
- * (hybsnapWindowRefill). hybsnapSectionClose writes back the overlayed buckets
+ * (hybsnapWindowCap). hi moves inside the section only at a statement boundary
+ * (hybsnapSectionGrant). hybsnapSectionClose writes back the overlayed buckets
  * the thread has passed and lifts the cap. */
 static void hybsnapSectionOpen(void) {
     uint64_t v;
     atomicGet(hybsnap_section_seq, v);          /* single writer: relaxed read of our own value */
-    if (v & 1) {
-        if (hybsnap_live) hybsnapWindowRefill(hybsnap_live);
-        return;
-    }
+    if (v & 1) return;
     atomicSetWithSync(hybsnap_section_seq, v + 1);   /* seq_cst: pairs with hybsnapWalkerQuiesce */
     if (hybsnap_live) hybsnapWindowCap(hybsnap_live);
+}
+
+/* Main thread, between two statements of EXEC or a script, inside the
+ * command's section: no link or kvobj pointer of the outer command is live, so
+ * the thread may be granted the next W buckets. */
+void hybsnapSectionGrant(void) {
+    uint64_t v;
+    atomicGet(hybsnap_section_seq, v);
+    if ((v & 1) && hybsnap_live) hybsnapWindowRefill(hybsnap_live);
 }
 
 void hybsnapSectionClose(void) {
@@ -4281,11 +4292,16 @@ static void hybsnapScanTests(int accurate) {
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: the thread read its grant and waits at hi (64 buckets: d0, then part of d2)",
               stalls == 1 && first > 0 && dispatched == first && first < total_keys && !hybsnapScanIsFinished(ctx));
-    hybsnapSectionOpen();   /* a later hook of the same section: the thread is past mid, the next 64 buckets are granted */
+    hybsnapSectionOpen();   /* a later hook of the same command: no grant */
+    usleep(20000);
+    long same;
+    atomicGet(st->dispatched, same);
+    test_cond("credit: a later hook of the same command does not raise hi", ctx->grants == 0 && same == first);
+    hybsnapSectionGrant();  /* the next statement of EXEC or a script: the thread is past mid, the next 64 buckets are granted */
     long long stalls2 = stalls;
     for (int i = 0; i < 2000 && stalls2 == stalls; i++) { usleep(1000); atomicGet(ctx->stalls, stalls2); }
     atomicGet(st->dispatched, dispatched);
-    test_cond("credit: a hook inside the section raised hi, the thread read on and waits again",
+    test_cond("credit: a statement boundary inside the section raised hi, the thread read on and waits again",
               ctx->grants == 1 && stalls2 == 2 && dispatched > first && dispatched < total_keys);
     hybsnapSectionClose();   /* no limit outside sections */
     while (!hybsnapScanIsFinished(ctx)) usleep(100);
@@ -4384,7 +4400,7 @@ static void hybsnapScanTests(int accurate) {
         hybsnapTestWindow(ctx, b0, b0 + mid);          /* the thread may read [0, mid) */
         hybsnapSectionOpen();                           /* a command opens its write section */
         hybsnapBucketPos p_ahead = hybsnapBucketPosition(ctx, 0, 3, d, 0, mid + 1, NULL);
-        hybsnapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant later in the same section moves the window over it */
+        hybsnapTestWindow(ctx, b0 + mid, b0 + size);   /* a grant at a later statement of the section moves the window over it */
         hybsnapBucketPos p_after = hybsnapBucketPosition(ctx, 0, 3, d, 0, mid + 1, NULL);
         hybsnapBucketPos p_behind = hybsnapBucketPosition(ctx, 0, 3, d, 0, 0, NULL);
         hybsnapSectionClose();

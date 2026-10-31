@@ -7,7 +7,7 @@ status: In Progress
 assignee:
   - '@claude'
 created_date: '2026-10-30 13:35'
-updated_date: '2026-10-31 22:31'
+updated_date: '2026-10-31 23:25'
 labels:
   - bgsave
   - persistence
@@ -88,7 +88,7 @@ Valkey bgiteration.c uses a uint32_t iterator_epoch per entry, consistent_modifi
 - [x] #5 Ten or more consecutive saves (some aborted) followed by a successful one reload equal: stale epochs from earlier saves are treated as fork-instant
 - [ ] #6 No new atomics on the kvobj creation path or in the scan thread; the main thread never waits for the scan thread (invariant 8)
 - [x] #7 Memory overhead measured on the snap-bench matrix (keys touched during a save vs idle, hybrid on vs off) and save time/latency compared to the bucket-emit baseline; results recorded in the task notes
-- [ ] #8 docs/hybrid-snapshot.md updated: epoch semantics, layout, attach/keep policy, rehash pause rule, and why it differs from the removed save_gen
+- [x] #8 docs/hybrid-snapshot.md updated: epoch semantics, layout, attach/keep policy, rehash pause rule, and why it differs from the removed save_gen
 - [x] #9 Rehash/resize is paused only on dicts the window covers (SCANNING and those inside the current grant); attached-but-unreached dicts grow and shrink freely; a test grows and shrinks PENDING and DONE dicts during a save and the reload is equal
 - [x] #10 Every flow that rebuilds a kvobj through kvobjSet()/kvobjCreate() (TTL attach, keymeta attach, overwrite with new metabits, RENAME/MOVE/COPY/RESTORE, encoding conversions) decides again: during a save it carries the running save's epoch, outside a save the creation policy decides whether to keep the 4 bytes. Defrag and in-place writes keep the bytes as they are. A test rebuilds stamped keys during a save and the reload has no duplicate
 <!-- AC:END -->
@@ -128,4 +128,6 @@ Run 165p (2026-10-31, same host; CSVs utils/snap-bench/run165r-mixed1m.csv, run1
 2026-11-01: AC#7 (lazy per-key overlay clone, Phase 2) moved to TASK-1.56 (AC#3) and parked: INSIDE hits are 0.001-0.004% of writes (run 165).
 
 2026-11-01: four Tcl tests in tests/unit/hybrid_snapshot.tcl (after the emit-ahead test), each checked against a mutant in a throwaway worktree: (1) 'keys given an epoch in a new allocation keep their TTL and field TTLs, active expiry reaches them after the save' (prealloc no; 1000 volatile keys and 320 hash fields, listpack and hashtable, expire actively without being touched) - mutant: hybsnapKeyRepoint skips db->expires/db->subexpires -> ASSERTION t_hash.c:4157 meta.trash. (2) AC#10 'keys rebuilt during the save (RENAME, MOVE, COPY, RESTORE, SET, EXPIRE) reload with the fork instant, none twice' x prealloc yes/no; stamped keys and pending neighbours, MOVE/COPY into db 12 which is scanned later - mutant: scan skips only epoch > E -> 'Duplicated key found in RDB file'. (3) AC#5 'epochs left by ten earlier saves (seven aborted) are fork-instant to the next one' (policies alternate; stamps, keys born under each epoch, a pending delete; the final save also writes ahead) - mutant: any epoch reads as stamped -> 382 keys missing. (4) AC#9 'a dict the walker finished and one it has not reached grow and shrink during the save' (db 2 DONE, db 12 PENDING, 4 -> >=1024 buckets and back, a stamped seed rehashed) - mutant: pause on first touch -> no growth. All four pass on HEAD.
+
+2026-11-01: REGRESSION found and fixed (uncommitted at time of writing): with the bitmap an ahead bucket handed out for an in-place write was marked emitted, so the thread skipped it even after hi passed it. With per-key epochs the thread walks such a bucket's chain and reads its other keys, but grants still ran at every hook inside a section (hybsnapSectionOpen's in-section branch, incl. kvsoEnter in kvsoDictSetAtLink / kvsoDictTwoPhaseUnlinkFreeKey), so a command could raise hi past a bucket it had just been handed and then write through its link or kvobj pointer (replace, insert, unlink, free) while the thread read it. Probe (throwaway worktree; logs a grant passing an ahead bucket handed out earlier in the same command): 1M keys, save with no delay, 300 MULTI blocks of 200 random SETs -> 1 hit in 243 grants (the grant fired in setKey's kvsoEnter after SET's lookup). Fix: grants only between statements (hybsnapSectionGrant, called before each EXEC statement in multi.c and each script statement in script.c, not for EXEC or scripts run by RM_Call, whose module may hold a key open); hooks inside a command never move hi. Probe on the fix: 285 grants, 0 hits. Unit 218/218, unit/hybrid_snapshot 89 ok, multi/scripting/functions with hybrid on 551 ok. AC#8: docs/hybrid-snapshot.md updated (stale bitmap wording, grants between statements, the race-free argument, why an epoch and not save_gen).
 <!-- SECTION:NOTES:END -->

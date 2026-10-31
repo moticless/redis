@@ -694,6 +694,9 @@ void scriptCall(scriptRunCtx *run_ctx, sds *err) {
     if (run_ctx->repl_flags & PROPAGATE_REPL) {
         call_flags |= CMD_CALL_PROPAGATE_REPL;
     }
+    /* Between two statements of the script: nothing of the last one is live.
+     * Not for a script run by RM_Call, whose module may hold a key open. */
+    if (!(run_ctx->original_client->flags & CLIENT_MODULE)) hybsnapSectionGrant();
     call(c, call_flags);
     serverAssert((c->flags & CLIENT_BLOCKED) == 0);
 

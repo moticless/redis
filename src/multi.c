@@ -223,6 +223,9 @@ void execCommand(client *c) {
                 "following reason: %s", reason);
         } else {
             c->mstate.executing_cmd = j;
+            /* Between two statements nothing of the last one is live (an EXEC
+             * run by RM_Call excepted: its module may hold a key open). */
+            if (!(c->flags & CLIENT_MODULE)) hybsnapSectionGrant();
             if (c->id == CLIENT_ID_AOF)
                 call(c,CMD_CALL_NONE);
             else
