@@ -1438,6 +1438,195 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             }
         }
 
+        test {Hybrid snapshot: keys given an epoch in a new allocation keep their TTL and field TTLs, active expiry reaches them after the save} {
+            # without prealloc a key written ahead of the walker may move to a
+            # new allocation; db->expires and db->subexpires must follow it.
+            # Only active expiry walks those structures, so the keys are not
+            # touched again after the save
+            r config set hybrid-snapshot-epoch-prealloc no
+            r flushall
+            set at [expr {[clock milliseconds] + 8000}]
+            populate 5000 xa: 20
+            for {set i 0} {$i < 5000} {incr i 5} { r pexpireat xa:$i $at }
+            for {set i 0} {$i < 300} {incr i} {
+                r hset xh:$i f v g w
+                r hpexpireat xh:$i $at FIELDS 1 f
+            }
+            for {set i 0} {$i < 20} {incr i} {
+                r hset xhb:$i {*}[snap_seq_pairs f 200]   ;# hashtable encoding
+                r hpexpireat xhb:$i $at FIELDS 1 f1
+            }
+            set keys0 [s expired_keys]
+            set subkeys0 [s expired_subkeys]
+            r config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+            r bgsave
+            snap_wait_save_started
+            for {set i 0} {$i < 5000} {incr i 5} { r append xa:$i x }
+            for {set i 0} {$i < 300} {incr i} { r hset xh:$i g x }
+            for {set i 0} {$i < 20} {incr i} { r hset xhb:$i f0 y }
+            assert_equal 1 [s snap_save_in_progress]
+            assert {[s snap_save_epoch_reallocs] > 0}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            wait_for_condition 200 100 {
+                [s expired_keys] - $keys0 == 1000 && [s expired_subkeys] - $subkeys0 == 320
+            } else {
+                fail "active expiry missed keys: [expr {[s expired_keys] - $keys0}] of 1000 keys, [expr {[s expired_subkeys] - $subkeys0}] of 320 fields"
+            }
+            assert_equal [expr {5000 - 1000 + 320}] [r dbsize]
+            r config set hybrid-snapshot-epoch-prealloc yes
+        }
+
+        foreach prealloc {yes no} {
+            test "Hybrid snapshot: keys rebuilt during the save (RENAME, MOVE, COPY, RESTORE, SET, EXPIRE) reload with the fork instant, none twice (epoch-prealloc $prealloc)" {
+                r config set hybrid-snapshot-epoch-prealloc $prealloc
+                r flushall
+                set multidb [expr {!$::singledb}]
+                if {$multidb} {
+                    # db 12 is scanned after db 9: a key moved or copied there
+                    # during the save must be skipped by its epoch
+                    r select 12
+                    for {set i 0} {$i < 20} {incr i} { r set seed:$i v }
+                    r select 9
+                }
+                populate 20000 rb: 20
+                for {set i 0} {$i < 20000} {incr i 50} { r pexpire rb:$i 100000000 }
+                wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+                set ref [debug_digest]
+                set refkeys [snap_key_digests]
+                r config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+                r bgsave
+                snap_wait_save_started
+                # rb:$i is stamped first (emitted ahead, then written in place);
+                # its neighbour rb:$p is still pending save when it is rebuilt
+                for {set i 0} {$i < 1200} {incr i 10} { r append rb:$i x }
+                for {set i 0} {$i < 1200} {incr i 10} {
+                    set p [expr {$i + 5}]
+                    foreach k [list rb:$i rb:$p] {
+                        switch [expr {($i / 10) % 6}] {
+                            0 { r rename $k rn:$k }
+                            1 { if {$multidb} { r move $k 12 } else { r del $k } }
+                            2 {
+                                r copy $k cp:$k
+                                if {$multidb} { r copy $k $k db 12 }
+                            }
+                            3 { r restore $k 0 [r dump $k] replace }
+                            4 { r set $k y ex 100000 }
+                            5 { r expire $k 200000 }
+                        }
+                    }
+                }
+                assert_equal 1 [s snap_save_in_progress]
+                assert {[s snap_save_main_keys] >= 120}
+                r config set rdb-key-save-delay 0
+                snap_wait_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                r debug reload nosave
+                if {[debug_digest] ne $ref} { snap_fail_with_diff $refkeys [snap_key_digests] "keys rebuilt during the save" }
+                r config set hybrid-snapshot-epoch-prealloc yes
+            }
+        }
+
+        test {Hybrid snapshot: epochs left by ten earlier saves (seven aborted) are fork-instant to the next one, reload equal} {
+            r flushall
+            populate 5000 ep: 20
+            for {set k 0} {$k < 10} {incr k} {
+                # alternate the policies: stamps in place and in new allocations
+                r config set hybrid-snapshot-epoch-prealloc [expr {$k % 2 ? "no" : "yes"}]
+                r config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+                r bgsave
+                snap_wait_save_started
+                # this save's epoch: keys stamped ahead of the walker, keys born under it
+                for {set i [expr {$k * 100}]} {$i < $k * 100 + 100} {incr i 5} { r append ep:$i x }
+                for {set j 0} {$j < 20} {incr j} { r set new$k:$j v$k }
+                r del ep:[expr {$k * 100 + 1}]   ;# a pending key deleted
+                assert {[s snap_save_main_keys] >= 10}   ;# about 1 in 8 is inside the window: overlayed
+                if {$k % 3 == 2} {
+                    r config set rdb-key-save-delay 0
+                    snap_wait_bgsave_done
+                    assert_equal ok [s rdb_last_bgsave_status]
+                } else {
+                    exec kill -9 [get_child_pid 0]
+                    r config set rdb-key-save-delay 0
+                    snap_wait_bgsave_done
+                    assert_equal err [s rdb_last_bgsave_status]
+                }
+            }
+            r config set hybrid-snapshot-epoch-prealloc yes
+            set ref [debug_digest]
+            set refkeys [snap_key_digests]
+            # the next save must take every earlier stamp for fork-instant: the
+            # scan emits those keys, and a write ahead of it emits them first
+            r config set rdb-key-save-delay 1000000
+            r bgsave
+            snap_wait_save_started
+            for {set k 0} {$k < 10} {incr k} {
+                r append ep:[expr {$k * 100}] y
+                r append new$k:0 y
+            }
+            assert {[s snap_save_main_keys] >= 10}
+            r config set rdb-key-save-delay 0
+            snap_wait_bgsave_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            r debug reload nosave
+            if {[debug_digest] ne $ref} { snap_fail_with_diff $refkeys [snap_key_digests] "save after ten earlier saves" }
+        }
+
+        if {!$::singledb} {
+            # The largest table of db's main dict: the main table, or the
+            # rehashing target while it rehashes.
+            proc snap_db_table_size {db} {
+                set max 0
+                foreach {-> n} [regexp -all -inline {table size: (\d+)} [r debug htstats $db]] {
+                    if {$n > $max} { set max $n }
+                }
+                return $max
+            }
+
+            test {Hybrid snapshot: a dict the walker finished and one it has not reached grow and shrink during the save, the reload is equal} {
+                r flushall
+                r select 2
+                for {set i 0} {$i < 4} {incr i} { r set done:$i v }   ;# scanned first: done within milliseconds
+                r select 12
+                for {set i 0} {$i < 4} {incr i} { r set pend:$i v }   ;# scanned last: pending throughout
+                r select 9
+                populate 20000 mid: 20                                ;# the walker spends the save here
+                wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+                set ref [debug_digest]
+                r config set rdb-key-save-delay 1000   ;# about 20 s for db 9
+                r bgsave
+                snap_wait_save_started
+                wait_for_condition 100 50 {[s snap_save_keys_nofork] + [s snap_save_keys_fork] >= 5} else { fail "the walker did not pass db 2" }
+                set size2 [snap_db_table_size 2]
+                set size12 [snap_db_table_size 12]
+                # a pending seed stamped before its dict rehashes: the stamp moves with it
+                r select 12
+                r append pend:0 x
+                foreach db {2 12} {
+                    r select $db
+                    for {set i 0} {$i < 3000} {incr i} { r set grow:$i v }
+                    set grown($db) [snap_db_table_size $db]
+                    for {set i 0} {$i < 3000} {incr i} { r del grow:$i }
+                    for {set i 0} {$i < 1000} {incr i} { r exists pend:0 }   ;# steps the rehash
+                    set shrunk($db) [snap_db_table_size $db]
+                }
+                r select 2
+                r append done:0 x   ;# behind the walker: a plain write
+                r select 9
+                assert_equal 1 [s snap_save_in_progress]
+                foreach {db size} [list 2 $size2 12 $size12] {
+                    assert_morethan $grown($db) $size
+                    assert_lessthan $shrunk($db) $grown($db)
+                }
+                r config set rdb-key-save-delay 0
+                snap_wait_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                r debug reload nosave
+                assert_equal $ref [debug_digest]
+            }
+        }
+
         test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the classic child keeps them} {
             r flushall
             populate 20000 cr: 60
