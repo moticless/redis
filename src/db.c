@@ -3147,7 +3147,10 @@ static kvobj *dbFindGeneric(kvstore *kvs, sds key) {
 
 /* Find a KV in the main db, read-only: a caller that modifies the value or
  * the key must look it up with dbFindByLink() (or lookupKeyWrite*()), which
- * lets a running hybrid snapshot prepare the key for the write first. */
+ * lets a running hybrid snapshot prepare the key for the write first. One
+ * exception: a value whose top-level pointer never moves (e.g. streams, as
+ * XACK writes them) may be written after a read lookup, see
+ * hybsnapKvobjIsPendingSaveMovable(). */
 kvobj *dbFind(redisDb *db, sds key) {
     return dbFindGeneric(db->keys, key);
 }
