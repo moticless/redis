@@ -354,7 +354,7 @@ void zfree_with_flags(void *ptr, int flags) {
 
 /* Sized free with explicit jemalloc flags (arena / tcache selection). 'size'
  * must be the usable size so used_memory accounting stays accurate. */
-void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
+static inline void zfree_with_size_and_flags(void *ptr, size_t size, int flags) {
     if (ptr == NULL) return;
     update_zmalloc_stat_free(size);
     je_sdallocx(ptr, size, flags);

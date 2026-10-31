@@ -15,7 +15,7 @@
  *   - the save: INFO/DEBUG, bucket position and emit-ahead, stores versus
  *     dbs, the outbound queue to the child;
  *   - the child writer, then the parent orchestration;
- *   - unit tests (redis-server test snapshot).
+ *   - unit tests (redis-server test hybrid_snapshot).
  *
  * Copyright (c) 2026-Present, Redis Ltd.
  * All rights reserved.
@@ -500,15 +500,15 @@ static void hybsnapFallbackLog(void) {
                           "REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT", who);
 }
 
-/* Fork visibility of the arena: DONTFORK, so a child forked without the
- * keyspace (the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE module fork:
- * redisFork() with REDIS_FORK_NO_KEYSPACE) never maps it. Any other fork (classic save, diskless
- * sync, AOF rewrite, module, Lua debugger) needs the keyspace, so redisFork()
- * flips it to DOFORK (hybsnapArenaBeforeFork) and the child reap path flips it
- * back once no child is left (hybsnapArenaChildExited). One madvise each way,
- * O(1) in keys; that child pays classic copy-on-write.
+/* Fork visibility of the arena. It is DONTFORK, so a child forked without the
+ * keyspace (redisFork() with REDIS_FORK_NO_KEYSPACE) never maps it. Any other
+ * fork (classic save, diskless sync, AOF rewrite, module, Lua debugger) needs
+ * the keyspace: redisFork() makes the arena DOFORK (hybsnapArenaBeforeFork) and
+ * the reap path restores DONTFORK once no child is left
+ * (hybsnapArenaChildExited). One madvise each way; that child pays classic
+ * copy-on-write.
  *
- * Returns 1 iff hybrid arena exists and set to MADV_DOFORK. 0, otherwise. */
+ * Returns 1 when the arena exists and is DOFORK, else 0. */
 int hybsnapArenaIsForkable(void) {
 #ifdef HAVE_HYBRID_ARENA
     return hybsnapArenaExists() && zmalloc_hybrid_arena_is_forkable();
@@ -552,21 +552,16 @@ void hybsnapArenaChildExited(void) {
         serverLog(LL_NOTICE, "Hybrid arena back to MADV_DONTFORK");
 }
 
-/* redisFork(), child side, first thing after the fork of a child that never
- * touches the keyspace (REDIS_FORK_NO_KEYSPACE: the hybrid save child, a
- * REDISMODULE_FORK_NO_KEYSPACE module fork). From here on the keyspace module
- * APIs are refused (hybsnapIsChildNoKeyspace), with the feature on or off: one
- * contract whatever the configuration.
+/* redisFork(), child side, first thing in a child forked without the keyspace
+ * (REDIS_FORK_NO_KEYSPACE: the hybrid save child, a REDISMODULE_FORK_NO_KEYSPACE
+ * module fork). The keyspace module APIs are refused from here on
+ * (hybsnapIsChildNoKeyspace), feature on or off.
  *
- * The arena was left DONTFORK (no page tables copied for it, no copy-on-write
- * on it while the child runs), so its range is not mapped here and the kernel
- * would hand its addresses to our own allocations as the heap grows; zmalloc
- * routes frees and reallocs by address (zmalloc_in_hybrid_arena), so such a
- * block would be reallocated in the parent-only arena and the write would
- * fault (seen as a crash in the hybrid child's pipe reader). Reserve the whole
- * range PROT_NONE so nothing of ours can land in it. When the arena is
- * forkable anyway (feature off, a debugger child) the child has it mapped and
- * there is nothing to reserve. */
+ * The DONTFORK arena is not mapped here, so the kernel could hand its
+ * addresses to our own heap; zmalloc routes frees and reallocs by address
+ * (zmalloc_in_hybrid_arena) and would treat such a block as an arena block.
+ * Reserve the range PROT_NONE. A forkable arena (feature off, a debugger
+ * child) is mapped: nothing to reserve. */
 void hybsnapChildNoKeyspaceInit(void) {
     hybsnap_child_no_keyspace = 1;
 #ifdef HAVE_HYBRID_ARENA
@@ -922,17 +917,14 @@ static void *hybsnapOverlayCloneKey(void *privdata, int didx, void *orig_) {
     return kv;
 }
 
-/* Does the clone of 'orig' take over its value (1) or copy it (0)? The one
- * definition, used when the clone is made and again when the original is
- * released, so nothing is remembered between the two: it depends on the
- * original's header, which is never written, and on the numeric address of its
- * value, which is never dereferenced (a shared value may be gone by then).
+/* Does the clone of 'orig' take over its value (1) or copy it (0)? Used when
+ * the clone is made and again when the original is released, so it depends
+ * only on the original's header (never written) and on its value's address
+ * (never dereferenced: a shared value may be gone by then):
  *   - a value inside the header allocation is copied with it;
- *   - a single-allocation value (string, listpack, intset, listpack with
- *     field TTLs) is copied when the scan thread reads it, i.e. when it is in
- *     the arena (the class is the address, see hybsnapKeyClass), and without the
- *     arena always: the thread would read a shared value the clone then
- *     reallocates;
+ *   - a single-allocation value (string, listpack, intset, listpack with field
+ *     TTLs) is copied when the scan thread reads it: in the arena, and always
+ *     without the arena (the thread would read a value the clone reallocates);
  *   - a multi-allocation value is the fork child's and is taken over. */
 static int hybsnapOriginalSharesValue(const kvobj *orig) {
     if (hybsnapValueIsInline(orig->type, orig->encoding)) return 0;
@@ -1159,8 +1151,12 @@ static inline hybsnapSlotState hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 /* The credit window (hybrid_snapshot.h). Here:
  * cur is the last position of the batch the thread reads next (its prefetch
  * lookahead included), lo is stored after every bucket. hi is capped by
- * hybsnapWindowCap at section open and raised by hybsnapWindowRefill; after the cap
- * the thread is at most on cur, and any later position it reaches sees it. */
+ * hybsnapWindowCap at section open and raised by hybsnapWindowRefill each time
+ * lo passes half the grant, unless HYBSNAP_OV_SLOTS_SOFT overlay windows are in
+ * use. The cap is a seq_cst store-load pair on each side (thread: store cur,
+ * load hi; main: store hi, load cur): either the main thread sees where the
+ * thread is, or the thread sees the cap. After the cap the thread is at most
+ * on cur, and any later position it reaches sees it. */
 /* The thread's words on a cache line of their own: it stores lo after every
  * bucket, and the main thread reads hybsnap_section_seq after every command. */
 static struct {
@@ -1315,14 +1311,11 @@ static void hybsnapWalkerQuiesce(hybsnapScanCtx *ctx) {
     }
 }
 
-/* Write sections. The main thread works on frozen dicts inside a "write
- * section": opened by the first guard or funnel hook of a command (reads
- * included), closed when the outermost command returns, at beforeSleep and
- * when a module thread releases the GIL (hybsnapSectionClose). Opening caps the
- * thread (hybsnapWindowCap); every later hook of the section may raise the cap
- * (hybsnapWindowRefill); closing writes back the overlayed buckets the thread
- * has passed and lifts the cap. Outside sections the thread runs free: the
- * main thread touches no frozen dict there. */
+/* Write sections (hybrid_snapshot.h, "The credit window"). Opened by the first
+ * guard or funnel hook of a command, reads included: caps the thread
+ * (hybsnapWindowCap), and every later hook may raise the cap
+ * (hybsnapWindowRefill). hybsnapSectionClose writes back the overlayed buckets
+ * the thread has passed and lifts the cap. */
 static void hybsnapSectionOpen(void) {
     uint64_t v;
     atomicGet(hybsnap_section_seq, v);          /* single writer: relaxed read of our own value */
@@ -1597,14 +1590,13 @@ static inline int hybsnapDictPaused(dict *d) {
     return sn && sn->paused;
 }
 
-/* Main thread, inside a write section: give dict (s, didx) what the scan
- * needs from it, on demand: attach the overlay; pause its layout when the
- * thread is on it. Called by the guard on the first structural write to a
- * dict the thread has not finished, or on any access while the thread is on
- * the dict. A dict attached by a write but not reached yet (beyond hi, not
- * paused) keeps growing and shrinking: what the main thread emitted ahead is
- * recorded in the keys (their epoch), which move with them. Returns the
- * overlay (NULL without one). */
+/* Main thread, inside a write section: attach dict (s, didx) to the scan on
+ * demand: its overlay, and a layout pause when the thread is on it. Called by
+ * the guard on the first structural write to a dict the thread has not
+ * finished, or on any access while the thread is on it. A dict attached but
+ * not reached yet (beyond hi, unpaused) may still grow and shrink: emit-ahead
+ * lives in the keys' epochs, which move with them. Returns the overlay (NULL
+ * without one). */
 static struct kvstoreDictOverlay *hybsnapScanAttach(hybsnapScanCtx *ctx, int s, int didx, dict *d, int pause) {
     hybsnapScanState(ctx, d);
     if (ctx->has_ov && !hybsnapMeta(d)->ov) kvstoreOverlayAttach(ctx->store[s].kvs, didx);
@@ -1638,14 +1630,13 @@ static struct kvstoreDictOverlay *hybsnapOverlayGuard(void *privdata, kvstore *k
     return hybsnapScanAttach(ctx, s, didx, d, pause);
 }
 
-/* One pass over the store's dicts (a store empty right now holds nothing of
- * the fork instant and is never scanned nor guarded): every non-empty dict
- * is the save's from here on: one reference taken, its word
- * stamped PENDING, its pointer in the save's table. The thread walks that
- * table, never the live slot table, so the store may free, empty or move
- * any of these dicts meanwhile: it detaches them and the save releases them
- * when their slot completes. A dict empty now, or allocated later, is not in
- * the table: nothing of the fork instant is in it, the guard leaves it alone. */
+/* Freeze one store: every dict non-empty now becomes the save's (a reference,
+ * its word stamped PENDING, its pointer in the save's table). The thread walks
+ * that table, never the live slot table, so the store may free, empty or move
+ * these dicts meanwhile: it detaches them and the save releases them when
+ * their slot completes. A dict empty now, or allocated later, holds nothing of
+ * the fork instant: the guard leaves it alone (an empty store is never scanned
+ * nor guarded). */
 static void hybsnapScanFreezeStore(hybsnapScanCtx *ctx, int s) {
     hybsnapScanStore *st = &ctx->store[s];
     kvstore *kvs = st->kvs;
@@ -2250,12 +2241,11 @@ int hybsnapDebugCommand(client *c) {
 
 /* Main thread, inside a write section: where the thread is relative to
  * bucket (table, idx) of dict d of slot (s, didx). Below lo it has read the
- * bucket; at or above hi it cannot reach it before the main thread raises hi
- * (and anything emitted by then is marked first); in between it may be
- * reading it. A dict the save holds but has not paused is beyond hi as a
- * whole. When the bucket is inside and 'win' is given, *win receives its
- * overlay window: the aligned run of ov_block buckets around it (at most the
- * table), tagged with the position of its last bucket. */
+ * bucket; at or above hi it cannot reach it before the main thread raises hi;
+ * in between it may be reading it. A dict the save holds but has not paused
+ * is beyond hi as a whole. For an inside bucket and a non-NULL 'win', *win is
+ * its overlay window: the aligned run of ov_block buckets around it (at most
+ * the table), tagged with the position of its last bucket. */
 static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
     hybsnapSlotState st = hybsnapScanDictStateMain(ctx, s, didx, d);
     if (st >= HYBSNAP_SLOT_SCANNED) return HYBSNAP_POS_BEHIND;
@@ -2355,10 +2345,8 @@ static void hybsnapSaveEmitKey(hybsnapSave *sv, int s, int didx, kvobj *kv) {
             sv->mstage_slot = didx;
         }
         sv->mstage = sdscatlen(sv->mstage, sv->mscratch, sdslen(sv->mscratch));
-        /* mq_bytes counts the stage when it is handed over as a message
-         * (hybsnapSaveQueuePushLocked); counting the records here as well
-         * made the figure drift by the whole emitted volume and produced
-         * a false hard-mark abort. */
+        /* mq_bytes counts the stage once, when it is handed over as a
+         * message (hybsnapSaveQueuePushLocked), not per record. */
         if (sdslen(sv->mstage) - sizeof(hybsnapMsgHdr) >= HYBSNAP_STAGE_BYTES) hybsnapSaveMainStageFlushLocked(sv);
         pthread_mutex_unlock(&sv->mq_lock);
     }
@@ -2366,8 +2354,6 @@ static void hybsnapSaveEmitKey(hybsnapSave *sv, int s, int didx, kvobj *kv) {
     hybsnap_main_emitting = 0;
 }
 
-/* Scan thread, every W buckets, at the end of each dict and before END:
- * forward what the main thread emitted. */
 /* Scan thread: rdb-key-save-delay for 'keys' fork-instant keys. The classic
  * child sleeps it per key, so a save of N keys takes N delays; here the
  * thread sleeps it for every key of the fork instant whoever produced the
@@ -2391,6 +2377,8 @@ static int hybsnapSaveKeyDelay(hybsnapSave *sv, long long keys) {
     return slept;
 }
 
+/* Scan thread, every W buckets, at the end of each dict and before END:
+ * forward what the main thread emitted. */
 static void hybsnapSaveWindowDone(void *priv) {
     hybsnapSave *sv = priv;
     list *ready = sv->mq_ready;   /* empty: drained by the previous call */
@@ -2576,21 +2564,16 @@ static void hybsnapSaveStoreDone(void *privdata, int s) {
     hybsnapSaveFreeFlushed(sv, s);
 }
 
-/* Returns 1 if 'kv' is pending save: a fork-instant object the running save
- * still has to serialize, so it must not be mutated in place. That is the case
- * when its bucket is ahead of the scan thread and the main thread has not
- * emitted it, or when the thread may be reading the bucket right now. A clone
- * in an overlayed bucket is never pending save (0); only the frozen original
- * is. A per-object answer, not the slot state PENDING: a key of a PENDING slot
- * may be emitted already, one of a SCANNING slot may still be pending save.
+/* Is 'kv' pending save (1): a fork-instant object the save has not serialized
+ * yet, so it must not be mutated in place? True when its bucket is ahead of the
+ * thread and it does not carry this save's epoch, or when the thread may be
+ * reading the bucket; never for a clone in an overlayed bucket. Per object,
+ * unlike the slot state PENDING.
  *
- * Side effect: opens the command's write section, which caps the thread. The
- * answer therefore holds until the command ends: a 0 cannot turn into a 1
- * (behind the thread or emitted stays so), while a 1 may become stale only in
- * the safe direction (the object is treated as pending save a little longer).
- *
- * Callers: a read path that may skip its mutation (lazy field expiry) skips it
- * on 1; a read path that must mutate calls hybsnapPrepareMutation() instead. */
+ * Opens the command's write section, so the answer holds until the command
+ * ends: a 0 stays 0, a 1 can only turn stale in the safe direction. A read path
+ * that may skip its mutation (lazy field expiry) skips it on 1; one that must
+ * mutate calls hybsnapPrepareMutation() instead. */
 int hybsnapKvobjIsPendingSave(redisDb *db, kvobj *kv) {
     hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return 0;
@@ -2626,15 +2609,14 @@ kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
     return lookupKeyWriteWithFlags(db, key, LOOKUP_NOTOUCH|LOOKUP_NONOTIFY|LOOKUP_NOSTATS|LOOKUP_NOEXPIRE);
 }
 
-/* Debug-build check at the write funnels: is 'kv' pending save and of a type
- * whose value may move on write? A HYBSNAP_FORK value whose top-level
- * pointer never moves (stream, hashtable, skiplist, quicklist, module type)
- * may be mutated in place even while pending save: the child serializes its own
- * copy-on-write image from the fork instant, and the header copy taken later
- * still points at the same object (only its LRU field may be a little stale).
- * XACK/XACKDEL reach such values through a read lookup (write-path audit,
- * streams row), which is why this exemption exists. Single-allocation values
- * (raw strings, listpacks, intsets) may move on write and stay checked. */
+/* Debug-build check at the write funnels: is 'kv' pending save with a value
+ * that may move on write? A HYBSNAP_FORK value whose top-level pointer never
+ * moves (stream, hashtable, skiplist, quicklist, module type) may be written in
+ * place while pending save: the child serializes its own fork-instant image,
+ * and a later header copy still points at the same object (its LRU may be a
+ * little stale). XACK/XACKDEL rely on this: they reach streams through a read
+ * lookup. Single-allocation values (raw strings, listpacks, intsets) may move
+ * and stay checked. */
 int hybsnapKvobjIsPendingSaveMovable(redisDb *db, kvobj *kv) {
     if (kv->type == OBJ_STREAM || kv->type == OBJ_MODULE ||
         kv->encoding == OBJ_ENCODING_HT || kv->encoding == OBJ_ENCODING_SKIPLIST ||
@@ -3625,14 +3607,12 @@ static int hybsnapSaveLaunch(hybsnapSave *sv) {
     return C_OK;
 }
 
-/* BGREWRITEAOF: the hybrid scan and child write the base file, an
- * RDB with aof-use-rdb-preamble or AOF commands without it (same producers
- * and channels, each record in command form and the child
- * emits SELECT on db change). The caller (rewriteAppendOnlyFileBackground)
- * has flushed the AOF and opened the new INCR file, so the fork instant below
- * is where the INCR file's history starts; backgroundRewriteDoneHandler does
- * the manifest work on the temp file the child leaves behind, as for the classic
- * child. */
+/* BGREWRITEAOF through the hybrid save: the scan and child write the base file,
+ * an RDB with aof-use-rdb-preamble, else AOF commands (records in command form,
+ * the child emitting SELECT on db change). The caller has flushed the AOF and
+ * opened the new INCR file, so the fork instant is where the INCR history
+ * starts; backgroundRewriteDoneHandler handles the child's temp file as for the
+ * classic child. */
 int hybsnapStartRewriteAofBackground(void) {
     if (hasActiveChildProcess()) return C_ERR;
     hybsnapSave *sv = hybsnapSaveCreate(HYBSNAP_SAVE_AOF, SLAVE_REQ_NONE, NULL, NULL, RDBFLAGS_AOF_PREAMBLE);
@@ -3641,14 +3621,12 @@ int hybsnapStartRewriteAofBackground(void) {
     return hybsnapSaveLaunch(sv);   /* the child names its own temp file */
 }
 
-/* The one decision whether a save takes the hybrid path, for every consumer
- * of a fork-based snapshot (rdbSaveBackground, startBgsaveForReplication,
- * rewriteAppendOnlyFileBackground): the switch is on, the request has
- * keyspace content (functions-only transfers keep the classic child; a slot
- * snapshot is a hybrid save over the migrating slots) and every relevant
- * module has opted in (otherwise the fallback is logged once per blocking
- * module). Returns 1 when the caller starts the hybrid save, 0 when it must
- * run the classic fork child. */
+/* Whether a save takes the hybrid path: the one decision for every fork-based
+ * snapshot (rdbSaveBackground, startBgsaveForReplication,
+ * rewriteAppendOnlyFileBackground). 1 when the switch is on, the request has
+ * keyspace content (functions-only transfers keep the classic child) and every
+ * relevant module has opted in (a blocking module is logged once); 0 when the
+ * caller must run the classic child. */
 int hybsnapSaveEligible(int req) {
     if (!hybsnapIsEnabled()) return 0;
     /* A functions-only transfer has no keyspace content for the scan thread;
@@ -3685,15 +3663,14 @@ int hybsnapStartSaveBackground(int req, char *filename, rdbSaveInfo *rsi, int rd
     return hybsnapSaveLaunch(sv);
 }
 
-/* Diskless full sync through the hybrid save: the same scan and
- * channel as a BGSAVE, but the child writes the replicas instead of a file.
- * Mirrors rdbSaveToSlavesSockets(): replicas in WAIT_BGSAVE_START with this
- * exact 'req' are set up for full resync at the current offset just before
- * the freeze-and-fork, so the offset is the snapshot's; with the rdb channel
- * the child writes the (blocking) replica connections directly, otherwise it
- * writes the classic rdb pipe that the parent fans out to the sockets, and
- * waits on the safe-to-exit pipe before exiting. The classic socket done
- * handler (RDB_CHILD_TYPE_SOCKET) does the replica bookkeeping afterwards. */
+/* Diskless full sync through the hybrid save: a BGSAVE's scan and channels,
+ * the child writing the replicas instead of a file. As in
+ * rdbSaveToSlavesSockets(), replicas in WAIT_BGSAVE_START with this 'req' are
+ * set up for full resync at the current offset just before the freeze, so the
+ * offset is the snapshot's. With the rdb channel the child writes the replica
+ * connections; otherwise it writes the rdb pipe the parent fans out and waits
+ * on the safe-to-exit pipe. The classic socket done handler does the replica
+ * bookkeeping. */
 int hybsnapStartSaveToSlavesSockets(int req, rdbSaveInfo *rsi) {
     listIter li;
     listNode *ln;

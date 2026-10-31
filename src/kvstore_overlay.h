@@ -14,18 +14,19 @@
  * keeps writing, and its implementation (kvstore_overlay.c). The first part of
  * this header is the contract; the second, INTERNALS, is how it is built.
  *
- * While a scan runs over a store, the snapshot's hooks are installed on it
- * (kvstoreSnapGuardSet): every access to a dict without an overlay asks the
- * guard first, which may attach one. A dict with an overlay is "frozen":
- * before every structural write the snapshot's 'prepare' hook
- * says whether the bucket's chain may be written in place. If not (DEFER:
- * the scan thread may be reading the bucket), the bucket is "overlayed": its
- * chain is duplicated, every key through 'clone' so in-place mutation by the
- * caller lands on the clone, and the write goes to the duplicate; the dict's
- * own chain stays exactly as the thread reads it. Reads, sizes and
- * enumeration describe the logical keyspace (each overlayed bucket's chain in
- * place of the dict's); reads never overlay anything. A store without hooks
- * pays one load per access.
+ * While a scan runs, the snapshot's hooks are installed on the store
+ * (kvstoreSnapGuardSet):
+ *   guard    every access to a dict without an overlay asks it first; it may
+ *            attach one. A dict with an overlay is "frozen".
+ *   prepare  before every structural write to a frozen dict: in place, or
+ *            DEFER when the scan thread may be reading the bucket.
+ *   overlay  on DEFER the bucket is "overlayed": its chain is duplicated, every
+ *            key through 'clone' (so the caller's in-place mutation lands on
+ *            the clone), and the write goes to the duplicate; the dict's own
+ *            chain stays as the thread reads it.
+ * Reads, sizes and enumeration see the logical keyspace (each overlayed
+ * bucket's chain in place of the dict's) and never overlay anything. A store
+ * without hooks pays one load per access.
  *
  * DEFER also reports the window the bucket is in (kvstoreOvWindow: a run of
  * buckets of one table and the scan position of its last bucket; positions

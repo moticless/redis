@@ -7,94 +7,93 @@
  * GNU Affero General Public License v3 (AGPLv3).
  *
  *
- * WHAT IS HYBRID SNAPSHOT?
- * ------------------------
- * It is a point-in-time snapshot (BGSAVE, full sync, AOF rewrite) that cuts fork()
- * page-table and copy-on-write cost. i.e, Unlike the classic fork(), small values
- * and selected structures live in a dedicated jemalloc arena such that pages are
- * marked MADV_DONTFORK and are serialized by a background thread of the parent.
- * The fork child serializes only the big ones. This feature can be toggled at
- * runtime with `hybrid-snapshot`.
+ * HYBRID SNAPSHOT
+ * ---------------
+ * A point-in-time snapshot (BGSAVE, full sync, AOF rewrite, slot migration)
+ * whose fork child does not map the keyspace. A classic save forks the whole
+ * process: the fork stalls the main thread for its page tables, and every page
+ * written during the save is copied. Here the keyspace itself (every kvobj
+ * header and keyspace dict table) and every small value live in a jemalloc
+ * arena marked MADV_DONTFORK. A background thread of the parent walks the
+ * keyspace and serializes the small values; for each big value it sends the
+ * child a copy of the key's header, and the child serializes the value from
+ * its own fork-instant memory. Switch: `hybrid-snapshot`, at runtime.
  *
- * Every value has a class, decided by where its memory is:
- *   HYBSNAP_NOFORK  single-allocation value (string, listpack, intset) of at most
- *                `save-small-max-bytes`, in the arena. Scan thread serializes it.
- *   HYBSNAP_FORK    everything else (multi-allocation encodings, big values), in
- *                forkable memory. The fork child serializes it.
- * Every kvobj header and keyspace dict table is in the arena whatever the
- * value's class, so the child never touches the parent's dicts. Placement is
- * applied on each insertion and when a value grows or changes encoding
- * (hybsnapPlaceValue): only the value moves, never the header. Allocation goes
+ * VALUE CLASSES
+ * -------------
+ * A value's class (hybsnapValueClass) follows where its memory is
+ * (hybsnapKeyClass):
+ *   HYBSNAP_NOFORK  one allocation (string, listpack, intset) of at most
+ *                   `save-small-max-bytes`, in the arena: the scan thread
+ *                   serializes it.
+ *   HYBSNAP_FORK    everything else, in forkable memory: the child serializes it.
+ * Placement keeps the class right as a value grows or changes encoding
+ * (hybsnapPlaceValue); only the value moves, never the header. Allocation goes
  * through zmalloc_hybrid*(); frees and reallocs route by address.
- * Any other fork (module, Lua debugger, a classic child while the feature is
- * off) needs the keyspace in the child, so the arena is flipped forkable around
- * it (hybsnapArenaBeforeFork / hybsnapArenaChildExited); a module fork that declares
- * REDISMODULE_FORK_NO_KEYSPACE is forked like the hybrid child instead
- * (redisFork() with REDIS_FORK_NO_KEYSPACE).
  *
- * ONE SAVE, END TO END
- * --------------------
- * 1. Freeze (main thread, the "fork instant"): a guard is installed on every
- *    keyspace store (kvstoreSnapGuardSet), every fork-instant dict gets a
- *    reference and a generation stamp. Nothing is copied.
- * 2. Fork: the child maps the HYBSNAP_FORK values and nothing of the keyspace.
- * 3. Scan (background thread): the frozen dicts are read bucket by bucket in
- *    a fixed order, below a limit the main thread sets (the credit window,
- *    below). HYBSNAP_NOFORK keys are serialized into 64 KB buffers, HYBSNAP_FORK
- *    keys are shipped to the child as header copies whose values the child
- *    resolves in its own memory. Two pipes: the small channel of buffers and
- *    the big channel of headers; the child drains the small backlog first.
- * 4. Writes meanwhile (main thread, the write funnel): what a write to a
- *    frozen dict does depends on where the scan thread is (below).
- * 5. Completion: buckets the thread has passed are written back as it moves
- *    on; when a dict's scan is complete its overlay is released and the dict
- *    unfrozen. The child exits after END; hybsnapOnChildEnd joins the thread and
- *    the classic done handler runs. Abort (hybrid-snapshot-max-retained-bytes
- *    hard mark, FLUSHALL, a killed child) joins the thread, drains every
- *    overlay and leaves the previous dump untouched.
+ * THREE RULES
+ * -----------
+ * Without copy-on-write the parent must keep what the thread reads unchanged
+ * until it is read, while commands keep writing. These rules make every
+ * fork-instant key written exactly once, as it was at the fork, and the main
+ * thread never waits:
+ *   1. The thread reads buckets in a fixed order and never at or past a limit
+ *      `hi` the main thread sets (the credit window, below).
+ *   2. A write to a bucket the thread has not reached first serializes that
+ *      key on the main thread and stamps it with the save's epoch; the thread
+ *      skips stamped keys (emit-ahead).
+ *   3. A write to a bucket the thread may be reading goes to a private copy of
+ *      the bucket, installed once the thread has passed it (kvstore_overlay.h).
+ * A write to a bucket the thread has passed is an ordinary in-place write.
  *
- * THE CREDIT WINDOW AND WRITE SECTIONS
- * ------------------------------------
- * Every bucket has a position in the scan order (store, dict, table, bucket
- * as one integer). The scan thread publishes lo (every position below it is
- * read) and announces in cur the batch it reads next; it never reads at or
- * past hi, which only the main thread moves.
+ * ONE SAVE
+ * --------
+ *   freeze    the fork instant: the save installs its hooks on the keyspace
+ *             stores (kvstoreSnapGuardSet), takes a reference to every dict,
+ *             stamps it with the save's generation and bumps the save epoch;
+ *             nothing is copied.
+ *   fork      the child maps the FORK values only.
+ *   scan      NOFORK keys go out in 64 KB buffers (small channel), FORK keys
+ *             as header copies (big channel); the child drains the small one
+ *             first.
+ *   complete  a dict the thread has read gets its overlay written back and is
+ *             released (its slot state is DONE); the child exits after END and
+ *             hybsnapOnChildEnd joins the thread.
+ *   abort     retained-bytes hard mark, FLUSHALL or a killed child: the thread
+ *             is joined, every overlay drained, the previous dump kept.
  *
- * The main thread touches frozen dicts only inside a "write section": opened
- * by the first guard or funnel hook of a command, closed when the outermost
- * command returns, at beforeSleep and when a module thread releases the GIL.
- * Outside sections hi is unlimited and the thread runs free. Opening a
- * section caps hi about W buckets past lo (default 1024, DEBUG
- * SNAP-WINDOW-BUCKETS); while it stays open the main thread raises hi each
- * time lo passes half the grant, unless many overlay windows are in use;
- * closing it writes back the overlayed buckets below lo and lifts the cap.
- * Inside a section a bucket the main thread writes is:
- *   behind  below lo: written in place;
- *   inside  in [lo, hi): the thread may be reading it, so the write goes to
- *           a duplicate of the bucket's chain (kvstore_overlay.h);
- *   ahead   hi and above: the written key is serialized by the main thread
- *           first (emit-ahead) and stamped with the save's epoch so the
- *           thread skips it, then written in place; the bucket's other
- *           keys stay for the thread.
+ * THE CREDIT WINDOW
+ * -----------------
+ * Every bucket has a position (store, dict, table, bucket as one integer). The
+ * thread publishes lo: every position below it is read. The main thread
+ * touches the keyspace only inside a write section: opened by a command's
+ * first access to a frozen dict, closed when the outermost command returns,
+ * at beforeSleep and when a module thread releases the GIL. Opening one caps
+ * hi about W buckets past lo (default 1024, DEBUG SNAP-WINDOW-BUCKETS); outside
+ * sections the thread runs free. A written bucket is
+ *   behind  below lo        in place
+ *   inside  in [lo, hi)     overlay (rule 3)
+ *   ahead   hi and above    emit-ahead, then in place (rule 2)
  * The thread waits only when it reaches hi during a long section, and once at
- * the end for an open section to close; the main thread never waits. The cap
- * is a seq_cst store-load pair on each side (thread: store cur, load hi;
- * main: store hi, load cur): either the main thread sees where the thread is,
- * or the thread sees the cap. A slot (dict) is held by the save until its
- * state is HYBSNAP_SLOT_DONE. The encoding and the code: hybrid_snapshot.c,
- * "Scan positions".
+ * the end for an open section to close. The encoding, the grants and the
+ * memory ordering: hybrid_snapshot.c, "Scan positions".
  *
  * MEMORY
  * ------
- * The hybrid keeps two things alive beyond the classic save: fork-instant originals
- * that were replaced or deleted while pending save (retained bytes, bounded by
- * `hybrid-snapshot-max-retained-bytes`, the save aborts above it) and records
- * queued for the child (`hybrid-snapshot-max-queued-bytes`, the thread waits
- * above it). INFO memory and persistence report both (hybsnapInfoMemory/Persistence).
- * Permanently, a kvobj may carry a 4-byte save epoch at its end (object.h
- * kvobjGetEpoch): every one created while the feature is on, or only those with
- * 4 free bytes in their allocation and those written during a save
- * (hybrid-snapshot-epoch-prealloc, hybsnapEpochMode).
+ * During a save: the fork-instant originals replaced or deleted while still
+ * pending save (`hybrid-snapshot-max-retained-bytes`, the save aborts above
+ * it) and the records queued for the child (`hybrid-snapshot-max-queued-bytes`,
+ * the thread waits above it); INFO memory and persistence report both. Always:
+ * up to 4 bytes per key for the save epoch (kvobjGetEpoch,
+ * `hybrid-snapshot-epoch-prealloc`).
+ *
+ * OTHER FORKS
+ * -----------
+ * A module fork, the Lua debugger or a classic child needs the keyspace, so
+ * the arena is made forkable around it (hybsnapArenaBeforeFork,
+ * hybsnapArenaChildExited); a module fork that declares
+ * REDISMODULE_FORK_NO_KEYSPACE is forked like the hybrid child (redisFork()
+ * with REDIS_FORK_NO_KEYSPACE).
  *
  * ENTRY POINTS
  * ------------
@@ -103,19 +102,19 @@
  * hybsnapStartSaveBackground, hybsnapStartSaveToSlavesSockets or
  * hybsnapStartRewriteAofBackground. It answers yes when the switch is on, the
  * request has keyspace content and every loaded module has opted in
- * (REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT), else the caller runs the
- * classic child. Functions-only transfers always keep the classic child. An atomic slot
- * migration's slot snapshot is a hybrid save over the migrating slots only:
- * the same scan and child, a RESP record form (RESTORE from DUMP payloads).
+ * (REDISMODULE_OPTIONS_HANDLE_HYBRID_SNAPSHOT); else the caller runs the
+ * classic child, as it always does for functions-only transfers. An atomic
+ * slot migration's slot snapshot is a hybrid save over the migrating slots
+ * only, with RESTORE commands from DUMP payloads as its records.
  *
  * WHERE TO LOOK
  * -------------
- * hybrid_snapshot.c: the implementation (its head lists its sections) and the unit
- * tests (redis-server test hybrid_snapshot). kvstore_overlay.h: the overlay
- * contract (frozen dicts, overlayed buckets) and its design; kvstore_overlay.c: its
- * implementation.
- * zmalloc.c: the arena.
- * All functions here are prefixed "hybsnap".
+ * hybrid_snapshot.c   the implementation (its head lists its sections) and the
+ *                     unit tests (redis-server test hybrid_snapshot)
+ * kvstore_overlay.h   the overlay: its contract and design; kvstore_overlay.c
+ *                     its implementation
+ * zmalloc.c           the arena
+ * Functions here are prefixed "hybsnap".
  */
 
 #ifndef __HYBRID_SNAPSHOT_H
