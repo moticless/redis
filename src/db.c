@@ -294,17 +294,11 @@ void dbgRunAssertions(redisDb *db) {
  * expired on replicas even if the master is lagging expiring our key via DELs
  * in the replication link. */
 kvobj *lookupKey(redisDb *db, robj *key, int flags, dictEntryLink *link) {
-    kvobj *val;
-
     /* Write intent matters during a hybrid snapshot: a link lookup on a key
-     * pending save clones it into the snapshot overlay (see kvstoreDictFindLink), so
-     * reads use the plain find and never clone. */
-    if (flags & LOOKUP_WRITE) {
-        val = dbFindByLink(db, key->ptr, link);
-    } else {
-        val = dbFind(db, key->ptr);
-        if (link) *link = NULL;
-    }
+     * pending save prepares it for the write (emit-ahead or the overlay, see
+     * kvstoreDictFindLink), so reads use the plain find. Only writers pass a link. */
+    kvobj *val = (flags & LOOKUP_WRITE) ? dbFindByLink(db, key->ptr, link)
+                                        : dbFind(db, key->ptr);
 
     if (val) {
         /* Forcing deletion of expired keys on a replica makes the replica
@@ -3151,11 +3145,14 @@ static kvobj *dbFindGeneric(kvstore *kvs, sds key) {
     return (res) ? dictGetKey(res) : NULL;
 }
 
+/* Find a KV in the main db, read-only: a caller that modifies the value or
+ * the key must look it up with dbFindByLink() (or lookupKeyWrite*()), which
+ * lets a running hybrid snapshot prepare the key for the write first. */
 kvobj *dbFind(redisDb *db, sds key) {
     return dbFindGeneric(db->keys, key);
 }
 
-/* Find a KV in the main db. Return also link to it.
+/* Find a KV in the main db, with write intent. Return also link to it.
  *
  * plink - If found, set to the link of the key in the dict.
  *         If not found, set to the bucket where the key should be added.

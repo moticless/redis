@@ -6275,7 +6275,7 @@ void handleExpiredIdmpEntries(void) {
         dictInitSafeIterator(&di, db->stream_idmp_keys);
         while ((de = dictNext(&di)) != NULL) {
             robj *key = dictGetKey(de);
-            kvobj *kv = dbFind(db, key->ptr);
+            kvobj *kv = dbFindByLink(db, key->ptr, NULL);   /* write intent */
 
             serverAssert(kv && kv->type == OBJ_STREAM);
 

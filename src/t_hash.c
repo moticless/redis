@@ -3579,7 +3579,7 @@ void rdbLoadTemplateCtxDisassemble(rdbLoadTemplateCtx *ctx) {
         int disassembled = 0;
         while ((ln = listNext(&li)) != NULL) {
             rdbLoadTemplateCtxKvRef *ref = listNodeValue(ln);
-            kvobj *o = dbFind(ref->db, ref->key);
+            kvobj *o = dbFindByLink(ref->db, ref->key, NULL);   /* write intent */
             if (o == NULL) continue;
             size_t oldsize = kvobjAllocSize(o);
             if (o->encoding == OBJ_ENCODING_TMPL_LP)
