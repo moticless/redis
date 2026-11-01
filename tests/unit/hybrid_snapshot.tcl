@@ -25,6 +25,32 @@ start_server {tags {"snapshot"} overrides {hybrid-snapshot yes}} {
             assert {[s allocator_resident_hybrid_arena] >= [s allocator_active_hybrid_arena]}
         }
     }
+
+    # The layouts of type/string.tcl's embedded key strings test, with the 4
+    # epoch bytes: always with epoch-prealloc yes; with no, only when the size
+    # class has 4 bytes to spare. An EMBSTR value gives them up from its slack.
+    if {[string match {*jemalloc*} [s mem_allocator]] && [s arch_bits] == 64} {
+        test {MEMORY USAGE and the value's slack of embedded key strings with a save epoch (epoch-prealloc yes and no)} {
+            proc snap_expected_mem {key val with_expire mem val_avail} {
+                r del $key
+                r set $key $val
+                if {$with_expire} { r expire $key 5678315 }
+                assert_equal $mem [r memory usage $key]
+                assert_equal "key_sds_len:4, key_sds_avail:0, key_zmalloc: $mem, val_sds_len:[string length $val], val_sds_avail:$val_avail, val_zmalloc: 0" [r debug sdslen $key]
+            }
+            r config set hybrid-snapshot-epoch-prealloc yes
+            snap_expected_mem x234 y2345 0 40 4            ;# 32 + 4: the next class
+            snap_expected_mem x234 y23456 0 40 3           ;# 33 + 4
+            snap_expected_mem x234 y234561234567 0 48 4    ;# 40 + 4: the next class
+            snap_expected_mem x234 y234561234567 1 56 4    ;# 48 + 4: the next class
+            r config set hybrid-snapshot-epoch-prealloc no
+            snap_expected_mem x234 y2345 0 32 0            ;# no room: no epoch
+            snap_expected_mem x234 y23456 0 40 3           ;# 7 to spare: the epoch takes 4
+            snap_expected_mem x234 y234561234567 0 40 0
+            snap_expected_mem x234 y234561234567 1 48 0
+            assert_equal OK [r config set hybrid-snapshot-epoch-prealloc yes]
+        } {} {needs:debug}
+    }
 }
 
 proc snap_placement {{db ""}} {
@@ -612,9 +638,9 @@ proc snap_aof_select_sequence {path} {
     return $out
 }
 
-proc snap_key_digests {} {
-    set keys [lsort [r keys *]]
-    set rd [redis_deferring_client]
+proc snap_key_digests {{level 0}} {
+    set keys [lsort [[srv $level client] keys *]]
+    set rd [redis_deferring_client $level]
     foreach k $keys { $rd type $k; $rd debug digest-value $k; $rd pttl $k }
     set d [dict create]
     foreach k $keys {
@@ -622,7 +648,7 @@ proc snap_key_digests {} {
         dict set d $k [list $t $dg [expr {$ttl >= 0 ? "ttl" : "nottl"}]]
     }
     $rd close
-    dict set d "#dbsize" [list [r dbsize] [llength $keys] -]
+    dict set d "#dbsize" [list [[srv $level client] dbsize] [llength $keys] -]
     return $d
 }
 
@@ -1719,6 +1745,88 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             }
         }
 
+        # Active defrag pauses while a child runs, and a hybrid save has one for
+        # its whole life, so defrag meets stamped keys only between saves. It
+        # moves a kvobj with its whole allocation (activeDefragKvobj): the epoch
+        # at the tail must move with it, or the next save reads garbage there
+        # and skips the key.
+        if {[string match {*jemalloc*} [s mem_allocator]] && [r debug mallctl arenas.page] <= 8192} {
+            foreach prealloc {yes no} {
+                test "Hybrid snapshot: active defrag moves stamped keys between saves and pauses during one; the next save under writes reloads equal (epoch-prealloc $prealloc)" {
+                    r config set hybrid-snapshot-epoch-prealloc $prealloc
+                    r config set activedefrag no
+                    r flushall
+                    populate 100000 df: 20    ;# EMBSTR
+                    populate 40000 dr: 150    ;# RAW: a separate value
+                    for {set i 0} {$i < 2000} {incr i} { r hset dh:$i f v g w }
+                    # the first save stamps every 7th key ahead of the walker
+                    r config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+                    r bgsave
+                    snap_wait_save_started
+                    set rd [redis_deferring_client]
+                    set n 0
+                    for {set i 0} {$i < 100000} {incr i 7} { $rd append df:$i x; incr n }
+                    for {set i 0} {$i < 40000} {incr i 7} { $rd append dr:$i x; incr n }
+                    for {set i 0} {$i < 2000} {incr i 7} { $rd hset dh:$i f x; incr n }
+                    for {set i 0} {$i < $n} {incr i} { $rd read }
+                    assert_equal 1 [s snap_save_in_progress]
+                    assert {[s snap_save_main_keys] >= $n / 2}   ;# the rest is inside the window: overlayed
+                    if {$prealloc eq "no"} { assert {[s snap_save_epoch_reallocs] > 0} }
+                    r config set rdb-key-save-delay 0
+                    snap_wait_bgsave_done
+                    assert_equal ok [s rdb_last_bgsave_status]
+                    # fragment: keep one key in four, stamped ones among them
+                    set n 0
+                    for {set i 0} {$i < 100000} {incr i} { if {$i % 4} { $rd del df:$i; incr n } }
+                    for {set i 0} {$i < 40000} {incr i} { if {$i % 4} { $rd del dr:$i; incr n } }
+                    for {set i 0} {$i < $n} {incr i} { $rd read }
+                    after 120   ;# serverCron updates the info every 100 ms
+                    assert {[s allocator_frag_ratio] >= 1.3}
+                    set hits0 [s active_defrag_hits]
+                    set hz [lindex [r config get hz] 1]
+                    r config set hz 100
+                    r config set active-defrag-threshold-lower 5
+                    r config set active-defrag-ignore-bytes 1mb
+                    r config set active-defrag-cycle-min 65
+                    r config set active-defrag-cycle-max 75
+                    r config set activedefrag yes
+                    wait_for_condition 100 50 {[s active_defrag_hits] - $hits0 > 1000} else { fail "defrag moved nothing: [s active_defrag_hits]" }
+                    # the second save starts while defrag may still run; the
+                    # stamps of the first are fork-instant to it
+                    set ref [debug_digest]
+                    set refkeys [snap_key_digests]
+                    r config set rdb-key-save-delay 100
+                    r bgsave
+                    snap_wait_save_started
+                    set hits1 [s active_defrag_hits]
+                    set n 0
+                    for {set i 0} {$i < 100000} {incr i 4} {
+                        switch [expr {$i % 5}] {
+                            0 { $rd append df:$i y }
+                            1 { $rd del df:$i }
+                            2 { $rd set df:$i [string repeat z 150] }
+                            3 { $rd expire df:$i 100000 }
+                            4 { $rd rename df:$i dn:$i }
+                        }
+                        incr n
+                    }
+                    for {set i 0} {$i < 40000} {incr i 4} { $rd append dr:$i y; $rd set dnew:$i v; incr n 2 }
+                    for {set i 0} {$i < $n} {incr i} { $rd read }
+                    $rd close
+                    assert_equal 1 [s snap_save_in_progress]
+                    assert_equal $hits1 [s active_defrag_hits]   ;# paused while the save runs
+                    r config set rdb-key-save-delay 0
+                    snap_wait_bgsave_done
+                    assert_equal ok [s rdb_last_bgsave_status]
+                    r config set activedefrag no
+                    r config set hz $hz
+                    r debug reload nosave
+                    if {[debug_digest] ne $ref} { snap_fail_with_diff $refkeys [snap_key_digests] "save after defrag" }
+                    r config set hybrid-snapshot-epoch-prealloc yes
+                }
+            }
+        }
+
         test {Hybrid snapshot harness: a crash in the hybrid child writes a full report without the keyspace sections; the classic child keeps them} {
             r flushall
             populate 20000 cr: 60
@@ -2153,6 +2261,80 @@ start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-sna
             assert {[regexp {(\d+) keys read} $out -> read]}
             assert_equal $nkeys $read
             assert_equal [expr {$nkeys - $moved}] [R 0 dbsize]
+        }
+    }
+} snap_all_slots_to_node0
+
+# The source's slot snapshot for atomic slot migration is a hybrid save over
+# the migrating slots: randomized writers race it (emit-ahead, stamps, new keys,
+# deletes) and the incremental stream replays them on the destination after
+# the snapshot. Meanwhile a hybrid BGSAVE on the destination meets the keys the
+# migration creates there, born during that save: its dump holds none of them.
+start_cluster 2 0 {tags {"snapshot cluster external:skip"} overrides {hybrid-snapshot yes save "" repl-diskless-sync no cluster-node-timeout 60000}} {
+    if {[snap_hybrid_supported]} {
+        test {Hybrid snapshot harness (cluster mode): writers race the source's slot snapshot of an atomic slot migration, the destination ends equal; a save on the destination skips the imported keys} {
+            foreach n {0 1} {
+                R $n config set cluster-slot-migration-handoff-max-lag-bytes 10mb
+                R $n config set cluster-slot-migration-write-pause-timeout 60000
+            }
+            snap_populate_race 0 0
+            # two slots the dataset leaves empty: the destination owns one, with
+            # keys of its own; the source keeps the other and stays a master
+            # (a node left without slots becomes a replica, its full sync a save)
+            set empty {}
+            for {set i 0} {[llength $empty] < 2} {incr i} {
+                set slot [R 0 cluster keyslot "{dst$i}"]
+                if {$slot > 0 && $slot < 16383 && [R 0 cluster countkeysinslot $slot] == 0 && [lsearch $empty $slot] < 0} {
+                    lappend empty $slot
+                    set tag "{dst$i}"
+                }
+            }
+            set own [R 0 cluster keyslot $tag]
+            lassign [lsort -integer $empty] lo hi
+            set ranges [list 0 [expr {$lo - 1}] [expr {$lo + 1}] [expr {$hi - 1}] [expr {$hi + 1}] 16383]
+            if {$lo + 1 > $hi - 1} { set ranges [list 0 [expr {$lo - 1}] [expr {$hi + 1}] 16383] }
+            R 1 CLUSTER MIGRATION IMPORT $own $own
+            wait_for_asm_done
+            for {set i 0} {$i < 2000} {incr i} { R 1 set $tag:$i v }
+            # the destination's own save: slow, it runs past the migration
+            R 1 config set rdb-key-save-delay 1000000   ;# the walker stays on its first key
+            R 1 bgsave
+            wait_for_condition 100 50 {[status [Rn 1] snap_save_in_progress] == 1} else { fail "destination save not started" }
+            R 0 debug asm-failpoint migrate-main-channel handoff-prep   ;# writes stop before the handoff
+            R 0 config set rdb-key-save-delay 2000   ;# about 7 s for the snapshot: every write below races it
+            set task_id [R 1 CLUSTER MIGRATION IMPORT {*}$ranges]
+            wait_for_condition 200 10 {[s snap_save_in_progress] == 1} else { fail "the slot snapshot did not take the hybrid path" }
+            for {set n 0} {$n < 400} {incr n} { snap_random_op 0 0 }
+            set emitted [s snap_save_main_keys]
+            # the counters above were read during the snapshot
+            if {![s snap_save_in_progress]} { fail "the slot snapshot ended under the writes: [R 0 CLUSTER MIGRATION STATUS ID $task_id]" }
+            assert_morethan $emitted 0
+            R 0 config set rdb-key-save-delay 0
+            wait_for_condition 1000 10 {
+                [regexp {state send-stream} [R 0 CLUSTER MIGRATION STATUS ID $task_id]] && [s snap_save_in_progress] == 0
+            } else { fail "the migration did not reach the streaming phase: [R 0 CLUSTER MIGRATION STATUS ID $task_id]" }
+            # DEBUG DIGEST counts an expired key until it is deleted: expire the
+            # short-PX keys (snap_random_op) lazily on each side before its digest
+            after 500
+            for {set i 0} {$i < 80} {incr i} { catch {R 0 exists exp:$i} }
+            set ref [R 0 debug digest]
+            set refkeys [snap_key_digests 0]
+            R 0 debug asm-failpoint "" ""
+            wait_for_asm_done
+            assert_equal 1 [status [Rn 1] snap_save_in_progress]   ;# the import landed under it
+            for {set i 0} {$i < 2000} {incr i} { R 1 del $tag:$i }
+            for {set i 0} {$i < 80} {incr i} { catch {R 1 exists exp:$i} }
+            if {[R 1 debug digest] ne $ref} { snap_fail_with_diff $refkeys [snap_key_digests -1] "destination differs from the source" }
+            assert_morethan [R 1 dbsize] 3000
+            R 1 config set rdb-key-save-delay 0
+            wait_for_condition 300 100 {
+                [status [Rn 1] rdb_bgsave_in_progress] == 0 && [status [Rn 1] snap_save_in_progress] == 0
+            } else { fail "destination save did not finish" }
+            assert_equal ok [status [Rn 1] rdb_last_bgsave_status]
+            set dump [file join [lindex [R 1 config get dir] 1] [lindex [R 1 config get dbfilename] 1]]
+            set out [exec src/redis-check-rdb $dump]
+            assert {[regexp {(\d+) keys read} $out -> read]}
+            assert_equal 2000 $read   ;# its fork instant: its own keys, none imported
         }
     }
 } snap_all_slots_to_node0

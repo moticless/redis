@@ -5406,6 +5406,77 @@ static void hybsnapEpochLayoutTests(void) {
     hybsnap_epoch_stamp = saved_stamp;
 }
 
+/* The accounted size (kvobjAllocSize, what MEMORY USAGE reports) with an
+ * epoch: an EMBSTR accounts its whole allocation with or without one (its
+ * value gives the 4 bytes up); any other kvobj accounts exactly 4 bytes more.
+ * The same for kvobjAddEpoch, in place or into a new allocation, which keeps
+ * the expire slot, the key and the value. */
+static void hybsnapEpochAccountingTests(void) {
+    int saved_mode = hybsnap_epoch_mode;
+    uint32_t saved_stamp = hybsnap_epoch_stamp;
+    hybsnap_epoch_stamp = 55;
+    char longkey[201];
+    memset(longkey, 'L', 200);
+    longkey[200] = '\0';
+    const char *keys[2] = { "k", longkey };
+    int ok_embstr = 1, ok_other = 1, ok_add = 1, n_embstr = 0, n_other = 0, n_moved = 0;
+    char val[41];
+    for (int meta = 0; meta < 2; meta++) {
+        uint32_t mbits = meta ? KEY_META_MASK_EXPIRE : 0;
+        for (int k = 0; k < 2; k++) {
+            for (int vlen = 0; vlen <= 41; vlen++) {
+                sds key = sdsnew(keys[k]);
+                kvobj *kv[2];
+                for (int e = 0; e < 2; e++) {
+                    hybsnap_epoch_mode = e ? HYBSNAP_EPOCH_ALWAYS : HYBSNAP_EPOCH_NONE;
+                    robj *v;
+                    if (vlen == 41) {
+                        v = createHashObject();   /* a separate value of another type */
+                    } else {
+                        memset(val, 'a' + (vlen % 26), vlen);
+                        val[vlen] = '\0';
+                        v = createStringObject(val, vlen);
+                    }
+                    kv[e] = kvobjSet(key, v, mbits);
+                    if (meta) kv[e] = kvobjSetExpire(kv[e], 1234);
+                }
+                if (kvobjBits(kv[0])->has_epoch || !kvobjBits(kv[1])->has_epoch || kv[0]->encoding != kv[1]->encoding) ok_other = 0;
+                int embstr = kv[0]->encoding == OBJ_ENCODING_EMBSTR;
+                size_t before = kvobjAllocSize(kv[0]);
+                if (embstr) {
+                    n_embstr++;
+                    for (int e = 0; e < 2; e++)
+                        if (kvobjAllocSize(kv[e]) != zmalloc_size(kvobjGetAllocPtr(kv[e]))) ok_embstr = 0;
+                } else {
+                    n_other++;
+                    if (kvobjAllocSize(kv[1]) != before + sizeof(uint32_t)) ok_other = 0;
+                }
+                /* The one without: add an epoch. */
+                void *valptr = kv[0]->ptr;
+                kvobj *nkv = kvobjAddEpoch(kv[0], 66);
+                if (nkv != kv[0]) {
+                    n_moved++;
+                    zfree(kvobjGetAllocPtr(kv[0]));   /* the old allocation alone: the value is the new one's */
+                }
+                size_t after = kvobjAllocSize(nkv);
+                if (embstr ? after != zmalloc_size(kvobjGetAllocPtr(nkv)) : after != before + sizeof(uint32_t)) ok_add = 0;
+                if (!embstr && nkv->ptr != valptr) ok_add = 0;
+                if (embstr && (sdslen(nkv->ptr) != (size_t)vlen || memcmp(nkv->ptr, val, vlen) != 0)) ok_add = 0;
+                if (kvobjGetEpoch(nkv) != 66 || strcmp(kvobjGetKey(nkv), keys[k]) != 0) ok_add = 0;
+                if (kvobjGetExpire(nkv) != (meta ? 1234 : -1)) ok_add = 0;
+                decrRefCount(nkv);
+                decrRefCount(kv[1]);
+                sdsfree(key);
+            }
+        }
+    }
+    test_cond("epoch: an EMBSTR accounts its whole allocation with and without an epoch", ok_embstr && n_embstr > 0);
+    test_cond("epoch: RAW strings and other types account exactly 4 bytes more with an epoch, with and without an expire slot", ok_other && n_other > 0);
+    test_cond("epoch: kvobjAddEpoch accounts the same way and keeps the expire slot, the key and the value", ok_add && n_moved > 0);
+    hybsnap_epoch_mode = saved_mode;
+    hybsnap_epoch_stamp = saved_stamp;
+}
+
 #define HYBSNAP_TEST_EPOCH_KEYS 300
 struct hybsnapEpochTestState { int seen[HYBSNAP_TEST_EPOCH_KEYS + 1]; redisAtomic int bad, dispatched; };
 
@@ -5637,6 +5708,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
     /* The background scan and the keyspace overlay do not depend on the arena. */
     hybsnapScanTests(accurate);
     hybsnapEpochLayoutTests();
+    hybsnapEpochAccountingTests();
     hybsnapEpochScanTests();
     hybsnapEpochEmitAheadTests();
     hybsnapRefcountTests();
@@ -5817,6 +5889,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
     hybsnapPlacementTests();
     hybsnapScanTests(accurate);
     hybsnapEpochLayoutTests();
+    hybsnapEpochAccountingTests();
     hybsnapEpochScanTests();
     hybsnapEpochEmitAheadTests();
     hybsnapRefcountTests();
