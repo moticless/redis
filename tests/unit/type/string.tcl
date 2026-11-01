@@ -903,7 +903,11 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
     
     if {[string match {*jemalloc*} [s mem_allocator]]} {
         test {Check MEMORY USAGE for embedded key strings with jemalloc} {
-        
+            # The layouts below have no hybrid snapshot save epoch: with the
+            # feature on, every kvobj carries 4 more bytes for it.
+            set hybrid [lindex [r config get hybrid-snapshot] 1]
+            if {$hybrid eq "yes"} { r config set hybrid-snapshot no }
+
             proc expected_mem {key val with_expire exp_mem_usage exp_debug_sdslen} {
                 r del $key
                 r set $key $val
@@ -931,6 +935,7 @@ if {[string match {*jemalloc*} [s mem_allocator]]} {
                 # 12 (kvobj) + 8 (expiry) + 1 (key-hdr-size) + 1 (sdshdr5) + 4 (key) + 1 (\0) + 3 (sdshdr8) + 17 (val) + 1 (\0) = 48bytes
                 expected_mem x234 y2345678901234567 1 48 "key_sds_len:4, key_sds_avail:0, key_zmalloc: 48, val_sds_len:17, val_sds_avail:0, val_zmalloc: 0"
             }
+            if {$hybrid eq "yes"} { assert_equal OK [r config set hybrid-snapshot yes] }
         } {} {needs:debug}
     }
 

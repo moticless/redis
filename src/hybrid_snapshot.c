@@ -1705,6 +1705,20 @@ static inline int hybsnapScanAborted(hybsnapScanCtx *ctx) {
     return v;
 }
 
+#if HYBSNAP_SCAN_PREFETCH2
+/* Scan thread: prefetch the value allocation of a raw string at the head of a
+ * bucket ('ptr' exists only for encodings with a separate allocation). Not
+ * instrumented for TSan, as kvobjEpochPtr(): the main thread may drop a
+ * reference to the kvobj meanwhile, which rewrites the header word with only
+ * refcount changed. */
+REDIS_NO_SANITIZE("thread")
+static void hybsnapScanPrefetchValue(dictEntry *de) {
+    if (!de) return;
+    kvobj *kv = dictGetKV(de);
+    if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_RAW) __builtin_prefetch(kv->ptr);
+}
+#endif
+
 /* Scan thread: read one frozen dict, a batch of buckets at a time, each
  * batch announced and kept below hi (hybsnapScanReach). Returns 1 if aborted. */
 static int hybsnapScanWalkDict(hybsnapScanCtx *ctx, int s, int didx, dict *d, unsigned long *since_done) {
@@ -1748,15 +1762,9 @@ static int hybsnapScanWalkDict(hybsnapScanCtx *ctx, int s, int didx, dict *d, un
                     dictWalkPrefetchBucket(d, t, i + HYBSNAP_SCAN_PREFETCH);
 #if HYBSNAP_SCAN_PREFETCH2
                 /* The header of that bucket is in cache by now: a raw string's
-                 * value allocation is the next miss ('ptr' exists only for
-                 * encodings that have a separate allocation). */
-                if (i + HYBSNAP_SCAN_PREFETCH2 < lim) {
-                    dictEntry *de2 = dictWalkBucketHead(d, t, i + HYBSNAP_SCAN_PREFETCH2);
-                    if (de2) {
-                        kvobj *kv2 = dictGetKV(de2);
-                        if (kv2->type == OBJ_STRING && kv2->encoding == OBJ_ENCODING_RAW) __builtin_prefetch(kv2->ptr);
-                    }
-                }
+                 * value allocation is the next miss. */
+                if (i + HYBSNAP_SCAN_PREFETCH2 < lim)
+                    hybsnapScanPrefetchValue(dictWalkBucketHead(d, t, i + HYBSNAP_SCAN_PREFETCH2));
 #endif
                 dictWalkBucketRange(d, t, i, i + 1, hybsnapScanEntryCb, &a);
                 hybsnapScanSetLo(base + i + 1);

@@ -274,7 +274,13 @@ sds kvobjGetKey(const kvobj *kv) {
 /* Where the save epoch is: after the embedded value of an EMBSTR (its sds
  * alloc stops 4 bytes short of the allocation's end), else after the key's
  * terminator. An EMBSTR kvobj never changes encoding in place (a new object
- * is created), nor does the key, so the place holds for the object's life. */
+ * is created), nor does the key, so the place holds for the object's life.
+ * Not instrumented for TSan: the hybrid snapshot's scan thread reads it while
+ * the main thread may drop a reference to the same kvobj (decrRefCount() of a
+ * command's argv after the command; SET shares its new kvobj with it). That
+ * rewrites the header word with only refcount changed: type, encoding and ptr
+ * read back as they were, and an aligned word does not tear. */
+REDIS_NO_SANITIZE("thread")
 static unsigned char *kvobjEpochPtr(const kvobj *kv) {
     if (kv->type == OBJ_STRING && kv->encoding == OBJ_ENCODING_EMBSTR)
         return (unsigned char *)kv->ptr + sdsalloc(kv->ptr) + 1;
