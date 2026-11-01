@@ -907,6 +907,98 @@ start_server {tags {"snapshot harness external:skip"} overrides {hybrid-snapshot
             }
         }
 
+        # One write that cannot fail on the keyspace below (string keys k:*,
+        # lists l:*, sets s:*), so a MULTI block or a script never stops early.
+        proc snap_stmt_op {n} {
+            set i [randomInt $n]
+            set j [expr {($i + 1 + [randomInt [expr {$n - 1}]]) % $n}]   ;# COPY onto itself is an error
+            set m [randomInt 1000]
+            switch [randomInt 10] {
+                0 { return [list set k:$i v$m] }
+                1 { return [list append k:$i x] }
+                2 { return [list del k:$i] }
+                3 { return [list set k:$i [string repeat B 9000]] }
+                4 { return [list copy k:$i k:$j replace] }
+                5 { return [list set k:$i v ex 100000] }
+                6 { return [list getdel k:$i] }
+                7 { return [list lmove l:[randomInt 1000] l:[randomInt 1000] left right] }
+                8 { return [list smove s:[randomInt 1000] s:[randomInt 1000] m[randomInt 5]] }
+                9 { return [list rpush l:[randomInt 1000] $m] }
+            }
+        }
+
+        test {Hybrid snapshot harness: MULTI and script writers race a full-speed save; the window moves only between their statements} {
+            # A command keeps writing in place through what its lookups handed
+            # out ahead of the thread, so hi may move only between statements
+            # (hybsnapSectionGrant). Long EXECs and scripts against a save that
+            # is not slowed down make the thread wait at hi inside their
+            # sections, so grants happen there, between the statements.
+            r flushall
+            set n 500000
+            r debug populate $n k 20
+            for {set i 0} {$i < 1000} {incr i} {
+                r rpush l:$i a b c
+                r sadd s:$i m0 m1 m2 m3 m4
+            }
+            set lua {
+                for i = 1, #ARGV, 3 do
+                    local op, a, b = ARGV[i], ARGV[i + 1], ARGV[i + 2]
+                    if op == 'set' then redis.call('SET', a, b)
+                    elseif op == 'append' then redis.call('APPEND', a, 'x')
+                    elseif op == 'del' then redis.call('DEL', a)
+                    elseif op == 'big' then redis.call('SET', a, string.rep('B', 9000))
+                    elseif op == 'copy' then redis.call('COPY', a, b, 'REPLACE')
+                    elseif op == 'lmove' then redis.call('LMOVE', a, b, 'LEFT', 'RIGHT')
+                    else redis.call('SMOVE', a, b, 'm1') end
+                end
+                return 1
+            }
+            set rd [redis_deferring_client]
+            set grants 0
+            set raced 0
+            for {set round 0} {$round < 3} {incr round} {
+                set ref [debug_digest]
+                r bgsave
+                snap_wait_save_started
+                for {set b 0} {$b < 300 && [s snap_save_in_progress]} {incr b} {
+                    if {$b % 2} {
+                        set args {}
+                        for {set q 0} {$q < 200} {incr q} {
+                            set i [randomInt $n]
+                            set j [expr {($i + 1 + [randomInt [expr {$n - 1}]]) % $n}]
+                            switch [randomInt 7] {
+                                0 { lappend args set k:$i v$q }
+                                1 { lappend args append k:$i - }
+                                2 { lappend args del k:$i - }
+                                3 { lappend args big k:$i - }
+                                4 { lappend args copy k:$i k:$j }
+                                5 { lappend args lmove l:[randomInt 1000] l:[randomInt 1000] }
+                                6 { lappend args smove s:[randomInt 1000] s:[randomInt 1000] }
+                            }
+                        }
+                        $rd eval $lua 0 {*}$args
+                        assert_equal 1 [$rd read]
+                    } else {
+                        $rd multi
+                        for {set q 0} {$q < 200} {incr q} { $rd {*}[snap_stmt_op $n] }
+                        $rd exec
+                        for {set q 0} {$q < 201} {incr q} { $rd read }   ;# OK, then QUEUED for each
+                        assert_equal 200 [llength [$rd read]]
+                    }
+                    incr raced
+                }
+                snap_wait_bgsave_done
+                assert_equal ok [s rdb_last_bgsave_status]
+                incr grants [s snap_save_window_grants]
+                r debug reload nosave
+                assert_equal $ref [debug_digest]
+            }
+            $rd close
+            if {$::verbose} { puts "statement writers: $raced blocks raced the saves, $grants grants" }
+            assert {$raced >= 3}
+            assert {$grants > 0}
+        }
+
         test {Hybrid snapshot: writes to keys the scan already passed are applied in place, not cloned} {
             r flushall
             populate_fillers 3000
