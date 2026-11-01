@@ -69,15 +69,25 @@ memory.
 
 ![One hybrid save in flight](images/hybrid-snapshot-flow.png)
 
-*Blue memory is the arena, never mapped in the child; pink is forkable. The scan thread reads
-the frozen dict through a window (`[lo, hi)` in the credit window's terms). Behind the window writes go in place (kv1). Inside it a write
-goes to a duplicate of the bucket's chain (kv3, kv7 are written, kv4, kv8 deleted, on the duplicate)
-while the scan reads the fork-instant originals in the dict: small values (kv3-kv5) go into 64 KB buffers, big values (kv6-kv8) travel
-as header copies and the child serializes them from its own snapshot. Ahead of the window the
-main thread serializes kv9 alone into a buffer and stamps it with the save's epoch so the scan
-skips it, then writes in place. kv8 is deleted during the save and still reaches the file.
+*Blue memory is the arena, never mapped in the child; pink is forkable. Any of the four entry
+points starts the save, which forks the child and creates the scan thread with the save's epoch
+(7). The thread reads the frozen dict between "low win" and "high win" (`lo` and `hi` in the
+credit window's terms); the dict's rehashing is paused while the window covers it. Behind the
+window the thread is done and writes go in place (kv2 -> kv2'). Inside it reads go to the dict
+(kv3, kv6), while writes and deletes go to the overlay (kv4, kv7 updated, kv5, kv8 deleted) and the
+thread reads the fork-instant originals: small values (kv3-kv5: listpack, str, intset) are
+serialized by the thread (green D) into buffers on the small pipe, big values (kv6-kv8: hash,
+list, module) travel as header copies on the big pipe and the child serializes them from its own
+snapshot (purple D). A small value written in the overlay is copied (str dup); a big one is shared
+with the clone (kv7 -> list). kv5 and kv8 are deleted during the save and still reach the file.
+Ahead of the window an update to kv9, whose epoch (3) is older than the save's, first emits kv9
+alone on the main thread and stamps it with epoch 7, so the thread skips it; then the write goes in
+place. The emitted record is a serialized small value (yellow D), or a header copy of a big one
+(stream) that the child serializes; the thread forwards it. The child drains the small pipe first.
 
-The figure draws the overlay per key ("dup", "tomb"). In the implemented bucket overlay a write inside the window duplicates the whole chain of its bucket, a deleted key is absent from the duplicate and no tombstone exists; the figure has not been redrawn.*
+The figure draws the overlay per key ("dup", "tomb"). The implemented overlay copies the written
+key's whole bucket: every key of the chain is cloned, a deleted key is absent from the copy and no
+tombstone exists.*
 
 **Queues and channels.**
 
