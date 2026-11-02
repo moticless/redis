@@ -1008,7 +1008,7 @@ test {Replicas that was marked as CLIENT_CLOSE_ASAP should not keep the replicat
     }
 }
 
-# Regression test for the crash where sendTrackingMessage() (src/tracking.c) calls
+# Regression test for the crash where sendTrackingMessage() (src/core/tracking.c) calls
 # pauseIOThread() for a REDIRECT target living on an IO thread while itself running on
 # a module thread (not the main thread): pauseIOThreadsRange() then asserts
 # pthread_equal(pthread_self(), server.main_thread_id) and the server aborts.

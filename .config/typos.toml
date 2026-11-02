@@ -4,11 +4,11 @@
 extend-exclude = [
     "deps/",
     # crc16_slottable is primarily pre-generated random strings.
-    "src/crc16_slottable.h",
+    "src/util/crc16_slottable.h",
     # Third-party imported code.
-    "src/pqsort.c",
-    "src/lzf*",
-    "src/sha1.c",
+    "src/util/pqsort.c",
+    "src/util/lzf*",
+    "src/util/sha1.c",
 ]
 
 [default]

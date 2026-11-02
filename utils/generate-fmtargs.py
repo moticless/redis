@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 
-# Outputs the generated part of src/fmtargs.h
+# Outputs the generated part of src/core/fmtargs.h
 MAX_ARGS = 160
 
 import os

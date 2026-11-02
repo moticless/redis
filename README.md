@@ -404,6 +404,32 @@ Redis supports compression of replication stream via zstd as of 8.10. To build w
 make BUILD_COMPRESSION=yes
 ```
 
+### Building with CMake
+
+`make` is a thin wrapper around a CMake build (it accepts the same variables as before and builds in `build/make`). It needs CMake 3.13 or newer, and uses Ninja when it is installed. CMake can also be used directly, with presets (CMake 3.21+) for the common variants:
+
+```sh
+cmake --preset release && cmake --build --preset release   # -O3 + LTO, jemalloc on Linux
+cmake --preset debug   && cmake --build --preset debug     # -O0 (make noopt)
+cmake --list-presets                                       # asan, ubsan, tsan, msan, valgrind, coverage, 32bit, tls, tls-module
+```
+
+Each preset builds outside the source tree in `build/<preset>/` and writes `compile_commands.json` there for clangd and other IDE tooling. The binaries are also copied into `src/`, so `./runtest` and the scripts that start `./src/redis-server` work unchanged. The make variables map to CMake cache variables as follows (see `cmake/RedisOptions.cmake`):
+
+| make | CMake |
+|---|---|
+| `MALLOC`, `USE_JEMALLOC=no` | `REDIS_MALLOC=jemalloc\|libc\|tcmalloc\|tcmalloc_minimal` |
+| `BUILD_TLS` | `REDIS_BUILD_TLS=no\|yes\|module` |
+| `SANITIZER` | `REDIS_SANITIZER=address\|undefined\|thread\|memory` |
+| `OPTIMIZATION` | `REDIS_OPTIMIZATION` (LTO is added for `-O3`) |
+| `USE_SYSTEMD` | `REDIS_SYSTEMD=auto\|yes\|no` |
+| `REDIS_CFLAGS`, `REDIS_LDFLAGS` | `REDIS_CFLAGS`, `REDIS_LDFLAGS` |
+| `CFLAGS`, `LDFLAGS` | `CMAKE_C_FLAGS`, `CMAKE_EXE_LINKER_FLAGS` |
+| `PROG_SUFFIX`, `DEBUG_DEFRAG`, `BUILD_COMPRESSION=yes`, `SKIP_VEC_SETS=yes` | `REDIS_PROG_SUFFIX`, `REDIS_DEBUG_DEFRAG`, `REDIS_COMPRESSION=ON`, `REDIS_SKIP_VEC_SETS=ON` |
+| `PREFIX` | `CMAKE_INSTALL_PREFIX` (`cmake --install build/release`) |
+
+The source layout of `src/` is described in [src/README.md](src/README.md).
+
 ### Fixing build problems with dependencies or cached build options
 
 Redis has some dependencies which are included in the `deps` directory. `make` does not automatically rebuild dependencies even if something in the source code of dependencies changes.

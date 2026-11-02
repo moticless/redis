@@ -415,7 +415,7 @@ start_server {tags {"modules" "external:skip" "cluster:skip"} overrides {enable-
     #
     # For production modules, classes MUST be registered in RedisModule_OnLoad()
     # to ensure they're available when AOF/RDB files are loaded on server startup.
-    # See src/module.c documentation for RM_CreateKeyMetaClass() for details.
+    # See src/moduleapi/module.c documentation for RM_CreateKeyMetaClass() for details.
     #
     # The test below verifies that AOF callbacks correctly emit KEYMETA.SET commands
     # to the AOF file during rewrite, which is the module's responsibility.

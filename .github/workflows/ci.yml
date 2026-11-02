@@ -48,7 +48,7 @@ jobs:
       run: |
         sed -i 's|http://deb.debian.org/debian|http://archive.debian.org/debian|g' /etc/apt/sources.list
         sed -i 's|http://security.debian.org|http://archive.debian.org/debian-security|g' /etc/apt/sources.list
-        apt-get update && apt-get install -y build-essential
+        apt-get update && apt-get install -y build-essential cmake
         make REDIS_CFLAGS='-Werror'
 
   build-macos-latest:
@@ -83,7 +83,7 @@ jobs:
     - uses: actions/checkout@v6
     - name: make
       run: |
-        dnf -y install which gcc make
+        dnf -y install which gcc make cmake
         make REDIS_CFLAGS='-Werror'
 
   build-old-chain-jemalloc:
@@ -100,6 +100,6 @@ jobs:
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 40976EAF437D05B5
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 3B4FE6ACC0B21F32
         apt-get update
-        apt-get install -y make gcc-4.8
+        apt-get install -y make gcc-4.8 cmake
         update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.8 100
         make CC=gcc REDIS_CFLAGS='-Werror'

@@ -3,4 +3,4 @@
 # will rebuild it based on src/commands/*.json before trying to compile it.
 # Otherwise the file gets modified and gets the same timestamp as the .json
 # files. So the Makefile doesn't attempt to rebuild it before compiling.
-src/commands.c merge=binary
+src/core/commands.c merge=binary

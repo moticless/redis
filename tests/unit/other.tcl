@@ -32,7 +32,7 @@ start_server {tags {"other"}} {
     }
     
     test {je_malloc_conf compile-time tuning is active} {
-        # Verify je_malloc_conf in src/zmalloc.c overrides jemalloc defaults:
+        # Verify je_malloc_conf in src/util/zmalloc.c overrides jemalloc defaults:
         # (tcache_nslots_small_max: 200, lg_tcache_nslots_mul: 1).
         if {[string match {*jemalloc*} [s mem_allocator]]} {
             assert_equal 1000 [r debug mallctl opt.tcache_nslots_small_max]

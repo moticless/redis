@@ -904,7 +904,7 @@ jobs:
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: make
       run: |
-        dnf -y install which gcc make
+        dnf -y install which gcc make cmake
         make REDIS_CFLAGS='-Werror'
     - name: testprep
       run: |
@@ -940,7 +940,7 @@ jobs:
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: make
       run: |
-        dnf -y install which gcc make openssl-devel openssl
+        dnf -y install which gcc make cmake openssl-devel openssl
         make BUILD_TLS=module REDIS_CFLAGS='-Werror'
     - name: testprep
       run: |
@@ -979,7 +979,7 @@ jobs:
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: make
       run: |
-        dnf -y install which gcc make openssl-devel openssl
+        dnf -y install which gcc make cmake openssl-devel openssl
         make BUILD_TLS=module REDIS_CFLAGS='-Werror'
     - name: testprep
       run: |
@@ -1100,7 +1100,7 @@ jobs:
         version: 15.1
         shell: bash
         run: |
-          sudo pkg install -y bash gmake lang/tcl86 lang/tclX gcc
+          sudo pkg install -y bash gmake lang/tcl86 lang/tclX gcc cmake-core
           gmake
           # The unit/networking test "Prefetch works with maximum batch size
           # of 128 and client number larger than batch size" creates 300 Tcl
@@ -1139,7 +1139,7 @@ jobs:
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: make
       run: |
-          apk add build-base
+          apk add build-base cmake samurai
           make REDIS_CFLAGS='-Werror'
     - name: testprep
       run: apk add tcl procps tclx
@@ -1172,7 +1172,7 @@ jobs:
         ref: ${{ env.GITHUB_HEAD_REF }}
     - name: make
       run: |
-          apk add build-base
+          apk add build-base cmake samurai
           make REDIS_CFLAGS='-Werror' USE_JEMALLOC=no CFLAGS=-DUSE_MALLOC_USABLE_SIZE
     - name: testprep
       run: apk add tcl procps tclx
@@ -1254,7 +1254,7 @@ jobs:
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 40976EAF437D05B5
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 3B4FE6ACC0B21F32
         apt-get update
-        apt-get install -y make gcc-4.8
+        apt-get install -y make gcc-4.8 cmake
         update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.8 100
         make CC=gcc REDIS_CFLAGS='-Werror'
     - name: testprep
@@ -1296,7 +1296,7 @@ jobs:
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 40976EAF437D05B5
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 3B4FE6ACC0B21F32
         apt-get update
-        apt-get install -y make gcc-4.8 openssl libssl-dev
+        apt-get install -y make gcc-4.8 openssl libssl-dev cmake
         update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.8 100
         make CC=gcc BUILD_TLS=module REDIS_CFLAGS='-Werror'
     - name: testprep
@@ -1342,7 +1342,7 @@ jobs:
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 40976EAF437D05B5
         apt-key adv --keyserver keyserver.ubuntu.com --recv-keys 3B4FE6ACC0B21F32
         apt-get update
-        apt-get install -y make gcc-4.8 openssl libssl-dev
+        apt-get install -y make gcc-4.8 openssl libssl-dev cmake
         update-alternatives --install /usr/bin/gcc gcc /usr/bin/gcc-4.8 100
         make BUILD_TLS=module CC=gcc REDIS_CFLAGS='-Werror'
     - name: testprep

@@ -139,7 +139,7 @@ end
 
 puts "<!-- This file is generated from module.c using\n"
 puts "     redis/redis:utils/generate-module-api-doc.rb -->\n\n"
-src = File.open(File.dirname(__FILE__) ++ "/../src/module.c").to_a
+src = File.open(File.dirname(__FILE__) ++ "/../src/moduleapi/module.c").to_a
 
 # Build function index
 $index = {}
@@ -158,7 +158,8 @@ if File.directory?(git_dir) && `which git` != ""
     `git --git-dir="#{git_dir}" tag --sort=v:refname`.each_line do |version|
         next if version !~ /^(\d+)\.\d+\.\d+?$/ || $1.to_i < 4
         version.chomp!
-        `git --git-dir="#{git_dir}" cat-file blob "#{version}:src/module.c"`.each_line do |line|
+        # module.c moved to src/moduleapi/ (utils/layout-map.txt); older tags have it in src/.
+        `git --git-dir="#{git_dir}" cat-file blob "#{version}:src/moduleapi/module.c" 2>/dev/null || git --git-dir="#{git_dir}" cat-file blob "#{version}:src/module.c"`.each_line do |line|
             if line =~ /^\w.*[ \*]RM_([A-z0-9]+)/
                 name = "RedisModule_#{$1}"
                 if ! $since[name]

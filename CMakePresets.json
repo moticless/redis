@@ -1,0 +1,72 @@
+{
+  "version": 3,
+  "cmakeMinimumRequired": { "major": 3, "minor": 21, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}"
+    },
+    { "name": "release", "inherits": "base", "displayName": "Release (-O3, LTO, jemalloc on Linux)" },
+    {
+      "name": "debug", "inherits": "base", "displayName": "No optimization (make noopt)",
+      "cacheVariables": { "REDIS_OPTIMIZATION": "-O0", "REDIS_HIREDIS_OPTIMIZATION": "-O0" }
+    },
+    {
+      "name": "valgrind", "inherits": "base", "displayName": "-O0 with libc malloc (make valgrind)",
+      "cacheVariables": { "REDIS_OPTIMIZATION": "-O0", "REDIS_HIREDIS_OPTIMIZATION": "-O0", "REDIS_MALLOC": "libc" }
+    },
+    {
+      "name": "asan", "inherits": "base", "displayName": "AddressSanitizer (SANITIZER=address)",
+      "cacheVariables": { "REDIS_SANITIZER": "address" }
+    },
+    {
+      "name": "ubsan", "inherits": "base", "displayName": "UndefinedBehaviorSanitizer (SANITIZER=undefined)",
+      "cacheVariables": { "REDIS_SANITIZER": "undefined" }
+    },
+    {
+      "name": "tsan", "inherits": "base", "displayName": "ThreadSanitizer (SANITIZER=thread)",
+      "cacheVariables": { "REDIS_SANITIZER": "thread" }
+    },
+    {
+      "name": "msan", "inherits": "base", "displayName": "MemorySanitizer, clang only (SANITIZER=memory)",
+      "cacheVariables": { "REDIS_SANITIZER": "memory", "CMAKE_C_COMPILER": "clang" }
+    },
+    {
+      "name": "coverage", "inherits": "base", "displayName": "gcov instrumentation (make gcov)",
+      "cacheVariables": {
+        "REDIS_CFLAGS": "-fprofile-arcs -ftest-coverage -fprofile-update=atomic -DCOVERAGE_TEST",
+        "REDIS_LDFLAGS": "-fprofile-arcs -ftest-coverage"
+      }
+    },
+    {
+      "name": "32bit", "inherits": "base", "displayName": "32-bit build (make 32bit)",
+      "cacheVariables": {
+        "CMAKE_C_FLAGS": "-m32", "CMAKE_EXE_LINKER_FLAGS": "-m32",
+        "CMAKE_MODULE_LINKER_FLAGS": "-m32", "REDIS_SKIP_VEC_SETS": "ON"
+      }
+    },
+    {
+      "name": "tls", "inherits": "base", "displayName": "TLS built in (BUILD_TLS=yes)",
+      "cacheVariables": { "REDIS_BUILD_TLS": "yes" }
+    },
+    {
+      "name": "tls-module", "inherits": "base", "displayName": "TLS as a module (BUILD_TLS=module)",
+      "cacheVariables": { "REDIS_BUILD_TLS": "module" }
+    }
+  ],
+  "buildPresets": [
+    { "name": "release", "configurePreset": "release" },
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "valgrind", "configurePreset": "valgrind" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "ubsan", "configurePreset": "ubsan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "msan", "configurePreset": "msan" },
+    { "name": "coverage", "configurePreset": "coverage" },
+    { "name": "32bit", "configurePreset": "32bit" },
+    { "name": "tls", "configurePreset": "tls" },
+    { "name": "tls-module", "configurePreset": "tls-module" }
+  ]
+}
