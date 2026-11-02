@@ -14,7 +14,7 @@
  */
 
 #include "server.h"
-#include "../deps/tre/local_includes/tre.h"
+#include "tre.h"
 #include <math.h>
 
 /******************************************************************************
