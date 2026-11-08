@@ -5319,8 +5319,7 @@ void backgroundSaveDoneHandler(int exitcode, int bysignal) {
  * the child did not exit for an error, but because we wanted), and performs
  * the cleanup needed. */
 void killRDBChild(void) {
-    /* Hybrid snapshot: the scan thread must stop reading the frozen keyspace and
-     * the overlay must be merged before anyone destroys or mutates the dicts. */
+    /* Hybrid snapshot: stop scan thread and the overlay must be merged back */
     hybsnapSaveAbort();
     kill(server.child_pid, SIGUSR1);
     /* Because we are not using here waitpid (like we have in killAppendOnlyChild

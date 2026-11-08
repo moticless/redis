@@ -1250,9 +1250,10 @@ void killAppendOnlyChild(void) {
     /* Kill AOFRW child, wait for child exit. */
     serverLog(LL_NOTICE,"Killing running AOF rewrite child: %ld",
         (long) server.child_pid);
-    /* Hybrid rewrite: stop the scan thread and drain the overlay first, as
-     * killRDBChild does. */
+
+    /* Hybrid snapshot: stop scan thread and the overlay must be merged back */
     hybsnapSaveAbort();
+
     int killed = kill(server.child_pid,SIGUSR1) != -1;
     if (killed) {
         while(waitpid(-1, &statloc, 0) != server.child_pid);
