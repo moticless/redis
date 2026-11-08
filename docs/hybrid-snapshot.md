@@ -64,7 +64,7 @@ memory.
 | 2 | **Freeze**: for every non-empty keyspace dict take one reference, stamp it `(generation, PENDING)` and record it in the save's table; install the store's snapshot guard. Nothing is paused, nothing allocated per dict. | | |
 | 3 | `redisFork()`. The arena stays `MADV_DONTFORK`. | | Inherits the HYBSNAP_FORK values (copy-on-write), the forkable half of the server, no headers, no tables, no small values. Reserves the arena's address range `PROT_NONE` so its own mappings cannot land there. |
 | 4 | Start the scan thread; register the completion notifier with the event loop. Serve commands: every keyspace write goes through the funnel (section 3). | Walk the save's table of dicts in scan order (section 3, the credit window). For each dict: claim it, announce its layout position and read its table sizes, then announce batches of 128 buckets (plus the prefetch lookahead) and read their chains with atomic loads, staying below `hi` and skipping keys whose save epoch is the save's (emitted ahead, or created after the fork instant); publish `lo` behind each bucket. HYBSNAP_NOFORK keys are serialized into a 64 KB staging buffer; HYBSNAP_FORK keys become KVOBJ messages. Every `W` buckets (default 1024) and at the end of each dict forward what the main thread queued. | Write the RDB header (or the AOF prologue). Then loop: take the small channel while the parent reports at least 1 MB of small backlog, waiting up to 20 ms for it to reach the pipe; otherwise take one big value. A BUFFER whose dependency (`robj_off`: big values that must precede it) is unmet is held until they are written. Track `SELECTDB` / `RESIZEDB` / `SLOT_INFO` (or `SELECT`) per message. |
-| 5 | Write back overlayed buckets at the end of every write section and once per cron tick: a bucket the thread has passed (its overlay window wholly below `lo`) gets its duplicate chain installed in the dict and its originals released. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, set `lo` and `cur` past every position, wait once for an open write section to close (it may still be emitting), drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
+| 5 | Write back overlayed buckets at the end of every write section and once per cron tick: a bucket the thread has passed (its scan position below `lo`) gets its duplicate chain installed in the dict and its originals released. Complete slots the thread published as SCANNED: apply what is left, resume layout changes, mark DONE, drop the reference. Abort at the hard mark. | When a dict is fully read publish SCANNED. When all are read, set `lo` and `cur` past every position, wait once for an open write section to close (it may still be emitting), drain the queue a last time, send END with both channels' message counts. | Finish when both counts are consumed: footer, fsync, rename (or the EOF mark on the sockets). Exit. |
 | 6 | `checkChildrenDone` -> the classic done handler -> `hybsnapOnChildEnd`: abort the scan if the child failed or the scan is unfinished, join the thread, release every remaining state, publish the last-save peaks. | Joined. | Reaped. |
 
 ![One hybrid save in flight](images/hybrid-snapshot-flow.png)
@@ -217,8 +217,8 @@ at or above `hi`, read up to `min(batch end, hi)`, store `lo` after each bucket.
   (release). Never in the middle of a command: a command keeps writing in place through the links
   and kvobj pointers its lookups handed out ahead of `hi`, so those buckets must stay out of the
   thread's reach until it returns. Not for an EXEC or a script run by `RM_Call` either: its module
-  may hold a key open. A grant is skipped while 16 overlay windows hold buckets: they are written
-  back only at the section's end, and the thread then waits for it.
+  may hold a key open. Before the grant the overlayed buckets the thread has passed are written
+  back, so the buckets alive at once never span more than the credit window and its last grant.
 - **Section close.** Write back the overlayed buckets the thread has passed, then set `hi`
   unlimited.
 
@@ -264,8 +264,7 @@ further protection: the write lookup before them went through it, so the key is 
 in an overlayed bucket, or stamped ahead of `hi`, where it stays until the command returns. The
 scan thread never blocks the main thread. The main thread holds the scan thread back only inside a
 section, and only once the thread reaches `hi`: for the rest of a command (one command is never
-granted more), until the next statement of EXEC or a script, or while its overlay windows are at
-the soft count.
+granted more), until the next statement of EXEC or a script.
 
 **Attach and pause.** A dict acquires its per-save state on demand: the store's guard, which runs
 on every access to a dict without an overlay while the scan runs, attaches on the first
@@ -275,14 +274,15 @@ overlay. A dict's rehashing and auto-resize are paused before `hi` may pass its 
 A dict beyond `hi` may keep growing and shrinking, attached or not: what the main thread emitted
 ahead is recorded in the keys' epochs, which move with the keys.
 
-**The overlayed buckets.** Indexed by the overlay window they were deferred in: the overlay's
-`prepare` hook returns the window with its verdict, the aligned run of `W` buckets (rounded up to
-a power of two, at most the table) around the bucket, with the scan position of the run's last
-bucket. One index serves the whole save: slots, each the buckets of one window of one dict, a
-bucket at offset `index - lo` of its slot's array, with a bitmap of the offsets in use. The index
-grows on demand; the write-back at every section's end and the grant limit of 16 windows in use
-keep it small. `W` is at most `HYBSNAP_WINDOW_BUCKETS_MAX` (65536), so a slot's array is bounded
-too. An overlayed bucket is named by `(table, bucket index)` and
+**The overlayed buckets.** Indexed by their place in the scan: the overlay's `prepare` hook
+returns the bucket's scan position with its DEFER verdict, and every dict the save pauses takes
+the next run of dense indices (`kvstoreOverlayIndexBase`), one per bucket the thread reads, so
+consecutive buckets of the scan have consecutive indices. One index serves the save: a ring of
+`4W` slots (a power of two, at least 1024) keyed by the dense index (the dict's base plus the
+bucket's offset among the buckets read, from the paused dict's `rehashidx` and table size), each
+slot the chain of the buckets that share it, so a lookup is one slot, one load and one compare. The buckets alive at once fit the ring with room to spare because the passed ones
+are written back before every raise of `hi` (section open, grants, section close); a collision
+would cost a compare, never an answer. An overlayed bucket is named by `(table, bucket index)` and
 owns the duplicate chain (ordinary dict entries, so a position in it is an ordinary
 `dictEntryLink`) and records nothing per original: the originals are found by walking the dict's
 own chain at that bucket, and whether a clone took over its original's value is recomputed from
@@ -329,10 +329,10 @@ What a hybrid save holds beyond the dataset, and what bounds it:
 |---|---|---|
 | copy-on-write on HYBSNAP_FORK values written during the save | child, kernel | the forkable memory: `allocator_active` minus `allocator_active_hybrid_arena`, reached only if every forkable page is written |
 | child page tables | child | proportional to the forkable range; sets the fork stall |
-| retained originals: fork-instant HYBSNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket's overlay window |
+| retained originals: fork-instant HYBSNAP_NOFORK values kept alive while their bucket is overlayed (a clone replaced them or they were deleted) and inside the window | parent | released once the thread passes the bucket |
 | emit-ahead records queued by the main thread (`mq`) | parent | forwarded within the thread's next `W` buckets or at the end of its dict |
 | the scan thread's queues to the child (`oq` + `bq`) | parent | `hybrid-snapshot-max-queued-bytes` (default 100 MB): past it the thread waits for the child, never aborts |
-| the overlay index | parent | per overlay window holding buckets an array of one pointer per bucket of the window (8 KB at the default 1024) and its bitmap of the offsets in use, plus the duplicated chains; grants stop at 16 windows in use |
+| the overlay index | parent | one ring of `4W` slots for the save (32 KB at the default `W` of 1024, 2 MB at the maximum) and its bitmap, plus the duplicated chains of the overlayed buckets; the passed buckets are written back before every raise of `hi` |
 | save epochs | parent, permanent | 4 bytes at the end of a kvobj: every kvobj created while the feature is on (`hybrid-snapshot-epoch-prealloc yes`), or only those with room for it and those written ahead of the thread or created during a save (`no`); a jemalloc size class step only when the 4 bytes cross one |
 
 The **hard mark**, `hybrid-snapshot-max-retained-bytes` (default 256 MB, 0 unlimited), covers the
@@ -529,8 +529,8 @@ MADV_DONTFORK`.
   `lo`; the main thread alone moves `hi`, unlimited outside write sections, capped at a section's
   start and raised by `W` buckets between its statements (a **grant**), never in the middle of a
   command.
-- **overlay window**: the aligned run of `W` buckets (power of two) an overlayed bucket is indexed
-  by; written back once the thread is past its last bucket.
+- **overlay index**: the ring of slots, keyed by a bucket's dense place in the scan, that finds an
+  overlayed bucket; a bucket is written back once the thread is past its position.
 - **write section**: the interval on the main thread from a command's first hook on a frozen
   dict (read or write) to the end of the outermost command; it caps the scan thread at its start
   and lifts the cap at its end.
@@ -542,7 +542,7 @@ MADV_DONTFORK`.
   at the end of its allocation says the save of that epoch, or a later one, must not serialize it
   from the scan.
 - **overlay** / **overlayed bucket**: for each bucket written while it was inside the window, a
-  duplicate of its chain, indexed by its overlay window, (clones, adds, no deleted keys) that the main
+  duplicate of its chain, indexed by its scan position, (clones, adds, no deleted keys) that the main
   thread uses in place of the dict's chain until the write-back.
 - **retained**: fork-instant originals kept alive by overlayed buckets; **queued**: records waiting
   for the child; **hard mark**: the bound over both on the parent side.

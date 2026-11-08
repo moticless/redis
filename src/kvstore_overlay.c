@@ -33,10 +33,9 @@
  * Snapshot overlay
  * ========================================================================== */
 
-/* The overlay of a frozen dict and the one index of overlayed buckets, by
- * window (kvstore_overlay.h, THE OVERLAYED BUCKETS). kvstore.c sees only the
- * forward declaration. Only the main thread touches any of this. */
-#define KVSO_SLOT_KEEP 4096   /* offsets a free slot keeps allocated for the next window */
+/* The overlay of a frozen dict, its overlayed buckets and the one index of
+ * them by scan position (kvstore_overlay.h, THE OVERLAYED BUCKETS). kvstore.c
+ * sees only the forward declaration. Only the main thread touches any of this. */
 
 /* The overlay's work counters (main thread only), see kvstoreOverlayStats.
  * A pause still open is added at read time from its count and the sum of its
@@ -68,7 +67,10 @@ kvstoreOverlayStats kvstoreOverlayStatsGet(void) {
 
 typedef struct kvsoBucket {
     struct kvstoreDictOverlay *ov;   /* the dict's overlay */
-    int slot;                   /* its index slot (kvso_index) */
+    struct kvsoBucket *hnext;   /* the index: the next bucket of the same slot (a collision) */
+    struct kvsoBucket *onext, *oprev;   /* the overlay's buckets */
+    uint64_t pos;               /* its scan position: written back once the scan is past it */
+    unsigned long slot;         /* its index slot */
     int table;
     unsigned long idx;
     dictEntry *chain;           /* the bucket's logical chain: detached entries holding the clones and the adds */
@@ -90,23 +92,19 @@ typedef struct kvstoreDictOverlay {
     int unlink_frozen;          /* the pending two-phase unlink targets the frozen dict */
     kvsoBucket *unlink_ob;        /* ... or this overlayed bucket */
     void *privdata;
+    kvsoBucket *buckets;        /* its overlayed buckets, newest first (nb of them) */
 } kvstoreDictOverlay;
 
-/* The overlayed buckets of one window of one dict. */
-typedef struct kvsoSlot {
-    kvstoreDictOverlay *ov;     /* NULL: free */
-    uint64_t last;              /* the scan position of the window's last bucket */
-    int table;
-    unsigned long lo, n;        /* buckets [lo, lo + n) */
-    long count;                 /* overlayed buckets in it */
-    kvsoBucket **b;               /* by offset idx - lo */
-    uint64_t *bits;             /* the offsets in use */
-    unsigned long cap;          /* offsets allocated in b and bits */
-} kvsoSlot;
-
-static kvsoSlot *kvso_index;     /* kvso_nslots entries */
-static int kvso_nslots;
-static int kvso_slots_used;
+/* The index of overlayed buckets, one for the save (kvstoreOverlayIndexInit):
+ * a ring of slots keyed by the bucket's dense scan index (the dict's base,
+ * kvstoreOverlayIndexBase, plus kvsoDenseOffset), each slot the chain of the
+ * buckets that map to it. */
+static struct {
+    kvsoBucket **slot;          /* chains, by index & mask */
+    uint64_t *bits;             /* the slots holding a bucket */
+    unsigned long mask;         /* slots - 1 (a power of two); no index without one */
+    long count;
+} kvso_index;
 
 int kvsoActive(kvstoreDictOverlay *ov) {
     return ov && ov->nb > 0;
@@ -133,75 +131,91 @@ static void kvsoKeyCountAdd(kvstore *kvs, int didx, long delta) {
 
 /* ---- The index of overlayed buckets ---- */
 
+void kvstoreOverlayIndexInit(unsigned long slots) {
+    assert(slots && (slots & (slots - 1)) == 0);
+    kvstoreOverlayIndexFree();
+    kvso_index.slot = zcalloc(slots * sizeof(*kvso_index.slot));
+    kvso_index.bits = zcalloc((slots >> 6 ? slots >> 6 : 1) * sizeof(*kvso_index.bits));
+    kvso_index.mask = slots - 1;
+}
+
+void kvstoreOverlayIndexFree(void) {
+    assert(kvso_index.count == 0);   /* every overlay released its buckets */
+    zfree(kvso_index.slot);
+    zfree(kvso_index.bits);
+    memset(&kvso_index, 0, sizeof(kvso_index));
+}
+
+/* The dict's buckets in scan order, from 0: table 0 from rehashidx (the
+ * buckets below it were moved to table 1 before the freeze), then table 1.
+ * Stable while the dict is paused: rehashidx and the sizes hold still, and a
+ * table 1 the dict grows meanwhile (dictType.pausedExpandAllowed) starts
+ * with rehashidx 0. */
+static inline uint64_t kvsoDenseOffset(dict *d, int table, unsigned long idx) {
+    unsigned long r = dictIsRehashing(d) ? (unsigned long)d->rehashidx : 0;
+    return table == 0 ? (uint64_t)(idx - r) : (uint64_t)(DICTHT_SIZE(d->ht_size_exp[0]) - r) + idx;
+}
+
+uint64_t kvstoreOverlayIndexBase(dict *d, uint64_t base) {
+    ((kvstoreDictMetaBase *)dictMetadata(d))->ov_index_base = base;
+    /* One past the last bucket the scan reads: table 1's end when rehashing, else table 0's. */
+    return dictIsRehashing(d) ? kvsoDenseOffset(d, 1, DICTHT_SIZE(d->ht_size_exp[1])) : kvsoDenseOffset(d, 0, DICTHT_SIZE(d->ht_size_exp[0]));
+}
+
+static inline unsigned long kvsoSlotOf(kvstoreDictOverlay *ov, int table, unsigned long idx) {
+    uint64_t base = ((kvstoreDictMetaBase *)dictMetadata(ov->d))->ov_index_base;
+    return (unsigned long)(base + kvsoDenseOffset(ov->d, table, idx)) & kvso_index.mask;
+}
+
+/* The overlayed bucket (table, idx) of the dict, or NULL: its slot, then the
+ * bucket named so in the slot's chain (one, normally). */
 static kvsoBucket *kvsoLookup(kvstoreDictOverlay *ov, int table, unsigned long idx) {
     if (!ov->nb) return NULL;
-    for (int k = 0; k < kvso_nslots; k++) {
-        kvsoSlot *s = &kvso_index[k];
-        if (s->ov == ov && s->table == table && idx - s->lo < s->n && s->b[idx - s->lo]) return s->b[idx - s->lo];
-    }
+    for (kvsoBucket *b = kvso_index.slot[kvsoSlotOf(ov, table, idx)]; b; b = b->hnext)
+        if (b->ov == ov && b->table == table && b->idx == idx) return b;
     return NULL;
 }
 
-/* The first offset at or after 'from' that holds a bucket, s->n if none. */
-static unsigned long kvsoSlotNext(const kvsoSlot *s, unsigned long from) {
-    if (from >= s->n) return s->n;
-    unsigned long w = from >> 6, words = (s->n + 63) >> 6;
-    uint64_t word = s->bits[w] & (~0ULL << (from & 63));
-    while (!word) {
-        if (++w >= words) return s->n;
-        word = s->bits[w];
-    }
-    return (w << 6) + (unsigned long)__builtin_ctzll(word);
+static void kvsoIndexAdd(kvsoBucket *ob) {
+    assert(kvso_index.slot != NULL);
+    unsigned long s = kvsoSlotOf(ob->ov, ob->table, ob->idx);
+    ob->slot = s;
+    ob->hnext = kvso_index.slot[s];
+    kvso_index.slot[s] = ob;
+    kvso_index.bits[s >> 6] |= 1ULL << (s & 63);
+    kvso_index.count++;
 }
 
-/* The slot of window 'w' of the dict, taken now if no slot has it yet. */
-static kvsoSlot *kvsoSlotFor(kvstoreDictOverlay *ov, const kvstoreOvWindow *w) {
-    kvsoSlot *free_slot = NULL;
-    for (int k = 0; k < kvso_nslots; k++) {
-        kvsoSlot *s = &kvso_index[k];
-        if (s->ov == ov && s->last == w->last && s->table == w->table && s->lo == w->lo && s->n == w->n) return s;
-        if (!s->ov && !free_slot) free_slot = s;
-    }
-    if (!free_slot) {
-        int n = kvso_nslots ? kvso_nslots * 2 : 4;
-        kvso_index = zrealloc(kvso_index, n * sizeof(*kvso_index));
-        memset(kvso_index + kvso_nslots, 0, (n - kvso_nslots) * sizeof(*kvso_index));
-        free_slot = &kvso_index[kvso_nslots];
-        kvso_nslots = n;
-    }
-    kvsoSlot *s = free_slot;
-    kvso_slots_used++;
-    if (s->cap < w->n) {
-        zfree(s->b);
-        zfree(s->bits);
-        s->b = zcalloc(w->n * sizeof(*s->b));
-        s->bits = zcalloc(((w->n + 63) >> 6) * sizeof(*s->bits));
-        s->cap = w->n;
-    }
-    s->ov = ov;
-    s->last = w->last;
-    s->table = w->table;
-    s->lo = w->lo;
-    s->n = w->n;
-    return s;
+static void kvsoIndexRemove(kvsoBucket *ob) {
+    kvsoBucket **link = &kvso_index.slot[ob->slot];
+    while (*link != ob) link = &(*link)->hnext;
+    *link = ob->hnext;
+    if (!kvso_index.slot[ob->slot]) kvso_index.bits[ob->slot >> 6] &= ~(1ULL << (ob->slot & 63));
+    kvso_index.count--;
 }
 
-/* Take ob out of its slot; a slot left empty is free again. */
-static void kvsoSlotRemove(kvsoBucket *ob) {
-    kvsoSlot *s = &kvso_index[ob->slot];
-    unsigned long off = ob->idx - s->lo;
-    s->b[off] = NULL;
-    s->bits[off >> 6] &= ~(1ULL << (off & 63));
-    if (--s->count) return;
-    s->ov = NULL;
-    kvso_slots_used--;
-    if (s->cap > KVSO_SLOT_KEEP) {
-        zfree(s->b);
-        zfree(s->bits);
-        s->b = NULL;
-        s->bits = NULL;
-        s->cap = 0;
-    }
+/* ---- The overlay's buckets ---- */
+
+static void kvsoBucketsAdd(kvstoreDictOverlay *ov, kvsoBucket *ob) {
+    ob->oprev = NULL;
+    ob->onext = ov->buckets;
+    if (ov->buckets) ov->buckets->oprev = ob;
+    ov->buckets = ob;
+    ov->nb++;
+}
+
+static void kvsoBucketsRemove(kvstoreDictOverlay *ov, kvsoBucket *ob) {
+    if (ob->oprev) ob->oprev->onext = ob->onext;
+    else ov->buckets = ob->onext;
+    if (ob->onext) ob->onext->oprev = ob->oprev;
+    ov->nb--;
+}
+
+/* The k-th bucket of the overlay (newest first). */
+static kvsoBucket *kvsoBucketAt(kvstoreDictOverlay *ov, int k) {
+    kvsoBucket *b = ov->buckets;
+    while (b && k-- > 0) b = b->onext;
+    return b;
 }
 
 /* Is 'key' (a stored key pointer) one of the originals of overlayed bucket ob? */
@@ -312,27 +326,18 @@ static void kvsoWriteBack(kvsoBucket *ob) {
         e = next;
     }
     dictChainFreeNodes(d, ob->orig_head);
-    kvsoSlotRemove(ob);
+    kvsoIndexRemove(ob);
+    kvsoBucketsRemove(ov, ob);
     kvso_stats.cur--;
     zfree(ob);
-    if (--ov->nb == 0) kvsoResume(ov);
+    if (ov->nb == 0) kvsoResume(ov);
 }
 
-/* Write back every bucket of slot s. */
-static void kvsoSlotWriteBack(kvsoSlot *s) {
-    unsigned long off = 0;
-    while (s->count) {   /* the last write-back frees the slot */
-        off = kvsoSlotNext(s, off);
-        kvsoWriteBack(s->b[off]);
-        off++;
-    }
-}
-
-/* Duplicate the chain of bucket (table, idx), deferred in window 'w': every
- * key through the 'clone' hook, same order. The dict is not written. */
-static kvsoBucket *kvsoBucketCreate(int didx, kvstoreDictOverlay *ov, int table, unsigned long idx, const kvstoreOvWindow *w) {
+/* Duplicate the chain of bucket (table, idx), deferred at scan position
+ * 'pos': every key through the 'clone' hook, same order. The dict is not
+ * written. */
+static kvsoBucket *kvsoBucketCreate(int didx, kvstoreDictOverlay *ov, int table, unsigned long idx, uint64_t pos) {
     dict *d = ov->d;
-    assert(w->table == table && idx - w->lo < w->n);
     if (!ov->paused) {   /* the buckets are named by (table, idx): the layout holds still while any is overlayed */
         dictPauseRehashing(d);
         dictPauseAutoResize(d);
@@ -341,10 +346,9 @@ static kvsoBucket *kvsoBucketCreate(int didx, kvstoreDictOverlay *ov, int table,
         kvso_stats.open++;
         kvso_stats.open_since_sum += ov->paused_at;
     }
-    kvsoSlot *s = kvsoSlotFor(ov, w);
     kvsoBucket *ob = zcalloc(sizeof(*ob));
     ob->ov = ov;
-    ob->slot = (int)(s - kvso_index);
+    ob->pos = pos;
     ob->table = table;
     ob->idx = idx;
     ob->orig_head = d->ht_table[table][idx];
@@ -359,11 +363,8 @@ static kvsoBucket *kvsoBucketCreate(int didx, kvstoreDictOverlay *ov, int table,
         ob->nkeys++;
         kvso_stats.s.clones++;
     }
-    unsigned long off = idx - s->lo;
-    s->b[off] = ob;
-    s->bits[off >> 6] |= 1ULL << (off & 63);
-    s->count++;
-    ov->nb++;
+    kvsoBucketsAdd(ov, ob);
+    kvsoIndexAdd(ob);
     kvso_stats.s.buckets++;
     if (++kvso_stats.cur > kvso_stats.s.peak) kvso_stats.s.peak = kvso_stats.cur;
     return ob;
@@ -378,19 +379,16 @@ static inline void kvsoEnter(kvstoreDictOverlay *ov) {
     if (ov->h->enter) ov->h->enter(ov->privdata);
 }
 
-/* May the frozen chain of 'key' (in table 'table') be written in place? If
- * not, *w is the window the bucket is deferred in. Must be called after
- * kvsoEnter() (the answer is only stable inside a write section). Without a
- * prepare hook the overlay is pure copy-on-write, one window per table. */
-static inline kvstoreOverlayPrepareResult kvsoPrepare(int didx, kvstoreDictOverlay *ov, const void *key, int table, kvstoreOvWindow *w) {
+/* May the frozen chain of 'key' be written in place? If not, *pos is the
+ * scan position the bucket is deferred at. Must be called after kvsoEnter()
+ * (the answer is only stable inside a write section). Without a prepare hook
+ * the overlay is pure copy-on-write at position 0. */
+static inline kvstoreOverlayPrepareResult kvsoPrepare(int didx, kvstoreDictOverlay *ov, const void *key, uint64_t *pos) {
     if (!ov->h->prepare) {
-        w->last = 0;
-        w->table = table;
-        w->lo = 0;
-        w->n = DICTHT_SIZE(ov->d->ht_size_exp[table]);
+        *pos = 0;
         return KVSTORE_OV_DEFER;
     }
-    return ov->h->prepare(ov->privdata, didx, ov->d, key, w);
+    return ov->h->prepare(ov->privdata, didx, ov->d, key, pos);
 }
 
 /* Is 'bucket' (a link handed out as a bucket) one of dict d's own buckets? */
@@ -458,16 +456,16 @@ static kvsoWriteTarget kvsoWriteBucket(kvstore *kvs, int didx, kvstoreDictOverla
     unsigned long i;
     kvsoKeyBucket(ov, key, &t, &i);
     kvsoBucket *ob = kvsoLookup(ov, t, i);
-    kvstoreOvWindow win;
+    uint64_t pos;
     if (ob) {
         *out = ob;
         w = KVSO_W_BUCKET;
     } else if (!miss_ok && dictFind(d, key) == NULL) {
         w = KVSO_W_ABSENT;
-    } else if (kvsoPrepare(didx, ov, key, t, &win) == KVSTORE_OV_INPLACE) {
+    } else if (kvsoPrepare(didx, ov, key, &pos) == KVSTORE_OV_INPLACE) {
         w = KVSO_W_INPLACE;
     } else {
-        *out = kvsoBucketCreate(didx, ov, t, i, &win);
+        *out = kvsoBucketCreate(didx, ov, t, i, pos);
         w = KVSO_W_BUCKET;
     }
     dictResumeRehashing(d);
@@ -497,15 +495,20 @@ void kvsoDetachFromStore(dict *d) {
 }
 
 /* Owner thread: the scan has passed every position below 'below', so the
- * windows whose last bucket is below it are behind it with all their buckets. */
+ * buckets there are behind it. The slots in use, by the bitmap. */
 long kvstoreOverlayDrain(uint64_t below) {
-    for (int k = 0; k < kvso_nslots; k++)
-        if (kvso_index[k].ov && kvso_index[k].last < below) kvsoSlotWriteBack(&kvso_index[k]);
+    if (!kvso_index.count) return 0;
+    unsigned long words = (kvso_index.mask >> 6) + 1;
+    for (unsigned long w = 0; w < words; w++) {
+        for (uint64_t word = kvso_index.bits[w]; word; word &= word - 1) {
+            unsigned long s = (w << 6) + (unsigned long)__builtin_ctzll(word);
+            for (kvsoBucket *b = kvso_index.slot[s], *next; b; b = next) {
+                next = b->hnext;   /* the write-back unlinks b */
+                if (b->pos < below) kvsoWriteBack(b);
+            }
+        }
+    }
     return kvso_stats.cur;
-}
-
-int kvstoreOverlaySlotsInUse(void) {
-    return kvso_slots_used;
 }
 
 long kvstoreOverlayPending(void) {
@@ -515,8 +518,7 @@ long kvstoreOverlayPending(void) {
 /* Owner thread, after the scan of this dict is complete: write back whatever
  * is left and drop the overlay. */
 static void kvsoRelease(kvstoreDictOverlay *ov) {
-    for (int k = 0; k < kvso_nslots; k++)   /* written to the dict itself; its holder decides what becomes of it */
-        if (kvso_index[k].ov == ov) kvsoSlotWriteBack(&kvso_index[k]);
+    while (ov->buckets) kvsoWriteBack(ov->buckets);   /* written to the dict itself; its holder decides what becomes of it */
     assert(ov->nb == 0 && ov->delta == 0 && !ov->paused);
     zfree(ov);
 }
@@ -548,51 +550,31 @@ void kvstoreOverlayRelease(dict *d) {
  * bucket the dict has no entry for comes last.
  * ========================================================================== */
 
-/* The next overlayed bucket of the dict with no originals, at or after
- * offset *pos of index slot *slot; advances both. */
-static kvsoBucket *kvsoNextBare(kvstoreDictOverlay *ov, int *slot, long *pos) {
-    for (; *slot < kvso_nslots; (*slot)++, *pos = 0) {
-        kvsoSlot *s = &kvso_index[*slot];
-        if (s->ov != ov) continue;
-        for (unsigned long off = kvsoSlotNext(s, (unsigned long)*pos); off < s->n; off = kvsoSlotNext(s, off + 1)) {
-            if (!s->b[off]->norig) {
-                *pos = (long)off + 1;
-                return s->b[off];
-            }
+/* The next overlayed bucket of the dict with no originals, from bucket *it of
+ * its list (NULL: none left); advances it. */
+static kvsoBucket *kvsoNextBare(kvsoBucket **it) {
+    for (kvsoBucket *b = *it; b; b = b->onext) {
+        if (!b->norig) {
+            *it = b->onext;
+            return b;
         }
     }
+    *it = NULL;
     return NULL;
 }
 
-/* The dict's overlayed buckets one by one, from a random index slot and a
- * random offset in each slot, wrapping around; NULL at the end. */
-typedef struct { int k0, k, begun, wrapped; unsigned long start, off; } kvsoRandomWalk;
-static void kvsoRandomWalkInit(kvsoRandomWalk *rw) {
-    memset(rw, 0, sizeof(*rw));
-    rw->k0 = kvso_nslots ? (int)(random() % kvso_nslots) : 0;
+/* The dict's overlayed buckets one by one from a random one, wrapping around;
+ * NULL at the end. */
+typedef struct { kvsoBucket *b; int left; } kvsoRandomWalk;
+static void kvsoRandomWalkInit(kvstoreDictOverlay *ov, kvsoRandomWalk *rw) {
+    rw->left = ov->nb;
+    rw->b = ov->nb ? kvsoBucketAt(ov, (int)(random() % ov->nb)) : NULL;
 }
 static kvsoBucket *kvsoRandomNext(kvstoreDictOverlay *ov, kvsoRandomWalk *rw) {
-    for (; rw->k < kvso_nslots; rw->k++, rw->begun = 0) {
-        kvsoSlot *s = &kvso_index[(rw->k0 + rw->k) % kvso_nslots];
-        if (s->ov != ov) continue;
-        if (!rw->begun) {
-            rw->begun = 1;
-            rw->wrapped = 0;
-            rw->start = rw->off = (unsigned long)random() % s->n;
-        }
-        for (;;) {
-            unsigned long off = kvsoSlotNext(s, rw->off);
-            if (!rw->wrapped && off >= s->n) {   /* to the end, then from offset 0 up to the start */
-                rw->wrapped = 1;
-                rw->off = 0;
-                continue;
-            }
-            if (rw->wrapped && off >= rw->start) break;
-            rw->off = off + 1;
-            return s->b[off];
-        }
-    }
-    return NULL;
+    if (rw->left-- <= 0) return NULL;
+    kvsoBucket *b = rw->b;
+    rw->b = b->onext ? b->onext : ov->buckets;
+    return b;
 }
 
 struct kvsoScanCtx { kvstoreDictOverlay *ov; dictScanFunction *fn; void *priv; kvsoBucket *last; };
@@ -620,9 +602,8 @@ unsigned long long kvsoScan(kvstore *kvs, kvstoreDictOverlay *ov, dict *d, unsig
     struct kvsoScanCtx sctx = { ov, scan_cb, privdata, NULL };
     unsigned long long next = (d && dictSize(d)) ? dictScan(d, cursor, kvsoScanCb, &sctx) : 0;
     if (next == 0) {
-        int slot = 0;
-        long pos = 0;
-        for (kvsoBucket *ob; (ob = kvsoNextBare(ov, &slot, &pos)) != NULL;) {
+        kvsoBucket *it = ov->buckets;
+        for (kvsoBucket *ob; (ob = kvsoNextBare(&it)) != NULL;) {
             for (dictEntry *te = ob->chain; te;) {
                 dictEntry *nx = dictGetNext(te);
                 scan_cb(privdata, te, NULL);
@@ -663,7 +644,7 @@ dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, kvsoCursor
             }
             if (cur->phase == 1) { cur->phase = 0; continue; }
             /* Phase 2: the next bucket without originals. */
-            kvsoBucket *ob = kvsoNextBare(ov, &cur->slot, &cur->bucket);
+            kvsoBucket *ob = kvsoNextBare((kvsoBucket **)&cur->ob);
             if (!ob) return NULL;
             cur->next = ob->chain;
             continue;
@@ -672,8 +653,7 @@ dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, kvsoCursor
         if (!de) {
             if (!di->d) return NULL;
             cur->phase = 2;
-            cur->slot = 0;
-            cur->bucket = 0;
+            cur->ob = ov->buckets;
             cur->next = NULL;
             continue;
         }
@@ -701,7 +681,7 @@ dictEntry *kvsoIteratorNext(kvstoreDictOverlay *ov, dictIterator *di, kvsoCursor
 /* The chain head of the first non-empty overlayed bucket from a random start, or NULL. */
 static dictEntry *kvsoRandomChainHead(kvstoreDictOverlay *ov) {
     kvsoRandomWalk rw;
-    kvsoRandomWalkInit(&rw);
+    kvsoRandomWalkInit(ov, &rw);
     for (kvsoBucket *ob; (ob = kvsoRandomNext(ov, &rw)) != NULL;)
         if (ob->chain) return ob->chain;
     return NULL;
@@ -741,7 +721,7 @@ unsigned int kvsoGetSomeKeys(kvstoreDictOverlay *ov, dictEntry **des, unsigned i
     }
     if (n < count && ov->nb) {
         kvsoRandomWalk rw;
-        kvsoRandomWalkInit(&rw);
+        kvsoRandomWalkInit(ov, &rw);
         for (kvsoBucket *ob; n < count && (ob = kvsoRandomNext(ov, &rw)) != NULL;)
             for (dictEntry *te = ob->chain; te && n < count; te = dictGetNext(te)) des[n++] = te;
     }

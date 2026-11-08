@@ -200,7 +200,7 @@ struct hybsnapScanCtx {
     void **ov_priv;                 /* Per store. */
     int frozen_all;                 /* hybsnapScanFreeze() done. */
     unsigned long window_buckets;   /* copied from hybsnap_window_buckets at create: the thread's credit W */
-    unsigned long ov_block;         /* overlay windows: aligned runs of this many buckets (W rounded up to a power of two) */
+    uint64_t index_next;            /* overlay index: the dense index the next dict paused gets (hybsnapScanPauseLayout) */
     uint64_t pos_end;               /* the position past every dict: the thread's lo and cur at the end */
     uint64_t hi;                    /* main thread: its own last store of hybsnap_hi */
     uint64_t mid;                   /* main thread: the next grant is due once lo reaches this */
@@ -1148,15 +1148,19 @@ static inline hybsnapSlotState hybsnapDictStateOf(hybsnapScanCtx *ctx, dict *d);
 #define HYBSNAP_SCAN_BATCH 128                /* buckets the thread reads per announcement */
 #define HYBSNAP_SCAN_LOOKAHEAD (HYBSNAP_SCAN_PREFETCH > HYBSNAP_SCAN_PREFETCH2 ? HYBSNAP_SCAN_PREFETCH : HYBSNAP_SCAN_PREFETCH2)   /* announced past the batch for the prefetches */
 #define HYBSNAP_ADVANCE_DICTS 64              /* dicts one grant may open */
-#define HYBSNAP_OV_SLOTS_SOFT 16              /* overlay windows in use past which a section stops granting */
+/* The overlay index (kvstore_overlay.h) is sized for the buckets alive at
+ * once: those inside the credit window and the ones the thread passed since
+ * the last write-back, which comes before every raise of hi. Four W, and
+ * room for the thread's batch and lookahead when W is tiny. */
+#define HYBSNAP_INDEX_MIN_SLOTS 1024
 
 /* The credit window (hybrid_snapshot.h). Here:
  * cur is the last position of the batch the thread reads next (its prefetch
  * lookahead included), lo is stored after every bucket. hi is capped by
  * hybsnapWindowCap at section open and raised by hybsnapWindowRefill, at the
  * statement boundaries of EXEC and scripts only (hybsnapSectionGrant), each
- * time lo passes half the grant, unless HYBSNAP_OV_SLOTS_SOFT overlay windows
- * are in use. Never in the middle of a command: a key it handed out ahead of
+ * time lo passes half the grant; the overlayed buckets the thread has passed
+ * are written back first. Never in the middle of a command: a key it handed out ahead of
  * the thread (a link, a kvobj pointer) is written in place until the command
  * ends, so its bucket must stay out of the thread's reach until then.
  * The cap is a seq_cst store-load pair on each side (thread: store cur,
@@ -1259,12 +1263,12 @@ static void hybsnapWindowCap(hybsnapScanCtx *ctx) {
 }
 
 /* Main thread, at a statement boundary inside a section (hybsnapSectionGrant):
- * once the thread is half way through its grant, grant the next W buckets
- * (pausing the dicts they open). Not while many overlay windows are in use:
- * the section's drain has to come first. */
+ * once the thread is half way through its grant, write back the overlayed
+ * buckets it has passed (no caller holds a link here) and grant the next W
+ * buckets (pausing the dicts they open). */
 static void hybsnapWindowRefill(hybsnapScanCtx *ctx) {
     if (hybsnapPosLoLoad() < ctx->mid) return;
-    if (kvstoreOverlaySlotsInUse() >= HYBSNAP_OV_SLOTS_SOFT) return;
+    hybsnapSectionDrain();
     uint64_t mid, h = hybsnapWindowAdvance(ctx, hybsnapPosLoLoad(), ctx->window_buckets, &mid);
     if (h > ctx->hi) {
         ctx->hi = h;
@@ -1329,7 +1333,10 @@ static void hybsnapSectionOpen(void) {
     atomicGet(hybsnap_section_seq, v);          /* single writer: relaxed read of our own value */
     if (v & 1) return;
     atomicSetWithSync(hybsnap_section_seq, v + 1);   /* seq_cst: pairs with hybsnapWalkerQuiesce */
-    if (hybsnap_live) hybsnapWindowCap(hybsnap_live);
+    if (hybsnap_live) {
+        hybsnapSectionDrain();   /* the first hook of a command: no link is held; the passed buckets go back before the cap */
+        hybsnapWindowCap(hybsnap_live);
+    }
 }
 
 /* Main thread, between two statements of EXEC or a script, inside the
@@ -1565,8 +1572,9 @@ static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores,
     ctx->pos_end = HYBSNAP_POS(ords, 0, 0);
     ctx->hi = 0;   /* no grant until the thread starts: every bucket is ahead */
     ctx->window_buckets = hybsnap_window_buckets;
-    ctx->ov_block = 1;
-    while (ctx->ov_block < ctx->window_buckets) ctx->ov_block <<= 1;
+    unsigned long slots = HYBSNAP_INDEX_MIN_SLOTS;
+    while (slots < 4 * ctx->window_buckets) slots <<= 1;
+    kvstoreOverlayIndexInit(slots);
     ctx->gen = ++hybsnap_scan_gen;
     atomicSet(ctx->cur_slot, -1);
     ctx->dispatch = dispatch;
@@ -1600,6 +1608,11 @@ static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d, uint64_t ord) {
     sn->layout_pos = HYBSNAP_POS(ord, 0, 0);
     dictPauseRehashing(d);
     dictPauseAutoResize(d);
+    /* The dict's run of overlay index slots, one per bucket the thread reads.
+     * Dicts are paused in scan order (the cap and the grants walk it from lo),
+     * so the runs follow the scan and the buckets alive at once are packed; a
+     * pause out of order would only cost index collisions. */
+    ctx->index_next += kvstoreOverlayIndexBase(d, ctx->index_next);
 }
 
 static inline int hybsnapDictPaused(dict *d) {
@@ -2030,6 +2043,7 @@ static void hybsnapScanRelease(hybsnapScanCtx *ctx) {
     }
     for (int s = 0; s < ctx->num_stores; s++)
         serverAssert(!ctx->store[s].frozen);   /* every slot completed: the guard is already off */
+    kvstoreOverlayIndexFree();                 /* ... and every overlay released */
     for (int s = 0; s < ctx->num_stores; s++) zfree(ctx->store[s].dicts);
     if (ctx->frozen_all) hybsnapEpochEnd();
     zfree(ctx->store);
@@ -2292,10 +2306,9 @@ int hybsnapDebugCommand(client *c) {
  * bucket (table, idx) of dict d of slot (s, didx). Below lo it has read the
  * bucket; at or above hi it cannot reach it before the main thread raises hi;
  * in between it may be reading it. A dict the save holds but has not paused
- * is beyond hi as a whole. For an inside bucket and a non-NULL 'win', *win is
- * its overlay window: the aligned run of ov_block buckets around it (at most
- * the table), tagged with the position of its last bucket. */
-static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, kvstoreOvWindow *win) {
+ * is beyond hi as a whole. For an inside bucket and a non-NULL 'pos', *pos is
+ * its scan position. */
+static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int didx, dict *d, int table, unsigned long idx, uint64_t *pos) {
     hybsnapSlotState st = hybsnapScanDictStateMain(ctx, s, didx, d);
     if (st >= HYBSNAP_SLOT_SCANNED) return HYBSNAP_POS_BEHIND;
     if (st == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) return HYBSNAP_POS_AHEAD;
@@ -2304,14 +2317,7 @@ static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int di
     uint64_t p = base + idx;
     if (p < hybsnapPosLoLoad()) return HYBSNAP_POS_BEHIND;
     if (p >= ctx->hi) return HYBSNAP_POS_AHEAD;
-    if (win) {
-        unsigned long size = DICTHT_SIZE(d->ht_size_exp[table]);
-        unsigned long n = ctx->ov_block < size ? ctx->ov_block : size;
-        win->table = table;
-        win->lo = idx & ~(n - 1);
-        win->n = n;
-        win->last = base + win->lo + n - 1;
-    }
+    if (pos) *pos = p;
     return HYBSNAP_POS_INSIDE;
 }
 
@@ -2513,7 +2519,7 @@ static kvobj *hybsnapKvobjStamp(hybsnapSave *sv, int s, int didx, dict *d, dictE
  * the thread skips it; the other keys of the bucket stay for the thread, and
  * a key the write adds is newer than the fork instant (stamped at creation).
  * Behind the thread, and for a key already stamped, the write is in place. */
-static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, kvstoreOvWindow *win) {
+static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int didx, dict *d, const void *key, uint64_t *win) {
     int s = ((struct hybsnapGuardPriv *)privdata)->s;
     hybsnapSave *sv = hybsnap_save;
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
@@ -2539,8 +2545,10 @@ static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int did
 
 /* Main thread, inside a write section at a point where no caller holds a
  * link: write back the overlayed buckets the scan thread has passed, i.e.
- * those of the overlay windows wholly below lo. Called at the end of every
- * section and from cron; a no-op until lo has moved since the last drain. */
+ * those at positions below lo. Called at a section's open (before the cap),
+ * before every grant, at the end of every section and from cron, so the
+ * buckets alive at once stay within the credit window and its last grant;
+ * a no-op until lo has moved since the last drain. */
 static uint64_t hybsnap_drain_lo = 0;
 static void hybsnapSectionDrain(void) {
     hybsnapSave *sv = hybsnap_save;
@@ -5168,19 +5176,11 @@ static void hybsnapOverlayBucketTests(void) {
     zfree(st);
 }
 
-/* The window the test 'prepare' hook defers every write in: half a table
- * (the half the bucket is in), its last position ov_test_seq. */
+/* The test 'prepare' hook defers every write at position ov_test_seq. */
 static uint64_t ov_test_seq;
-static kvstoreOverlayPrepareResult ovTestPrepareHalves(void *priv, int didx, dict *d, const void *key, kvstoreOvWindow *w) {
-    UNUSED(priv); UNUSED(didx);
-    int t;
-    unsigned long i;
-    dictKeyBucket(d, key, &t, &i);
-    unsigned long half = DICTHT_SIZE(d->ht_size_exp[t]) / 2;
-    w->last = ov_test_seq;
-    w->table = t;
-    w->lo = i < half ? 0 : half;
-    w->n = half;
+static kvstoreOverlayPrepareResult ovTestPreparePos(void *priv, int didx, dict *d, const void *key, uint64_t *pos) {
+    UNUSED(priv); UNUSED(didx); UNUSED(d); UNUSED(key);
+    *pos = ov_test_seq;
     return KVSTORE_OV_DEFER;
 }
 
@@ -5199,11 +5199,11 @@ static int ovTestKeyInHalf(dict *d, int didx, int n, int upper, char *used, char
     return 0;
 }
 
-/* The index of overlayed buckets: one slot per (dict, window), a drain writes
- * back exactly the windows whose last position is below the one it is given,
- * a dict that left its store is drained like the others, and the index grows
- * past its first four slots.
- * No scan thread: a test 'prepare' hook defers every write in a window it
+/* The index of overlayed buckets by scan position: a drain writes back
+ * exactly the buckets whose position is below the one it is given, a dict
+ * that left its store is drained like the others, and many buckets of one
+ * dict drain in position order.
+ * No scan thread: a test 'prepare' hook defers every write at a position it
  * chooses. */
 static void hybsnapOverlayWindowTests(void) {
     dictType noval = KvstoreDictTestType;
@@ -5225,11 +5225,14 @@ static void hybsnapOverlayWindowTests(void) {
     struct ovTestCounters cnt = {0, 0};
     void *privs[1] = { &cnt };
     kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter,
-                               .prepare = ovTestPrepareHalves };
+                               .prepare = ovTestPreparePos };
     hybsnapScanCtx *ctx = hybsnapScanCreate(stores, 1, hybsnapTestDispatch, hybsnapTestSlotDone, st);
     st->ctx = ctx;
     hybsnapScanSetOverlay(ctx, &hooks, privs);
     hybsnapScanFreeze(ctx);
+    /* No pauses here (no scan thread): number the dicts' index runs as the pause would. */
+    uint64_t next = 0;
+    for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++) next += kvstoreOverlayIndexBase(kvstoreGetDict(ks, didx), next);
     char *used[HYBSNAP_TEST_DICTS];
     for (int didx = 0; didx < HYBSNAP_TEST_DICTS; didx++)
         used[didx] = zcalloc(DICTHT_SIZE(kvstoreGetDict(ks, didx)->ht_size_exp[0]));
@@ -5280,14 +5283,13 @@ static void hybsnapOverlayWindowTests(void) {
     unsigned long long logical = kvstoreSize(ks);
     test_cond("overlay window: scan and iteration see the logical keyspace across the windows",
               (unsigned long long)scanned == logical && (unsigned long long)iterated == logical && logical == 3ULL * N - 5);
-    test_cond("overlay window: windows 20 and 21 drain in turn",
-              kvstoreOverlaySlotsInUse() == 4 &&
+    test_cond("overlay window: positions 20 and 21 drain in turn",
               kvstoreOverlayDrain(21) == 2 && dictFind(d0, lo0) != NULL && dictFind(d0, hi0) == NULL && dictFind(d2, lo2) != NULL &&
-              kvstoreOverlayDrain(22) == 0 && dictFind(d2, lo2) == NULL && dictFind(d2, hi2) == NULL && cnt.frees == cnt.clones &&
-              kvstoreOverlaySlotsInUse() == 0);
+              kvstoreOverlayDrain(22) == 0 && dictFind(d2, lo2) == NULL && dictFind(d2, hi2) == NULL && cnt.frees == cnt.clones);
 
-    /* Ten windows at once (one bucket each in dict 3): the index grows, every
-     * bucket stays reachable, and the drain takes them in order. */
+    /* Ten buckets of dict 3, five in each half, deferred one after the other
+     * at positions 30..39: every bucket stays reachable through the index,
+     * and the drain takes them in position order, one by one. */
     char k3[10][32];
     dict *d3 = kvstoreGetDict(ks, 3);
     for (int w = 0; w < 10; w++) {
@@ -5297,13 +5299,15 @@ static void hybsnapOverlayWindowTests(void) {
     }
     int gone_all = 1;
     for (int w = 0; w < 10; w++) if (kvstoreDictFind(ks, 3, k3[w]) != NULL || dictFind(d3, k3[w]) == NULL) gone_all = 0;
-    test_cond("overlay window: ten windows hold buckets, the index grew, each delete is visible through it",
-              kvstoreOverlaySlotsInUse() == 10 && kvstoreOverlayPending() == 10 && gone_all &&
-              kvstoreDictSize(ks, 3) == (unsigned long)N - 10);
-    test_cond("overlay window: the grown index drains window by window",
-              kvstoreOverlayDrain(35) == 5 && dictFind(d3, k3[4]) == NULL && dictFind(d3, k3[5]) != NULL &&
-              kvstoreOverlayDrain(40) == 0 && kvstoreOverlaySlotsInUse() == 0 && dictSize(d3) == (unsigned long)N - 10 &&
-              cnt.frees == cnt.clones);
+    test_cond("overlay window: ten buckets of one dict are indexed, each delete is visible through the index",
+              kvstoreOverlayPending() == 10 && gone_all && kvstoreDictSize(ks, 3) == (unsigned long)N - 10);
+    long left35 = kvstoreOverlayDrain(35);   /* positions 30..34 */
+    int first_gone = 1, rest_kept = 1;
+    for (int w = 0; w < 5; w++) if (dictFind(d3, k3[w]) != NULL) first_gone = 0;
+    for (int w = 5; w < 10; w++) if (dictFind(d3, k3[w]) == NULL) rest_kept = 0;
+    test_cond("overlay window: a drain in the middle of the positions writes back exactly the buckets below it",
+              left35 == 5 && first_gone && rest_kept &&
+              kvstoreOverlayDrain(40) == 0 && dictSize(d3) == (unsigned long)N - 10 && cnt.frees == cnt.clones);
 
     hybsnapSectionClose();
     hybsnapScanAbort(ctx);
@@ -5707,7 +5711,7 @@ static void hybsnapEpochEmitAheadTests(void) {
     sv->mscratch = sdsempty();
     hybsnap_save = sv;
     struct hybsnapGuardPriv gp = { ctx, 0, NULL };
-    kvstoreOvWindow win;
+    uint64_t win;
     const int w = 2;   /* the written key */
     kvstoreOverlayPrepareResult r1 = hybsnapOverlayPrepare(&gp, 0, d, k[w], &win);
     long long emitted;

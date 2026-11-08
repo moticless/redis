@@ -44,8 +44,9 @@ typedef struct _kvstore kvstore;
 /* Snapshot overlay: an iterator's position over a frozen dict and its overlayed buckets. */
 typedef struct kvstoreOvCursor {
     int phase;                  /* 0 = frozen dict, 1 = a replaced bucket's chain, 2 = buckets the dict has no entry for */
-    int slot, last, skipn;      /* phases 1 and 2: position in the overlay's bucket chains */
+    int last, skipn;            /* phase 1: the replaced bucket ('bucket') and its originals handed out already */
     long bucket;
+    void *ob;                   /* phase 2: the overlay's next bucket to look at */
     dictEntry *next;
 } kvstoreOvCursor;
 
@@ -120,6 +121,7 @@ typedef struct {
     void *ext;
     struct kvstoreDictOverlay *ov;  /* the dict's overlay while it is frozen (kvstore_overlay.c), else NULL;
                                        main thread stores (release), scan thread loads (acquire) */
+    uint64_t ov_index_base;     /* overlay index: the dense scan index of the dict's first bucket (kvstoreOverlayIndexBase) */
 
     /* Dict identity and lifetime (set for every dict of the store). */
     int didx;                   /* the dict's index in its kvstore (for the snapshot hooks) */
