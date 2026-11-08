@@ -84,8 +84,11 @@
  * write    on DEFER the bucket is overlayed on its first write (every key of
  *          the chain through 'clone') and the write lands in the duplicate;
  *          later writes to it go there directly. Rehash and auto-resize are
- *          held while any bucket of the dict is overlayed. Logical key counts
- *          are kept as it goes.
+ *          held while any bucket of the dict is overlayed, except that the
+ *          store's dictType may let the dict grow a new table 1
+ *          (pausedExpandAllowed): table 0 keeps its buckets, a key added to
+ *          one before stays there (kvstoreOverlayKeyBucket). Logical key
+ *          counts are kept as it goes.
  * drain    the write-back of a bucket: the duplicate becomes the slot's
  *          chain, the originals are released through 'free_orig' and the
  *          original chain's nodes are freed. Rehash and auto-resize resume
@@ -134,6 +137,8 @@ void kvstoreSnapGuardSet(kvstore *kvs, const kvstoreSnapHooks *hooks, void *priv
 void kvstoreOverlayAttach(kvstore *kvs, int didx);
 int kvstoreOverlayIsFrozen(kvstore *kvs, int didx);
 void kvstoreOverlayRelease(dict *d);
+/* The bucket of 'key' in dict d (dictKeyBucket()) as the dict's overlay, if any, sees it. */
+void kvstoreOverlayKeyBucket(dict *d, const void *key, int *table, unsigned long *idx);
 /* Across every store: write back the buckets of the windows whose last position is below 'below' (returns what is left);
  * count the overlayed buckets; count the index slots in use (windows holding buckets). */
 long kvstoreOverlayDrain(uint64_t below);

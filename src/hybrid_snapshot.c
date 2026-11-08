@@ -151,6 +151,8 @@ typedef struct hybsnapScanStore {
  * generation. The overlay lives next to it (kvstoreDictMetaBase.ov). */
 typedef struct hybsnapDictState {
     int paused;                 /* rehash and auto-resize paused: hi may pass the layout (positions are stable) */
+    int rehashing;              /* the layout at the pause had a table 1; one made later holds no key the thread reads */
+    uint64_t layout_pos;        /* the dict's layout position: lo past it, the thread has read the layout */
 } hybsnapDictState;
 
 
@@ -1187,7 +1189,8 @@ static void hybsnapOrdDecode(hybsnapScanCtx *ctx, uint64_t ord, int *s, int *did
     *didx = (int)(ord - (uint64_t)ctx->store[k].ord_base);
 }
 
-static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d);
+static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d, uint64_t ord);
+static int hybsnapLayoutRehashing(dict *d);
 
 /* Main thread: the position 'budget' readable buckets after 'from' in the
  * scan order, and in *mid the one half way. Only buckets the thread will read
@@ -1215,9 +1218,9 @@ static uint64_t hybsnapWindowAdvance(hybsnapScanCtx *ctx, uint64_t from, unsigne
                 if (*mid == HYBSNAP_POS_INF) *mid = HYBSNAP_POS(ord, 0, 0);
                 return HYBSNAP_POS(ord, 0, 0);
             }
-            hybsnapScanPauseLayout(ctx, d);
+            hybsnapScanPauseLayout(ctx, d, ord);
             if (phase == 0) phase = 1, idx = 0;
-            int rehashing = dictIsRehashing(d);
+            int rehashing = hybsnapLayoutRehashing(d);   /* not a table 1 made since the pause */
             for (; phase <= (rehashing ? 2 : 1); phase++, idx = 0) {
                 unsigned long size = DICTHT_SIZE(d->ht_size_exp[phase - 1]);
                 if (phase == 1 && rehashing && idx < (unsigned long)d->rehashidx) idx = (unsigned long)d->rehashidx;
@@ -1246,7 +1249,7 @@ static void hybsnapWindowCap(hybsnapScanCtx *ctx) {
         int s, didx;
         hybsnapOrdDecode(ctx, HYBSNAP_POS_ORD(c), &s, &didx);
         dict *d = ctx->store[s].frozen ? hybsnapTableDict(ctx, s, didx) : NULL;
-        if (d && hybsnapDictStateOf(ctx, d) == HYBSNAP_SLOT_SCANNING) hybsnapScanPauseLayout(ctx, d);
+        if (d && hybsnapDictStateOf(ctx, d) == HYBSNAP_SLOT_SCANNING) hybsnapScanPauseLayout(ctx, d, hybsnapOrd(ctx, s, didx));
         h = c + 1;
         __atomic_store_n(&hybsnap_hi, h, __ATOMIC_RELEASE);
         mid = h;
@@ -1587,11 +1590,14 @@ static hybsnapDictState *hybsnapScanState(hybsnapScanCtx *ctx, dict *d) {
 /* Main thread: hold the dict's layout (table sizes, rehashidx) until its slot
  * completes. Done before the thread may read the layout (hybsnapWindowAdvance,
  * hybsnapWindowCap) and on any access while it is on the dict (guard). Works for
- * a dict that left its store: no overlay is attached here. */
-static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d) {
+ * a dict that left its store: no overlay is attached here. 'ord' is the
+ * dict's ordinal in the scan positions. */
+static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d, uint64_t ord) {
     hybsnapDictState *sn = hybsnapScanState(ctx, d);
     if (sn->paused) return;
     sn->paused = 1;
+    sn->rehashing = dictIsRehashing(d);
+    sn->layout_pos = HYBSNAP_POS(ord, 0, 0);
     dictPauseRehashing(d);
     dictPauseAutoResize(d);
 }
@@ -1599,6 +1605,28 @@ static void hybsnapScanPauseLayout(hybsnapScanCtx *ctx, dict *d) {
 static inline int hybsnapDictPaused(dict *d) {
     hybsnapDictState *sn = hybsnapMeta(d)->ext;
     return sn && sn->paused;
+}
+
+/* Main thread: does the layout the thread reads have a table 1? For a held
+ * dict, the one at the pause: a table 1 made since then is not the save's. */
+static int hybsnapLayoutRehashing(dict *d) {
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;
+    return sn && sn->paused ? sn->rehashing : dictIsRehashing(d);
+}
+
+/* dictType.pausedExpandAllowed of the keyspace (main thread). A dict whose
+ * layout the save holds may still grow into a new table 1 (rehashing stays
+ * paused, so table 0 holds still and the thread walks only the tables it saw)
+ * once the thread has read the layout: it reads it with no section open or
+ * before announcing lo past it, so a later expand cannot race that read.
+ * Table 1 then holds only keys the scan does not read: new ones, ones another
+ * dict's scan covers, and ones that left table 0 emitted or deferred first
+ * (hybsnapBucketPosition() puts it behind the thread). Overlayed buckets keep
+ * their names (table 0 is not reallocated); a key added to one before the
+ * expand stays there (kvstoreOverlayKeyBucket()). */
+int hybsnapDictPausedExpandAllowed(dict *d) {
+    hybsnapDictState *sn = hybsnapMeta(d)->ext;
+    return sn && sn->paused && !sn->rehashing && hybsnapPosLoLoad() > sn->layout_pos;
 }
 
 /* Main thread, inside a write section: attach dict (s, didx) to the scan on
@@ -1611,7 +1639,7 @@ static inline int hybsnapDictPaused(dict *d) {
 static struct kvstoreDictOverlay *hybsnapScanAttach(hybsnapScanCtx *ctx, int s, int didx, dict *d, int pause) {
     hybsnapScanState(ctx, d);
     if (ctx->has_ov && !hybsnapMeta(d)->ov) kvstoreOverlayAttach(ctx->store[s].kvs, didx);
-    if (pause) hybsnapScanPauseLayout(ctx, d);
+    if (pause) hybsnapScanPauseLayout(ctx, d, hybsnapOrd(ctx, s, didx));
     return hybsnapMeta(d)->ov;
 }
 
@@ -1728,7 +1756,9 @@ static int hybsnapScanWalkDict(hybsnapScanCtx *ctx, int s, int didx, dict *d, un
      * (hybsnapWindowAdvance), and with no limit no section is open. */
     uint64_t lp = HYBSNAP_POS(ord, 0, 0);
     if (!hybsnapScanReach(ctx, lp, lp)) return 1;
-    int rehashing = dictIsRehashing(d);   /* stable: rehashing is paused */
+    /* Stable: rehashing is paused, and a held dict grows a table 1 only once
+     * lo is past lp (hybsnapDictPausedExpandAllowed), so after this read. */
+    int rehashing = dictIsRehashing(d);
     hybsnapScanSetLo(lp + 1);
     for (int t = 0; t < (rehashing ? 2 : 1); t++) {
         unsigned long size = DICTHT_SIZE(d->ht_size_exp[t]);
@@ -2269,6 +2299,7 @@ static hybsnapBucketPos hybsnapBucketPosition(hybsnapScanCtx *ctx, int s, int di
     hybsnapSlotState st = hybsnapScanDictStateMain(ctx, s, didx, d);
     if (st >= HYBSNAP_SLOT_SCANNED) return HYBSNAP_POS_BEHIND;
     if (st == HYBSNAP_SLOT_PENDING && !hybsnapDictPaused(d)) return HYBSNAP_POS_AHEAD;
+    if (table == 1 && !hybsnapLayoutRehashing(d)) return HYBSNAP_POS_BEHIND;   /* made since the pause: not the save's */
     uint64_t base = HYBSNAP_POS(hybsnapOrd(ctx, s, didx), 1 + table, 0);
     uint64_t p = base + idx;
     if (p < hybsnapPosLoLoad()) return HYBSNAP_POS_BEHIND;
@@ -2488,7 +2519,7 @@ static kvstoreOverlayPrepareResult hybsnapOverlayPrepare(void *privdata, int did
     if (!sv || sv->aborted) return KVSTORE_OV_INPLACE;
     int table;
     unsigned long idx;
-    dictKeyBucket(d, key, &table, &idx);
+    kvstoreOverlayKeyBucket(d, key, &table, &idx);
     hybsnapBucketPos pos = hybsnapBucketPosition(sv->scan, s, didx, d, table, idx, win);
     if (pos == HYBSNAP_POS_INSIDE) return KVSTORE_OV_DEFER;
     if (pos == HYBSNAP_POS_AHEAD) {
@@ -2607,7 +2638,7 @@ int hybsnapKvobjIsPendingSave(redisDb *db, kvobj *kv) {
     hybsnapSectionOpen();   /* the cap: positions below lo stay behind, hi moves only by our hand */
     int table;
     unsigned long idx;
-    dictKeyBucket(d, key, &table, &idx);
+    kvstoreOverlayKeyBucket(d, key, &table, &idx);
     if (hybsnapBucketPosition(sv->scan, s, slot, d, table, idx, NULL) == HYBSNAP_POS_BEHIND) return 0;
     /* Emitted ahead of the thread (whatever the position now: hi may have
      * passed it since), or newer than the fork instant: the thread skips it. */
@@ -4106,6 +4137,7 @@ static void hybsnapScanTests(int accurate) {
     dictType noval = KvstoreDictTestType;
     noval.no_value = 1;
     noval.keyCompare = hybsnapTestKeyCompare;   /* the kvstore test type compares pointers */
+    noval.pausedExpandAllowed = hybsnapDictPausedExpandAllowed;   /* as the keyspace */
     kvstore *stores[HYBSNAP_TEST_STORES];
     for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
         stores[s] = kvstoreCreate(&KvstoreTestType, &noval, HYBSNAP_TEST_DICT_BITS, KVSTORE_ALLOCATE_DICTS_ON_DEMAND);
@@ -4435,6 +4467,64 @@ static void hybsnapScanTests(int accurate) {
     }
     hybsnapScanAbort(ctx);   /* frozen, never started: unfreezes */
     hybsnapScanRelease(ctx);
+
+    /* ---- A held dict grows into a new table 1: refused while the thread may
+     * still read the layout, then table 0 holds still, new keys go to table
+     * 1, which is behind the thread and not in its grants. Simulated, no
+     * thread. ---- */
+    {
+        dict *d = kvstoreGetDict(stores[1], 0);   /* 100 keys */
+        while (dictIsRehashing(d)) dictRehash(d, 1000);
+        ctx = hybsnapScanCreate(stores, HYBSNAP_TEST_STORES, hybsnapTestDispatch, hybsnapTestSlotDone, st);
+        st->ctx = ctx;
+        hybsnapScanFreeze(ctx);
+        unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]);
+        dictEntry **t0 = d->ht_table[0];
+        uint64_t o = hybsnapOrd(ctx, 1, 0), lp = HYBSNAP_POS(o, 0, 0);
+        hybsnapScanAttach(ctx, 1, 0, d, 1);                                  /* the pause, as the guard would */
+        hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_SCANNING));  /* as the thread's claim would */
+        hybsnapTestWindow(ctx, lp, lp + 1);   /* the thread may be reading the layout */
+        hybsnapSectionOpen();
+        int n = st->inserted[1][0];
+        while ((unsigned long)n < size + 8)
+            serverAssert(kvstoreDictAddRaw(stores[1], 0, hybsnapTestKey(1, 0, n++), NULL) != NULL);
+        int refused = !dictIsRehashing(d) && d->ht_used[0] == (unsigned long)n;
+        hybsnapTestWindow(ctx, lp + 1, lp + 1);   /* the layout is read; no bucket inside the window */
+        unsigned long used0 = d->ht_used[0];
+        serverAssert(kvstoreDictAddRaw(stores[1], 0, hybsnapTestKey(1, 0, n++), NULL) != NULL);
+        int grew = dictIsRehashing(d) && d->ht_table[0] == t0 && DICTHT_SIZE(d->ht_size_exp[0]) == size &&
+                   DICTHT_SIZE(d->ht_size_exp[1]) > size && d->ht_used[0] == used0 && d->ht_used[1] == 1 &&
+                   d->rehashidx == 0;
+        for (int i = 0; i < 50; i++)
+            serverAssert(kvstoreDictAddRaw(stores[1], 0, hybsnapTestKey(1, 0, n++), NULL) != NULL);
+        int t1_only = d->ht_used[0] == used0 && d->ht_used[1] == 51 && d->rehashidx == 0;
+        int t; unsigned long i1;
+        char *knew = hybsnapTestKey(1, 0, n - 1);
+        dictKeyBucket(d, knew, &t, &i1);
+        zfree(knew);
+        hybsnapBucketPos p1 = hybsnapBucketPosition(ctx, 1, 0, d, 1, i1, NULL);
+        hybsnapBucketPos p0 = hybsnapBucketPosition(ctx, 1, 0, d, 0, size - 1, NULL);
+        /* A grant over the dict counts table 0 only, then moves to the next dict. */
+        uint64_t mid, h = hybsnapWindowAdvance(ctx, HYBSNAP_POS(o, 1, 0), size + 3, &mid);
+        hybsnapSectionClose();
+        test_cond("expand while held: refused while the thread may be reading the layout", refused);
+        test_cond("expand while held: once the layout is read, the dict grows a table 1 and table 0 holds still", grew);
+        test_cond("expand while held: new keys go to table 1, none to table 0, no rehash step", t1_only && t == 1);
+        test_cond("expand while held: table 1 is behind the thread, table 0 still the save's", p1 == HYBSNAP_POS_BEHIND && p0 == HYBSNAP_POS_AHEAD);
+        test_cond("expand while held: a grant counts table 0 only", HYBSNAP_POS_ORD(h) != o);
+        hybsnapScanAbort(ctx);   /* frozen, never started: unfreezes and unpauses */
+        hybsnapScanRelease(ctx);
+        hybsnapWindowReset(NULL);
+        while (dictIsRehashing(d)) dictRehash(d, 1000);
+        int all = dictSize(d) == (unsigned long)n;
+        for (int i = 0; i < n && all; i++) {
+            char *k = hybsnapTestKey(1, 0, i);
+            if (kvstoreDictFind(stores[1], 0, k) == NULL) all = 0;
+            zfree(k);
+        }
+        st->inserted[1][0] = n;
+        test_cond("expand while held: after the release the rehash completes and every key is found", all && !dictIsRehashing(d));
+    }
 
     /* ---- Empty stores ---- */
     {

@@ -242,35 +242,134 @@ start_server {tags {"snapshot placement"} overrides {hybrid-snapshot yes save ""
             return $size
         }
 
-        test {Hybrid snapshot: keyspace dicts keep their bucket layout during a save and resize afterwards} {
+        # Table 0 and, while rehashing, table 1 of db 9's keyspace dict: {size keys ?size keys?}
+        proc snap_main_tables {} {
+            set ht [lindex [split [r debug htstats 9] {[}] 1]   ;# the [Dictionary HT] section
+            set l {}
+            foreach {-> size keys} [regexp -all -inline {table size: (\d+)\n number of elements: (\d+)} $ht] { lappend l $size $keys }
+            return $l
+        }
+
+        # Fill db 9 to just under 1:1, start a slow save and wait for the scan
+        # thread to be on the dict (past its layout); returns the table size.
+        proc snap_start_held_save {nkeys delay} {
             r flushall
-            populate_fillers 2000
+            populate_fillers $nkeys
             wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
             set size0 [snap_main_table_size]
-            assert {$size0 >= 2048}
-            r config set rdb-key-save-delay 3000   ;# 2000 keys x 3 ms: about 6 s
+            r config set rdb-key-save-delay $delay
             r bgsave
-            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
-            # the layout is locked once the thread is on the dict (stage B lets
-            # an unreached dict grow): wait for its first dispatched key, which
-            # a slow start (sanitizer builds) can otherwise delay past the adds
-            wait_for_condition 100 50 {[s snap_save_keys_nofork] + [s snap_save_keys_fork] >= 1} else { fail "scan thread did not reach the dict" }
-            # far more adds than an expand needs: with the layout locked the
-            # table must not grow or start rehashing while the thread reads it
+            wait_for_condition 50 50 {[s rdb_bgsave_in_progress] == 1} else { fail "save not started" }
+            if {[s snap_save_in_progress]} {
+                # the layout is held once the thread is on the dict: wait for its
+                # first dispatched key, which a slow start (sanitizer builds) can
+                # otherwise delay past the adds
+                wait_for_condition 100 50 {[s snap_save_keys_nofork] + [s snap_save_keys_fork] >= 1} else { fail "scan thread did not reach the dict" }
+            }
+            return $size0
+        }
+
+        snap_arena_test {Hybrid snapshot: a held keyspace dict keeps table 0 during a save and grows into a table 1 at 1:1, rehashing afterwards} {
+            # a small window: inside it written buckets are overlayed, and the
+            # dict grows only while none is
+            r debug snap-window-buckets 16
+            set size0 [snap_start_held_save 2000 3000]   ;# 2000 keys x 3 ms: about 6 s
+            assert_equal 2048 $size0
+            # far more adds than an expand needs, but short of the 4:1 that
+            # DICT_RESIZE_AVOID waits for (8000 < 4 x 2048): the tables are in
+            # the DONTFORK arena, so the dict grows as with no child, into a
+            # new table 1 while the thread keeps reading table 0
             for {set i 0} {$i < 6000} {incr i} { r set grow:$i x }
-            r debug htstats 9   ;# exercised for the "rehashing target" check below
-            assert_equal $size0 [snap_main_table_size]
-            assert {![string match "*rehashing target*" [r debug htstats 9]]}
+            lassign [snap_main_tables] s0 k0 s1 k1
             assert_equal 1 [s snap_save_in_progress]
+            assert_equal $size0 $s0
+            assert {$s1 ne "" && $s1 > $size0}
+            assert {$k1 >= 1000}   ;# the adds after the expand went to table 1
             assert_equal 8000 [r dbsize]
             r config set rdb-key-save-delay 0
             wait_hybrid_snapshot_done
             assert_equal ok [s rdb_last_bgsave_status]
-            # unfrozen: the table catches up with its 8000 keys
-            wait_for_condition 100 50 {[snap_main_table_size] > $size0 || [string match "*rehashing target*" [r debug htstats 9]]} else {
-                fail "table did not resize after the save"
+            # released: the rehash runs to the end
+            wait_for_condition 100 50 {![string match "*rehashing target*" [r debug htstats 9]] && [snap_main_table_size] > $size0} else {
+                fail "table did not finish resizing after the save"
             }
             assert_equal 8000 [r dbsize]
+            r debug snap-window-buckets 1024
+            r flushall
+        }
+
+        # The live keyspace has each grow:$i once, with value $val.
+        proc snap_assert_grow_keys {n val} {
+            for {set i 0} {$i < $n} {incr i 500} {
+                set names {}
+                for {set j $i} {$j < $i + 500 && $j < $n} {incr j} { lappend names grow:$j }
+                foreach v [r mget {*}$names] { assert_equal $val $v }
+            }
+            set keys [r keys *]
+            assert_equal [llength $keys] [llength [lsort -unique $keys]]
+            assert_equal [llength $keys] [r dbsize]
+        }
+
+        snap_arena_test {Hybrid snapshot: a held dict that grows a table 1 under adds, updates, deletes and renames saves the fork instant and keeps the live keyspace exact} {
+            r debug snap-window-buckets 16
+            r flushall
+            # 2048 buckets: about 950 adds before 1:1, some into overlayed
+            # buckets, which keep them across the expand
+            populate_fillers 1100
+            wait_for_condition 100 20 {![string match "*rehashing target*" [r debug htstats 9]]} else { fail "rehash did not finish" }
+            assert_equal 2048 [snap_main_table_size]
+            set ref [debug_digest]
+            r config set rdb-key-save-delay 4000   ;# 1100 keys x 4 ms: about 4.4 s
+            r bgsave
+            wait_for_condition 50 50 {[s snap_save_in_progress] == 1} else { fail "hybrid save not started" }
+            wait_for_condition 100 50 {[s snap_save_keys_nofork] + [s snap_save_keys_fork] >= 1} else { fail "scan thread did not reach the dict" }
+            set rd [redis_deferring_client]
+            $rd select 9
+            set n 1
+            for {set i 0} {$i < 6000} {incr i} {
+                $rd set grow:$i x; incr n
+                if {$i % 10 == 0} {
+                    set f [expr {($i / 10) % 1100}]
+                    switch [expr {($i / 10) % 4}] {
+                        0 { $rd append filler:$f y }
+                        1 { $rd del filler:$f }
+                        2 { $rd rename filler:$f renamed:$f }
+                        3 { $rd set filler:$f back }
+                    }
+                    incr n
+                }
+            }
+            # after the expand: every added key again (some still in overlayed
+            # buckets of table 0), and keys of table 0 the thread has not read
+            for {set i 0} {$i < 6000} {incr i} { $rd append grow:$i y; incr n }
+            for {set f 1} {$f < 1100} {incr f 7} { $rd append filler:$f z; incr n }
+            for {set i 0} {$i < $n} {incr i} { catch {$rd read} }
+            $rd close
+            assert_equal 1 [s snap_save_in_progress]
+            assert_match {*rehashing target*} [r debug htstats 9]
+            snap_assert_grow_keys 6000 xy
+            r config set rdb-key-save-delay 0
+            wait_hybrid_snapshot_done
+            assert_equal ok [s rdb_last_bgsave_status]
+            snap_assert_grow_keys 6000 xy   ;# after the write-back of the overlayed buckets
+            r debug reload nosave
+            assert_equal $ref [debug_digest]
+            r debug snap-window-buckets 1024
+            r flushall
+        }
+
+        test {Classic save: DICT_RESIZE_AVOID still holds while a fork child maps the tables} {
+            r config set hybrid-snapshot no
+            set size0 [snap_start_held_save 2000 3000]   ;# a classic child: 2000 keys x 3 ms
+            assert_equal 0 [s snap_save_in_progress]
+            for {set i 0} {$i < 6000} {incr i} { r set grow:$i x }
+            assert_equal 1 [s rdb_bgsave_in_progress]
+            # 8000 keys in 2048 buckets is short of 4:1: no expand with a child
+            assert_equal [list $size0 8000] [snap_main_tables]
+            wait_for_condition 100 100 {[s rdb_bgsave_in_progress] == 0} else { fail "classic save did not finish" }
+            assert_equal ok [s rdb_last_bgsave_status]
+            r config set rdb-key-save-delay 0
+            r config set hybrid-snapshot yes
             r flushall
         }
 

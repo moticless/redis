@@ -12,17 +12,15 @@
  * A point-in-time snapshot (BGSAVE, full sync, AOF rewrite, slot migration)
  * whose fork child does not map the keyspace. A classic save forks the whole
  * process: the fork stalls the main thread for its page tables, and every page
- * written during the save is copied. Here the keyspace itself (every kvobj
- * header and keyspace dict table) and every small value live in a jemalloc
- * arena marked MADV_DONTFORK. A background thread of the parent walks the
- * keyspace and serializes the small values; for each big value it sends the
- * child a copy of the key's header, and the child serializes the value from
- * its own fork-instant memory. Switch: `hybrid-snapshot`, at runtime.
+ * written during the save is copied. Here the keyspace itself (i.e. kvstore & kvobj)
+ * and every small value live in a dedicated
+ * jemalloc arena that marked with MADV_DONTFORK. A background thread of the 
+ * parent walks the keyspace and serializes the small values; for each big value 
+ * it sends the child a copy of the key's header, and the child serializes the 
+ * value from its own fork-instant memory. Switch: `hybrid-snapshot`, at runtime.
  *
- * VALUE CLASSES
- * -------------
- * A value's class (hybsnapValueClass) follows where its memory is
- * (hybsnapKeyClass):
+ * hybsnapClassify() decides a value's class from its type, encoding and
+ * allocation size; the class says where its memory is:
  *   HYBSNAP_NOFORK  one allocation (string, listpack, intset) of at most
  *                   `save-small-max-bytes`, in the arena: the scan thread
  *                   serializes it.
@@ -78,6 +76,41 @@
  * The thread waits only when it reaches hi during a long section, and once at
  * the end for an open section to close. The encoding, the grants and the
  * memory ordering: hybrid_snapshot.c, "Scan positions".
+ *
+ * THE PICTURE
+ * -----------
+ * One save in flight: the thread reads the buckets of the window [lo, hi)
+ * and the zone of the bucket a command writes decides how the write is done.
+ *
+ *   main thread              scan thread                           child
+ *   commands                 reads buckets in order within     forked once,
+ *                            [lo, hi), never at or past hi;      maps FORK
+ *                            save epoch = 7                     memory only
+ *      |                            |                                |
+ *     Pause scanned dict            |                                |
+ *      |                            |                                |     
+ *      |  BEHIND lo: already read. A write is an ordinary in-place   |
+ *      |  write:  kv1 -> "###"    kv2 -> "###" ==> kv2 -> "###'"     |
+ *  +---|------------------------------- lo-window -------------------|--------+
+ *  |   |  INSIDE [lo, hi): the thread may be reading here. A write   |        |
+ *  |   |  goes to a copy of the bucket (overlay), installed once lo  |        |
+ *  |   |  passes it; the originals stay for the thread.              |        |
+ *  |   |                            |                                |        |
+ *  | --|--- hybrid arena (MADV_DONTFORK, the child never maps it) ---|------  |
+ *  |   v                            |                                |        |
+ *  |  kv3 -> listpack \             v                                v        |
+ *  |  kv4 -> str       > NOFORK -> DUMP -> BUFFER (64KB) --small pipe+-> out  |
+ *  |  kv5 -> intset   /             |                                |        |
+ *  | --|--- forkable (default) arena --------------------------------|------  |
+ *  |   v                            v                                v        |
+ *  |  kv6 -> hash, list, stream,  kvobj header copy -------big pipe--+-> DUMP |
+ *  |   |     module types (FORK)                                     | & out  |
+ *  +---|------------------------------- hi-window -------------------|--------+
+ *      |  AHEAD of hi: not read yet. The main thread emits the key   |
+ *      |  first (NOFORK: DUMP -> BUFFER; FORK: header copy), stamps  |
+ *      |  its epoch 3 -> 7 and writes in place; the thread forwards  |
+ *      |  the record and later skips the key (epoch == 7).           |
+ *      v                                                             v
  *
  * MEMORY
  * ------
@@ -214,6 +247,10 @@ typedef struct hybsnapRdbCfg {
     int apply_key_save_delay;    /* rdb-key-save-delay applies here (classic contexts only) */
 } hybsnapRdbCfg;
 hybsnapRdbCfg hybsnapRdbCfgGet(void);
+
+/* dictType.pausedExpandAllowed of the keyspace: may a dict whose layout a save
+ * holds grow into a new table 1 now (hybrid_snapshot.c)? */
+int hybsnapDictPausedExpandAllowed(dict *d);
 
 /* ---- Hybrid snapshot: the save --------------------------------------------- */
 

@@ -125,6 +125,13 @@ typedef struct dictType {
 
     /* Ensures that the entire hash table is rehashed at once if set. */
     unsigned int force_full_rehash:1;
+    
+    /* Allocate the dict struct, bucket arrays and entry nodes in the
+     * hybrid arena (hybrid snapshot, keyspace dicts only). Frees need no
+     * special handling: the generic zfree/zrealloc are arena-aware. Kept
+     * last so that positional dictType initializers in upstream code (e.g.
+     * t_stream.c) keep their meaning. */
+    unsigned int hybrid_arena_alloc:1;
 
     /* Callback to extract key from stored-key object. When set, the dict can
      * store keys in one format (e.g., a structure) but look them up using a
@@ -155,12 +162,11 @@ typedef struct dictType {
     void *(*prefetchEntryKey)(const dictEntry *de);
     void *(*prefetchEntryValue)(const dictEntry *de);
 
-    /* Allocate the dict struct, bucket arrays and entry nodes in the
-     * hybrid arena (hybrid snapshot, keyspace dicts only). Frees need no
-     * special handling: the generic zfree/zrealloc are arena-aware. Kept
-     * last so that positional dictType initializers in upstream code (e.g.
-     * t_stream.c) keep their meaning. */
-    unsigned int hybrid_arena_alloc:1;
+    /* Optional: while automatic resizing is paused, may the dict still grow
+     * into a new ht_table[1]? Asked only when the dict is not rehashing and
+     * rehashing is paused too: table 0 then holds still (no entry moves
+     * until rehashing resumes) and new keys go to table 1. */
+    int (*pausedExpandAllowed)(dict *d);
 } dictType;
 
 #define DICTHT_SIZE(exp) ((exp) == -1 ? 0 : (unsigned long)1<<(exp))
@@ -252,7 +258,8 @@ typedef struct {
 
 typedef enum {
     DICT_RESIZE_ENABLE,
-    DICT_RESIZE_AVOID,
+    DICT_RESIZE_AVOID,        /* a fork child shares every table: resize only at the forced ratios */
+    DICT_RESIZE_AVOID_SHARED, /* avoid for dicts whose tables the child maps (not in hybrid arena) */
     DICT_RESIZE_FORBID,
 } dictResizeEnable;
 

@@ -89,6 +89,40 @@ The figure draws the overlay per key ("dup", "tomb"). The implemented overlay co
 key's whole bucket: every key of the chain is cloned, a deleted key is absent from the copy and no
 tombstone exists.*
 
+**The same picture in text**, one save in flight: the thread reads the buckets of the
+window `[lo, hi)` and the zone of the bucket a command writes decides how the write is
+done (the header comment of `src/hybrid_snapshot.h` carries this figure too).
+
+```
+  main thread              scan thread                           child
+  commands                 reads buckets in order within     forked once,
+                           [lo, hi), never at or past hi;      maps FORK
+                           save epoch = 7                     memory only
+     |                            |                                |
+     |  BEHIND lo: already read. A write is an ordinary in-place   |
+     |  write:  kv1 -> "###"    kv2 -> "###" ==> kv2 -> "###'"     |
+ +---|------------------------------- lo --------------------------|--------+
+ |   |  INSIDE [lo, hi): the thread may be reading here. A write   |        |
+ |   |  goes to a copy of the bucket (overlay), installed once lo  |        |
+ |   |  passes it; the originals stay for the thread.              |        |
+ |   |                            |                                |        |
+ |---|--- hybrid arena (MADV_DONTFORK, the child never maps it) ---|------  |
+ |   v   dict (rehash paused)     |                                |        |
+ |  kv3 -> listpack \             v                                v        |
+ |  kv4 -> str       > NOFORK -> DUMP -> BUFFER (64KB) --small pipe+-> out  |
+ |  kv5 -> intset   /             |                                |        |
+ |---|--- forkable (default) arena --------------------------------|------  |
+ |   v                            v                                v        |
+ |  kv6 -> hash, list, stream,  kvobj header copy -------big pipe--+-> DUMP |
+ |         module types (FORK)                                     | -> out |
+ +---|------------------------------- hi --------------------------|--------+
+     |  AHEAD of hi: not read yet. The main thread emits the key   |
+     |  first (NOFORK: DUMP -> BUFFER; FORK: header copy), stamps  |
+     |  its epoch 3 -> 7 and writes in place; the thread forwards  |
+     |  the record and later skips the key (epoch == 7).           |
+     v                                                             v
+```
+
 **Queues and channels.**
 
 ```

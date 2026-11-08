@@ -6066,8 +6066,8 @@ dictType idmpDictType = {
     .no_value = 0,              /* Use regular dict entries with NULL values to support defrag */
     .keys_are_odd = 0,          /* keys are not odd */
     .force_full_rehash = 0,     /* no force full rehash */
-    NULL,                       /* key from stored key */
-    NULL,                       /* on dict release */
+    .keyFromStoredKey = NULL,   /* key from stored key */
+    .onDictRelease = NULL,      /* on dict release */
 };
 
 /* Create a new idmpEntry with the given IID string.

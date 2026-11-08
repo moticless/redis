@@ -662,6 +662,7 @@ dictType dbDictType = {
     .prefetchEntryKey = dbDictPrefetchEntryKey,
     .prefetchEntryValue = dbDictPrefetchEntryValue,
     .hybrid_arena_alloc = 1,      /* hybrid snapshot: tables live in the hybrid arena */
+    .pausedExpandAllowed = hybsnapDictPausedExpandAllowed,   /* a dict the save holds may grow a table 1 */
 };
 
 /* Db->expires */
@@ -833,7 +834,10 @@ void updateDictResizePolicy(void) {
     if (server.in_fork_child != CHILD_TYPE_NONE)
         dictSetResizeEnabled(DICT_RESIZE_FORBID);
     else if (hasActiveChildProcess())
-        dictSetResizeEnabled(DICT_RESIZE_AVOID);
+        /* A child that does not map the hybrid arena (hybsnapArenaIsForkable
+         * is 0) shares only the tables outside it: dicts whose tables are all
+         * in the arena keep resizing (dict.c dictResizePolicy). */
+        dictSetResizeEnabled(hybsnapArenaIsForkable() ? DICT_RESIZE_AVOID : DICT_RESIZE_AVOID_SHARED);
     else
         dictSetResizeEnabled(DICT_RESIZE_ENABLE);
 }
@@ -1487,7 +1491,8 @@ void checkChildrenDone(void) {
                           "Warning, detected child with unmatched pid: %ld",
                           (long) pid);
             } else {
-                hybsnapArenaChildExited();
+                hybsnapArenaChildExited();   /* may restore DONTFORK under a running hybrid child */
+                updateDictResizePolicy();
             }
         }
 

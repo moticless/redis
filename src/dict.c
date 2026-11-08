@@ -41,9 +41,34 @@
  *  - A hash table is still allowed to expand if the ratio between the number
  *    of elements and the buckets >= dict_force_resize_ratio.
  *  - A hash table is still allowed to shrink if the ratio between the number
- *    of elements and the buckets <= 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio). */
+ *    of elements and the buckets <= 1 / (HASHTABLE_MIN_FILL * dict_force_resize_ratio).
+ * DICT_RESIZE_AVOID_SHARED is DICT_RESIZE_AVOID for the dicts the child shares
+ * only (dictResizePolicy). */
 static redisAtomic dictResizeEnable dict_can_resize = DICT_RESIZE_ENABLE;
 static const unsigned int dict_force_resize_ratio = 4;
+
+/* The resize policy for dict d: the global setting, except that
+ * DICT_RESIZE_AVOID_SHARED (a child that does not map the hybrid arena,
+ * updateDictResizePolicy) resolves per dict. Avoiding a resize spares the child
+ * the copy-on-write of the tables it shares with the parent; a dict whose
+ * tables are all in the arena shares nothing with it and resizes as with no
+ * child. Only a type that allocates in the arena (dictType.hybrid_arena_alloc)
+ * can have a table there, and its new table goes there too, so the address
+ * check is reached only for such dicts and is two compares per table. */
+static dictResizeEnable dictResizePolicy(dict *d) {
+    dictResizeEnable can_resize;
+    atomicGet(dict_can_resize, can_resize);
+    if (can_resize != DICT_RESIZE_AVOID_SHARED) return can_resize;
+#ifdef HAVE_HYBRID_ARENA
+    if (d->type->hybrid_arena_alloc &&
+        zmalloc_in_hybrid_arena(d->ht_table[0]) &&
+        (!d->ht_table[1] || zmalloc_in_hybrid_arena(d->ht_table[1])))
+        return DICT_RESIZE_ENABLE;
+#else
+    (void)d;
+#endif
+    return DICT_RESIZE_AVOID;
+}
 
 /* -------------------------- types ----------------------------------------- */
 struct dictEntry {
@@ -409,8 +434,7 @@ int dictRehash(dict *d, int n) {
     int empty_visits = n*10; /* Max number of empty buckets to visit. */
     unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
     unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
-    dictResizeEnable can_resize;
-    atomicGet(dict_can_resize, can_resize);
+    dictResizeEnable can_resize = dictResizePolicy(d);
     if (can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
     /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing.
      * - If expanding, the threshold is dict_force_resize_ratio which is 4.
@@ -479,8 +503,7 @@ int _dictBucketRehash(dict *d, uint64_t idx) {
     if (d->pauserehash != 0) return 0;
     unsigned long s0 = DICTHT_SIZE(d->ht_size_exp[0]);
     unsigned long s1 = DICTHT_SIZE(d->ht_size_exp[1]);
-    dictResizeEnable can_resize;
-    atomicGet(dict_can_resize, can_resize);
+    dictResizeEnable can_resize = dictResizePolicy(d);
     if (can_resize == DICT_RESIZE_FORBID || !dictIsRehashing(d)) return 0;
     /* If dict_can_resize is DICT_RESIZE_AVOID, we want to avoid rehashing.
      * - If expanding, the threshold is dict_force_resize_ratio which is 4.
@@ -1748,13 +1771,24 @@ static int dictTypeResizeAllowed(dict *d, size_t size) {
                     (double)d->ht_used[0] / DICTHT_SIZE(d->ht_size_exp[0]));
 }
 
-/* Returning DICT_OK indicates a successful expand or the dictionary is undergoing rehashing, 
+/* May a dict with automatic resizing paused (e.g. a snapshot thread reads its
+ * table and the bucket layout must not change) still grow into a new table 1?
+ * Only when the holder allows it (dictType.pausedExpandAllowed) and the expand
+ * leaves table 0 as it is: rehashing paused, so no entry moves and new keys go
+ * to table 1; table 0 not empty (the resize would free it at once); no forced
+ * full rehash. */
+static int dictPausedExpandAllowed(dict *d) {
+    return d->type->pausedExpandAllowed && !d->type->force_full_rehash &&
+           dictIsRehashingPaused(d) && d->ht_used[0] > 0 &&
+           d->type->pausedExpandAllowed(d);
+}
+
+/* Returning DICT_OK indicates a successful expand or the dictionary is undergoing rehashing,
  * and there is nothing else we need to do about this dictionary currently. While DICT_ERR indicates
  * that expand has not been triggered (may be try shrinking?)*/
 int dictExpandIfNeeded(dict *d) {
-    /* Automatic resizing is disallowed (e.g. a snapshot thread is reading the
-     * table and its bucket layout must not change). */
-    if (d->pauseAutoResize > 0) return DICT_ERR;
+    /* Automatic resizing is disallowed. */
+    if (d->pauseAutoResize > 0 && !dictPausedExpandAllowed(d)) return DICT_ERR;
 
     /* Incremental rehashing already in progress. Return. */
     if (dictIsRehashing(d)) return DICT_OK;
@@ -1768,13 +1802,14 @@ int dictExpandIfNeeded(dict *d) {
     /* If we reached the 1:1 ratio, and we are allowed to resize the hash
      * table (global setting) or we should avoid it but the ratio between
      * elements/buckets is over the "safe" threshold, we resize doubling
-     * the number of buckets. */
-    dictResizeEnable can_resize;
-    atomicGet(dict_can_resize, can_resize);
-    if ((can_resize == DICT_RESIZE_ENABLE &&
-         d->ht_used[0] >= DICTHT_SIZE(d->ht_size_exp[0])) ||
+     * the number of buckets. The ratio is tested first: it fails on nearly
+     * every insert, and the policy may cost a few compares per dict. */
+    unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]);
+    if (d->ht_used[0] < size) return DICT_ERR;
+    dictResizeEnable can_resize = dictResizePolicy(d);
+    if (can_resize == DICT_RESIZE_ENABLE ||
         (can_resize != DICT_RESIZE_FORBID &&
-         d->ht_used[0] >= dict_force_resize_ratio * DICTHT_SIZE(d->ht_size_exp[0])))
+         d->ht_used[0] >= dict_force_resize_ratio * size))
     {
         if (dictTypeResizeAllowed(d, d->ht_used[0] + 1))
             dictExpand(d, d->ht_used[0] + 1);
@@ -1803,13 +1838,14 @@ int dictShrinkIfNeeded(dict *d) {
 
     /* If we reached below 1:8 elements/buckets ratio, and we are allowed to resize
      * the hash table (global setting) or we should avoid it but the ratio is below 1:32,
-     * we'll trigger a resize of the hash table. */
-    dictResizeEnable can_resize;
-    atomicGet(dict_can_resize, can_resize);
-    if ((can_resize == DICT_RESIZE_ENABLE &&
-         d->ht_used[0] * HASHTABLE_MIN_FILL <= DICTHT_SIZE(d->ht_size_exp[0])) ||
+     * we'll trigger a resize of the hash table. The ratio is tested first
+     * (see dictExpandIfNeeded). */
+    unsigned long size = DICTHT_SIZE(d->ht_size_exp[0]);
+    if (d->ht_used[0] * HASHTABLE_MIN_FILL > size) return DICT_ERR;
+    dictResizeEnable can_resize = dictResizePolicy(d);
+    if (can_resize == DICT_RESIZE_ENABLE ||
         (can_resize != DICT_RESIZE_FORBID &&
-         d->ht_used[0] * HASHTABLE_MIN_FILL * dict_force_resize_ratio <= DICTHT_SIZE(d->ht_size_exp[0])))
+         d->ht_used[0] * HASHTABLE_MIN_FILL * dict_force_resize_ratio <= size))
     {
         if (dictTypeResizeAllowed(d, d->ht_used[0]))
             dictShrink(d, d->ht_used[0]);

@@ -241,6 +241,26 @@ static dictEntryLink kvsoChainFind(kvstoreDictOverlay *ov, kvsoBucket *ob, const
     return NULL;
 }
 
+/* The bucket of 'key' in the frozen dict as the overlay sees it. While the
+ * dict is rehashing, dictKeyBucket() maps a key to table 0 when the dict's
+ * table-0 chain holds it; for an overlayed bucket the chain that counts is
+ * the bucket's own, which may hold a key added to it before the dict grew a
+ * table 1 during the save (dictType.pausedExpandAllowed) and the dict's chain
+ * lacks. A dict rehashing when it was frozen never adds such a key: new keys
+ * go to table 1 from the start. */
+static void kvsoKeyBucket(kvstoreDictOverlay *ov, const void *key, int *table, unsigned long *idx) {
+    dict *d = ov->d;
+    dictKeyBucket(d, key, table, idx);
+    if (*table == 0 || !ov->nb) return;
+    unsigned long i0 = dictGetHash(d, key) & DICTHT_SIZE_MASK(d->ht_size_exp[0]);
+    if ((long)i0 < d->rehashidx) return;
+    kvsoBucket *ob = kvsoLookup(ov, 0, i0);
+    if (ob && kvsoChainFind(ov, ob, key)) {
+        *table = 0;
+        *idx = i0;
+    }
+}
+
 /* A new entry for stored key 'kv' at the head of the bucket's chain; returns it. */
 static dictEntry *kvsoChainPush(kvstoreDictOverlay *ov, kvsoBucket *ob, void *kv) {
     ob->chain = dictEntryCreateDetached(ov->d, kv, ob->chain);
@@ -408,6 +428,12 @@ int kvstoreOverlayIsFrozen(kvstore *kvs, int didx) {
     return kvsoOf(kvs, didx) != NULL;
 }
 
+void kvstoreOverlayKeyBucket(dict *d, const void *key, int *table, unsigned long *idx) {
+    kvstoreDictOverlay *ov = ((kvstoreDictMetaBase *)dictMetadata(d))->ov;
+    if (ov) kvsoKeyBucket(ov, key, table, idx);
+    else dictKeyBucket(d, key, table, idx);
+}
+
 /* What a write to 'key' of a frozen dict works on. */
 typedef enum kvsoWriteTarget {
     KVSO_W_INPLACE = 0,   /* the dict itself: the snapshot holds the bucket */
@@ -430,7 +456,7 @@ static kvsoWriteTarget kvsoWriteBucket(kvstore *kvs, int didx, kvstoreDictOverla
     int t;
     kvsoWriteTarget w;
     unsigned long i;
-    dictKeyBucket(d, key, &t, &i);
+    kvsoKeyBucket(ov, key, &t, &i);
     kvsoBucket *ob = kvsoLookup(ov, t, i);
     kvstoreOvWindow win;
     if (ob) {
@@ -732,7 +758,7 @@ dictEntry *kvsoDictFind(kvstoreDictOverlay *ov, void *key) {
     /* Read: the logical keyspace, no copying. */
     int t;
     unsigned long i;
-    dictKeyBucket(ov->d, key, &t, &i);
+    kvsoKeyBucket(ov, key, &t, &i);
     kvsoBucket *ob = kvsoLookup(ov, t, i);
     if (!ob) return dictFind(ov->d, key);
     dictEntryLink link = kvsoChainFind(ov, ob, key);
@@ -761,7 +787,7 @@ void kvsoDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv,
         if (!l) {
             int t;
             unsigned long i;
-            dictKeyBucket(d, key, &t, &i);
+            kvsoKeyBucket(ov, key, &t, &i);
             kvsoBucket *ob = kvsoLookup(ov, t, i);
             if (ob) {
                 l = kvsoChainFind(ov, ob, key);
@@ -780,7 +806,7 @@ void kvsoDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv,
         if (!in_dict) {
             int t;
             unsigned long i;
-            dictKeyBucket(d, key, &t, &i);
+            kvsoKeyBucket(ov, key, &t, &i);
             ob = kvsoLookup(ov, t, i);
             assert(ob != NULL);
         }
@@ -788,7 +814,7 @@ void kvsoDictSetAtLink(kvstore *kvs, int didx, kvstoreDictOverlay *ov, void *kv,
         in_dict = kvsoWriteBucket(kvs, didx, ov, key, 1, &ob) == KVSO_W_INPLACE;
     }
     if (in_dict) {
-        dictSetKeyAtLink(d, kv, link, 1);   /* no expand: auto-resize is paused */
+        dictSetKeyAtLink(d, kv, link, 1);   /* may grow a table 1 (dictType.pausedExpandAllowed) */
         kvsoKeyCountAdd(kvs, didx, 1);
     } else {
         kvsoChainPush(ov, ob, kv);
