@@ -2427,6 +2427,11 @@ void createSharedObjects(void) {
      * string in string comparisons for the ZRANGEBYLEX command. */
     shared.minstring = sdsnew("minstring");
     shared.maxstring = sdsnew("maxstring");
+
+    /* The shared objects stay in the default (forkable) arena: a child may
+     * touch them, and the hybrid child never maps the hybrid arena. They are
+     * created before hybsnapArenaInit() turns the arena on (initServer). */
+    serverAssert(!zmalloc_hybrid_arena_enabled() && !zmalloc_in_hybrid_arena(shared.ok));
 }
 
 void initServerClientMemUsageBuckets(void) {
