@@ -25,41 +25,27 @@
  * Out of memory aborts the server, unless a caller uses a ztry variant.
  *
  *
- * HYBRID ARENA
- * -----------------
- * Used by the hybrid snapshot (hybrid_snapshot.h) to keep memory out of fork
- * children. A dedicated jemalloc arena takes all its extents from ONE
- * reserved virtual address range (64 GB to 16 TB, the largest that mmap
- * grants, PROT_NONE and MAP_NORESERVE) marked MADV_DONTFORK, so a fork child
- * never maps it: what lives there costs nothing at fork() and nothing in
- * copy-on-write. 64-bit Linux with jemalloc only (HAVE_HYBRID_ARENA);
- * elsewhere the zmalloc_hybrid*() entry points are the default allocators and
- * the hybrid save runs without an arena (see hybrid_snapshot.h).
+ * ZMALLOC HYBRID ARENA
+ * --------------------
+ * Keeps memory out of fork children (hybrid snapshot, hybrid_snapshot.h).
+ * A dedicated jemalloc arena takes all its extents from ONE reserved address
+ * range (64 GB to 16 TB, PROT_NONE, MAP_NORESERVE) marked MADV_DONTFORK, so a
+ * child never maps it: no page-table copy at fork(), no copy-on-write. 64-bit
+ * Linux with jemalloc only (HAVE_HYBRID_ARENA); elsewhere zmalloc_hybrid*()
+ * are the default allocators and the hybrid save runs without an arena.
  *
- * - Ownership is an address test. The range is contiguous, so "is this block
- *   in the arena" is two compares (zmalloc_in_hybrid_arena). zfree() and zrealloc()
- *   use it to keep arena memory in the arena: a block stays there across
- *   realloc, is freed back to it and never goes through a default-arena
- *   thread cache. sds, listpack, dict and the rest need not know.
- * - New arena allocations come only from the zmalloc_hybrid*() entry points,
- *   and only while zmalloc_hybrid_arena_enabled() (hybrid-snapshot on). With the
- *   feature off they are plain zmalloc() and the layout is the classic one;
- *   blocks already in the arena still route by address.
- * - The arena's extents come from a bump pointer in the range through
- *   jemalloc extent hooks. Address space is never returned (dalloc reports
- *   failure) and decommit is reported unsupported, so jemalloc purges with
- *   MADV_DONTNEED/MADV_FREE, which keep the DONTFORK flag; an mmap(MAP_FIXED)
- *   decommit would replace the mapping and lose it.
- * - Each thread has its own explicit tcache for the arena, so arena blocks
- *   never mix with default allocations. serverCron flushes the calling
- *   thread's cache once a second (zmalloc_hybrid_arena_tcache_flush).
- * - Fork visibility is switchable. The range is DONTFORK normally; around
- *   any other fork (classic child, module fork, Lua debugger) it is flipped
- *   to MADV_DOFORK with zmalloc_hybrid_arena_set_forkable() and back when no
- *   child is left (driven by hybrid_snapshot.c).
- * - In the hybrid child the range is absent, so the kernel may hand its
- *   addresses to the child's own mmaps; the child re-reserves the range
- *   PROT_NONE first thing, so the address test keeps meaning "arena".
+ * - Ownership is an address test (zmalloc_in_hybrid_arena): zfree() and
+ *   zrealloc() keep an arena block there; sds, listpack, dict never know.
+ * - New arena allocations come only from zmalloc_hybrid*(), and only while
+ *   hybrid-snapshot is on (zmalloc_hybrid_arena_enabled); off, plain zmalloc().
+ * - DONTFORK is a flag on the mapping; the extent hooks never unmap or remap:
+ *   dalloc fails (extent retained), decommit is unsupported (jemalloc's
+ *   mmap(MAP_FIXED) would drop the flag); purge (MADV_DONTNEED/FREE) keeps it.
+ * - Per-thread tcache for the arena, flushed by serverCron once a second.
+ * - Around any other fork (classic child, module fork, Lua debugger) the range
+ *   is flipped to MADV_DOFORK and back (zmalloc_hybrid_arena_set_forkable).
+ * - The hybrid child re-reserves the range PROT_NONE first thing, so the
+ *   address test still means "arena" there.
  */
 
 #ifndef __ZMALLOC_H
@@ -94,6 +80,9 @@
 #define HAVE_MALLOC_SIZE 1
 #define zmalloc_size(p) malloc_size(p)
 #endif
+
+#include <limits.h>
+#include "config.h"   /* likely / unlikely */
 
 /* On native libc implementations, we should still do our best to provide a
  * HAVE_MALLOC_SIZE capability. This can be set explicitly as well:
@@ -190,9 +179,6 @@ void zfree_with_flags(void *ptr, int flags);
 #endif
 
 /* ---- Hybrid arena: see "HYBRID ARENA" at the top of this file. ---- */
-#include <stdint.h>
-#include <limits.h>
-#include "config.h"   /* likely / unlikely */
 #if defined(USE_JEMALLOC) && defined(__linux__) && (UINTPTR_MAX > 0xffffffffUL)
 #define HAVE_HYBRID_ARENA 1
 /* Three globals exported for the two inline hot-path checks below only (one
