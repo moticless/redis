@@ -113,16 +113,16 @@ typedef enum hybsnapSaveKind {
 
 /* Keyspace placement statistics (DEBUG SNAP-PLACEMENT, SNAP-DRIFT). */
 typedef struct hybsnapPlacementStats {
-    long long keys;
-    long long headers_in_arena;        /* every kvobj header should be here */
-    long long headers_outside;
-    long long class_nofork;            /* hybsnapKeyClass() == HYBSNAP_NOFORK */
-    long long class_fork;
-    long long drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
-    long long drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
-    long long violations;              /* header outside, or multi-allocation value inside */
-    long long dict_tables_in_arena;    /* dict structs + bucket arrays of db->keys / db->expires */
-    long long dict_tables_outside;
+    int64_t keys;
+    int64_t headers_in_arena;        /* every kvobj header should be here */
+    int64_t headers_outside;
+    int64_t class_nofork;            /* hybsnapKeyClass() == HYBSNAP_NOFORK */
+    int64_t class_fork;
+    int64_t drift_nofork_outside;    /* policy says NOFORK, value outside the arena */
+    int64_t drift_fork_inside;       /* policy says FORK (single-alloc, too big), value inside */
+    int64_t violations;              /* header outside, or multi-allocation value inside */
+    int64_t dict_tables_in_arena;    /* dict structs + bucket arrays of db->keys / db->expires */
+    int64_t dict_tables_outside;
 } hybsnapPlacementStats;
 
 /* The privdata of every kvstore hook on store s (guard, layout and overlay
@@ -192,7 +192,7 @@ struct hybsnapScanCtx {
     long slots_total;               /* fork-instant dicts (non-empty at freeze) in the scanned stores */
     redisAtomic long slots_scanned; /* dicts the thread passed */
     long slots_done;                /* claimed dicts completed. Main thread only. */
-    redisAtomic long long keys_dispatched;
+    redisAtomic int64_t keys_dispatched;
 
     /* Keyspace overlay (optional). */
     kvstoreSnapHooks hooks;         /* installed on every store: the scan's guard and layout hooks plus the user's overlay callbacks */
@@ -204,10 +204,10 @@ struct hybsnapScanCtx {
     uint64_t pos_end;               /* the position past every dict: the thread's lo and cur at the end */
     uint64_t hi;                    /* main thread: its own last store of hybsnap_hi */
     uint64_t mid;                   /* main thread: the next grant is due once lo reaches this */
-    long long grants;               /* main thread: hi raised inside a section */
-    redisAtomic long long stalls;   /* thread: times it waited for hi */
-    redisAtomic long long stall_us; /* thread: time spent waiting */
-    redisAtomic long long keys_stamped;      /* keys the thread skipped (epoch: already emitted, or newer than the fork instant) */
+    int64_t grants;               /* main thread: hi raised inside a section */
+    redisAtomic int64_t stalls;   /* thread: times it waited for hi */
+    redisAtomic int64_t stall_us; /* thread: time spent waiting */
+    redisAtomic int64_t keys_stamped;      /* keys the thread skipped (epoch: already emitted, or newer than the fork instant) */
     /* Optional hooks, set by the owner before start. */
     hybsnapScanThreadDoneFn *thread_done;   /* scan thread, after the last slot or on abort, before the scan is published as finished */
     void (*thread_init)(void *privdata);   /* first thing on the scan thread */
@@ -232,8 +232,8 @@ typedef struct hybsnapMsgHdr {
 /* records the key and expire counts at the fork instant. RDB stream must announce 
  * those counts before the keys they describe, and by then the live keyspace has changed. */
 typedef struct hybsnapDbSizes {
-    unsigned long long keys, expires;
-    unsigned long long *slot_keys, *slot_expires;   /* cluster mode */
+    uint64_t keys, expires;
+    uint64_t *slot_keys, *slot_expires;   /* cluster mode */
     int nslots;
 } hybsnapDbSizes;
 
@@ -285,18 +285,18 @@ struct hybsnapSave {
     size_t retained_peak;
     redisAtomic int key_save_delay;   /* rdb-key-save-delay, copied for the scan thread */
     int maxmemory_policy, rdb_compression;   /* config frozen at start for the scan thread */
-    long long inplace_writes;  /* writes served in place on scanned keys (main thread) */
+    int64_t inplace_writes;  /* writes served in place on scanned keys (main thread) */
     /* Scan-thread staging buffer. */
     sds stage;
     int stage_dbid, stage_slot;
-    redisAtomic long long keys_nofork, keys_fork, bytes_sent;
+    redisAtomic int64_t keys_nofork, keys_fork, bytes_sent;
     /* Cluster mode: the slots an atomic slot migration was trimming at the
      * fork instant, one bit each (NULL when none). Their keys are leaving the
      * node: the classic child skips them, reading the fork-instant copy of the
      * trim jobs, and so do the two producers here. A trim that starts during
      * the save is not in the set, as in the classic save. */
     uint8_t *trim_slots;
-    redisAtomic long long keys_skipped;
+    redisAtomic int64_t keys_skipped;
     /* Main-thread emission (emit-ahead): records the main thread serialized
      * before writing a bucket the thread had not reached. mq_lock guards
      * mq (ready messages) and mstage (the partial BUFFER of one (db, slot));
@@ -308,9 +308,9 @@ struct hybsnapSave {
     int mstage_dbid, mstage_slot;
     sds mscratch;                       /* main thread only: one record at a time */
     redisAtomic size_t mq_bytes;        /* allocation bytes of the messages in mq, not yet forwarded */
-    long long epoch_reallocs;           /* main thread only: keys given an epoch in a new allocation (no room in theirs) */
-    redisAtomic long long main_keys;    /* keys the main thread emitted ahead (read by the scan thread: their save delay is due on it) */
-    long long delayed_main_keys;        /* scan thread only: main-emitted keys it has slept the key-save delay for */
+    int64_t epoch_reallocs;           /* main thread only: keys given an epoch in a new allocation (no room in theirs) */
+    redisAtomic int64_t main_keys;    /* keys the main thread emitted ahead (read by the scan thread: their save delay is due on it) */
+    int64_t delayed_main_keys;        /* scan thread only: main-emitted keys it has slept the key-save delay for */
     /* Outbound queue: every message the scan thread produces or
      * forwards waits here for the pipe, which is written non-blockingly, so a
      * child busy inside one huge fork-class value does not stall the scan.
@@ -389,7 +389,7 @@ static inline int hybsnapScanAborted(hybsnapScanCtx *ctx);
 static void hybsnapScanFinishAll(hybsnapScanCtx *ctx);
 /* Progress counters for INFO and tests. */
 static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *slots_scanned,
-                      long *slots_done, long long *keys_dispatched);
+                      long *slots_done, int64_t *keys_dispatched);
 
 /* ---- Credit window and write sections --------------------------------- */
 
@@ -435,8 +435,8 @@ static void hybsnapOutRecycle(hybsnapSave *sv, sds m);
 
 static size_t hybsnapScanTableBytes(hybsnapScanCtx *ctx);
 /* The running save: slots and keys. */
-static void hybsnapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
-                      long long *keys_fork, long long *bytes_sent);
+static void hybsnapSaveProgress(long *slots_total, long *slots_done, int64_t *keys_nofork,
+                      int64_t *keys_fork, int64_t *bytes_sent);
 /* Retained originals (replaced or deleted) and overlayed buckets; the peak over the last save. */
 static size_t hybsnapSaveRetainedBytes(void);
 static long hybsnapSaveSideEntries(void);
@@ -448,11 +448,11 @@ static size_t hybsnapSaveLastQueuedPeak(void);
 static long hybsnapSaveRetainedDicts(void);
 /* Main-thread work: keys emitted ahead of the window, of which given an epoch in a new allocation; keys the thread
  * skipped for their epoch; in-place writes behind it (this save, last save). */
-static long long hybsnapSaveMainKeys(void);
-static long long hybsnapSaveEpochReallocs(void);
-static long long hybsnapSaveKeysStamped(void);
-static long long hybsnapSaveInplaceWrites(void);
-static long long hybsnapSaveLastInplaceWrites(void);
+static int64_t hybsnapSaveMainKeys(void);
+static int64_t hybsnapSaveEpochReallocs(void);
+static int64_t hybsnapSaveKeysStamped(void);
+static int64_t hybsnapSaveInplaceWrites(void);
+static int64_t hybsnapSaveLastInplaceWrites(void);
 
 /* ---- Defined elsewhere ------------------------------------------------ */
 
@@ -1295,7 +1295,7 @@ static uint64_t hybsnapScanReach(hybsnapScanCtx *ctx, uint64_t p, uint64_t last)
             else usleep(20);
             hi = __atomic_load_n(&hybsnap_hi, __ATOMIC_SEQ_CST);
         }
-        atomicIncr(ctx->stall_us, (long long)elapsedUs(t));
+        atomicIncr(ctx->stall_us, (int64_t)elapsedUs(t));
     }
     return hi > last ? last + 1 : hi;
 }
@@ -1365,8 +1365,8 @@ void hybsnapSectionClose(void) {
 
 /* The scan thread's waits for hi and the grants raised inside sections, of
  * the running save, else of the last one (kept at its release). */
-static struct { long long stalls, stall_us, grants; } hybsnap_last_window;
-static void hybsnapScanWindowStats(hybsnapScanCtx *ctx, long long *stalls, long long *stall_us, long long *grants) {
+static struct { int64_t stalls, stall_us, grants; } hybsnap_last_window;
+static void hybsnapScanWindowStats(hybsnapScanCtx *ctx, int64_t *stalls, int64_t *stall_us, int64_t *grants) {
     if (!ctx) {
         *stalls = hybsnap_last_window.stalls;
         *stall_us = hybsnap_last_window.stall_us;
@@ -1558,7 +1558,7 @@ static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores,
     hybsnapScanCtx *ctx = zcalloc(sizeof(*ctx));
     ctx->store = zcalloc(sizeof(hybsnapScanStore) * num_stores);
     ctx->num_stores = num_stores;
-    long long ords = 0;
+    int64_t ords = 0;
     for (int s = 0; s < num_stores; s++) {
         hybsnapScanStore *st = &ctx->store[s];
         st->kvs = stores[s];
@@ -2071,7 +2071,7 @@ static void hybsnapScanAeHandler(struct aeEventLoop *el, int fd, void *privdata,
 /* Progress for INFO / tests: dicts allocated at freeze in the scanned
  * stores, dicts the thread passed, dicts finished (completed or skipped). */
 static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *slots_scanned,
-                      long *slots_done, long long *keys_dispatched)
+                      long *slots_done, int64_t *keys_dispatched)
 {
     if (slots_total) *slots_total = ctx->slots_total;
     if (slots_scanned) atomicGet(ctx->slots_scanned, *slots_scanned);
@@ -2112,10 +2112,10 @@ static void hybsnapScanProgress(hybsnapScanCtx *ctx, long *slots_total, long *sl
 
 static size_t hybsnap_last_retained_peak = 0;
 static size_t hybsnap_last_queued_peak = 0;
-static long long hybsnap_last_inplace_writes = 0;
+static int64_t hybsnap_last_inplace_writes = 0;
 
-static long long hybsnapSaveInplaceWrites(void) { return hybsnap_save ? hybsnap_save->inplace_writes : 0; }
-static long long hybsnapSaveLastInplaceWrites(void) { return hybsnap_last_inplace_writes; }
+static int64_t hybsnapSaveInplaceWrites(void) { return hybsnap_save ? hybsnap_save->inplace_writes : 0; }
+static int64_t hybsnapSaveLastInplaceWrites(void) { return hybsnap_last_inplace_writes; }
 
 int hybsnapIsEnabled(void) { return server.hybrid_snapshot; }
 
@@ -2149,7 +2149,7 @@ size_t hybsnapSaveOverheadBytes(void) {
     size_t bytes = hybsnapSaveQueuedBytes() + sv->retained_bytes + hybsnapScanTableBytes(sv->scan);
     bytes += (size_t)sv->dbnum * sizeof(hybsnapDbSizes);
     for (int j = 0; j < sv->dbnum; j++)
-        bytes += (size_t)sv->sizes[j].nslots * 2 * sizeof(unsigned long long);
+        bytes += (size_t)sv->sizes[j].nslots * 2 * sizeof(uint64_t);
     if (sv->trim_slots) bytes += CLUSTER_SLOTS / 8;
     if (sv->slot_filter) bytes += CLUSTER_SLOTS / 8;
     return bytes;
@@ -2163,9 +2163,9 @@ static size_t hybsnapSaveQueuedBytes(void) {
     return n + o;
 }
 static size_t hybsnapSaveLastQueuedPeak(void) { return hybsnap_last_queued_peak; }
-static long long hybsnapSaveEpochReallocs(void) { return hybsnap_save ? hybsnap_save->epoch_reallocs : 0; }
-static long long hybsnapSaveKeysStamped(void) { long long n = 0; if (hybsnap_save) atomicGet(hybsnap_save->scan->keys_stamped, n); return n; }
-static long long hybsnapSaveMainKeys(void) { long long n = 0; if (hybsnap_save) atomicGet(hybsnap_save->main_keys, n); return n; }
+static int64_t hybsnapSaveEpochReallocs(void) { return hybsnap_save ? hybsnap_save->epoch_reallocs : 0; }
+static int64_t hybsnapSaveKeysStamped(void) { int64_t n = 0; if (hybsnap_save) atomicGet(hybsnap_save->scan->keys_stamped, n); return n; }
+static int64_t hybsnapSaveMainKeys(void) { int64_t n = 0; if (hybsnap_save) atomicGet(hybsnap_save->main_keys, n); return n; }
 
 
 /* ---- INFO, DEBUG and the crash report (server.c, debug.c call these) ---- */
@@ -2190,7 +2190,7 @@ sds hybsnapInfoMemory(sds info) {
 size_t hybsnapSaveKeysProcessed(size_t classic) {
     if (!hybsnapSaveIsInProgress()) return classic;
     long slots_total, slots_done;
-    long long keys_nofork, keys_fork, bytes_sent;
+    int64_t keys_nofork, keys_fork, bytes_sent;
     hybsnapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
     return (size_t)(keys_nofork + keys_fork + hybsnapSaveMainKeys());
 }
@@ -2199,39 +2199,39 @@ size_t hybsnapSaveKeysProcessed(size_t classic) {
  * peaks and the counters across saves. */
 sds hybsnapInfoPersistence(sds info) {
     long slots_total = 0, slots_done = 0;
-    long long keys_nofork = 0, keys_fork = 0, bytes_sent = 0;
+    int64_t keys_nofork = 0, keys_fork = 0, bytes_sent = 0;
     hybsnapSaveProgress(&slots_total, &slots_done, &keys_nofork, &keys_fork, &bytes_sent);
     kvstoreOverlayStats os = kvstoreOverlayStatsGet();
-    long long stalls, stall_us, grants;
+    int64_t stalls, stall_us, grants;
     hybsnapScanWindowStats(hybsnap_save ? hybsnap_save->scan : NULL, &stalls, &stall_us, &grants);
     return sdscatprintf(info, FMTARGS(
         "snap_save_in_progress:%d\r\n", hybsnapSaveIsInProgress(),
         "snap_save_slots_total:%ld\r\n", slots_total,
         "snap_save_slots_done:%ld\r\n", slots_done,
-        "snap_save_keys_nofork:%lld\r\n", keys_nofork,
-        "snap_save_keys_fork:%lld\r\n", keys_fork,
-        "snap_save_bytes_sent:%lld\r\n", bytes_sent,
+        "snap_save_keys_nofork:%" PRId64 "\r\n", keys_nofork,
+        "snap_save_keys_fork:%" PRId64 "\r\n", keys_fork,
+        "snap_save_bytes_sent:%" PRId64 "\r\n", bytes_sent,
         "snap_save_retained_bytes:%zu\r\n", hybsnapSaveRetainedBytes(),
         "snap_save_side_entries:%ld\r\n", hybsnapSaveSideEntries(),
         "snap_save_overlay_buckets:%lld\r\n", os.buckets,
         "snap_save_overlay_clones:%lld\r\n", os.clones,
         "snap_save_overlay_peak_buckets:%ld\r\n", os.peak,
         "snap_save_overlay_paused_ms:%lld\r\n", os.paused_us / 1000,
-        "snap_save_scan_stalls:%lld\r\n", stalls,
-        "snap_save_scan_stall_ms:%lld\r\n", stall_us / 1000,
-        "snap_save_window_grants:%lld\r\n", grants,
+        "snap_save_scan_stalls:%" PRId64 "\r\n", stalls,
+        "snap_save_scan_stall_ms:%" PRId64 "\r\n", stall_us / 1000,
+        "snap_save_window_grants:%" PRId64 "\r\n", grants,
         "snap_last_save_retained_peak:%zu\r\n", hybsnapSaveLastRetainedPeak(),
         "snap_save_queued_bytes:%zu\r\n", hybsnapSaveQueuedBytes(),
         "snap_last_save_queued_peak:%zu\r\n", hybsnapSaveLastQueuedPeak(),
         "snap_retained_dicts:%ld\r\n", hybsnapSaveRetainedDicts(),
-        "snap_save_main_keys:%lld\r\n", hybsnapSaveMainKeys(),
-        "snap_save_scan_stamped_keys:%lld\r\n", hybsnapSaveKeysStamped(),
-        "snap_save_epoch_reallocs:%lld\r\n", hybsnapSaveEpochReallocs(),
+        "snap_save_main_keys:%" PRId64 "\r\n", hybsnapSaveMainKeys(),
+        "snap_save_scan_stamped_keys:%" PRId64 "\r\n", hybsnapSaveKeysStamped(),
+        "snap_save_epoch_reallocs:%" PRId64 "\r\n", hybsnapSaveEpochReallocs(),
         "snap_hard_mark_aborts:%lld\r\n", server.stat_hybsnap_hard_mark_aborts,
         "snap_saves:%lld\r\n", server.stat_hybsnap_saves,
         "snap_hybrid_blocked_by:%s\r\n", moduleHybridSnapshotBlockedBy(),
-        "snap_save_inplace_writes:%lld\r\n", hybsnapSaveInplaceWrites(),
-        "snap_last_save_inplace_writes:%lld\r\n", hybsnapSaveLastInplaceWrites(),
+        "snap_save_inplace_writes:%" PRId64 "\r\n", hybsnapSaveInplaceWrites(),
+        "snap_last_save_inplace_writes:%" PRId64 "\r\n", hybsnapSaveLastInplaceWrites(),
         "snap_inplace_writes_total:%lld\r\n", server.stat_hybsnap_inplace_writes));
 }
 
@@ -2247,7 +2247,7 @@ const char *const *hybsnapCrashReportInfoSections(void) {
 
 static redisDb *hybsnapDebugDbArg(client *c) {
     if (c->argc == 2) return c->db;
-    long long dbid;
+    long long dbid;   /* getLongLongFromObjectOrReply */
     if (getLongLongFromObjectOrReply(c, c->argv[2], &dbid, NULL) != C_OK) return NULL;
     if (dbid < 0 || dbid >= server.dbnum) {
         addReplyError(c, "Out of range database");
@@ -2286,7 +2286,7 @@ int hybsnapDebugCommand(client *c) {
     }
     if (!strcasecmp(sub, "snap-window-buckets") && (c->argc == 2 || c->argc == 3)) {
         if (c->argc == 3) {
-            long long n;
+            long long n;   /* getLongLongFromObjectOrReply */
             if (getLongLongFromObjectOrReply(c, c->argv[2], &n, NULL) != C_OK) return 1;
             if (n < 1 || n > HYBSNAP_WINDOW_BUCKETS_MAX) {
                 addReplyError(c, "Out of range");
@@ -2294,7 +2294,7 @@ int hybsnapDebugCommand(client *c) {
             }
             hybsnapSetWindowBuckets((unsigned long)n);
         }
-        addReplyLongLong(c, (long long)hybsnapGetWindowBuckets());
+        addReplyLongLong(c, (int64_t)hybsnapGetWindowBuckets());
         return 1;
     }
     return 0;
@@ -2417,7 +2417,7 @@ static void hybsnapSaveEmitKey(hybsnapSave *sv, int s, int didx, kvobj *kv) {
  * emit-ahead, which must not slow the command that triggered it, so its
  * share is slept before END), in slices so an abort or CONFIG SET
  * rdb-key-save-delay 0 is seen within 10 ms. */
-static int hybsnapSaveKeyDelay(hybsnapSave *sv, long long keys) {
+static int hybsnapSaveKeyDelay(hybsnapSave *sv, int64_t keys) {
     int slept = 0;
     while (keys-- > 0 && !hybsnapScanAborted(sv->scan)) {
         int delay;
@@ -2761,8 +2761,8 @@ void hybsnapSaveCron(void) {
     killRDBChild();   /* -> hybsnapSaveAbort(): drains the overlays; the done handler releases */
 }
 
-static void hybsnapSaveProgress(long *slots_total, long *slots_done, long long *keys_nofork,
-                      long long *keys_fork, long long *bytes_sent)
+static void hybsnapSaveProgress(long *slots_total, long *slots_done, int64_t *keys_nofork,
+                      int64_t *keys_fork, int64_t *bytes_sent)
 {
     *slots_total = *slots_done = 0;
     *keys_nofork = *keys_fork = *bytes_sent = 0;
@@ -2931,7 +2931,7 @@ static int hybsnapOutEnqueue(hybsnapSave *sv, sds m, uint32_t type) {
     atomicGet(sv->mq_bytes, mqb);
     atomicGet(sv->queued_peak, peak);
     if (q + mqb > peak) atomicSet(sv->queued_peak, q + mqb);
-    atomicIncr(sv->bytes_sent, (long long)n);
+    atomicIncr(sv->bytes_sent, (int64_t)n);
     int rc = hybsnapOutDrain(sv, HYBSNAP_DRAIN_TRY, 0);
     if (rc == 0 && sv->oq_limit) {
         atomicGet(sv->oq_bytes, q);
@@ -3044,7 +3044,7 @@ static void hybsnapSaveThreadDone(void *priv, int aborted) {
          * records were forwarded as the thread went, so the drain was never
          * held back): slept here, before END, so a save of N fork-instant keys
          * still lasts N delays whoever produced the records. */
-        long long mk;
+        int64_t mk;
         atomicGet(sv->main_keys, mk);
         if (mk > sv->delayed_main_keys) {
             hybsnapSaveKeyDelay(sv, mk - sv->delayed_main_keys);
@@ -3126,7 +3126,7 @@ static int hybsnapSaveChildWrite(hybsnapSave *sv, rio *out) {
     char *bigbuf = NULL;               /* KVOBJ copies: apart from 'payload', which may hold a held buffer */
     size_t bigbuf_cap = 0;
     long key_counter = 0, msgs = 0;
-    long long info_updated_time = 0;
+    int64_t info_updated_time = 0;
     int cur_db = -1, cur_slot = -1;
     int aborted = 0;
     FILE *fp = NULL;
@@ -3319,7 +3319,7 @@ static int hybsnapSaveChildWrite(hybsnapSave *sv, rio *out) {
         if (rioWrite(rdb, payload, h.len) == 0) { err_op = "write buffer"; goto werr; }
     progress:
         if ((msgs++ & 1023) == 0) {
-            long long now = mstime();
+            int64_t now = mstime();
             if (now - info_updated_time >= 1000) {
                 sendChildInfo(CHILD_INFO_TYPE_CURRENT_INFO, key_counter, hybsnapIsAof(sv) ? "AOF rewrite" : "RDB");
                 info_updated_time = now;
@@ -3543,7 +3543,7 @@ static hybsnapSave *hybsnapSaveCreate(hybsnapSaveKind kind, int req, char *filen
         if (server.cluster_enabled) {
             int n = kvstoreNumDicts(db->keys);
             sv->sizes[j].nslots = n;
-            sv->sizes[j].slot_keys = zmalloc(sizeof(unsigned long long) * 2 * n);   /* both tables, one block */
+            sv->sizes[j].slot_keys = zmalloc(sizeof(uint64_t) * 2 * n);   /* both tables, one block */
             sv->sizes[j].slot_expires = sv->sizes[j].slot_keys + n;
             for (int didx = 0; didx < n; didx++) {
                 sv->sizes[j].slot_keys[didx] = kvstoreDictSize(db->keys, didx);
@@ -3693,7 +3693,7 @@ int hybsnapSaveEligible(int req) {
     if (req & SLAVE_REQ_RDB_EXCLUDE_DATA) return 0;
     if ((req & SLAVE_REQ_SLOTS_SNAPSHOT) && !asmMigrateInProgress()) return 0;
     /* Scan positions number every dict of every db in HYBSNAP_POS_ORD_BITS bits. */
-    if ((long long)server.dbnum * (server.cluster_enabled ? CLUSTER_SLOTS : 1) >= (1LL << HYBSNAP_POS_ORD_BITS)) {
+    if ((int64_t)server.dbnum * (server.cluster_enabled ? CLUSTER_SLOTS : 1) >= (1LL << HYBSNAP_POS_ORD_BITS)) {
         static int logged = 0;
         if (!logged) serverLog(LL_NOTICE, "Hybrid snapshot: too many databases for the scan positions, the classic child serves the save");
         logged = 1;
@@ -3880,12 +3880,12 @@ void hybsnapOnChildEnd(int exitcode, int bysignal) {
         /* The classic end-of-save line, from the side that knows the counts: the
          * keys the scan thread and the main thread produced, and the keys of
          * slots under a trim job at the fork instant that were skipped. */
-        long long nofork, fork, skipped, main;
+        int64_t nofork, fork, skipped, main;
         atomicGet(sv->keys_nofork, nofork);
         atomicGet(sv->keys_fork, fork);
         atomicGet(sv->keys_skipped, skipped);
         atomicGet(sv->main_keys, main);
-        serverLog(LL_NOTICE, "%s done, %lld keys saved, %lld keys skipped.",
+        serverLog(LL_NOTICE, "%s done, %" PRId64 " keys saved, %" PRId64 " keys skipped.",
                   hybsnapIsAof(sv) ? "AOF rewrite" : sv->slots_form ? "Slot snapshot" : "BGSAVE",
                   nofork + fork + main, skipped);
     }
@@ -4043,10 +4043,10 @@ static int hybsnapTestMappingIsDontcopy(const void *p) {
     return result;
 }
 
-static long long hybsnapTestNowNs(void) {
+static int64_t hybsnapTestNowNs(void) {
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
 }
 
 static int hybsnapTestCountMaps(void) {
@@ -4274,9 +4274,9 @@ static void hybsnapScanTests(int accurate) {
      * thread never rehashes: it only reads a layout that holds still). */
     printf("scan: mid-rehash dict %s mid-rehash when its slot completed\n", st->rehashing_at_done ? "still" : "no longer");
     {
-        long t, sc, dn; long long kd;
+        long t, sc, dn; int64_t kd;
         hybsnapScanProgress(ctx, &t, &sc, &dn, &kd);
-        printf("scan: progress total %ld scanned %ld done %ld keys %lld (empty slots %d)\n", t, sc, dn, kd, empty_slots);
+        printf("scan: progress total %ld scanned %ld done %ld keys %" PRId64 " (empty slots %d)\n", t, sc, dn, kd, empty_slots);
         test_cond("scan: progress counters consistent (the allocated dicts)",
                   t == HYBSNAP_TEST_STORES * HYBSNAP_TEST_DICTS - empty_slots && sc == t && dn == t && kd == total_keys);
     }
@@ -4295,9 +4295,9 @@ static void hybsnapScanTests(int accurate) {
     /* Wait until the thread is inside the first big slot. */
     long d0;
     do { usleep(1000); atomicGet(st->dispatched, d0); } while (d0 < 50 && !hybsnapScanIsFinished(ctx));
-    long long t0 = hybsnapTestNowNs();
+    int64_t t0 = hybsnapTestNowNs();
     hybsnapScanAbort(ctx);
-    long long abort_ms = (hybsnapTestNowNs() - t0) / 1000000;
+    int64_t abort_ms = (hybsnapTestNowNs() - t0) / 1000000;
     atomicGet(st->dispatched, dispatched);
     int aborted_slots = 0, normal_slots = 0, calls = 0, twice = 0;
     for (int s = 0; s < HYBSNAP_TEST_STORES; s++)
@@ -4307,7 +4307,7 @@ static void hybsnapScanTests(int accurate) {
             if (!st->done_calls[s][didx]) continue;   /* not reached: the save never touched it */
             if (st->done_aborted[s][didx]) aborted_slots++; else normal_slots++;
         }
-    printf("abort: after %ld dispatched keys, abort took %lld ms; %d slots aborted, %d completed normally\n",
+    printf("abort: after %ld dispatched keys, abort took %" PRId64 " ms; %d slots aborted, %d completed normally\n",
            dispatched, abort_ms, aborted_slots, normal_slots);
     test_cond("abort: stopped well before the scan would have finished", dispatched < total_keys);
     test_cond("abort: returned promptly (< 500 ms)", abort_ms < 500);
@@ -4332,7 +4332,7 @@ static void hybsnapScanTests(int accurate) {
     st->ctx = ctx;
     hybsnapSectionOpen();
     test_cond("credit: start with a write section open", hybsnapScanStart(ctx) == C_OK);
-    long long stalls = 0;
+    int64_t stalls = 0;
     for (int i = 0; i < 2000 && stalls == 0; i++) { usleep(1000); atomicGet(ctx->stalls, stalls); }
     long first;
     atomicGet(st->dispatched, first);
@@ -4346,7 +4346,7 @@ static void hybsnapScanTests(int accurate) {
     atomicGet(st->dispatched, same);
     test_cond("credit: a later hook of the same command does not raise hi", ctx->grants == 0 && same == first);
     hybsnapSectionGrant();  /* the next statement of EXEC or a script: the thread is past mid, the next 64 buckets are granted */
-    long long stalls2 = stalls;
+    int64_t stalls2 = stalls;
     for (int i = 0; i < 2000 && stalls2 == stalls; i++) { usleep(1000); atomicGet(ctx->stalls, stalls2); }
     atomicGet(st->dispatched, dispatched);
     test_cond("credit: a statement boundary inside the section raised hi, the thread read on and waits again",
@@ -4547,7 +4547,7 @@ static void hybsnapScanTests(int accurate) {
         while (!hybsnapScanIsFinished(ectx)) usleep(100);
         hybsnapScanHandleCompletions(ectx);
         atomicGet(st->dispatched, dispatched);
-        long et, esc, edn; long long ekd;
+        long et, esc, edn; int64_t ekd;
         hybsnapScanProgress(ectx, &et, &esc, &edn, &ekd);
         test_cond("empty: nothing to scan, nothing visited, zero dispatches", et == 0 && edn == 0 && esc == 0 && dispatched == 0);
         hybsnapScanRelease(ectx);
@@ -4686,7 +4686,7 @@ static void hybsnapPlacementTests(void) {
     {
         robj *o = createIntsetObject();
         uint8_t ok;
-        for (long long i = 0; i < 50; i++) o->ptr = intsetAdd(o->ptr, i * 7, &ok);
+        for (int64_t i = 0; i < 50; i++) o->ptr = intsetAdd(o->ptr, i * 7, &ok);
         kvobj *kv = kvobjSet(key, o, 0);
         test_cond("intset moved into the arena", zmalloc_in_hybrid_arena(kv->ptr) && hybsnapKeyClass(kv) == HYBSNAP_NOFORK && intsetLen(kv->ptr) == 50);
         decrRefCount(kv);
@@ -4790,7 +4790,7 @@ static void hybsnapRefcountTests(void) {
     void *privs[1] = { &cnt };
     kvstoreSnapHooks hooks = { .clone = ovTestClone, .free_orig = ovTestFree, .enter = hybsnapOverlayEnter };
     long dispatched, bad, t, sc, dn;
-    long long kd;
+    int64_t kd;
 
     /* A credit of one bucket: each save below starts inside a section, so the
      * thread reads a bucket of dict 0 per guard hook and never reaches dict 3
@@ -4963,7 +4963,7 @@ static void hybsnapOverlayTests(int abort_variant) {
     kvstoreDictTwoPhaseUnlinkFree(ks, 0, link, table);
     test_cond("overlay: deleted key is invisible", kvstoreDictFind(ks, 0, "k:0:0:7") == NULL);
     test_cond("overlay: frozen dict still holds the deleted original", dictGetKey(dictFind(frozen, "k:0:0:7")) == orig7);
-    test_cond("overlay: logical size dropped to N-1", kvstoreDictSize(ks, 0) == (unsigned long)N - 1 && kvstoreSize(ks) == (unsigned long long)N - 1);
+    test_cond("overlay: logical size dropped to N-1", kvstoreDictSize(ks, 0) == (unsigned long)N - 1 && kvstoreSize(ks) == (uint64_t)N - 1);
     test_cond("overlay: deleting a deleted key fails", kvstoreDictTwoPhaseUnlinkFind(ks, 0, "k:0:0:7", &table) == NULL &&
               kvstoreDictDelete(ks, 0, "k:0:0:7") == DICT_ERR);
 
@@ -4975,7 +4975,7 @@ static void hybsnapOverlayTests(int abort_variant) {
     kvstoreDictSetAtLink(ks, 0, readd7, NULL, 1);
     test_cond("overlay: added and re-added keys are visible",
               kvstoreDictFind(ks, 0, "k:0:0:new") && dictGetKey(kvstoreDictFind(ks, 0, "k:0:0:7")) == readd7);
-    test_cond("overlay: logical size is N+1", kvstoreDictSize(ks, 0) == (unsigned long)N + 1 && kvstoreSize(ks) == (unsigned long long)N + 1);
+    test_cond("overlay: logical size is N+1", kvstoreDictSize(ks, 0) == (unsigned long)N + 1 && kvstoreSize(ks) == (uint64_t)N + 1);
     test_cond("overlay: frozen dict does not contain the added key", dictFind(frozen, "k:0:0:new") == NULL);
     /* Add to a slot that was empty at freeze: not frozen, goes to a real dict. */
     kvstoreDictSetAtLink(ks, 3, zstrdup("k:0:3:0"), NULL, 1);
@@ -4987,7 +4987,7 @@ static void hybsnapOverlayTests(int abort_variant) {
     test_cond("overlay: kvstore iterator yields the logical keyspace (N+2 keys, add included, clone substituted)",
               n == N + 2 && has_new && e5 == clone5);
     long scanned = 0;
-    unsigned long long cursor = 0;
+    uint64_t cursor = 0;
     do { cursor = kvstoreScan(ks, cursor, -1, ovTestScanCb, NULL, &scanned); } while (cursor);
     test_cond("overlay: kvstoreScan yields the logical keyspace", scanned == N + 2);
     int bad_random = 0;
@@ -5035,7 +5035,7 @@ static void hybsnapOverlayTests(int abort_variant) {
               kvstoreGetDict(ks, 3) && dictFind(kvstoreGetDict(ks, 3), "k:0:3:0") != NULL);
     test_cond("overlay: drained sizes are consistent",
               dictSize(frozen) == (unsigned long)N + 1 && kvstoreDictSize(ks, 0) == (unsigned long)N + 1 &&
-              kvstoreSize(ks) == (unsigned long long)N + 2);
+              kvstoreSize(ks) == (uint64_t)N + 2);
     test_cond("overlay: every original of the overlayed buckets was freed", cnt.frees == cnt.clones && cnt.clones >= 2);
     has_new = 0; e5 = NULL;
     n = ovTestCountIter(ks, &has_new, &e5);
@@ -5154,7 +5154,7 @@ static void hybsnapOverlayBucketTests(void) {
         zfree(k);
     }
     memset(seen, 0, sizeof(seen));
-    unsigned long long cursor = 0;
+    uint64_t cursor = 0;
     int steps = 0;
     do {
         cursor = kvstoreScan(ks, cursor, 0, ovTestScanSeen, NULL, seen);
@@ -5276,13 +5276,13 @@ static void hybsnapOverlayWindowTests(void) {
     test_cond("overlay window: four windows hold buckets at once; a re-add lands in the overlayed bucket",
               kvstoreOverlayPending() == 4 && kvstoreDictFind(ks, 0, lo0) != NULL && kvstoreDictSize(ks, 0) == (unsigned long)N - 3);
     long scanned = 0;
-    unsigned long long cursor = 0;
+    uint64_t cursor = 0;
     do { cursor = kvstoreScan(ks, cursor, -1, ovTestScanCb, NULL, &scanned); } while (cursor);
     int has_new = 0;
     long iterated = ovTestCountIter(ks, &has_new, NULL);
-    unsigned long long logical = kvstoreSize(ks);
+    uint64_t logical = kvstoreSize(ks);
     test_cond("overlay window: scan and iteration see the logical keyspace across the windows",
-              (unsigned long long)scanned == logical && (unsigned long long)iterated == logical && logical == 3ULL * N - 5);
+              (uint64_t)scanned == logical && (uint64_t)iterated == logical && logical == 3ULL * N - 5);
     test_cond("overlay window: positions 20 and 21 drain in turn",
               kvstoreOverlayDrain(21) == 2 && dictFind(d0, lo0) != NULL && dictFind(d0, hi0) == NULL && dictFind(d2, lo2) != NULL &&
               kvstoreOverlayDrain(22) == 0 && dictFind(d2, lo2) == NULL && dictFind(d2, hi2) == NULL && cnt.frees == cnt.clones);
@@ -5396,7 +5396,7 @@ static void hybsnapOverlayRehashTests(void) {
 
     /* A scan that spans the write-back returns every key that was there throughout. */
     memset(seen, 0, sizeof(seen));
-    unsigned long long cursor = 0;
+    uint64_t cursor = 0;
     int steps = 0;
     do {
         cursor = kvstoreScan(ks, cursor, 0, ovTestScanSeen, NULL, seen);
@@ -5640,7 +5640,7 @@ static void hybsnapEpochScanTests(void) {
         if (et->seen[i] != expect) ok = 0;
     }
     int bad, dispatched;
-    long long skipped;
+    int64_t skipped;
     atomicGet(et->bad, bad);
     atomicGet(et->dispatched, dispatched);
     atomicGet(ctx->keys_stamped, skipped);
@@ -5714,7 +5714,7 @@ static void hybsnapEpochEmitAheadTests(void) {
     uint64_t win;
     const int w = 2;   /* the written key */
     kvstoreOverlayPrepareResult r1 = hybsnapOverlayPrepare(&gp, 0, d, k[w], &win);
-    long long emitted;
+    int64_t emitted;
     atomicGet(sv->main_keys, emitted);
     /* One record: in the stage (a small value) or a header copy message (a fork-class value). */
     size_t staged = sdslen(sv->mstage);
@@ -5731,7 +5731,7 @@ static void hybsnapEpochEmitAheadTests(void) {
               hybsnapBucketPosition(ctx, 0, 0, d, 0, 0, NULL) == HYBSNAP_POS_AHEAD);
     test_cond("emit-ahead: a write to one key of a multi-key bucket emits that key alone and stamps it",
               r1 == KVSTORE_OV_INPLACE && emitted == 1 && one_record && stamped_only_w);
-    long long inplace0 = sv->inplace_writes;
+    int64_t inplace0 = sv->inplace_writes;
     kvstoreOverlayPrepareResult r2 = hybsnapOverlayPrepare(&gp, 0, d, k[w], &win);
     kvstoreOverlayPrepareResult r3 = hybsnapOverlayPrepare(&gp, 0, d, k[HYBSNAP_TEST_BUCKET_KEYS], &win);   /* an insert */
     atomicGet(sv->main_keys, emitted);
@@ -5745,7 +5745,7 @@ static void hybsnapEpochEmitAheadTests(void) {
     int ok = 1, bad, dispatched;
     for (int i = 0; i < HYBSNAP_TEST_BUCKET_KEYS; i++)
         if (et->seen[i] != (i != w)) ok = 0;
-    long long skipped;
+    int64_t skipped;
     atomicGet(et->bad, bad);
     atomicGet(et->dispatched, dispatched);
     atomicGet(ctx->keys_stamped, skipped);
@@ -5927,7 +5927,7 @@ int hybsnapTest(int argc, char **argv, int flags) {
     {
         const int N = accurate ? 5000000 : 1000000;
         void **a = zmalloc(sizeof(void*) * N);
-        long long t0, t1;
+        int64_t t0, t1;
 
         t0 = hybsnapTestNowNs();
         for (int i = 0; i < N; i++) { void *x = zmalloc(64); zfree(x); }
