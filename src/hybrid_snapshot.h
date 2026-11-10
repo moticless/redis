@@ -7,39 +7,42 @@
  * GNU Affero General Public License v3 (AGPLv3).
  *
  *
- * HYBRID SNAPSHOT
- * ---------------
- * Unlike classic save that forks the whole process with all the implications, a 
- * hybrid save/snapshot (Switch: `hybrid-snapshot`, at runtime), which includes 
- * BGSAVE, full sync, AOF rewrite and slot migration, uses dedicated jemalloc 
- * arena that marked with MADV_DONTFORK to allocate:
- * - Small keys with single allocation (string, listpack, intset)
- * - kvstore 
- * - kvobj (headers)
- * 
- * A background thread of the parent walks the kvstore and serializes the small 
- * values. And as for each big values it sends the child a copy of the key's header, 
- * and the child serializes the value from its own fork-instant memory.
+ * WHAT IS HYBRID SNAPSHOT
+ * -----------------------
+ * A classic save forks the whole process: every page table is mapped at
+ * fork() and every page the parent then writes triggers CoW. A hybrid
+ * save (`hybrid-snapshot`, switchable at runtime; BGSAVE, full sync, AOF
+ * rewrite and slot migration) keeps most of the keyspace out of the child.
+ * Small values held in one allocation (string, listpack, intset), the kvobj
+ * headers and the kvstore itself live in a dedicated jemalloc arena marked
+ * MADV_DONTFORK, which the child never maps.
+ *
+ * The work splits by value: a background thread of the parent walks the
+ * kvstore, serializes the small values itself and forwards serialization to
+ * the child. For each big value it sends the child a copy of the key's header
+ * and the child serializes the value from its own fork-instant memory. Fork
+ * cost and copy-on-write follow the big values only.
+ *
  *
  * HYBRID SNAPSHOT FLOW
  * --------------------
  * Without copy-on-write the parent must keep what the thread has not read yet
  * unchanged while commands keep writing. One save, step by step:
  *
- *   1. Freeze (the fork instant). The save installs its hooks on the keyspace
- *      stores (kvstoreSnapGuardSet), takes a reference to every dict, stamps
- *      it with the save's generation and bumps the save epoch. Nothing is
- *      copied.
+ *   1. Freeze (the fork instant). The main thread installs its hooks on the
+ *      keyspace stores (kvstoreSnapGuardSet), takes a reference to every
+ *      dict, stamps it with the save's generation and bumps the save epoch.
+ *      Nothing is copied.
  *
- *   2. Fork. The child maps the FORK values only; the hybrid arena is
+ *   2. Fork. The child maps the FORK (big) values only; the hybrid arena is
  *      MADV_DONTFORK.
  *
- *   3. Scan. The thread reads buckets in a fixed order. Every bucket has a
- *      position (store, dict, table, bucket as one integer); the thread
- *      publishes lo, every position below it is read, and never reads at or
- *      past a limit hi the main thread sets. NOFORK keys go out in 64 KB
- *      buffers (small channel), FORK keys as header copies (big channel); the
- *      child drains the small one first.
+ *   3. Scan. The scan background thread reads buckets in a fixed order. Every
+ *      bucket has a position (db, dict, table, bucket, packed as one integer);
+ *      the thread publishes lo, every position below it is read, and never
+ *      reads at or past a limit hi the main thread sets. NOFORK keys go out in
+ *      64 KB buffers (small channel), FORK keys as header copies (big channel);
+ *      the child drains the small one first.
  *
  *   4. Write during the scan. The main thread touches the keyspace only
  *      inside a write section: opened by a command's first access to a frozen
@@ -88,8 +91,8 @@
  *
  * ENTRY POINTS
  * ------------
- * Usage: if (hybsnapSaveEligible(req))  
- *           rdbSaveBackground()                 // opt1        
+ * Usage: if (hybsnapSaveEligible(req))
+ *           rdbSaveBackground()                 // opt1
  *           rdbSaveToSlavesSockets()            // opt2
  *           rewriteAppendOnlyFileBackground()   // opt3
  *
@@ -107,7 +110,7 @@
  * kvstore_overlay.h   the overlay: its contract and design; kvstore_overlay.c
  *                     its implementation
  * zmalloc.c           the arena
- * 
+ *
  * Functions here are prefixed "hybsnap".
  */
 
@@ -119,16 +122,12 @@
 #include "sds.h"
 #include "intset.h"
 
-/* Key classes: the class of a key's VALUE allocation (headers are always in the arena). */
 typedef enum hybsnapValueClass {
-    HYBSNAP_NOFORK = 0,   /* Value in the hybrid arena; serialized by the scan thread. */
-    HYBSNAP_FORK   = 1,   /* Value in forkable memory; serialized by the fork child. */
+    HYBSNAP_NOFORK = 0,   /* Value in the hybrid arena - serialized by the scan thread. */
+    HYBSNAP_FORK   = 1,   /* Value in forkable memory  - serialized by the fork child. */
 } hybsnapValueClass;
 
-struct listpackEx;
-struct aeEventLoop;
-
-/* ---- hybrid arena (can toggle forkable or not)----------------------------- */
+/* ---- hybrid arena (can be toggled forkable or not) ----------------------- */
 
 /* If supported create the arena: once, main thread, before the first zmalloc_hybrid*() */
 void hybsnapArenaInit(void);
