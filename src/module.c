@@ -15294,30 +15294,15 @@ size_t moduleCount(void) {
  * ## Key eviction API
  * -------------------------------------------------------------------------- */
 
-/* RM_SetLRU / RM_SetLFU write the kvobj header, which the hybrid snapshot scan
- * thread reads for the IDLE / FREQ opcodes while the key is pending save. A
- * handle opened with REDISMODULE_WRITE already went through the write funnel
- * at open time; a READ handle (the documented way to set the idle time
- * without touching it first, READ|NOTOUCH) is handed over here: the write
- * lookup emits or clones its bucket, and the pointer is refreshed since
- * a clone replaces the frozen original. Returns 0 when there is no key. */
-static int moduleKeyPrepareLruWrite(RedisModuleKey *key) {
-    if (!key->kv) return 0;
-    if (key->mode & REDISMODULE_WRITE) return 1;
-    /* A READ handle: during a hybrid snapshot a key pending save goes through the
-     * write funnel first, as a WRITE handle did at open time. */
-    kvobj *kv = hybsnapPrepareMutation(key->db, key->key, key->kv);
-    if (!kv) return 0;
-    key->kv = kv;
-    return 1;
-}
-
 /* Set the key last access time for LRU based eviction. not relevant if the
  * servers's maxmemory policy is LFU based. Value is idle time in milliseconds.
  * returns REDISMODULE_OK if the LRU was updated, REDISMODULE_ERR otherwise. */
 int RM_SetLRU(RedisModuleKey *key, mstime_t lru_idle) {
-    if (!moduleKeyPrepareLruWrite(key))
+    if (!key->kv)
         return REDISMODULE_ERR;
+    /* Written in place even on a READ handle during a hybrid snapshot: the
+     * scan thread may read the header meanwhile, and the only effect is the
+     * IDLE / FREQ the save records for this key. */
     if (objectSetLRUOrLFU(key->kv, -1, lru_idle, lru_idle>=0 ? LRU_CLOCK() : 0, 1))
         return REDISMODULE_OK;
     return REDISMODULE_ERR;
@@ -15343,7 +15328,7 @@ int RM_GetLRU(RedisModuleKey *key, mstime_t *lru_idle) {
  * the access frequencyonly (must be <= 255).
  * returns REDISMODULE_OK if the LFU was updated, REDISMODULE_ERR otherwise. */
 int RM_SetLFU(RedisModuleKey *key, long long lfu_freq) {
-    if (!moduleKeyPrepareLruWrite(key))
+    if (!key->kv)
         return REDISMODULE_ERR;
     if (objectSetLRUOrLFU(key->kv, lfu_freq, -1, 0, 1))
         return REDISMODULE_OK;

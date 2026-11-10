@@ -2670,7 +2670,7 @@ start_server {tags {"snapshot modules external:skip"} overrides {hybrid-snapshot
         assert_equal {} [s snap_hybrid_blocked_by]
     }
 
-    test {Hybrid snapshot modules: RM_SetLRU and RM_SetLFU on a READ handle go through the write funnel during a save} {
+    test {Hybrid snapshot modules: RM_SetLRU and RM_SetLFU on a READ handle write in place during a save} {
         r flushall
         r set plain v
         populate 3000 k: 40
@@ -2679,8 +2679,8 @@ start_server {tags {"snapshot modules external:skip"} overrides {hybrid-snapshot
         r bgsave
         snap_wait_save_started
         # [SetLRU read, SetLRU write, SetLFU read, SetLFU write] under the LRU
-        # policy: both handles succeed, the READ one after the funnel emitted or
-        # cloned the key (a WRITE handle did that at open time)
+        # policy: both handles succeed while the key is pending save; the LRU
+        # is written in place, the save still completes and the data matches
         r config set maxmemory-policy allkeys-lru
         assert_equal {1 1 0 0} [r hv.setlru plain]
         assert {[r object idletime plain] >= 1}

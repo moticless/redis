@@ -248,10 +248,11 @@ the layout of its 64th dict.
 - A dict claimed by the thread while `hi` was unlimited is paused at the next section's cap (it
   finds the thread there), by `advance` (it enters the dict), or by the guard (an access to a
   SCANNING dict pauses it); the main thread touched no frozen dict in between.
-- In-place header writes outside the funnel do not happen during a hybrid save: the LRU/LFU touch
-  in `lookupKey` is skipped while a child exists (the save's writer child counts), and the
-  in-place writes of read commands (`PFCOUNT`'s cache, `RM_SetLRU` on a READ handle) go through the
-  funnel (`hybsnapPrepareMutation`).
+- In-place writes outside the funnel: the LRU/LFU touch in `lookupKey` is skipped while a child
+  exists (the save's writer child counts), and `PFCOUNT`'s cache write goes through the funnel
+  (`hybsnapPrepareMutation`). The one exception is `RM_SetLRU` / `RM_SetLFU` on a READ handle,
+  which writes the header's LRU field in place while the scan thread may read it: the only effect
+  is the IDLE / FREQ the save records for that key (Valkey's forkless save does the same).
 - **Abort**: the thread's wait for `hi` checks for an abort, as does its final wait.
 - **Module threads** holding the GIL open, grant and close sections exactly as the main thread
   does; the GIL serializes them with it.
@@ -393,7 +394,7 @@ What happens when something else touches the keyspace or the child during a hybr
 | active defrag | off while a child exists (classic rule); the arena's tcache is flushed once a second by cron | yes |
 | key expiry and eviction | active expiry and eviction continue; deletes go through the funnel; LRU/LFU updates on lookups are skipped while a child exists | yes |
 | hash-field expiry | active field expiry is suspended for the save; lazy field expiry and `HRANDFIELD` skip deletion on keys pending save (expired fields are invisible, not deleted, as on a replica) | hybrid-specific |
-| `RM_SetLRU` / `RM_SetLFU` on a READ handle | routed through the write funnel first | hybrid-specific |
+| `RM_SetLRU` / `RM_SetLFU` on a READ handle | written in place; the save may record the new idle time or frequency | hybrid-specific |
 | `PFCOUNT` cache write on a key pending save | re-enters through the write path | hybrid-specific |
 | SHUTDOWN | kills the child; the hybrid abort runs through `killRDBChild` | yes |
 | child killed or crashed | the done handler aborts the scan, joins the thread, releases every state; the previous dump is untouched; a child crash report skips the keyspace sections it cannot read | yes |

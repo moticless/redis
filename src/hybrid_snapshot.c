@@ -2657,9 +2657,9 @@ int hybsnapKvobjIsPendingSave(redisDb *db, kvobj *kv) {
     return l && dictGetKV(*l) == kv;
 }
 
-/* A read-path command about to write 'kv' in place (PFCOUNT's cache, a module
- * setting LRU/LFU through a READ handle): if the object is pending save, take the key
- * through the write funnel (a write lookup that emits or clones its bucket)
+/* A read-path command about to write 'kv' in place (PFCOUNT's cache): if the
+ * object is pending save, take the key through the write funnel (a write
+ * lookup that emits or clones its bucket)
  * and return the object to write, which may be the clone; else 'kv'. NULL
  * only if the key is gone. */
 kvobj *hybsnapPrepareMutation(redisDb *db, robj *key, kvobj *kv) {
