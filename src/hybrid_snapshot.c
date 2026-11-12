@@ -171,7 +171,8 @@ struct hybsnapScanCtx {
                                        by the main thread or born after the fork instant, and the thread skips it */
     int skip_stamped;               /* the keys are kvobjs and the thread skips the stamped ones (set by the owner before
                                        start; the server keyspace; the unit tests' plain string keys have no epoch) */
-    const uint8_t *slot_filter;     /* cluster mode, optional: freeze and scan only the slots whose bit is set (a slot snapshot) */
+    const slotRangeArray *slot_ranges;   /* cluster mode, optional: freeze and scan only these slots (a slot snapshot);
+                                            borrowed, read by the freeze only, cleared after it */
 
     hybsnapScanDispatchFn *dispatch;
     hybsnapScanSlotDoneFn *slot_done;
@@ -254,7 +255,6 @@ typedef struct hybsnapShared {
 struct hybsnapSave {
     hybsnapScanCtx *scan;
     void *tables;              /* one block: stores, flushed and sizes below, each dbnum entries */
-    void *bitmaps;             /* cluster mode, one block: slot_filter then trim_slots, CLUSTER_SLOTS bits each; NULL when neither is used */
     kvstore **stores;          /* per store (db id at the fork instant): the kvstore being scanned */
     hybsnapFlushedDb *flushed;    /* per store */
     int dbnum;
@@ -273,7 +273,6 @@ struct hybsnapSave {
     int aof_cmd_form;          /* CHILD_TYPE_AOF without the RDB preamble: records are AOF commands, not RDB pairs */
     int slots_form;            /* atomic slot migration's slot snapshot (SLAVE_REQ_SLOTS_SNAPSHOT): records are
                                   RESTORE commands from DUMP payloads (cluster_asm.c), the stream is RESP, no RDB framing */
-    uint8_t *slot_filter;      /* slots_form: the migrating slots at the fork instant (CLUSTER_SLOTS bits); only they are frozen and scanned */
     char *filename;
     rdbSaveInfo rsi;
     int has_rsi;
@@ -369,7 +368,7 @@ static hybsnapScanCtx *hybsnapScanCreate(kvstore **stores, int num_stores, hybsn
 /* Before start: the keyspace overlay callbacks (clone, free_orig, enter, prepare). */
 static void hybsnapScanSetOverlay(hybsnapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata);
 /* Before start, cluster mode: freeze and scan only the slots whose bit is set (CLUSTER_SLOTS bits, must outlive the scan). */
-static void hybsnapScanSetSlotFilter(hybsnapScanCtx *ctx, const uint8_t *bitmap);
+static void hybsnapScanSetSlotRanges(hybsnapScanCtx *ctx, const slotRangeArray *ranges);
 /* Main thread: freeze every store (the fork instant), then, after the fork, spawn the thread; C_OK / C_ERR. */
 static void hybsnapScanFreeze(hybsnapScanCtx *ctx);
 static int hybsnapScanStartThread(hybsnapScanCtx *ctx);
@@ -1519,13 +1518,14 @@ static size_t hybsnapScanTableBytes(hybsnapScanCtx *ctx) {
  * own. Every hook of store s receives the store's hybsnapGuardPriv, whose 'user'
  * field is 'store_privdata[s]' (NULL array: NULL). Must be called before
  * hybsnapScanFreeze(). */
-/* Before start: restrict the scan to the slots whose bit is set (cluster
- * mode; the bitmap must outlive the scan). Dicts outside the set are never
- * frozen: the guard treats them as not the save's, so their writes are plain
- * writes, and the thread's pass never visits them. */
-static void hybsnapScanSetSlotFilter(hybsnapScanCtx *ctx, const uint8_t *bitmap) {
-    serverAssert(!ctx->started);
-    ctx->slot_filter = bitmap;
+/* Before the freeze: restrict the scan to these slots (cluster mode). Only the
+ * freeze reads them, and it clears the pointer, so 'ranges' must stay valid
+ * until then only. Dicts outside the set are never frozen: the guard treats
+ * them as not the save's, so their writes are plain writes, and the thread's
+ * pass never visits them. */
+static void hybsnapScanSetSlotRanges(hybsnapScanCtx *ctx, const slotRangeArray *ranges) {
+    serverAssert(!ctx->started && !ctx->frozen_all);
+    ctx->slot_ranges = ranges;
 }
 
 static void hybsnapScanSetOverlay(hybsnapScanCtx *ctx, const kvstoreSnapHooks *hooks, void **store_privdata)
@@ -1695,14 +1695,22 @@ static void hybsnapScanFreezeStore(hybsnapScanCtx *ctx, int s) {
     if (kvstoreSize(kvs) == 0) return;
     int n = st->num_dicts;
     st->dicts = zcalloc(sizeof(dict *) * n);
-    for (int didx = 0; didx < n; didx++) {
-        if (ctx->slot_filter && !(ctx->slot_filter[didx >> 3] & (1u << (didx & 7)))) continue;   /* not ours: a plain dict throughout */
-        dict *d = kvstoreGetDict(kvs, didx);
-        if (!d || dictSize(d) == 0) continue;
-        kvstoreDictRetain(kvs, didx);
-        hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_PENDING));
-        st->dicts[didx] = d;
-        st->nrefs++;
+    /* Every dict, or only those of the slot ranges: a dict outside them is
+     * not ours, a plain dict throughout. */
+    const slotRangeArray *sr = ctx->slot_ranges;
+    int nr = sr ? sr->num_ranges : 1;
+    for (int r = 0; r < nr; r++) {
+        int first = sr ? sr->ranges[r].start : 0;
+        int last = sr ? sr->ranges[r].end : n - 1;
+        serverAssert(last < n);
+        for (int didx = first; didx <= last; didx++) {
+            dict *d = kvstoreGetDict(kvs, didx);
+            if (!d || dictSize(d) == 0) continue;
+            kvstoreDictRetain(kvs, didx);
+            hybsnapWordStore(d, HYBSNAP_WORD(ctx->gen, HYBSNAP_SLOT_PENDING));
+            st->dicts[didx] = d;
+            st->nrefs++;
+        }
     }
     ctx->slots_total += st->nrefs;
     ctx->hooks.guard = hybsnapOverlayGuard;
@@ -1889,6 +1897,7 @@ static void hybsnapScanFreeze(hybsnapScanCtx *ctx) {
     hybsnapWindowReset(NULL);   /* no thread yet: drop the positions of a previous save */
     hybsnapEpochBegin(ctx);
     for (int s = 0; s < ctx->num_stores; s++) hybsnapScanFreezeStore(ctx, s);
+    ctx->slot_ranges = NULL;   /* borrowed: never read past the freeze */
     ctx->ring = zmalloc(sizeof(uint64_t) * (ctx->slots_total ? ctx->slots_total : 1));
     ctx->frozen_all = 1;
 }
@@ -2151,7 +2160,6 @@ size_t hybsnapSaveOverheadBytes(void) {
     for (int j = 0; j < sv->dbnum; j++)
         bytes += (size_t)sv->sizes[j].nslots * 2 * sizeof(uint64_t);
     if (sv->trim_slots) bytes += CLUSTER_SLOTS / 8;
-    if (sv->slot_filter) bytes += CLUSTER_SLOTS / 8;
     return bytes;
 }
 
@@ -3485,7 +3493,7 @@ static void hybsnapSaveFree(hybsnapSave *sv) {
      * when the child ended before their slots completed): free them while
      * sv->stores is still there, hybsnapSaveFreeFlushed clears the entry. */
     for (int j = 0; j < sv->dbnum; j++) hybsnapSaveFreeFlushed(sv, j);   /* normally freed at store completion */
-    zfree(sv->bitmaps);
+    zfree(sv->trim_slots);
     zfree(sv->tables);
     zfree(sv);
 }
@@ -3519,19 +3527,17 @@ static hybsnapSave *hybsnapSaveCreate(hybsnapSaveKind kind, int req, char *filen
         /* Atomic slot migration's slot snapshot: only the migrating slots, as
          * the classic child reads them from its copy of the migrate task. */
         sv->slots_form = 1;
-        sv->bitmaps = zcalloc(2 * (CLUSTER_SLOTS / 8));
-        sv->slot_filter = sv->bitmaps;
-        if (asmMigratingSlotsBitmap(sv->slot_filter) == 0) {
+        slotRangeArray *ranges = asmMigratingSlotRanges();
+        if (!ranges || ranges->num_ranges == 0) {
             serverLog(LL_WARNING, "Hybrid snapshot: slot snapshot requested with no migrate task running");
-            zfree(sv->bitmaps); zfree(sv->tables); zfree(sv);
+            zfree(sv->tables); zfree(sv);
             return NULL;
         }
     }
     if (server.cluster_enabled && asmIsTrimInProgress()) {
         /* The fork-instant set of slots under a trim job (the classic child reads
          * its copy-on-write copy of the same jobs). */
-        if (!sv->bitmaps) sv->bitmaps = zcalloc(2 * (CLUSTER_SLOTS / 8));
-        sv->trim_slots = (uint8_t *)sv->bitmaps + CLUSTER_SLOTS / 8;
+        sv->trim_slots = zcalloc(CLUSTER_SLOTS / 8);
         for (int slot = 0; slot < CLUSTER_SLOTS; slot++)
             if (isSlotInTrimJob(slot)) sv->trim_slots[slot >> 3] |= 1u << (slot & 7);
     }
@@ -3603,7 +3609,7 @@ static hybsnapSave *hybsnapSaveCreate(hybsnapSaveKind kind, int req, char *filen
     server.stat_hybsnap_saves++;
     sv->scan = hybsnapScanCreate(sv->stores, sv->dbnum, hybsnapSaveDispatch, NULL, sv);
     sv->scan->skip_stamped = 1;
-    if (sv->slot_filter) hybsnapScanSetSlotFilter(sv->scan, sv->slot_filter);
+    if (sv->slots_form) hybsnapScanSetSlotRanges(sv->scan, asmMigratingSlotRanges());
     hybsnapScanSetOverlay(sv->scan, &hybsnap_server_hooks, NULL);
     sv->scan->store_done = hybsnapSaveStoreDone;
     sv->scan->thread_done = hybsnapSaveThreadDone;

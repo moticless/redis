@@ -2379,10 +2379,6 @@ static void propagateModuleCommandsAtEnd(asmTask *task) {
     task->post_stream_module_cmds = NULL;
 }
 
-/* Save the slot ranges snapshot to the file. It generates the DUMP encoded
- * representation of each key in the slot ranges and writes it to the file.
- *
- * Returns C_OK on success, or C_ERR on error. */
 /* The single running migrate task, or NULL. */
 static asmTask *asmMigrateTask(void) {
     if (listLength(asmManager->tasks) != 1) return NULL;
@@ -2390,22 +2386,12 @@ static asmTask *asmMigrateTask(void) {
     return task->operation == ASM_MIGRATE ? task : NULL;
 }
 
-/* The slots of the running migrate task as a CLUSTER_SLOTS-bit bitmap
- * (bitmap: CLUSTER_SLOTS / 8 bytes, zeroed by the caller). Returns the number
- * of slots, 0 when no migrate task runs. The hybrid snapshot captures it at
- * the fork instant to freeze and scan only those slots. */
-int asmMigratingSlotsBitmap(uint8_t *bitmap) {
+/* The slots of the running migrate task, or NULL when no migrate task runs.
+ * Borrowed: valid while the task runs. The hybrid snapshot reads it at the
+ * fork instant to freeze only those slots. */
+slotRangeArray *asmMigratingSlotRanges(void) {
     asmTask *task = asmMigrateTask();
-    if (!task) return 0;
-    int n = 0;
-    for (int j = 0; j < task->slots->num_ranges; j++) {
-        slotRange *sr = &task->slots->ranges[j];
-        for (int k = sr->start; k <= sr->end; k++) {
-            bitmap[k >> 3] |= 1u << (k & 7);
-            n++;
-        }
-    }
-    return n;
+    return task ? task->slots : NULL;
 }
 
 /* The start of the slot snapshot stream, in the process that writes it (the
@@ -2461,6 +2447,10 @@ int slotSnapshotWriteEOF(rio *rdb) {
     return C_OK;
 }
 
+/* Save the slot ranges snapshot to the file. It generates the DUMP encoded
+ * representation of each key in the slot ranges and writes it to the file.
+ *
+ * Returns C_OK on success, or C_ERR on error. */
 int slotSnapshotSaveRio(int req, rio *rdb, int *error) {
     serverAssert(req & SLAVE_REQ_SLOTS_SNAPSHOT);
 
